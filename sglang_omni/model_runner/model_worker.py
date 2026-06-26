@@ -27,6 +27,9 @@ _ARCH_CONFIG_MAP: dict[str, tuple[str, str | None]] = {
     "Qwen3OmniTalker": ("talker_config", "text_config"),
     "Qwen3OmniThinkerForCausalLM": ("thinker_config", "text_config"),
     "Qwen3ASRForConditionalGeneration": ("thinker_config", "text_config"),
+    # Fun-ASR-Nano has no thinker_config wrapper: the Qwen3 text config is a
+    # top-level sibling (hf_config.text_config), so text_config_attr is None.
+    "FunAsrNanoForConditionalGeneration": ("text_config", None),
     "Qwen3TTSTalker": ("talker_config", None),
     "MossTTSDelaySGLangModel": ("language_config", None),
     "MossTTSLocalSGLangModel": ("language_config", None),
