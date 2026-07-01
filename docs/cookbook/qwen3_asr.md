@@ -66,16 +66,16 @@ print(resp.json()["text"])
 
 ## Benchmarking
 
-SeedTTS EN concurrency/WER benchmarking lives in
-`benchmarks/eval/benchmark_qwen3_asr_concurrency.py`. The same entry supports
-both Qwen3-ASR (default) and [Fun-ASR-Nano](fun_asr.md) (`--model fun_asr`);
-the per-model HTTP knobs are resolved by `benchmarks.tasks.tts.make_asr_send_fn`.
+SeedTTS EN concurrency/WER benchmarking for Qwen3-ASR lives in
+`benchmarks/eval/benchmark_asr_concurrency.py` (default
+`--model-path Qwen/Qwen3-ASR-1.7B`). The per-model HTTP knobs are resolved by
+`benchmarks.tasks.tts.make_asr_send_fn`.
 
 ```bash
 sgl-omni serve --model-path Qwen/Qwen3-ASR-1.7B --port 8000
 
 # Sweep the full SeedTTS EN set (1088 clips) at 1..64 concurrency, 3 repeats:
-python -m benchmarks.eval.benchmark_qwen3_asr_concurrency \
+python -m benchmarks.eval.benchmark_asr_concurrency \
   --port 8000 --concurrencies 1,2,4,8,16,32,64 --repeats 3
 ```
 

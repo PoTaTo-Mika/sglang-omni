@@ -62,6 +62,9 @@ tests/
     ├── qwen3_asr/
     │   ├── test_pipeline.py
     │   └── test_request_builders.py
+    ├── fun_asr/
+    │   ├── test_pipeline.py
+    │   └── test_request_builders.py
     ├── qwen3_tts/
     │   └── test_pipeline.py
     ├── higgs_tts/
@@ -271,6 +274,12 @@ that happened to contain an older version of the test.
     request builder paths
   - token-level result adapter marker handling, avoiding decode/encode
     text round-trips for byte-level BPE output.
+- `unit_test/fun_asr/`: Fun-ASR-Nano unit tests:
+  - pipeline config and stage factory: single `asr` stage, `max_running_requests=32`,
+    auto static KV budget, disabled multimodal embedding cache and torch.compile,
+    and `FunAsrNanoForConditionalGeneration` registry wiring
+  - request builder: inclusive audio offset recording, language-prompt prefix
+    construction, and result adapter direct-transcript decoding.
 - `unit_test/qwen3_omni/` Qwen3-Omni unit tests:
 
   - public CLI/config behavior
