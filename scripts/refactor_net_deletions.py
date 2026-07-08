@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import subprocess
 import sys
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Sequence
 
@@ -92,6 +94,7 @@ class Report:
     mode: str
     totals: dict[str, Totals]
     files: tuple[FileStat, ...]
+    pathspecs: tuple[str, ...] = ()
 
     @property
     def target_met(self) -> bool:
@@ -156,7 +159,10 @@ def parse_numstat_z(data: bytes) -> tuple[FileStat, ...]:
     return tuple(results)
 
 
-def build_report(repo: Path, diff_spec: DiffSpec, mode: str) -> Report:
+def build_report(
+    repo: Path, diff_spec: DiffSpec, mode: str, pathspecs: Sequence[str] = ()
+) -> Report:
+    path_args = ("--", *pathspecs) if pathspecs else ()
     raw = _run_git(
         repo,
         (
@@ -165,6 +171,7 @@ def build_report(repo: Path, diff_spec: DiffSpec, mode: str) -> Report:
             "-z",
             "--find-renames",
             *diff_spec.git_args,
+            *path_args,
         ),
     )
     files = parse_numstat_z(raw)
@@ -189,6 +196,7 @@ def build_report(repo: Path, diff_spec: DiffSpec, mode: str) -> Report:
             "all": all_totals,
         },
         files=files,
+        pathspecs=tuple(pathspecs),
     )
 
 
@@ -198,6 +206,7 @@ def format_text(report: Report, list_test_files: bool, list_non_test_files: bool
         f"Repo: {report.repo}",
         f"Diff: {report.diff_label}",
         f"Mode: {report.mode}",
+        f"Paths: {_format_pathspecs(report.pathspecs)}",
         "",
         _format_table(report),
         "",
@@ -225,6 +234,7 @@ def format_markdown(
         "",
         f"- Diff: `{report.diff_label}`",
         f"- Mode: `{report.mode}`",
+        f"- Paths: `{_format_pathspecs(report.pathspecs)}`",
         f"- Target: non-test net deleted > 0 (**{_format_target(report)}**)",
         "",
         "| Category | Files | Binary | Added | Deleted | Net deleted |",
@@ -257,6 +267,7 @@ def format_json(report: Report) -> str:
         "repo": report.repo,
         "diff": report.diff_label,
         "mode": report.mode,
+        "pathspecs": report.pathspecs,
         "target": {
             "name": "non_test_net_deleted_gt_zero",
             "met": report.target_met,
@@ -271,6 +282,260 @@ def format_json(report: Report) -> str:
         ],
     }
     return json.dumps(payload, indent=2, sort_keys=True)
+
+
+def format_html(
+    report: Report,
+    title: str,
+    issue_url: str | None,
+    refresh_seconds: int,
+    list_test_files: bool,
+    list_non_test_files: bool,
+) -> str:
+    generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    status_class = "met" if report.target_met else "miss"
+    status_label = "On track" if report.target_met else "Needs deletion"
+    issue_link = ""
+    if issue_url:
+        issue_link = (
+            f'<a class="link" href="{html.escape(issue_url, quote=True)}">'
+            "Roadmap issue</a>"
+        )
+
+    refresh_meta = ""
+    if refresh_seconds > 0:
+        refresh_meta = f'<meta http-equiv="refresh" content="{refresh_seconds}">'
+
+    file_sections = []
+    if list_non_test_files:
+        file_sections.append(
+            _format_html_file_section("Counted non-test files", report.files, False)
+        )
+    if list_test_files:
+        file_sections.append(
+            _format_html_file_section("Excluded test files", report.files, True)
+        )
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  {refresh_meta}
+  <title>{html.escape(title)}</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --text: #172033;
+      --muted: #667085;
+      --border: #d9dee8;
+      --green: #157f3b;
+      --green-bg: #e8f6ee;
+      --red: #b42318;
+      --red-bg: #fdecec;
+      --amber: #b54708;
+      --blue: #175cd3;
+      --shadow: 0 1px 2px rgba(16, 24, 40, 0.08);
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      letter-spacing: 0;
+    }}
+    main {{
+      width: min(1180px, calc(100vw - 32px));
+      margin: 0 auto;
+      padding: 28px 0 36px;
+    }}
+    header {{
+      display: flex;
+      justify-content: space-between;
+      gap: 20px;
+      align-items: flex-start;
+      margin-bottom: 18px;
+    }}
+    h1 {{
+      margin: 0 0 8px;
+      font-size: 28px;
+      line-height: 1.2;
+      font-weight: 720;
+    }}
+    .subline {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px 14px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
+    }}
+    .status {{
+      min-width: 156px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+      padding: 12px 14px;
+      text-align: right;
+    }}
+    .status .label {{
+      display: inline-block;
+      border-radius: 999px;
+      padding: 4px 9px;
+      font-size: 12px;
+      font-weight: 700;
+    }}
+    .status.met .label {{ color: var(--green); background: var(--green-bg); }}
+    .status.miss .label {{ color: var(--red); background: var(--red-bg); }}
+    .status .target {{
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 12px;
+    }}
+    .grid {{
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+      margin: 18px 0;
+    }}
+    .card {{
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      padding: 16px;
+    }}
+    .card h2 {{
+      margin: 0 0 12px;
+      font-size: 14px;
+      line-height: 1.25;
+      color: var(--muted);
+      font-weight: 700;
+      text-transform: uppercase;
+    }}
+    .net {{
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 12px;
+    }}
+    .net strong {{
+      font-size: 34px;
+      line-height: 1;
+      font-weight: 760;
+    }}
+    .net span {{
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }}
+    .metric-row {{
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 8px;
+      border-top: 1px solid var(--border);
+      padding-top: 12px;
+    }}
+    .metric .name {{
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 2px;
+    }}
+    .metric .value {{
+      font-size: 16px;
+      font-weight: 700;
+    }}
+    .positive {{ color: var(--green); }}
+    .negative {{ color: var(--red); }}
+    .zero {{ color: var(--amber); }}
+    .context {{
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      padding: 14px 16px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.55;
+    }}
+    .context code {{
+      color: var(--text);
+      background: #eef1f6;
+      padding: 1px 5px;
+      border-radius: 4px;
+    }}
+    .link {{ color: var(--blue); text-decoration: none; font-weight: 700; }}
+    .link:hover {{ text-decoration: underline; }}
+    .files {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 12px;
+    }}
+    .file-list {{
+      margin: 0;
+      padding: 0;
+      list-style: none;
+      max-height: 360px;
+      overflow: auto;
+      border-top: 1px solid var(--border);
+    }}
+    .file-list li {{
+      padding: 8px 0;
+      border-bottom: 1px solid var(--border);
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      font-size: 12px;
+      overflow-wrap: anywhere;
+    }}
+    @media (max-width: 840px) {{
+      header {{ display: block; }}
+      .status {{ text-align: left; margin-top: 12px; }}
+      .grid, .files {{ grid-template-columns: 1fr; }}
+      .metric-row {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>{html.escape(title)}</h1>
+        <div class="subline">
+          <span>Generated {html.escape(generated_at)}</span>
+          <span>Diff <code>{html.escape(report.diff_label)}</code></span>
+          <span>Mode <code>{html.escape(report.mode)}</code></span>
+          <span>Paths <code>{html.escape(_format_pathspecs(report.pathspecs))}</code></span>
+          {issue_link}
+        </div>
+      </div>
+      <div class="status {status_class}">
+        <span class="label">{status_label}</span>
+        <div class="target">non-test net deleted &gt; 0</div>
+      </div>
+    </header>
+
+    <section class="grid">
+      {_format_html_total_card("Non-test", report.totals["non_test"])}
+      {_format_html_total_card("Test", report.totals["test"])}
+      {_format_html_total_card("All", report.totals["all"])}
+    </section>
+
+    <section class="context">
+      Progress is measured as <code>deleted non-test lines - added non-test lines</code>.
+      Files classified as tests are reported separately and do not offset the
+      implementation deletion target.
+    </section>
+
+    {"".join(file_sections)}
+  </main>
+</body>
+</html>"""
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
@@ -312,9 +577,35 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--format",
-        choices=("text", "markdown", "json"),
+        choices=("text", "markdown", "json", "html"),
         default="text",
         help="Output format.",
+    )
+    parser.add_argument(
+        "--path",
+        action="append",
+        default=[],
+        help="Limit the diff to this git pathspec. May be repeated.",
+    )
+    parser.add_argument(
+        "--output",
+        help="Write output to this path instead of stdout.",
+    )
+    parser.add_argument(
+        "--title",
+        default="TTS Refactor Progress",
+        help="Dashboard title used by HTML output.",
+    )
+    parser.add_argument(
+        "--issue-url",
+        default="https://github.com/sgl-project/sglang-omni/issues/985",
+        help="Roadmap issue URL used by HTML output. Pass an empty string to omit.",
+    )
+    parser.add_argument(
+        "--refresh-seconds",
+        type=int,
+        default=0,
+        help="Add an HTML meta-refresh interval in seconds. Defaults to disabled.",
     )
     parser.add_argument(
         "--list-test-files",
@@ -339,16 +630,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     repo = Path(args.repo).resolve()
 
     diff_spec = resolve_diff_spec(repo, args)
-    report = build_report(repo, diff_spec, args.mode)
+    report = build_report(repo, diff_spec, args.mode, args.path)
 
     if args.format == "json":
         output = format_json(report)
     elif args.format == "markdown":
         output = format_markdown(report, args.list_test_files, args.list_non_test_files)
+    elif args.format == "html":
+        issue_url = args.issue_url or None
+        output = format_html(
+            report,
+            args.title,
+            issue_url,
+            args.refresh_seconds,
+            args.list_test_files,
+            args.list_non_test_files,
+        )
     else:
         output = format_text(report, args.list_test_files, args.list_non_test_files)
 
-    print(output)
+    if args.output:
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(output + "\n", encoding="utf-8")
+    else:
+        print(output)
     if args.fail_on_nonpositive and not report.target_met:
         return 1
     return 0
@@ -428,6 +734,59 @@ def _format_table(report: Report) -> str:
 
 def _format_target(report: Report) -> str:
     return "met" if report.target_met else "not met"
+
+
+def _format_pathspecs(pathspecs: Sequence[str]) -> str:
+    if not pathspecs:
+        return "(entire repository)"
+    return ", ".join(pathspecs)
+
+
+def _format_html_total_card(label: str, totals: Totals) -> str:
+    net_class = "positive" if totals.net_deleted > 0 else "negative"
+    if totals.net_deleted == 0:
+        net_class = "zero"
+
+    return f"""
+      <article class="card">
+        <h2>{html.escape(label)}</h2>
+        <div class="net">
+          <strong class="{net_class}">{totals.net_deleted:+d}</strong>
+          <span>net deleted</span>
+        </div>
+        <div class="metric-row">
+          {_format_html_metric("Added", totals.added)}
+          {_format_html_metric("Deleted", totals.deleted)}
+          {_format_html_metric("Files", totals.files)}
+          {_format_html_metric("Binary", totals.binary_files)}
+        </div>
+      </article>"""
+
+
+def _format_html_metric(label: str, value: int) -> str:
+    return (
+        '<div class="metric">'
+        f'<div class="name">{html.escape(label)}</div>'
+        f'<div class="value">{value}</div>'
+        "</div>"
+    )
+
+
+def _format_html_file_section(
+    title: str, files: Sequence[FileStat], is_test: bool
+) -> str:
+    paths = _matching_paths(files, is_test)
+    if paths:
+        items = "\n".join(f"<li>{html.escape(path)}</li>" for path in paths)
+    else:
+        items = '<li class="empty">none</li>'
+    return f"""
+    <section class="card" style="margin-top: 12px;">
+      <h2>{html.escape(title)}</h2>
+      <ul class="file-list">
+        {items}
+      </ul>
+    </section>"""
 
 
 def _matching_paths(files: Sequence[FileStat], is_test: bool) -> tuple[str, ...]:

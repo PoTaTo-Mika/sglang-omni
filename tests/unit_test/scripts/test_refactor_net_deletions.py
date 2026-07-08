@@ -91,3 +91,45 @@ def test_build_report_splits_test_and_non_test_totals() -> None:
     assert report.totals["test"].net_deleted == -28
     assert report.totals["all"].net_deleted == -13
     assert report.target_met
+
+
+def test_format_html_dashboard_escapes_paths_and_lists_test_files() -> None:
+    files = (
+        refactor_net_deletions.FileStat(
+            paths=("sglang_omni/foo<bar>.py",), added=1, deleted=4, is_test=False
+        ),
+        refactor_net_deletions.FileStat(
+            paths=("tests/unit_test/test_foo.py",), added=5, deleted=0, is_test=True
+        ),
+    )
+    totals = {
+        "non_test": refactor_net_deletions.Totals(),
+        "test": refactor_net_deletions.Totals(),
+        "all": refactor_net_deletions.Totals(),
+    }
+    for file_stat in files:
+        totals["all"].add(file_stat)
+        totals["test" if file_stat.is_test else "non_test"].add(file_stat)
+    report = refactor_net_deletions.Report(
+        repo="/repo",
+        diff_label="baseline...origin/main",
+        mode="merge-base",
+        totals=totals,
+        files=files,
+    )
+
+    rendered = refactor_net_deletions.format_html(
+        report,
+        title="TTS <Progress>",
+        issue_url="https://github.com/sgl-project/sglang-omni/issues/985",
+        refresh_seconds=300,
+        list_test_files=True,
+        list_non_test_files=True,
+    )
+
+    assert "<title>TTS &lt;Progress&gt;</title>" in rendered
+    assert '<meta http-equiv="refresh" content="300">' in rendered
+    assert "https://github.com/sgl-project/sglang-omni/issues/985" in rendered
+    assert "sglang_omni/foo&lt;bar&gt;.py" in rendered
+    assert "tests/unit_test/test_foo.py" in rendered
+    assert "+3" in rendered
