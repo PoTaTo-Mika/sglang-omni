@@ -68,6 +68,10 @@ plain local HTTP server, then expose that localhost port with
 [Cloudflare Quick Tunnels](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/trycloudflare/)
 or [ngrok](https://ngrok.com/docs/getting-started).
 
+The dashboard also includes a `Reusable shared surfaces` panel that links the
+TTS refactor design doc and the shared files developers should check before
+adding new model-local code.
+
 For the whole TTS refactor, choose one stable baseline and keep using it. The
 parent of the first landed TTS refactor PR is a reasonable baseline:
 

@@ -130,6 +130,10 @@ def test_format_html_dashboard_escapes_paths_and_lists_test_files() -> None:
     assert "<title>TTS &lt;Progress&gt;</title>" in rendered
     assert '<meta http-equiv="refresh" content="300">' in rendered
     assert "https://github.com/sgl-project/sglang-omni/issues/985" in rendered
+    assert "TTS refactor design doc" in rendered
+    assert "https://osgbw74w8zwb.sg.larksuite.com/docx/L3XId4GHYoJqSKxwXYqlXaBrgNd" in rendered
+    assert "Reusable shared surfaces" in rendered
+    assert "sglang_omni/scheduling/reference_encoder.py" in rendered
     assert "sglang_omni/foo&lt;bar&gt;.py" in rendered
     assert "tests/unit_test/test_foo.py" in rendered
     assert "+3" in rendered

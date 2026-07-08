@@ -36,6 +36,52 @@ TEST_FILE_SUFFIXES = (
     ".spec.ts",
     ".spec.tsx",
 )
+GITHUB_BLOB_BASE_URL = "https://github.com/sgl-project/sglang-omni/blob/main/"
+TTS_REFACTOR_DESIGN_DOC_URL = (
+    "https://osgbw74w8zwb.sg.larksuite.com/docx/L3XId4GHYoJqSKxwXYqlXaBrgNd"
+)
+TTS_REFACTOR_SHARED_SURFACES = (
+    (
+        "PipelineStateBase",
+        "sglang_omni/scheduling/pipeline_state.py",
+        "Per-request state serialization, tensor-safe value handling, and usage accounting.",
+    ),
+    (
+        "TtsEngineBuilder",
+        "sglang_omni/scheduling/engine_factory.py",
+        "Template for TTS SGLang AR engine startup, model-local hooks, and scheduler construction.",
+    ),
+    (
+        "ReferenceEncodeService",
+        "sglang_omni/scheduling/reference_encoder.py",
+        "Bounded cache and same-key single-flight for uploaded/reference audio artifacts.",
+    ),
+    (
+        "StageOutputCache",
+        "sglang_omni/scheduling/stage_cache.py",
+        "Small bounded LRU cache for non-AR stage outputs and encoded artifacts.",
+    ),
+    (
+        "BatchVocoderBase",
+        "sglang_omni/scheduling/vocoder_base.py",
+        "SimpleScheduler-backed base for batched non-streaming vocoder stages.",
+    ),
+    (
+        "ModelCapabilities",
+        "sglang_omni/models/model_capabilities.py",
+        "Static model capability declarations for routing, docs, and review checks.",
+    ),
+    (
+        "SpeakerArtifactCache",
+        "sglang_omni/scheduling/speaker_cache.py",
+        "Process-wide LRU cache for uploaded-speaker feature artifacts.",
+    ),
+    (
+        "ReferenceEncodeService docs",
+        "docs/developer_reference/reference_encode_service.md",
+        "Usage rules, cache-key contract, and migration notes for reference encoding.",
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -471,6 +517,40 @@ def format_html(
     }}
     .link {{ color: var(--blue); text-decoration: none; font-weight: 700; }}
     .link:hover {{ text-decoration: underline; }}
+    .resource-grid {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 10px;
+    }}
+    .resource {{
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px;
+      background: #fbfcfe;
+      min-width: 0;
+    }}
+    .resource a {{
+      color: var(--blue);
+      text-decoration: none;
+      font-size: 13px;
+      font-weight: 760;
+      overflow-wrap: anywhere;
+    }}
+    .resource a:hover {{ text-decoration: underline; }}
+    .resource code {{
+      display: block;
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 11px;
+      overflow-wrap: anywhere;
+    }}
+    .resource p {{
+      margin: 8px 0 0;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+    }}
     .files {{
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -496,7 +576,7 @@ def format_html(
     @media (max-width: 840px) {{
       header {{ display: block; }}
       .status {{ text-align: left; margin-top: 12px; }}
-      .grid, .files {{ grid-template-columns: 1fr; }}
+      .grid, .files, .resource-grid {{ grid-template-columns: 1fr; }}
       .metric-row {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
     }}
   </style>
@@ -531,6 +611,8 @@ def format_html(
       Files classified as tests are reported separately and do not offset the
       implementation deletion target.
     </section>
+
+    {_format_html_resources()}
 
     {"".join(file_sections)}
   </main>
@@ -787,6 +869,57 @@ def _format_html_file_section(
         {items}
       </ul>
     </section>"""
+
+
+def _format_html_resources() -> str:
+    design_url = html.escape(TTS_REFACTOR_DESIGN_DOC_URL, quote=True)
+    items = [
+        (
+            "TTS refactor design doc",
+            TTS_REFACTOR_DESIGN_DOC_URL,
+            "External RFC/design source for the TTS refactor roadmap and shared-surface decisions.",
+            "",
+        )
+    ]
+    for title, path, description in TTS_REFACTOR_SHARED_SURFACES:
+        items.append(
+            (
+                title,
+                f"{GITHUB_BLOB_BASE_URL}{path}",
+                description,
+                path,
+            )
+        )
+
+    rendered = "\n".join(
+        _format_html_resource_item(title, url, description, path)
+        for title, url, description, path in items
+    )
+    return f"""
+    <section class="card" style="margin-top: 12px;">
+      <h2>Reusable shared surfaces</h2>
+      <div class="context" style="box-shadow: none; margin-bottom: 10px;">
+        Start here before adding new model-local code. Reuse these shared files
+        when a new refactor touches state, engine construction, reference
+        encoding, vocoder mechanics, capability metadata, or stage caches.
+        <a class="link" href="{design_url}">Open the design doc</a>.
+      </div>
+      <div class="resource-grid">
+        {rendered}
+      </div>
+    </section>"""
+
+
+def _format_html_resource_item(
+    title: str, url: str, description: str, path: str
+) -> str:
+    path_line = f"<code>{html.escape(path)}</code>" if path else ""
+    return f"""
+        <article class="resource">
+          <a href="{html.escape(url, quote=True)}">{html.escape(title)}</a>
+          {path_line}
+          <p>{html.escape(description)}</p>
+        </article>"""
 
 
 def _matching_paths(files: Sequence[FileStat], is_test: bool) -> tuple[str, ...]:
