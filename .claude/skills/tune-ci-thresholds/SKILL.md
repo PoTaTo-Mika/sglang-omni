@@ -195,17 +195,26 @@ partial observations, wrong sample scope, missing metrics, or mixed commit SHA.
 
 `apply-plan` is read-only JSON: for each metric it emits `worst_raw`,
 `write_value`, `current_raw`, and `direction` (`tightens` / `loosens` /
-`equal`). The agent (or operator) performs the file edits. Application writes
-pre-slack reference values only. CI assertion slack remains in the tests. Never
-write constants derived by `apply_slack`, `apply_wer_slack`, `apply_mos_slack`,
-`THRESHOLD_SLACK_HIGHER`, or `THRESHOLD_SLACK_LOWER`.
+`equal` / `fixed`). The agent (or operator) performs the file edits.
+Application writes pre-slack reference values only. CI assertion slack remains
+in the tests. Never write constants derived by `apply_slack`,
+`apply_wer_slack`, `apply_mos_slack`, `THRESHOLD_SLACK_HIGHER`, or
+`THRESHOLD_SLACK_LOWER`.
+
+**Fixed thresholds (never apply):** symbols in
+`_FIXED_THRESHOLD_SYMBOLS` are excluded from discover and must not be rewritten
+during calibration. Today that includes
+`MOSS_TD_STREAM_N_ABOVE_50_CER_MAX` (keep at `31`; streaming headcount is too
+unstable for worst-of-N). If `apply-plan` reports `direction=fixed`, leave the
+literal unchanged.
 
 Supported decisions after the report:
 
 - `report`: do not edit thresholds.
 - `smart`: apply correctness/quality references; automatically tighten speed;
-  ask before loosening speed.
-- `full`: apply every non-equal worst-of-N `write_value`.
+  ask before loosening speed. Skip `direction=fixed`.
+- `full`: apply every non-equal worst-of-N `write_value`. Skip
+  `direction=fixed`.
 
 Before applying speed changes, skim each speed stage’s five raw values. If the
 relative range is large (rough guide: ≳ 20–30% of the median for throughput or

@@ -21,6 +21,13 @@ def test_expected_samples_never_uses_concurrency():
     )
 
 
+def test_moss_td_stream_n_above_50_cer_max_is_fixed_not_calibrated():
+    """Streaming n_above_50 stays hand-pinned; discover/apply must not target it."""
+    assert "MOSS_TD_STREAM_N_ABOVE_50_CER_MAX" in tune._FIXED_THRESHOLD_SYMBOLS
+    assert tune.match_metric("MOSS_TD_STREAM_N_ABOVE_50_CER_MAX", None) is None
+    assert tune.match_metric("MOSS_TD_N_ABOVE_50_CER_MAX", None) == "n_above_50_pct_cer"
+
+
 def test_configured_expected_samples_supports_group_override():
     assert tune._configured_expected_samples({"expected_samples": 50}, "speed") == 50
     assert (

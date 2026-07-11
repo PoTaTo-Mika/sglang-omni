@@ -163,11 +163,19 @@ _TTS_FIXED_PRESETS = frozenset({
     "STREAMING_BENCHMARK_MAX_SAMPLES",
 })
 
+# Assertion literals that stay hand-pinned. Discover must not emit them as
+# calibration metrics, and apply must never rewrite them from worst-of-N.
+# MOSS streaming n_above_50 is too unstable for worst-of-N; keep the test
+# constant fixed (currently 31) across calibration cycles.
+_FIXED_THRESHOLD_SYMBOLS = frozenset({
+    "MOSS_TD_STREAM_N_ABOVE_50_CER_MAX",
+})
+
 
 def match_metric(name, nested):
     if nested is not None:
         return nested if nested in _NESTED else None
-    if name in _TTS_FIXED_PRESETS:
+    if name in _TTS_FIXED_PRESETS or name in _FIXED_THRESHOLD_SYMBOLS:
         return None
     if re.fullmatch(r".*_ACC(?:URACY)?_MIN", name) or re.fullmatch(r".*_MIN_ACCURACY", name):
         return "accuracy"
@@ -187,6 +195,8 @@ def match_metric(name, nested):
         return "cp_cer_percent"
     if "DELTA_CER_PERCENT" in name:
         return "delta_cer_percent"
+    # Non-streaming uses MOSS_TD_N_ABOVE_50_CER_REF (+ slack-derived MAX).
+    # Streaming MAX is in _FIXED_THRESHOLD_SYMBOLS and never matches here.
     if "N_ABOVE_50_CER_MAX" in name:
         return "n_above_50_pct_cer"
     # DER calibrates the reference constant (test derives the MAX via slack),
@@ -3361,15 +3371,21 @@ def apply_plan(run_dir):
                 worst_rounded = round(worst, digits)
             else:
                 worst, worst_rounded = None, None
-            write_value = _apply_write_value(
-                worst_op, worst, worst_rounded, s.get("group"))
             if kind == "bare":
                 cur = _read_bare_value(threshold_text, sym)
             elif kind == "nested":
                 cur = _read_nested_value(threshold_text, sym, conc, sub)
             else:
                 cur = None
-            direction = _classify_direction(worst_op, cur, write_value)
+            # Defense in depth: fixed symbols stay out of discover, but if an
+            # old stages.yaml still lists one, never propose rewriting it.
+            if sym in _FIXED_THRESHOLD_SYMBOLS:
+                write_value = None
+                direction = "fixed"
+            else:
+                write_value = _apply_write_value(
+                    worst_op, worst, worst_rounded, s.get("group"))
+                direction = _classify_direction(worst_op, cur, write_value)
             sg["metrics"].append({
                 "metric_key": mk,
                 "source": m["source"],

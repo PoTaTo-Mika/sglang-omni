@@ -73,7 +73,12 @@ derived assertion threshold.
 
 `apply-plan` is read-only planning output. File edits happen only after an
 explicit apply decision (`report` / `smart` / `full`). After a `full` apply,
-re-running `apply-plan` should show `direction=equal` for every metric.
+re-running `apply-plan` should show `direction=equal` for every calibratable
+metric (`direction=fixed` symbols are never rewritten).
+
+Fixed threshold symbols (`_FIXED_THRESHOLD_SYMBOLS` in `tune.py`, currently
+`MOSS_TD_STREAM_N_ABOVE_50_CER_MAX`) are not discover targets and must remain
+hand-pinned across calibration cycles.
 
 ## Speed health before apply
 
