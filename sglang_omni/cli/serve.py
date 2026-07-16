@@ -863,6 +863,38 @@ def apply_decode_mode_cli_overrides(
     return pipeline_config
 
 
+def apply_prefill_coalesce_cli_overrides(
+    pipeline_config: PipelineConfig,
+    *,
+    prefill_coalesce_requests: int | None,
+    prefill_coalesce_wait_ms: float | None,
+) -> PipelineConfig:
+    updates: dict[str, object] = {}
+    if prefill_coalesce_requests is not None:
+        if prefill_coalesce_requests < 0:
+            raise typer.BadParameter("--prefill-coalesce-requests must be >= 0")
+        updates["prefill_coalesce_requests"] = int(prefill_coalesce_requests)
+    if prefill_coalesce_wait_ms is not None:
+        if prefill_coalesce_wait_ms <= 0:
+            raise typer.BadParameter("--prefill-coalesce-wait-ms must be > 0")
+        updates["prefill_coalesce_wait_ms"] = float(prefill_coalesce_wait_ms)
+    if not updates:
+        return pipeline_config
+    matching_stages = [
+        stage
+        for stage in pipeline_config.stages
+        if stage.factory in _ASYNC_DECODE_FACTORIES
+    ]
+    if not matching_stages:
+        raise typer.BadParameter(
+            "--prefill-coalesce-requests/--prefill-coalesce-wait-ms currently "
+            f"support only {_ASYNC_DECODE_SUPPORTED_MODELS}; no stage in this "
+            "pipeline uses a supported factory"
+        )
+    _apply_factory_args_updates(pipeline_config, matching_stages, updates)
+    return pipeline_config
+
+
 def apply_torch_compile_cli_overrides(
     pipeline_config: PipelineConfig,
     *,
@@ -1210,6 +1242,30 @@ def serve(
             ),
         ),
     ] = None,
+    prefill_coalesce_requests: Annotated[
+        int | None,
+        typer.Option(
+            "--prefill-coalesce-requests",
+            "--prefill_coalesce_requests",
+            help=(
+                "Hold prefill admission until this many requests are waiting "
+                "(or the oldest has waited --prefill-coalesce-wait-ms), "
+                "amortizing the per-step host cost. 0 disables (default). "
+                f"Available for {_ASYNC_DECODE_SUPPORTED_MODELS}."
+            ),
+        ),
+    ] = None,
+    prefill_coalesce_wait_ms: Annotated[
+        float | None,
+        typer.Option(
+            "--prefill-coalesce-wait-ms",
+            "--prefill_coalesce_wait_ms",
+            help=(
+                "Upper bound on the extra time-to-first-token a queued request "
+                "pays for prefill coalescing. Default 60."
+            ),
+        ),
+    ] = None,
     max_running_requests: Annotated[
         int | None,
         typer.Option(
@@ -1327,6 +1383,11 @@ def serve(
         merged_config,
         decode_mode=decode_mode,
         async_lookahead_min_batch_size=async_lookahead_min_batch_size,
+    )
+    merged_config = apply_prefill_coalesce_cli_overrides(
+        merged_config,
+        prefill_coalesce_requests=prefill_coalesce_requests,
+        prefill_coalesce_wait_ms=prefill_coalesce_wait_ms,
     )
     generation_server_args_overrides: dict[str, object] = {}
     if max_running_requests is not None:
