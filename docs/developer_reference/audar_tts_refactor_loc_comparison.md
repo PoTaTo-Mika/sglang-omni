@@ -106,7 +106,7 @@ python3 scripts/refactor_net_deletions.py \
 | T1 前最小 | `tests/unit_test/audar_tts` | 8 passed |
 | T1 前生产 | `tests/unit_test/audar_tts` | 14 passed |
 | 最新最小 | Audar + pipeline-state + capabilities | 55 passed |
-| 最新生产 | Audar + pipeline-state + capabilities | 64 passed |
+| 最新生产 | Audar + pipeline-state + capabilities | 65 passed |
 
 四个分支的 Audar 文件均通过 `ruff format --check` 和 `ruff check`。
 
