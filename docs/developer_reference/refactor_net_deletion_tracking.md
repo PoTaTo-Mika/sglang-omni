@@ -15,6 +15,11 @@ The target is met when `non-test net deleted > 0`. Test changes are still
 reported, but they are excluded from the progress target so that added coverage
 does not hide whether the refactor is actually shrinking implementation code.
 
+The locked four-way Audar-TTS integration experiment is recorded in
+[audar_tts_refactor_loc_comparison.md](./audar_tts_refactor_loc_comparison.md).
+It separates minimal integration LOC from production-enhanced LOC and uses the
+same test-exclusion rules as this tracker.
+
 ## Test File Detection
 
 A changed file is treated as a test file when either of these rules match:
