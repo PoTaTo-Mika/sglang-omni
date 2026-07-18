@@ -133,7 +133,7 @@ batching、TP 或 streaming。这个限制在重构前后完全相同，所以 L
 - 代码与轻量结果：上述四个 Git 分支和本文件。
 - 模型：[`audarai/Audar-TTS-V1-Turbo`](https://huggingface.co/audarai/Audar-TTS-V1-Turbo)，官方 Hugging Face 仓库。
 - 轻量 benchmark 汇总在 latest production 分支的
-  `tests/benchmark/audar_tts/RESULTS.md` 和 `comparison.json`。
+  `benchmarks/audar_tts/RESULTS.md` 和 `comparison.json`。
 - 28 次请求的原始输出暂存于 H100
   `/data/jaxan/audar-results-production-equal-final`。计划上传到正确 owner 的
   Hugging Face dataset repo；当前缺少对应 credential，状态为 pending。
