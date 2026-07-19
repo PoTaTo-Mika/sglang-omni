@@ -41,6 +41,9 @@ results/
 .humanize/
 .benchmark-data/
 
+# Rust build artifacts
+target/
+
 .tune-runs/
 .eval-runs/
 benchmarks/eval/*.edit.lock

@@ -22,9 +22,9 @@ env:
 
 jobs:
   rust-router:
-    name: worker-pool
+    name: standalone router qualification
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 50
 
     defaults:
       run:
@@ -99,12 +99,20 @@ jobs:
           cargo tree --locked -d
           cargo tree --locked --target all -d
 
+      - name: Release qualification
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+
+          cargo test --release --workspace --all-features --locked --test process
+          cargo build --release --locked --bin sgl-omni-router
+
       - name: CLI smoke tests
         timeout-minutes: 3
         run: |
           set -euo pipefail
 
-          binary="./target/debug/sgl-omni-router"
+          binary="./target/release/sgl-omni-router"
           config="$RUNNER_TEMP/sgl-omni-router.toml"
 
           "$binary" --help
@@ -174,6 +182,37 @@ jobs:
           EOF
 
           "$binary" --config "$config" --check-config
+
+      - name: Record release identity
+        run: |
+          set -euo pipefail
+
+          commit="$(git rev-parse HEAD)"
+          tree="$(git rev-parse 'HEAD^{tree}')"
+          rustc_version="$(rustc --version)"
+          host_target="$(rustc --version --verbose | sed -n 's/^host: //p')"
+          lock_sha256="$(sha256sum Cargo.lock | cut -d ' ' -f 1)"
+          binary_sha256="$(sha256sum target/release/sgl-omni-router | cut -d ' ' -f 1)"
+
+          test -n "$commit"
+          test -n "$tree"
+          test -n "$rustc_version"
+          test -n "$host_target"
+          test -n "$lock_sha256"
+          test -n "$binary_sha256"
+
+          {
+            echo "## Standalone router release identity"
+            echo
+            echo "| Field | Exact value |"
+            echo "| --- | --- |"
+            printf '| Git commit | `%s` |\n' "$commit"
+            printf '| Git tree | `%s` |\n' "$tree"
+            printf '| Rust compiler | `%s` |\n' "$rustc_version"
+            printf '| Host target | `%s` |\n' "$host_target"
+            printf '| Cargo.lock SHA-256 | `%s` |\n' "$lock_sha256"
+            printf '| Release binary SHA-256 | `%s` |\n' "$binary_sha256"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Verify clean generated state
         if: always()
