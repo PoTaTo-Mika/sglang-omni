@@ -3,7 +3,8 @@
 This directory contains the standalone `sgl-omni-router` service. The
 worker-pool release validates one bounded static worker manifest, runs isolated
 bounded health probes, serves router-local liveness and readiness, and owns
-graceful process shutdown. It has no proxy or inference route.
+graceful process shutdown. Its only inference route is the optional exact
+`POST /v1/chat/completions` relay described below.
 
 Run the service with:
 
@@ -36,6 +37,7 @@ filter = "info"
 [router]
 strategy = "round_robin"
 required_services = ["generation_http"]
+max_concurrent_classifications = 4
 
 [admission]
 global = 1024
@@ -54,6 +56,16 @@ success_threshold = 2
 failure_threshold = 3
 max_concurrent_probes = 16
 
+[http_generation]
+trust_domain = "local"
+buffered_request_max_bytes = 8388608
+buffered_request_total_bytes = 268435456
+streamed_request_max_bytes = 536870912
+connect_timeout_ms = 5000
+request_timeout_ms = 1800000
+pool_idle_timeout_ms = 90000
+pool_max_idle_per_host = 8
+
 [[workers]]
 worker_id = "omni-a"
 base_url = "http://omni-a.internal:30001"
@@ -68,17 +80,23 @@ generation_http = 64
 [[workers.service_profiles]]
 service = "generation_http"
 model_ids = ["omni-model"]
-message_content_forms = ["string", "typed_parts"]
-media_placements = ["top_level", "typed_parts"]
-input_modalities = ["text", "image", "audio", "video"]
-output_modalities = ["text", "audio"]
-chat_audio_formats = ["wav", "mp3", "flac", "pcm", "aac", "opus"]
+message_content_forms = ["string"]
+media_placements = []
+input_modalities = ["text"]
+output_modalities = ["text"]
+chat_audio_formats = []
 stream_modes = ["non_streaming", "streaming"]
 ```
 
-All fields are explicit. Unknown and duplicate fields are rejected. The
+This runnable row deliberately claims only model-proven text chat; media rows
+must be added per model/topology after integration proof. All fields are
+explicit. Unknown and duplicate fields are rejected. The
 logging filter comes only from this file; environment variables such as
 `RUST_LOG` are not read.
+
+`router.max_concurrent_classifications` bounds buffered request classification
+across the process. Admitted requests wait for a slot within their existing
+request deadline. The default is `4`; valid values are `1` through `64`.
 
 Worker transport resolution is static and fail-closed. A hostname `base_url`
 requires one `resolved_ip`; an IPv4 or IPv6 literal `base_url` forbids it.
@@ -124,11 +142,22 @@ For HTTP, omitted or false `stream` maps to `non_streaming`, while true maps to
 belong in a separate correlated row advertising only `non_streaming`. The mode
 is operator-approved eligibility for the public request behavior, not a
 promise of one universal chunk cadence. This branch records and matches these
-facts but still exposes no inference route, request parser, or WebSocket relay.
+speech facts but exposes no speech HTTP request parser or WebSocket relay.
+
+`POST /v1/chat/completions` is enabled only when `[http_generation]` is
+present. It accepts HTTP/1.1 JSON, selects one compatible generation row, and
+relays original request and response bytes. `request_timeout_ms` is one
+absolute precommit deadline covering ingress through upstream response
+headers. After response commitment, the direct body has no absolute wall-clock
+deadline; it ends on upstream EOF/error, downstream drop, or process shutdown.
+The focused direct-dependency decisions for this relay are recorded in
+[`DEPENDENCIES.md`](DEPENDENCIES.md).
 
 `GET /live` is worker-independent and remains logically live while serving or
 draining. `GET /ready` starts at `503` and returns `200` only while serving and
-every configured required service class has a healthy serving profile. Permit
+every configured required service class has a healthy serving profile. When
+chat generation is enabled, readiness additionally requires a healthy serving
+generation worker in the exact `http_generation.trust_domain`. Permit
 saturation does not change readiness. Worker health is status-only exact
 `GET /health` by default; response bodies are not parsed or buffered. No public
-`/health` alias or inference route is registered.
+`/health` alias is registered.

@@ -3,13 +3,14 @@ use std::sync::Arc;
 use axum::Router;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::routing::get;
-use tokio::sync::oneshot;
+use axum::routing::{get, post};
+use tokio::sync::{Semaphore, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{error, info};
 
 use crate::config::Config;
 use crate::error::RouterError;
+use crate::http_generation::{self, HttpGeneration};
 use crate::lifecycle::Lifecycle;
 use crate::shutdown;
 use crate::worker_pool::{HealthSupervisor, HealthTaskError, WorkerPool};
@@ -27,16 +28,29 @@ const READY_BODY: &str = "ready\n";
 struct AppState {
     lifecycle: Arc<Lifecycle>,
     pool: Arc<WorkerPool>,
+    generation: Option<Arc<HttpGeneration>>,
 }
 
 pub(crate) async fn serve(config: Config) -> Result<(), RouterError> {
     let lifecycle = Arc::new(Lifecycle::starting());
     let pool = Arc::new(WorkerPool::build(&config)?);
+    let classification_slots = Arc::new(Semaphore::new(
+        config.router.max_concurrent_classifications(),
+    ));
+    let generation = HttpGeneration::build(
+        &config,
+        Arc::clone(&pool),
+        Arc::clone(&classification_slots),
+    )?;
     let mut signal_observer = shutdown::SignalObserver::install().map_err(RouterError::Signal)?;
-    let app = route_table(AppState {
-        lifecycle: Arc::clone(&lifecycle),
-        pool: Arc::clone(&pool),
-    });
+    let app = route_table(
+        AppState {
+            lifecycle: Arc::clone(&lifecycle),
+            pool: Arc::clone(&pool),
+            generation: generation.clone(),
+        },
+        generation,
+    );
     let listener = tokio::net::TcpListener::bind(config.server.listen)
         .await
         .map_err(RouterError::Bind)?;
@@ -168,11 +182,19 @@ pub(crate) async fn serve(config: Config) -> Result<(), RouterError> {
     Ok(())
 }
 
-fn route_table(state: AppState) -> Router {
-    Router::new()
+fn route_table(state: AppState, generation: Option<Arc<HttpGeneration>>) -> Router {
+    let app = Router::new()
         .route("/live", get(live).head(reject_head))
         .route("/ready", get(ready).head(reject_head))
-        .with_state(state)
+        .with_state(state);
+    if let Some(generation) = generation {
+        app.route(
+            "/v1/chat/completions",
+            post(http_generation::chat).with_state(generation),
+        )
+    } else {
+        app
+    }
 }
 
 async fn live(State(state): State<AppState>) -> (StatusCode, &'static str) {
@@ -184,7 +206,13 @@ async fn live(State(state): State<AppState>) -> (StatusCode, &'static str) {
 }
 
 async fn ready(State(state): State<AppState>) -> (StatusCode, &'static str) {
-    if state.lifecycle.is_serving() && state.pool.is_ready() {
+    if state.lifecycle.is_serving()
+        && state.pool.is_ready()
+        && state
+            .generation
+            .as_ref()
+            .is_none_or(|generation| generation.is_ready())
+    {
         (StatusCode::OK, READY_BODY)
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, NOT_READY_BODY)

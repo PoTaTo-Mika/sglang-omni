@@ -28,7 +28,7 @@ pub(crate) use resolver::ResolvedTarget;
 use health::HealthCell;
 use permit::{AdmissionController, Gate, class_index};
 use profile::{ServiceProfile, WorkerCapacityConfig};
-use resolver::{StaticResolver, build_health_client};
+use resolver::{StaticResolver, build_generation_client, build_health_client};
 use selection::{PolicyCandidate, Selector};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -132,6 +132,7 @@ pub(crate) struct WorkerPool {
     homogeneous_generation_http: Vec<HomogeneousGenerationCohort>,
     realtime_defaults_unambiguous: bool,
     health_client: reqwest::Client,
+    generation_client: Option<reqwest::Client>,
 }
 
 struct HomogeneousGenerationCohort {
@@ -163,12 +164,26 @@ impl WorkerPool {
             .ok_or(crate::error::RouterError::WorkerPoolInvariant)?;
         let resolver = StaticResolver::from_targets(&targets)
             .ok_or(crate::error::RouterError::WorkerPoolInvariant)?;
+        let resolver = Arc::new(resolver);
         let health_client = build_health_client(
-            Arc::new(resolver),
+            Arc::clone(&resolver),
             config.health.timeout(),
             config.health.interval(),
         )
         .map_err(crate::error::RouterError::HealthClient)?;
+        let generation_client = config
+            .http_generation
+            .as_ref()
+            .map(|generation| {
+                build_generation_client(
+                    resolver,
+                    generation.connect_timeout(),
+                    generation.pool_idle_timeout(),
+                    generation.pool_max_idle_per_host,
+                )
+            })
+            .transpose()
+            .map_err(crate::error::RouterError::GenerationClient)?;
         let gate = Arc::new(RwLock::new(Gate::open()));
         let classes = [
             config.admission.generation_http,
@@ -225,6 +240,7 @@ impl WorkerPool {
             homogeneous_generation_http,
             realtime_defaults_unambiguous,
             health_client,
+            generation_client,
         })
     }
 
@@ -237,6 +253,10 @@ impl WorkerPool {
             config.health.failure_threshold(),
             config.health.max_concurrent_probes(),
         )
+    }
+
+    pub(crate) fn generation_client(&self) -> Option<reqwest::Client> {
+        self.generation_client.clone()
     }
 
     pub(crate) fn try_admit(&self, class: CapacityClass) -> Result<AdmissionLease, AdmissionError> {
@@ -345,10 +365,6 @@ impl WorkerPool {
             .map(|cohort| HomogeneousGenerationHttp { pool: self, cohort })
     }
 
-    pub(crate) fn request_immediate_probe(&self, lease: &RequestLease) {
-        lease.registration.immediate_probe.notify_one();
-    }
-
     pub(crate) fn is_ready(&self) -> bool {
         self.gate.read().is_ok_and(|gate| {
             gate.open
@@ -361,6 +377,20 @@ impl WorkerPool {
                     self.records
                         .iter()
                         .any(|record| record.serves_class(*class, self.voice_owner.as_ref()))
+                })
+        })
+    }
+
+    pub(crate) fn generation_http_ready(&self, trust: &TrustDomain) -> bool {
+        self.gate.read().is_ok_and(|gate| {
+            gate.open
+                && self.records.iter().any(|record| {
+                    &record.trust_domain == trust
+                        && record.available_for_dispatch()
+                        && record
+                            .profiles
+                            .iter()
+                            .any(|profile| profile.service_class() == ServiceClass::GenerationHttp)
                 })
         })
     }
@@ -546,8 +576,8 @@ pub(crate) mod benchmark {
     };
     use super::{
         AdmissionController, CapacityClass, CapacitySlot, Disposition, Gate, HealthCell,
-        HealthState, PolicyCandidate, ResolvedTarget, Selector, StaticResolver, WorkerPool,
-        WorkerRecord, build_health_client, build_homogeneous_generation_cohorts,
+        HealthState, PolicyCandidate, RequestLease, ResolvedTarget, Selector, StaticResolver,
+        WorkerPool, WorkerRecord, build_health_client, build_homogeneous_generation_cohorts,
         build_policy_candidates, compute_realtime_defaults_unambiguous,
     };
     use crate::config::RoutingStrategy;
@@ -638,6 +668,7 @@ pub(crate) mod benchmark {
                 gate: Arc::clone(&gate),
                 admission: AdmissionController::new(gate, 2, [2; 7]),
                 selector: Selector::new(strategy),
+                generation_client: Some(health_client.clone()),
                 health_client,
             };
             Ok(Self {
@@ -704,6 +735,47 @@ pub(crate) mod benchmark {
                 return false;
             };
             proof.dispatch(admission).is_ok()
+        }
+
+        pub(crate) fn pool(&self) -> &WorkerPool {
+            &self.dispatch_pool
+        }
+
+        pub(crate) fn trust_domain(&self) -> &TrustDomain {
+            &self.trust_domain
+        }
+
+        pub(crate) fn request_lease(&self) -> Option<RequestLease> {
+            let admission = self
+                .dispatch_pool
+                .try_admit(CapacityClass::GenerationHttp)
+                .ok()?;
+            self.dispatch_pool
+                .dispatch(admission, &self.requirement)
+                .ok()
+        }
+
+        pub(crate) fn probe_requested(&self) -> bool {
+            use std::future::Future;
+            use std::task::{Context, Poll, Waker};
+
+            let Some(record) = self.records.first() else {
+                return false;
+            };
+            let mut notified = std::pin::pin!(record.immediate_probe.notified());
+            let waker = Waker::noop();
+            let mut context = Context::from_waker(waker);
+            matches!(
+                Future::poll(notified.as_mut(), &mut context),
+                Poll::Ready(())
+            )
+        }
+
+        pub(crate) fn exact_semaphore(&self) -> Option<Arc<Semaphore>> {
+            self.records
+                .first()?
+                .slot(CapacityClass::GenerationHttp)
+                .map(|slot| Arc::clone(&slot.semaphore))
         }
     }
 }
@@ -980,6 +1052,7 @@ mod tests {
             selector: Selector::new(strategy),
             homogeneous_generation_http,
             realtime_defaults_unambiguous,
+            generation_client: Some(health_client.clone()),
             health_client,
         }
     }
@@ -1572,6 +1645,69 @@ mod tests {
         pool.drain().expect("readiness fixture drain");
         assert!(!pool.is_ready());
         drop(lease);
+    }
+
+    #[test]
+    fn generation_readiness_is_scoped_to_the_configured_route_trust() {
+        let local = record_with_default(0, 1, "local", "omni", vec![generation_profile()]);
+        let remote = record_with_default(1, 1, "remote", "omni", vec![generation_profile()]);
+        let pool = pool_with_records(
+            RoutingStrategy::RoundRobin,
+            ServiceClass::GenerationHttp,
+            vec![Arc::clone(&local), Arc::clone(&remote)],
+        );
+        let local_trust = TrustDomain::new(String::from("local"));
+        let remote_trust = TrustDomain::new(String::from("remote"));
+
+        local.health.store(HealthState::Unhealthy);
+        assert!(
+            pool.is_ready(),
+            "generic required-service readiness may be satisfied by the remote trust"
+        );
+        assert!(!pool.generation_http_ready(&local_trust));
+        assert!(pool.generation_http_ready(&remote_trust));
+
+        local.health.store(HealthState::Healthy);
+        assert!(pool.generation_http_ready(&local_trust));
+        local.mark_draining();
+        assert!(!pool.generation_http_ready(&local_trust));
+    }
+
+    #[test]
+    fn empty_known_input_requirement_dispatches_against_a_nonempty_worker_profile() {
+        let pool = pool_with_records(
+            RoutingStrategy::RoundRobin,
+            ServiceClass::GenerationHttp,
+            vec![record_with_default(
+                0,
+                1,
+                "local",
+                "omni",
+                vec![rich_generation_profile()],
+            )],
+        );
+        let requirement = RouteRequirement::new(
+            ProfileRequirement::GenerationHttp {
+                model: ModelSelection::Explicit(String::from("omni")),
+                message_content_forms: vec![MessageContentForm::TypedParts],
+                media_placements: Vec::new(),
+                input_modalities: Vec::new(),
+                output_modalities: vec![OutputModality::Text],
+                audio_format: None,
+                stream_mode: StreamMode::NonStreaming,
+            },
+            TrustDomain::new(String::from("local")),
+            false,
+        );
+        assert!(requirement.profile.is_well_formed());
+        let lease = pool
+            .dispatch(
+                pool.try_admit(CapacityClass::GenerationHttp)
+                    .expect("empty-input requirement admission"),
+                &requirement,
+            )
+            .expect("empty input is a request constraint, not an empty worker profile");
+        assert_eq!(lease.worker_id().as_str(), "worker-0");
     }
 
     #[test]

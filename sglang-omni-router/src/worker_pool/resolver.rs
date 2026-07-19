@@ -194,6 +194,28 @@ pub(super) fn build_health_client(
         .build()
 }
 
+pub(super) fn build_generation_client(
+    resolver: Arc<StaticResolver>,
+    connect_timeout: Duration,
+    pool_idle_timeout: Duration,
+    pool_max_idle_per_host: usize,
+) -> Result<Client, reqwest::Error> {
+    Client::builder()
+        .dns_resolver(resolver)
+        .no_proxy()
+        .redirect(Policy::none())
+        .retry(reqwest::retry::never())
+        .http1_only()
+        .connect_timeout(connect_timeout)
+        .pool_idle_timeout(Some(pool_idle_timeout))
+        .pool_max_idle_per_host(pool_max_idle_per_host)
+        .no_gzip()
+        .no_brotli()
+        .no_zstd()
+        .no_deflate()
+        .build()
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic)]
 mod tests {

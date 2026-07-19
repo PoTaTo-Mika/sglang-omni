@@ -28,12 +28,20 @@ thiserror = { version = "=2.0.18", default-features = false, features = ["std"] 
 tracing = { version = "=0.1.44", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["env-filter", "fmt", "json", "std"] }
 reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls"] }
+bytes = { version = "=1.12.1", default-features = false }
+http-body = { version = "=1.1.0", default-features = false }
+serde_json = { version = "=1.0.150", default-features = false, features = ["std"] }
+sync_wrapper = { version = "=1.0.2", default-features = false }
 
 [dev-dependencies]
 criterion = { version = "=0.5.1", default-features = false, features = ["cargo_bench_support"] }
 
 [[bench]]
 name = "worker_pool"
+harness = false
+
+[[bench]]
+name = "chat_relay"
 harness = false
 
 [lints.rust]

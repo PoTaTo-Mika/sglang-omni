@@ -1084,10 +1084,14 @@ name = "sglang-omni-router"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bytes",
  "clap",
  "criterion",
+ "http-body",
  "reqwest",
  "serde",
+ "serde_json",
+ "sync_wrapper",
  "thiserror",
  "tokio",
  "toml",

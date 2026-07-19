@@ -112,6 +112,11 @@ impl RequestLease {
         self.class
     }
 
+    /// Requests one health observation after an exact upstream protocol fault.
+    pub(crate) fn request_immediate_probe(&self) {
+        self.registration.immediate_probe.notify_one();
+    }
+
     pub(super) fn exact_permit(&self) -> &OwnedSemaphorePermit {
         &self.exact
     }

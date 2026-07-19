@@ -450,7 +450,7 @@ impl ProfileRequirement {
                 model.is_valid()
                     && valid_bounded_set(message_content_forms, false)
                     && valid_bounded_set(media_placements, true)
-                    && valid_bounded_set(input_modalities, false)
+                    && valid_bounded_set(input_modalities, true)
                     && valid_bounded_set(output_modalities, false)
                     && validate_generation_relationships(
                         message_content_forms,
@@ -1861,6 +1861,21 @@ mod tests {
             assert!(requirement.is_well_formed());
             assert!(capability.matches(&requirement, Some("wrong-default")));
         }
+
+        let empty_known_input = ProfileRequirement::GenerationHttp {
+            model: ModelSelection::Explicit(String::from("omni")),
+            message_content_forms: vec![MessageContentForm::TypedParts],
+            media_placements: Vec::new(),
+            input_modalities: Vec::new(),
+            output_modalities: vec![OutputModality::Text],
+            audio_format: None,
+            stream_mode: StreamMode::NonStreaming,
+        };
+        assert!(empty_known_input.is_well_formed());
+        assert!(
+            capability.matches(&empty_known_input, Some("wrong-default")),
+            "an empty request constraint must match a nonempty worker modality profile"
+        );
 
         let invalid = [
             ProfileRequirement::GenerationHttp {

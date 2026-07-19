@@ -38,7 +38,7 @@ impl Drop for TestDir {
 
 fn valid_config(listen: &str, drain_timeout_ms: u64, filter: &str) -> String {
     format!(
-        "schema_version = 1\n\n[server]\nlisten = \"{listen}\"\n\n[shutdown]\ndrain_timeout_ms = {drain_timeout_ms}\n\n[logging]\nformat = \"json\"\nfilter = \"{filter}\"\n\n[router]\nrequired_services = [\"generation_http\"]\n\n[admission]\nglobal = 8\ngeneration_http = 4\nspeech_http = 1\ntranscription_http = 1\nspeech_batch = 1\nspeech_websocket = 1\nrealtime_websocket = 1\ncontrol = 1\n\n[health]\ninterval_ms = 100\ntimeout_ms = 50\nsuccess_threshold = 2\nfailure_threshold = 3\nmax_concurrent_probes = 2\n\n[[workers]]\nworker_id = \"worker-1\"\nbase_url = \"http://127.0.0.1:9\"\ntrust_domain = \"local\"\ndefault_model_id = \"omni\"\n\n[workers.capacity]\ngeneration_http = 4\n\n[[workers.service_profiles]]\nservice = \"generation_http\"\nmodel_ids = [\"omni\"]\nmessage_content_forms = [\"string\"]\nmedia_placements = []\ninput_modalities = [\"text\"]\noutput_modalities = [\"text\"]\nchat_audio_formats = []\nstream_modes = [\"non_streaming\", \"streaming\"]\n"
+        "schema_version = 1\n\n[server]\nlisten = \"{listen}\"\n\n[shutdown]\ndrain_timeout_ms = {drain_timeout_ms}\n\n[logging]\nformat = \"json\"\nfilter = \"{filter}\"\n\n[router]\nrequired_services = [\"generation_http\"]\n\n[admission]\nglobal = 8\ngeneration_http = 4\nspeech_http = 1\ntranscription_http = 1\nspeech_batch = 1\nspeech_websocket = 1\nrealtime_websocket = 1\ncontrol = 1\n\n[health]\ninterval_ms = 100\ntimeout_ms = 50\nsuccess_threshold = 2\nfailure_threshold = 3\nmax_concurrent_probes = 2\n\n[http_generation]\ntrust_domain = \"local\"\nbuffered_request_max_bytes = 8388608\nbuffered_request_total_bytes = 268435456\nstreamed_request_max_bytes = 536870912\nconnect_timeout_ms = 5000\nrequest_timeout_ms = 1800000\npool_idle_timeout_ms = 90000\npool_max_idle_per_host = 8\n\n[[workers]]\nworker_id = \"worker-1\"\nbase_url = \"http://127.0.0.1:9\"\ntrust_domain = \"local\"\ndefault_model_id = \"omni\"\n\n[workers.capacity]\ngeneration_http = 4\n\n[[workers.service_profiles]]\nservice = \"generation_http\"\nmodel_ids = [\"omni\"]\nmessage_content_forms = [\"string\"]\nmedia_placements = []\ninput_modalities = [\"text\"]\noutput_modalities = [\"text\"]\nchat_audio_formats = []\nstream_modes = [\"non_streaming\", \"streaming\"]\n"
     )
 }
 
@@ -88,6 +88,10 @@ fn worker_config_prefix(required_service: &str) -> String {
         .replace(
             "required_services = [\"generation_http\"]",
             &format!("required_services = [\"{required_service}\"]"),
+        )
+        .replace(
+            "[http_generation]\ntrust_domain = \"local\"\nbuffered_request_max_bytes = 8388608\nbuffered_request_total_bytes = 268435456\nstreamed_request_max_bytes = 536870912\nconnect_timeout_ms = 5000\nrequest_timeout_ms = 1800000\npool_idle_timeout_ms = 90000\npool_max_idle_per_host = 8\n\n",
+            "",
         )
 }
 
@@ -140,6 +144,32 @@ fn omitted_connection_cap_defaults_to_1024() {
 }
 
 #[test]
+fn classification_concurrency_defaults_and_boundaries_are_validated() {
+    let base = valid_config("127.0.0.1:30000", 30_000, "info");
+    load_bytes(base.as_bytes()).expect("omitted classification concurrency defaults to four");
+
+    for limit in [1, 64] {
+        let configured = base.replace(
+            "required_services = [\"generation_http\"]",
+            &format!(
+                "required_services = [\"generation_http\"]\nmax_concurrent_classifications = {limit}"
+            ),
+        );
+        load_bytes(configured.as_bytes()).expect("classification concurrency boundary is valid");
+    }
+
+    for limit in [0, 65] {
+        let configured = base.replace(
+            "required_services = [\"generation_http\"]",
+            &format!(
+                "required_services = [\"generation_http\"]\nmax_concurrent_classifications = {limit}"
+            ),
+        );
+        assert!(load_bytes(configured.as_bytes()).is_err());
+    }
+}
+
+#[test]
 fn validates_connection_cap_boundaries() {
     for max_connections in [1, 65_535] {
         let config = with_max_connections(
@@ -156,6 +186,51 @@ fn validates_connection_cap_boundaries() {
         );
         assert!(load_bytes(config.as_bytes()).is_err());
     }
+}
+
+#[test]
+fn validates_chat_enablement_security_and_resource_bounds() {
+    let base = valid_config("127.0.0.1:30000", 30_000, "info");
+    let rejected = [
+        base.replace("127.0.0.1:30000", "0.0.0.0:30000"),
+        base.replace(
+            "required_services = [\"generation_http\"]",
+            "required_services = [\"speech_http\"]",
+        ),
+        base.replace(
+            "trust_domain = \"local\"\nbuffered",
+            "trust_domain = \"remote\"\nbuffered",
+        ),
+        base.replace(
+            "buffered_request_max_bytes = 8388608",
+            "buffered_request_max_bytes = 0",
+        ),
+        base.replace(
+            "buffered_request_total_bytes = 268435456",
+            "buffered_request_total_bytes = 1024",
+        ),
+        base.replace(
+            "streamed_request_max_bytes = 536870912",
+            "streamed_request_max_bytes = 1024",
+        ),
+        base.replace("connect_timeout_ms = 5000", "connect_timeout_ms = 0"),
+        base.replace("request_timeout_ms = 1800000", "request_timeout_ms = 1000"),
+        base.replace("pool_idle_timeout_ms = 90000", "pool_idle_timeout_ms = 999"),
+        base.replace("pool_max_idle_per_host = 8", "pool_max_idle_per_host = 0"),
+        base.replace(
+            "pool_max_idle_per_host = 8",
+            "pool_max_idle_per_host = 8\nunknown = true",
+        ),
+    ];
+    for contents in rejected {
+        assert!(load_bytes(contents.as_bytes()).is_err());
+    }
+    let disabled = base.replace(
+        "[http_generation]\ntrust_domain = \"local\"\nbuffered_request_max_bytes = 8388608\nbuffered_request_total_bytes = 268435456\nstreamed_request_max_bytes = 536870912\nconnect_timeout_ms = 5000\nrequest_timeout_ms = 1800000\npool_idle_timeout_ms = 90000\npool_max_idle_per_host = 8\n\n",
+        "",
+    );
+    load_bytes(disabled.as_bytes())
+        .expect("omitted section disables chat without weakening other routes");
 }
 
 #[test]
@@ -540,6 +615,9 @@ realtime_websocket = 8
 control = 8
 
 [health]
+
+[http_generation]
+trust_domain = "production"
 
 [[workers]]
 worker_id = "worker-1"

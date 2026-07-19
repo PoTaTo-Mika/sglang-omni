@@ -19,6 +19,7 @@
 
 mod config;
 mod error;
+mod http_generation;
 mod lifecycle;
 mod server;
 mod shutdown;
