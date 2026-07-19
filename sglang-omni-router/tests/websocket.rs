@@ -20,6 +20,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Notify};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as ClientMessage;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
@@ -240,7 +241,10 @@ async fn connect_with_retry(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         match connect_async(url).await {
-            Ok((socket, _)) => return socket,
+            Ok((socket, response)) => {
+                assert!(response.headers().contains_key("x-request-id"));
+                return socket;
+            }
             Err(_) if tokio::time::Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
@@ -358,17 +362,42 @@ async fn speech_exact_replay_and_realtime_precommit_and_server_first_ordering() 
     drop(next_speech);
 
     let realtime_url = format!("ws://{router_address}/v1/realtime?model=ignored");
-    let connect_task = tokio::spawn(async move { connect_async(realtime_url).await });
+    let mut realtime_request = realtime_url
+        .into_client_request()
+        .expect("build realtime request");
+    realtime_request.headers_mut().insert(
+        "x-request-id",
+        "client-websocket-1"
+            .parse()
+            .expect("valid request ID header"),
+    );
+    realtime_request.headers_mut().insert(
+        "authorization",
+        "Bearer downstream-secret"
+            .parse()
+            .expect("valid authorization header"),
+    );
+    realtime_request
+        .headers_mut()
+        .insert("cookie", "private=1".parse().expect("valid cookie header"));
+    let connect_task = tokio::spawn(async move { connect_async(realtime_request).await });
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(
         !connect_task.is_finished(),
         "downstream 101 must await upstream handshake"
     );
     state.realtime_release.notify_one();
-    let (mut realtime, _) = connect_task
+    let (mut realtime, response) = connect_task
         .await
         .expect("join realtime connect")
         .expect("complete realtime downstream handshake");
+    assert_eq!(
+        response
+            .headers()
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("client-websocket-1")
+    );
     let created = realtime
         .next()
         .await

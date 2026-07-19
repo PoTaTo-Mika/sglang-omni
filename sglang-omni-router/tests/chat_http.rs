@@ -1170,7 +1170,7 @@ fn buffered_and_chunked_ingress_preserve_bytes_and_sanitize_both_directions() {
     let router = RouterProcess::start(worker.address, 1024);
     let body = br#"{"model":"omni","messages":[{"content":"hello"}],"temperature":0.25}"#;
     let request = format!(
-        "POST /v1/chat/completions HTTP/1.1\r\nHost: downstream\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAuthorization: secret\r\nCookie: private=1\r\nX-Smg-Target-Worker: forbidden\r\nConnection: close\r\n\r\n",
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: downstream\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAuthorization: secret\r\nCookie: private=1\r\nX-Smg-Target-Worker: forbidden\r\nX-Request-Id: client-chat-1\r\nConnection: close\r\n\r\n",
         body.len()
     );
     let mut wire = request.into_bytes();
@@ -1183,6 +1183,10 @@ fn buffered_and_chunked_ingress_preserve_bytes_and_sanitize_both_directions() {
     );
     assert_eq!(response_body(&response), br#"{"ok":1}"#);
     let response_head = String::from_utf8_lossy(&response);
+    assert_eq!(
+        header_value(&response_head, "x-request-id"),
+        Some("client-chat-1")
+    );
     assert!(!response_head.to_ascii_lowercase().contains("set-cookie"));
     assert!(
         !response_head
@@ -1200,6 +1204,10 @@ fn buffered_and_chunked_ingress_preserve_bytes_and_sanitize_both_directions() {
     for forbidden in ["authorization", "cookie", "x-smg-target-worker"] {
         assert!(!first.head.to_ascii_lowercase().contains(forbidden));
     }
+    assert_eq!(
+        header_value(&first.head, "x-request-id"),
+        Some("client-chat-1")
+    );
 
     let chunked_body = br#"{"messages":[{"content":"chunked"}]}"#;
     let split = 7;
@@ -1224,6 +1232,13 @@ fn buffered_and_chunked_ingress_preserve_bytes_and_sanitize_both_directions() {
         Some(chunked_body.len())
     );
     assert!(header_value(&second.head, "transfer-encoding").is_none());
+    let response_head = String::from_utf8_lossy(&response);
+    let downstream_id =
+        header_value(&response_head, "x-request-id").expect("generated downstream request ID");
+    assert_eq!(
+        header_value(&second.head, "x-request-id"),
+        Some(downstream_id)
+    );
 
     const EMPTY_TYPED: &[u8] = b"{\"messages\":[{\"content\":[]}]}";
     const UNKNOWN_TYPED: &[u8] =

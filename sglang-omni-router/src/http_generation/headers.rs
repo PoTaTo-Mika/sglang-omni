@@ -16,6 +16,17 @@ pub(crate) struct RequestFraming {
     pub(crate) has_content_encoding: bool,
 }
 
+pub(crate) const REQUEST_ID_HEADER: &str = "x-request-id";
+
+pub(crate) fn canonical_request_id(headers: &HeaderMap) -> Result<HeaderValue, HttpFault> {
+    let mut values = headers.get_all(REQUEST_ID_HEADER).iter();
+    let value = values.next().ok_or(HttpFault::InternalError)?;
+    if values.next().is_some() {
+        return Err(HttpFault::InternalError);
+    }
+    Ok(value.clone())
+}
+
 pub(crate) fn validate_request(headers: &HeaderMap) -> Result<RequestFraming, HttpFault> {
     let content_types: Vec<_> = headers.get_all(CONTENT_TYPE).iter().collect();
     if content_types.len() != 1
@@ -59,6 +70,34 @@ pub(crate) fn validate_request(headers: &HeaderMap) -> Result<RequestFraming, Ht
         has_route_hint,
         has_content_encoding: !encodings.is_empty(),
     })
+}
+
+pub(crate) fn validate_bodyless_request(headers: &HeaderMap) -> Result<(), HttpFault> {
+    let encodings: Vec<_> = headers.get_all(CONTENT_ENCODING).iter().collect();
+    if encodings.len() > 1
+        || encodings.first().is_some_and(|value| {
+            !value
+                .to_str()
+                .is_ok_and(|text| text.eq_ignore_ascii_case("identity"))
+        })
+    {
+        return Err(HttpFault::UnsupportedContentEncoding);
+    }
+    if headers.contains_key(EXPECT) {
+        return Err(HttpFault::ExpectationFailed);
+    }
+    if headers.contains_key(TRAILER) || headers.contains_key(TRANSFER_ENCODING) {
+        return Err(HttpFault::MalformedRequest);
+    }
+    let lengths: Vec<_> = headers.get_all(CONTENT_LENGTH).iter().collect();
+    if lengths.len() > 1
+        || lengths
+            .first()
+            .is_some_and(|value| parse_content_length(value) != Some(0))
+    {
+        return Err(HttpFault::MalformedRequest);
+    }
+    Ok(())
 }
 
 pub(crate) fn sanitize_response(
@@ -328,12 +367,14 @@ pub(crate) fn canonical_content_type() -> HeaderValue {
 #[allow(clippy::expect_used)]
 mod tests {
     use axum::http::header::{
-        CACHE_CONTROL, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE,
+        CACHE_CONTROL, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, EXPECT, TRAILER,
+        TRANSFER_ENCODING,
     };
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
 
     use super::{
-        ExpectedSuccess, HttpFault, sanitize_response, valid_generic_content_type, validate_request,
+        ExpectedSuccess, HttpFault, sanitize_response, valid_generic_content_type,
+        validate_bodyless_request, validate_request,
     };
 
     #[test]
@@ -375,6 +416,39 @@ mod tests {
             );
             assert_eq!(validate_request(&rejected).err(), Some(expected));
         }
+    }
+
+    #[test]
+    fn bodyless_header_matrix_accepts_only_zero_length_identity_framing() {
+        let mut accepted = HeaderMap::new();
+        validate_bodyless_request(&accepted).expect("absent body framing");
+        accepted.insert(CONTENT_LENGTH, HeaderValue::from_static("0"));
+        accepted.insert(CONTENT_ENCODING, HeaderValue::from_static("identity"));
+        validate_bodyless_request(&accepted).expect("explicit zero-length identity framing");
+
+        for (name, value, expected) in [
+            (CONTENT_LENGTH, "1", HttpFault::MalformedRequest),
+            (
+                CONTENT_ENCODING,
+                "gzip",
+                HttpFault::UnsupportedContentEncoding,
+            ),
+            (EXPECT, "100-continue", HttpFault::ExpectationFailed),
+            (TRAILER, "digest", HttpFault::MalformedRequest),
+            (TRANSFER_ENCODING, "chunked", HttpFault::MalformedRequest),
+        ] {
+            let mut rejected = HeaderMap::new();
+            rejected.insert(name, HeaderValue::from_static(value));
+            assert_eq!(validate_bodyless_request(&rejected).err(), Some(expected));
+        }
+
+        let mut repeated = HeaderMap::new();
+        repeated.append(CONTENT_LENGTH, HeaderValue::from_static("0"));
+        repeated.append(CONTENT_LENGTH, HeaderValue::from_static("0"));
+        assert_eq!(
+            validate_bodyless_request(&repeated).err(),
+            Some(HttpFault::MalformedRequest)
+        );
     }
 
     #[test]

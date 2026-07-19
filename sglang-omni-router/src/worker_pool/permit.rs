@@ -128,6 +128,8 @@ impl RequestLease {
 
 pub(super) struct AdmissionController {
     gate: Arc<RwLock<Gate>>,
+    global_limit: usize,
+    class_limits: [usize; 7],
     global: Arc<Semaphore>,
     classes: [Arc<Semaphore>; 7],
 }
@@ -136,6 +138,8 @@ impl AdmissionController {
     pub(super) fn new(gate: Arc<RwLock<Gate>>, global: usize, classes: [usize; 7]) -> Self {
         Self {
             gate,
+            global_limit: global,
+            class_limits: classes,
             global: Arc::new(Semaphore::new(global)),
             classes: classes.map(|limit| Arc::new(Semaphore::new(limit))),
         }
@@ -169,6 +173,18 @@ impl AdmissionController {
 
     pub(super) fn is_open(&self) -> bool {
         self.gate.read().is_ok_and(|gate| gate.open)
+    }
+
+    pub(super) fn snapshot(&self) -> [(usize, usize); 8] {
+        let mut snapshot = [(0, 0); 8];
+        snapshot[0] = (
+            self.global_limit,
+            self.global_limit - self.global.available_permits(),
+        );
+        for (index, (limit, semaphore)) in self.class_limits.iter().zip(&self.classes).enumerate() {
+            snapshot[index + 1] = (*limit, *limit - semaphore.available_permits());
+        }
+        snapshot
     }
 
     #[cfg(test)]

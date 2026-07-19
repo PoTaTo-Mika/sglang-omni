@@ -55,6 +55,21 @@ impl TestDir {
         fs::write(&path, contents).expect("write worker health config");
         path
     }
+
+    fn non_loopback_health_only_config(&self, address: SocketAddr) -> PathBuf {
+        let path = self.config(address, 1024, 2_000);
+        let mut contents = fs::read_to_string(&path).expect("read generated config");
+        let start = contents
+            .find("\n[http_generation]\n")
+            .expect("generation route section");
+        let end = contents[start + 1..]
+            .find("\n[[workers]]\n")
+            .map(|offset| start + 1 + offset)
+            .expect("worker section after generation route");
+        contents.replace_range(start..end, "");
+        fs::write(&path, contents).expect("write non-loopback health-only config");
+        path
+    }
 }
 
 impl Drop for TestDir {
@@ -146,21 +161,48 @@ fn rapid_distinct_signals(process_id: u32) {
 }
 
 fn request(address: SocketAddr, method: &str, path: &str) -> String {
+    raw_request(
+        address,
+        format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .as_bytes(),
+    )
+}
+
+fn raw_request(address: SocketAddr, request: &[u8]) -> String {
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(250))
         .expect("connect to serving router");
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .expect("set bounded response timeout");
-    write!(
-        stream,
-        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-    )
-    .expect("write HTTP request");
+    stream.write_all(request).expect("write HTTP request");
     let mut response = String::new();
     stream
         .read_to_string(&mut response)
         .expect("read bounded local HTTP response");
     response
+}
+
+fn response_header<'a>(response: &'a str, name: &str) -> Option<&'a str> {
+    response.split("\r\n").find_map(|line| {
+        let (candidate, value) = line.split_once(':')?;
+        candidate.eq_ignore_ascii_case(name).then_some(value.trim())
+    })
+}
+
+fn response_body(response: &str) -> &str {
+    response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .expect("complete HTTP response")
+}
+
+fn assert_exact_content_length(response: &str) {
+    let body = response_body(response);
+    let expected = body.len().to_string();
+    assert_eq!(
+        response_header(response, "content-length"),
+        Some(expected.as_str())
+    );
 }
 
 fn confirmed_keep_alive_connection(address: SocketAddr) -> TcpStream {
@@ -393,7 +435,7 @@ fn invalid_cli_and_config_exit_two_without_disclosing_contents() {
 }
 
 #[test]
-fn serves_only_exact_local_health_routes_and_shuts_down_cleanly() {
+fn serves_exact_local_health_and_operations_routes_and_shuts_down_cleanly() {
     let _process_guard = process_lock();
     let directory = TestDir::new();
     let address = unused_address();
@@ -404,6 +446,7 @@ fn serves_only_exact_local_health_routes_and_shuts_down_cleanly() {
     let live = request(address, "GET", "/live");
     assert!(live.starts_with("HTTP/1.1 200"));
     assert!(live.ends_with("live\n"));
+    assert!(response_header(&live, "x-request-id").is_some());
     let ready = request(address, "GET", "/ready");
     assert!(ready.starts_with("HTTP/1.1 503"));
     assert!(ready.ends_with("not ready\n"));
@@ -415,8 +458,6 @@ fn serves_only_exact_local_health_routes_and_shuts_down_cleanly() {
         ("GET", "/live/", "404"),
         ("GET", "/ready/", "404"),
         ("GET", "/health", "404"),
-        ("GET", "/metrics", "404"),
-        ("GET", "/v1/models", "404"),
         ("POST", "/generate", "404"),
     ] {
         let response = request(address, method, path);
@@ -426,10 +467,124 @@ fn serves_only_exact_local_health_routes_and_shuts_down_cleanly() {
         );
     }
 
+    let models = request(address, "GET", "/v1/models");
+    assert!(models.starts_with("HTTP/1.1 200"));
+    assert!(models.contains("content-type: application/json\r\n"));
+    assert!(models.contains("cache-control: no-store\r\n"));
+    assert_exact_content_length(&models);
+    assert!(models.ends_with(
+        r#"{"object":"list","data":[{"id":"omni","object":"model","created":0,"owned_by":"sglang-omni","permission":[{"id":"modelperm-default","object":"model_permission","allow_create_engine":false,"allow_sampling":true,"allow_logprobs":true}],"root":"omni"}]}"#
+    ));
+
+    let metrics = request(address, "GET", "/metrics");
+    assert!(metrics.starts_with("HTTP/1.1 200"));
+    assert!(metrics.contains("content-type: text/plain; version=0.0.4; charset=utf-8\r\n"));
+    assert_exact_content_length(&metrics);
+    assert!(metrics.contains("sglang_omni_router_lifecycle{state=\"serving\"} 1\n"));
+    assert!(metrics.contains("sglang_omni_router_ready 0\n"));
+    assert!(metrics.contains("sglang_omni_router_admission_limit{class=\"generation_http\"} 4\n"));
+    assert!(!metrics.contains("worker-1"));
+    assert!(!metrics.contains("omni\""));
+
+    let diagnostics = request(address, "GET", "/diagnostics");
+    assert!(diagnostics.starts_with("HTTP/1.1 200"));
+    assert_exact_content_length(&diagnostics);
+    assert!(diagnostics.contains(
+        r#"{"lifecycle":"serving","ready":false,"admission":[{"class":"global","limit":8,"in_flight":0},{"class":"generation_http","limit":4,"in_flight":0}"#
+    ));
+    assert!(diagnostics.contains(
+        r#""workers":[{"worker_id":"worker-1","registration_ordinal":0,"health":"unknown","disposition":"serving","capacity":[{"class":"generation_http","limit":4,"in_flight":0}]}]"#
+    ));
+    for forbidden in [
+        "base_url",
+        "trust_domain",
+        "health_path",
+        "default_model_id",
+        "http://127.0.0.1:9",
+        "/health",
+        "\"local\"",
+        "\"omni\"",
+    ] {
+        assert!(!response_body(&diagnostics).contains(forbidden));
+    }
+
+    for (method, path, status) in [
+        ("HEAD", "/v1/models", "405"),
+        ("POST", "/metrics", "405"),
+        ("PUT", "/diagnostics", "405"),
+        ("GET", "/metrics/", "404"),
+        ("GET", "/diagnostics?full=true", "400"),
+    ] {
+        let response = request(address, method, path);
+        assert!(response.starts_with(&format!("HTTP/1.1 {status}")));
+        assert!(response_header(&response, "x-request-id").is_some());
+    }
+    let framed = raw_request(
+        address,
+        b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx",
+    );
+    assert!(framed.starts_with("HTTP/1.1 400"));
+    let wrong_version = raw_request(
+        address,
+        b"GET /metrics HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(wrong_version.starts_with("HTTP/1.0 505"));
+    assert!(response_header(&wrong_version, "x-request-id").is_some());
+
+    let accepted = raw_request(
+        address,
+        b"GET /live HTTP/1.1\r\nHost: localhost\r\nX-Request-Id: client-visible-1\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(
+        response_header(&accepted, "x-request-id"),
+        Some("client-visible-1")
+    );
+    let duplicate = raw_request(
+        address,
+        b"GET /live HTTP/1.1\r\nHost: localhost\r\nX-Request-Id: first\r\nX-Request-Id: second\r\nConnection: close\r\n\r\n",
+    );
+    assert!(duplicate.starts_with("HTTP/1.1 400"));
+    let replacement = response_header(&duplicate, "x-request-id").expect("fresh request ID");
+    assert_ne!(replacement, "first");
+    assert_ne!(replacement, "second");
+    let malformed = raw_request(
+        address,
+        b"GET /live HTTP/1.1\r\nHost: localhost\r\nX-Request-Id: has space\r\nConnection: close\r\n\r\n",
+    );
+    assert!(malformed.starts_with("HTTP/1.1 400"));
+    assert_ne!(
+        response_header(&malformed, "x-request-id"),
+        Some("has space")
+    );
+
     signal(child.id(), "-TERM");
     assert_eq!(child.wait(PROCESS_DEADLINE).code(), Some(0));
     let reused = TcpListener::bind(address).expect("listener is reusable after joined shutdown");
     drop(reused);
+}
+
+#[test]
+fn non_loopback_health_only_listener_does_not_register_operations_routes() {
+    let _process_guard = process_lock();
+    let directory = TestDir::new();
+    let client_address = unused_address();
+    let listen_address = SocketAddr::from(([0, 0, 0, 0], client_address.port()));
+    let config = directory.non_loopback_health_only_config(listen_address);
+    let mut child = ChildGuard::spawn(&config);
+    wait_until_live(client_address, &mut child);
+
+    assert!(request(client_address, "GET", "/live").starts_with("HTTP/1.1 200"));
+    for path in ["/v1/models", "/metrics", "/diagnostics"] {
+        let response = request(client_address, "GET", path);
+        assert!(
+            response.starts_with("HTTP/1.1 404"),
+            "non-loopback listener registered {path}: {response}"
+        );
+        assert!(response_header(&response, "x-request-id").is_some());
+    }
+
+    signal(child.id(), "-TERM");
+    assert_eq!(child.wait(PROCESS_DEADLINE).code(), Some(0));
 }
 
 #[test]
@@ -557,8 +712,10 @@ fn readiness_tracks_required_health_while_liveness_remains_worker_independent() 
         .expect("read health fixture address");
     let healthy = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
+    let non_health_requests = Arc::new(AtomicU64::new(0));
     let server_healthy = Arc::clone(&healthy);
     let server_stop = Arc::clone(&stop);
+    let server_non_health_requests = Arc::clone(&non_health_requests);
     let worker_thread = thread::spawn(move || {
         while !server_stop.load(Ordering::Acquire) {
             match worker_listener.accept() {
@@ -567,18 +724,38 @@ fn readiness_tracks_required_health_while_liveness_remains_worker_independent() 
                         .set_read_timeout(Some(Duration::from_secs(1)))
                         .expect("bound health fixture request");
                     let mut request = [0_u8; 1024];
-                    match stream.read(&mut request) {
-                        Ok(0) => continue,
-                        Ok(_) => {}
-                        Err(error)
-                            if matches!(
-                                error.kind(),
-                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                            ) =>
-                        {
-                            continue;
+                    let mut length = 0;
+                    while length < request.len()
+                        && !request[..length]
+                            .windows(4)
+                            .any(|window| window == b"\r\n\r\n")
+                    {
+                        match stream.read(&mut request[length..]) {
+                            Ok(0) => break,
+                            Ok(read) => length += read,
+                            Err(error)
+                                if matches!(
+                                    error.kind(),
+                                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                                ) =>
+                            {
+                                break;
+                            }
+                            Err(error) => panic!("health fixture read failed: {error}"),
                         }
-                        Err(error) => panic!("health fixture read failed: {error}"),
+                    }
+                    if !request[..length]
+                        .windows(4)
+                        .any(|window| window == b"\r\n\r\n")
+                    {
+                        continue;
+                    }
+                    let request_line_end = request[..length]
+                        .windows(2)
+                        .position(|window| window == b"\r\n")
+                        .expect("complete header has one request line");
+                    if &request[..request_line_end] != b"GET /health HTTP/1.1" {
+                        server_non_health_requests.fetch_add(1, Ordering::Relaxed);
                     }
                     let status = if server_healthy.load(Ordering::Acquire) {
                         "200 OK"
@@ -605,10 +782,20 @@ fn readiness_tracks_required_health_while_liveness_remains_worker_independent() 
     let mut child = ChildGuard::spawn(&config);
     wait_until_live(address, &mut child);
     wait_for_status(address, "/ready", "503", &mut child);
+    let models_unready = request(address, "GET", "/v1/models");
+    assert!(models_unready.starts_with("HTTP/1.1 200"));
     healthy.store(true, Ordering::Release);
     wait_for_status(address, "/ready", "200", &mut child);
+    let models_ready = request(address, "GET", "/v1/models");
     healthy.store(false, Ordering::Release);
     wait_for_status(address, "/ready", "503", &mut child);
+    let models_unhealthy_again = request(address, "GET", "/v1/models");
+    assert_eq!(response_body(&models_unready), response_body(&models_ready));
+    assert_eq!(
+        response_body(&models_unready),
+        response_body(&models_unhealthy_again)
+    );
+    assert_eq!(non_health_requests.load(Ordering::Relaxed), 0);
     assert!(request(address, "GET", "/live").starts_with("HTTP/1.1 200"));
 
     signal(child.id(), "-TERM");

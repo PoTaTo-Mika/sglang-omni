@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
-use axum::http::{Request, Response, Version};
+use axum::http::{HeaderValue, Request, Response, Version};
 use tokio::sync::Semaphore;
 
 use crate::config::{Config, HttpMediaRoute};
@@ -25,6 +25,7 @@ use crate::worker_pool::{
     WorkerPool,
 };
 
+use crate::http_generation::headers::{REQUEST_ID_HEADER, canonical_request_id};
 use classify::Classified;
 use headers::{RequestKind, SuccessProfile};
 
@@ -42,6 +43,13 @@ pub(crate) struct HttpMedia {
     buffered_budget: Arc<Semaphore>,
     classification_slots: Arc<Semaphore>,
     request_timeout: std::time::Duration,
+}
+
+struct RelayMetadata {
+    content_type: HeaderValue,
+    route: HttpMediaRoute,
+    success: SuccessProfile,
+    request_id: HeaderValue,
 }
 
 impl HttpMediaRoute {
@@ -173,6 +181,7 @@ async fn handle(
     }
     let deadline = tokio::time::Instant::now() + media.request_timeout;
     let framing = headers::validate_request(request.headers(), route.request_kind())?;
+    let request_id = canonical_request_id(request.headers())?;
     let admission = media
         .pool
         .try_admit(route.capacity())
@@ -201,9 +210,13 @@ async fn handle(
             media,
             request.into_body(),
             length,
-            framing.content_type,
             lease,
-            route,
+            RelayMetadata {
+                content_type: framing.content_type,
+                route,
+                success: route.opaque_success(),
+                request_id,
+            },
             deadline,
         )
         .await;
@@ -252,10 +265,13 @@ async fn handle(
         media,
         body,
         length,
-        content_type,
         lease,
-        route,
-        classified.success,
+        RelayMetadata {
+            content_type,
+            route,
+            success: classified.success,
+            request_id,
+        },
         None,
         deadline,
     )
@@ -285,9 +301,8 @@ async fn relay_direct(
     media: Arc<HttpMedia>,
     body: Body,
     length: u64,
-    content_type: axum::http::HeaderValue,
     lease: RequestLease,
-    route: HttpMediaRoute,
+    metadata: RelayMetadata,
     deadline: tokio::time::Instant,
 ) -> Result<Response<Body>, HttpFault> {
     let state: SharedUploadState = Arc::new(Mutex::new(UploadState::Incomplete));
@@ -302,28 +317,29 @@ async fn relay_direct(
         media,
         reqwest::Body::wrap(direct),
         length,
-        content_type,
         lease,
-        route,
-        route.opaque_success(),
+        metadata,
         Some(state),
         deadline,
     )
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn send_once(
     media: Arc<HttpMedia>,
     body: reqwest::Body,
     length: u64,
-    content_type: axum::http::HeaderValue,
     lease: RequestLease,
-    route: HttpMediaRoute,
-    success: SuccessProfile,
+    metadata: RelayMetadata,
     upload: Option<SharedUploadState>,
     deadline: tokio::time::Instant,
 ) -> Result<Response<Body>, HttpFault> {
+    let RelayMetadata {
+        content_type,
+        route,
+        success,
+        request_id,
+    } = metadata;
     if tokio::time::Instant::now() >= deadline {
         return Err(deadline_fault(upload.as_ref()));
     }
@@ -335,6 +351,7 @@ async fn send_once(
         .post(url)
         .header(CONTENT_TYPE, content_type)
         .header(CONTENT_LENGTH, length)
+        .header(REQUEST_ID_HEADER, request_id)
         .body(body);
     let sent = tokio::select! {
         biased;

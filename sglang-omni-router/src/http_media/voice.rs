@@ -3,19 +3,27 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
-use axum::http::{Method, Request, Response, Version};
+use axum::http::{HeaderValue, Method, Request, Response, Version};
 
 use crate::config::VOICE_UPLOAD_MAX_BYTES;
 use crate::error::HttpFault;
+use crate::http_generation::headers::{
+    REQUEST_ID_HEADER, canonical_request_id, validate_bodyless_request,
+};
 use crate::http_generation::request_body::BufferedBody;
 use crate::http_generation::response_body::DirectResponseBody;
 use crate::http_generation::{read_buffered, reserve_budget};
 use crate::worker_pool::{AdmissionError, CapacityClass, DispatchError, RequestLease};
 
 use super::HttpMedia;
-use super::headers::{
-    RequestKind, SuccessProfile, sanitize_response, validate_bodyless_request, validate_request,
-};
+use super::headers::{RequestKind, SuccessProfile, sanitize_response, validate_request};
+
+struct UpstreamRequest<'a> {
+    method: Method,
+    query: Option<&'a str>,
+    name: Option<&'a str>,
+    request_id: HeaderValue,
+}
 
 pub(crate) async fn list(
     State(media): State<Arc<HttpMedia>>,
@@ -54,13 +62,17 @@ async fn handle_bodyless(
         return Err(HttpFault::MalformedRequest);
     }
     validate_bodyless_request(request.headers())?;
+    let request_id = canonical_request_id(request.headers())?;
     let deadline = tokio::time::Instant::now() + media.request_timeout;
     let lease = control_lease(&media)?;
     send_once(
         media,
-        method,
-        request.uri().query(),
-        name.as_deref(),
+        UpstreamRequest {
+            method,
+            query: request.uri().query(),
+            name: name.as_deref(),
+            request_id,
+        },
         None,
         lease,
         deadline,
@@ -75,6 +87,7 @@ async fn handle_upload(
     validate_common(&media, &request)?;
     let deadline = tokio::time::Instant::now() + media.request_timeout;
     let framing = validate_request(request.headers(), RequestKind::Multipart)?;
+    let request_id = canonical_request_id(request.headers())?;
     if framing
         .content_length
         .is_some_and(|length| length > VOICE_UPLOAD_MAX_BYTES)
@@ -96,9 +109,12 @@ async fn handle_upload(
     let body = reqwest::Body::wrap(BufferedBody::new(bytes, budget));
     send_once(
         media,
-        Method::POST,
-        query.as_deref(),
-        None,
+        UpstreamRequest {
+            method: Method::POST,
+            query: query.as_deref(),
+            name: None,
+            request_id,
+        },
         Some((body, length, framing.content_type)),
         lease,
         deadline,
@@ -131,13 +147,17 @@ type Upload = (reqwest::Body, u64, axum::http::HeaderValue);
 
 async fn send_once(
     media: Arc<HttpMedia>,
-    method: Method,
-    query: Option<&str>,
-    name: Option<&str>,
+    upstream: UpstreamRequest<'_>,
     upload: Option<Upload>,
     lease: RequestLease,
     deadline: tokio::time::Instant,
 ) -> Result<Response<Body>, HttpFault> {
+    let UpstreamRequest {
+        method,
+        query,
+        name,
+        request_id,
+    } = upstream;
     if tokio::time::Instant::now() >= deadline {
         return Err(HttpFault::UpstreamTimeout);
     }
@@ -152,7 +172,10 @@ async fn send_once(
         }
     }
     url.set_query(query);
-    let mut request = media.client.request(method, url);
+    let mut request = media
+        .client
+        .request(method, url)
+        .header(REQUEST_ID_HEADER, request_id);
     if let Some((body, length, content_type)) = upload {
         request = request
             .header(CONTENT_TYPE, content_type)

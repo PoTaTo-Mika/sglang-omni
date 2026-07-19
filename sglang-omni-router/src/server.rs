@@ -1,8 +1,10 @@
 use std::sync::Arc;
 
 use axum::Router;
+use axum::body::Body;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{Request, Response, StatusCode};
+use axum::middleware;
 use axum::routing::{delete, get, post};
 use tokio::sync::{Semaphore, oneshot};
 use tokio::task::JoinHandle;
@@ -13,6 +15,7 @@ use crate::error::RouterError;
 use crate::http_generation::{self, HttpGeneration};
 use crate::http_media::{self, HttpMedia};
 use crate::lifecycle::Lifecycle;
+use crate::operations::{self, Operations, RequestContext};
 use crate::shutdown;
 use crate::websocket::{self, SessionTracker, WebsocketGateway};
 use crate::worker_pool::{HealthSupervisor, HealthTaskError, WorkerPool};
@@ -33,6 +36,23 @@ struct AppState {
     generation: Option<Arc<HttpGeneration>>,
     media: Option<Arc<HttpMedia>>,
     websocket: Option<Arc<WebsocketGateway>>,
+    operations: Arc<Operations>,
+}
+
+impl AppState {
+    fn is_ready(&self) -> bool {
+        self.lifecycle.is_serving()
+            && self.pool.is_ready()
+            && self
+                .generation
+                .as_ref()
+                .is_none_or(|generation| generation.is_ready())
+            && self.media.as_ref().is_none_or(|media| media.is_ready())
+            && self
+                .websocket
+                .as_ref()
+                .is_none_or(|websocket| websocket.is_ready())
+    }
 }
 
 pub(crate) async fn serve(config: Config) -> Result<(), RouterError> {
@@ -58,6 +78,9 @@ pub(crate) async fn serve(config: Config) -> Result<(), RouterError> {
         sessions.clone(),
         Arc::clone(&classification_slots),
     );
+    let operations = Arc::new(Operations::build(&config)?);
+    let request_context = RequestContext::new()?;
+    let local_operations = config.server.listen.ip().is_loopback();
     let mut signal_observer = shutdown::SignalObserver::install().map_err(RouterError::Signal)?;
     let app = route_table(
         AppState {
@@ -66,10 +89,13 @@ pub(crate) async fn serve(config: Config) -> Result<(), RouterError> {
             generation: generation.clone(),
             media: media.clone(),
             websocket: websocket.clone(),
+            operations,
         },
         generation,
         media,
         websocket,
+        local_operations,
+        request_context,
     );
     let listener = tokio::net::TcpListener::bind(config.server.listen)
         .await
@@ -246,11 +272,13 @@ fn route_table(
     generation: Option<Arc<HttpGeneration>>,
     media: Option<Arc<HttpMedia>>,
     websocket: Option<Arc<WebsocketGateway>>,
+    local_operations: bool,
+    request_context: Arc<RequestContext>,
 ) -> Router {
     let mut app = Router::new()
         .route("/live", get(live).head(reject_head))
         .route("/ready", get(ready).head(reject_head))
-        .with_state(state);
+        .with_state(state.clone());
     if let Some(generation) = generation {
         app = app.route(
             "/v1/chat/completions",
@@ -305,7 +333,25 @@ fn route_table(
             );
         }
     }
-    app
+    if local_operations {
+        app = app
+            .route(
+                "/v1/models",
+                get(models).head(reject_head).with_state(state.clone()),
+            )
+            .route(
+                "/metrics",
+                get(metrics).head(reject_head).with_state(state.clone()),
+            )
+            .route(
+                "/diagnostics",
+                get(diagnostics).head(reject_head).with_state(state),
+            );
+    }
+    app.layer(middleware::from_fn_with_state(
+        request_context,
+        operations::request_context,
+    ))
 }
 
 async fn live(State(state): State<AppState>) -> (StatusCode, &'static str) {
@@ -317,22 +363,49 @@ async fn live(State(state): State<AppState>) -> (StatusCode, &'static str) {
 }
 
 async fn ready(State(state): State<AppState>) -> (StatusCode, &'static str) {
-    if state.lifecycle.is_serving()
-        && state.pool.is_ready()
-        && state
-            .generation
-            .as_ref()
-            .is_none_or(|generation| generation.is_ready())
-        && state.media.as_ref().is_none_or(|media| media.is_ready())
-        && state
-            .websocket
-            .as_ref()
-            .is_none_or(|websocket| websocket.is_ready())
-    {
+    if state.is_ready() {
         (StatusCode::OK, READY_BODY)
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, NOT_READY_BODY)
     }
+}
+
+async fn models(State(state): State<AppState>, request: Request<Body>) -> Response<Body> {
+    match operations::validate_get(&request, "/v1/models") {
+        Ok(()) => state.operations.models_response(),
+        Err(fault) => fault.into_response(),
+    }
+}
+
+async fn metrics(State(state): State<AppState>, request: Request<Body>) -> Response<Body> {
+    if let Err(fault) = operations::validate_get(&request, "/metrics") {
+        return fault.into_response();
+    }
+    let lifecycle = match state.lifecycle.snapshot() {
+        Ok(lifecycle) => lifecycle,
+        Err(_) => return crate::error::HttpFault::InternalError.into_response(),
+    };
+    let snapshot = match state.pool.operations_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(_) => return crate::error::HttpFault::InternalError.into_response(),
+    };
+    operations::metrics_response(lifecycle, state.is_ready(), &snapshot)
+}
+
+async fn diagnostics(State(state): State<AppState>, request: Request<Body>) -> Response<Body> {
+    if let Err(fault) = operations::validate_get(&request, "/diagnostics") {
+        return fault.into_response();
+    }
+    let lifecycle = match state.lifecycle.snapshot() {
+        Ok(lifecycle) => lifecycle,
+        Err(_) => return crate::error::HttpFault::InternalError.into_response(),
+    };
+    let snapshot = match state.pool.operations_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(_) => return crate::error::HttpFault::InternalError.into_response(),
+    };
+    operations::diagnostics_response(lifecycle, state.is_ready(), &snapshot)
+        .unwrap_or_else(crate::error::HttpFault::into_response)
 }
 
 async fn reject_head() -> StatusCode {

@@ -66,6 +66,7 @@ const MEDIA_ROUTE_SUBSETS: [&[MediaRoute]; 7] = [
 struct Captured {
     path: String,
     content_type: String,
+    request_id: String,
     body: Vec<u8>,
 }
 
@@ -194,12 +195,16 @@ fn handle_connection(
         let content_type = header_value(&head, "content-type")
             .expect("router sends content type")
             .to_owned();
+        let request_id = header_value(&head, "x-request-id")
+            .expect("router sends canonical request ID")
+            .to_owned();
         captured
             .lock()
             .expect("record media request")
             .push(Captured {
                 path: path.clone(),
                 content_type,
+                request_id,
                 body: body.clone(),
             });
         let response: &[u8] = match path.as_str() {
@@ -459,8 +464,9 @@ fn relays_all_media_routes_with_exact_bytes_headers_and_large_direct_uploads() {
     );
     assert_eq!(
         header(&response, "x-request-id"),
-        Some("transcription-public")
+        Some(capture.request_id.as_str())
     );
+    assert_ne!(capture.request_id, "transcription-public");
     assert_eq!(response_body(&response), b"{\"text\":\"hi\"}");
     assert_eq!(capture.body, multipart);
     assert_eq!(
@@ -494,6 +500,10 @@ fn relays_all_media_routes_with_exact_bytes_headers_and_large_direct_uploads() {
     large_speech[..2].copy_from_slice(b"{}");
     let (response, capture) = roundtrip("/v1/audio/speech", "application/json", &large_speech);
     assert!(response.starts_with(b"HTTP/1.1 200"));
+    assert_eq!(
+        header(&response, "x-request-id"),
+        Some(capture.request_id.as_str())
+    );
     assert_eq!(capture.body, large_speech);
 
     let large_batch = format!(
@@ -512,6 +522,10 @@ fn relays_all_media_routes_with_exact_bytes_headers_and_large_direct_uploads() {
         &large_multipart,
     );
     assert!(response.starts_with(b"HTTP/1.1 200"));
+    assert_eq!(
+        header(&response, "x-request-id"),
+        Some(capture.request_id.as_str())
+    );
     assert_eq!(capture.body, large_multipart);
 }
 

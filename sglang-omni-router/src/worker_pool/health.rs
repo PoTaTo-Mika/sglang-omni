@@ -25,6 +25,14 @@ impl HealthState {
             _ => Self::Unknown,
         }
     }
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Healthy => "healthy",
+            Self::Unhealthy => "unhealthy",
+        }
+    }
 }
 
 /// Atomic health cell. Release/Acquire publishes only the state transition;

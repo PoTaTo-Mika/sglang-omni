@@ -23,6 +23,7 @@ mod error;
 mod http_generation;
 mod http_media;
 mod lifecycle;
+mod operations;
 mod server;
 mod shutdown;
 mod speech_facts;

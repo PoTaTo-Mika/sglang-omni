@@ -1,13 +1,11 @@
-use std::collections::HashSet;
-
-use axum::http::header::{CONNECTION, HOST};
-use axum::http::{HeaderMap, HeaderName, StatusCode};
+use axum::http::{HeaderMap, StatusCode};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, client_async_tls_with_config};
 
 use crate::config::WebsocketConfig;
+use crate::http_generation::headers::REQUEST_ID_HEADER;
 use crate::worker_pool::ResolvedTarget;
 
 pub(super) type UpstreamSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -35,7 +33,7 @@ pub(super) async fn connect(
         .as_str()
         .into_client_request()
         .map_err(|_| ConnectError::InvalidRequest)?;
-    copy_end_to_end_headers(downstream_headers, request.headers_mut())?;
+    copy_upstream_headers(downstream_headers, request.headers_mut())?;
 
     let tcp = tokio::time::timeout(
         policy.connect_timeout(),
@@ -73,48 +71,21 @@ pub(super) async fn connect(
     Ok(socket)
 }
 
-pub(super) fn copy_end_to_end_headers(
+pub(super) fn copy_upstream_headers(
     source: &HeaderMap,
     destination: &mut HeaderMap,
 ) -> Result<(), ConnectError> {
-    let mut nominated = HashSet::new();
-    for value in source.get_all(CONNECTION) {
-        let text = value.to_str().map_err(|_| ConnectError::InvalidRequest)?;
-        for token in text
-            .split(',')
-            .map(str::trim)
-            .filter(|token| !token.is_empty())
-        {
-            let name = HeaderName::from_bytes(token.as_bytes())
-                .map_err(|_| ConnectError::InvalidRequest)?;
-            nominated.insert(name);
+    for name in ["origin", REQUEST_ID_HEADER] {
+        let mut values = source.get_all(name).iter();
+        match (values.next(), values.next()) {
+            (Some(value), None) => {
+                destination.insert(name, value.clone());
+            }
+            (None, None) if name != REQUEST_ID_HEADER => {}
+            _ => return Err(ConnectError::InvalidRequest),
         }
-    }
-    for (name, value) in source {
-        if name == HOST
-            || is_hop_by_hop(name)
-            || nominated.contains(name)
-            || name.as_str().starts_with("sec-websocket-")
-        {
-            continue;
-        }
-        destination.append(name, value.clone());
     }
     Ok(())
-}
-
-fn is_hop_by_hop(name: &HeaderName) -> bool {
-    matches!(
-        name.as_str(),
-        "connection"
-            | "keep-alive"
-            | "proxy-authenticate"
-            | "proxy-authorization"
-            | "te"
-            | "trailer"
-            | "transfer-encoding"
-            | "upgrade"
-    )
 }
 
 #[cfg(test)]
@@ -122,7 +93,7 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
-    use axum::http::header::{AUTHORIZATION, CONNECTION, HOST};
+    use axum::http::header::{AUTHORIZATION, CONNECTION, HOST, ORIGIN};
     use axum::http::{HeaderMap, HeaderValue};
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_hdr_async;
@@ -131,10 +102,12 @@ mod tests {
     use crate::config::WebsocketConfig;
     use crate::worker_pool::ResolvedTarget;
 
-    use super::{connect, copy_end_to_end_headers};
+    use crate::http_generation::headers::REQUEST_ID_HEADER;
+
+    use super::{connect, copy_upstream_headers};
 
     #[test]
-    fn strips_handshake_hop_and_connection_nominated_headers() {
+    fn preserves_only_origin_and_canonical_request_id() {
         let mut source = HeaderMap::new();
         source.insert(HOST, HeaderValue::from_static("downstream.invalid"));
         source.insert(CONNECTION, HeaderValue::from_static("upgrade, x-private"));
@@ -142,15 +115,46 @@ mod tests {
         source.insert("x-private", HeaderValue::from_static("remove"));
         source.insert("sec-websocket-key", HeaderValue::from_static("remove"));
         source.insert(AUTHORIZATION, HeaderValue::from_static("Bearer retained"));
+        for name in [
+            "proxy-authorization",
+            "cookie",
+            "set-cookie",
+            "forwarded",
+            "x-forwarded-for",
+            "x-sgl-route",
+            "x-smg-target-worker",
+            "x-custom-client-state",
+        ] {
+            source.insert(name, HeaderValue::from_static("remove"));
+        }
+        source.insert(ORIGIN, HeaderValue::from_static("https://client.example"));
+        source.insert(REQUEST_ID_HEADER, HeaderValue::from_static("request-1"));
         let mut destination = HeaderMap::new();
 
-        copy_end_to_end_headers(&source, &mut destination).expect("valid headers");
+        copy_upstream_headers(&source, &mut destination).expect("valid headers");
 
-        assert_eq!(destination.len(), 1);
+        assert_eq!(destination.len(), 2);
         assert_eq!(
-            destination.get(AUTHORIZATION),
-            Some(&HeaderValue::from_static("Bearer retained"))
+            destination.get(ORIGIN),
+            Some(&HeaderValue::from_static("https://client.example"))
         );
+        assert_eq!(
+            destination.get(REQUEST_ID_HEADER),
+            Some(&HeaderValue::from_static("request-1"))
+        );
+        assert!(!destination.contains_key(AUTHORIZATION));
+        for name in [
+            "proxy-authorization",
+            "cookie",
+            "set-cookie",
+            "forwarded",
+            "x-forwarded-for",
+            "x-sgl-route",
+            "x-smg-target-worker",
+            "x-custom-client-state",
+        ] {
+            assert!(!destination.contains_key(name));
+        }
     }
 
     #[tokio::test]
@@ -174,9 +178,26 @@ mod tests {
                             .map(str::to_owned),
                         request
                             .headers()
-                            .get(AUTHORIZATION)
+                            .get(REQUEST_ID_HEADER)
                             .and_then(|value| value.to_str().ok())
                             .map(str::to_owned),
+                        request
+                            .headers()
+                            .get(ORIGIN)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned),
+                        [
+                            "authorization",
+                            "proxy-authorization",
+                            "cookie",
+                            "forwarded",
+                            "x-forwarded-for",
+                            "x-sgl-route",
+                            "x-smg-target-worker",
+                            "x-custom-client-state",
+                        ]
+                        .into_iter()
+                        .any(|name| request.headers().contains_key(name)),
                     );
                     if let Some(sender) = sender.take() {
                         let _sent = sender.send(observed);
@@ -195,6 +216,19 @@ mod tests {
         .expect("valid pinned hostname target");
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer retained"));
+        headers.insert(ORIGIN, HeaderValue::from_static("https://client.example"));
+        for name in [
+            "proxy-authorization",
+            "cookie",
+            "forwarded",
+            "x-forwarded-for",
+            "x-sgl-route",
+            "x-smg-target-worker",
+            "x-custom-client-state",
+        ] {
+            headers.insert(name, HeaderValue::from_static("remove"));
+        }
+        headers.insert(REQUEST_ID_HEADER, HeaderValue::from_static("request-2"));
 
         let mut socket = connect(
             &target,
@@ -210,7 +244,9 @@ mod tests {
             observed.1.as_deref(),
             Some(format!("branch-five.invalid:{}", address.port()).as_str())
         );
-        assert_eq!(observed.2.as_deref(), Some("Bearer retained"));
+        assert_eq!(observed.2.as_deref(), Some("request-2"));
+        assert_eq!(observed.3.as_deref(), Some("https://client.example"));
+        assert!(!observed.4);
         let _closed = socket.close(None).await;
         server.await.expect("join pinned websocket fixture");
     }

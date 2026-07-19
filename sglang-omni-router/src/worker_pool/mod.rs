@@ -35,14 +35,67 @@ use selection::{PolicyCandidate, Selector};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
-enum Disposition {
+pub(crate) enum Disposition {
     Serving = 0,
     Draining = 1,
+}
+
+impl Disposition {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Serving => "serving",
+            Self::Draining => "draining",
+        }
+    }
 }
 
 struct CapacitySlot {
     limit: usize,
     semaphore: Arc<Semaphore>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CapacitySnapshot {
+    pub(crate) class: CapacityClass,
+    pub(crate) limit: usize,
+    pub(crate) in_flight: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AdmissionClass {
+    Global,
+    Capacity(CapacityClass),
+}
+
+impl AdmissionClass {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::Capacity(class) => class.label(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AdmissionSnapshot {
+    pub(crate) class: AdmissionClass,
+    pub(crate) limit: usize,
+    pub(crate) in_flight: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WorkerSnapshot {
+    pub(crate) worker_id: String,
+    pub(crate) registration_ordinal: usize,
+    pub(crate) health: HealthState,
+    pub(crate) disposition: Disposition,
+    pub(crate) capacity: Vec<CapacitySnapshot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OperationsSnapshot {
+    pub(crate) admission: [AdmissionSnapshot; 8],
+    pub(crate) workers: Vec<WorkerSnapshot>,
 }
 
 /// Immutable manifest identity/profile data plus narrow mutable runtime cells.
@@ -484,6 +537,46 @@ impl WorkerPool {
                         .any(|record| record.serves_class(*class, self.voice_owner.as_ref()))
                 })
         })
+    }
+
+    pub(crate) fn operations_snapshot(
+        &self,
+    ) -> Result<OperationsSnapshot, crate::error::RouterError> {
+        let _gate = self
+            .gate
+            .read()
+            .map_err(|_| crate::error::RouterError::WorkerPoolInvariant)?;
+        let raw_admission = self.admission.snapshot();
+        let admission = std::array::from_fn(|index| AdmissionSnapshot {
+            class: if index == 0 {
+                AdmissionClass::Global
+            } else {
+                AdmissionClass::Capacity(CapacityClass::ALL[index - 1])
+            },
+            limit: raw_admission[index].0,
+            in_flight: raw_admission[index].1,
+        });
+        let workers = self
+            .records
+            .iter()
+            .map(|record| WorkerSnapshot {
+                worker_id: record.worker_id.as_str().to_owned(),
+                registration_ordinal: record.registration_id.startup_ordinal(),
+                health: record.health.load(),
+                disposition: record.disposition(),
+                capacity: CapacityClass::ALL
+                    .into_iter()
+                    .filter_map(|class| {
+                        record.slot(class).map(|slot| CapacitySnapshot {
+                            class,
+                            limit: slot.limit,
+                            in_flight: slot.limit - slot.semaphore.available_permits(),
+                        })
+                    })
+                    .collect(),
+            })
+            .collect();
+        Ok(OperationsSnapshot { admission, workers })
     }
 
     pub(crate) fn generation_http_ready(&self, trust: &TrustDomain) -> bool {
@@ -1039,8 +1132,8 @@ mod tests {
     };
     use super::resolver::{ResolvedTarget, StaticResolver, build_health_client};
     use super::{
-        AdmissionError, CapacityClass, CapacitySlot, DispatchError, PolicyCandidate, Selector,
-        WorkerPool, WorkerRecord, build_homogeneous_generation_cohorts,
+        AdmissionClass, AdmissionError, CapacityClass, CapacitySlot, DispatchError, Disposition,
+        PolicyCandidate, Selector, WorkerPool, WorkerRecord, build_homogeneous_generation_cohorts,
         build_homogeneous_media_cohorts, compute_realtime_defaults_unambiguous,
     };
 
@@ -1955,6 +2048,57 @@ mod tests {
         pool.drain().expect("readiness fixture drain");
         assert!(!pool.is_ready());
         drop(lease);
+    }
+
+    #[test]
+    fn operations_snapshot_reads_exact_permits_and_releases_with_the_lease() {
+        let pool = fixture_pool(RoutingStrategy::RoundRobin, 1, 3);
+        let initial = pool
+            .operations_snapshot()
+            .expect("initial operations snapshot");
+        assert_eq!(initial.admission[0].class, AdmissionClass::Global);
+        assert_eq!(
+            initial.admission[1].class,
+            AdmissionClass::Capacity(CapacityClass::GenerationHttp)
+        );
+        assert_eq!(initial.admission[0].in_flight, 0);
+        assert_eq!(initial.admission[1].in_flight, 0);
+        assert_eq!(initial.workers[0].worker_id, "worker-0");
+        assert_eq!(initial.workers[0].registration_ordinal, 0);
+        assert_eq!(initial.workers[0].health, HealthState::Healthy);
+        assert_eq!(initial.workers[0].disposition, Disposition::Serving);
+        assert_eq!(initial.workers[0].capacity[0].limit, 3);
+        assert_eq!(initial.workers[0].capacity[0].in_flight, 0);
+
+        let lease = pool
+            .dispatch(
+                pool.try_admit(CapacityClass::GenerationHttp)
+                    .expect("snapshot admission"),
+                &generation_requirement(),
+            )
+            .expect("snapshot dispatch");
+        let occupied = pool
+            .operations_snapshot()
+            .expect("occupied operations snapshot");
+        assert_eq!(occupied.admission[0].in_flight, 1);
+        assert_eq!(occupied.admission[1].in_flight, 1);
+        assert_eq!(occupied.workers[0].capacity[0].in_flight, 1);
+
+        drop(lease);
+        let released = pool
+            .operations_snapshot()
+            .expect("released operations snapshot");
+        assert_eq!(released.admission[0].in_flight, 0);
+        assert_eq!(released.admission[1].in_flight, 0);
+        assert_eq!(released.workers[0].capacity[0].in_flight, 0);
+
+        pool.records[0].health.store(HealthState::Unhealthy);
+        pool.drain().expect("drain snapshot fixture");
+        let drained = pool
+            .operations_snapshot()
+            .expect("drained operations snapshot");
+        assert_eq!(drained.workers[0].health, HealthState::Unhealthy);
+        assert_eq!(drained.workers[0].disposition, Disposition::Draining);
     }
 
     #[test]

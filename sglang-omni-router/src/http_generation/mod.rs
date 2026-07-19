@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
-use axum::http::{Request, Response, Version};
+use axum::http::{HeaderValue, Request, Response, Version};
 use bytes::{Bytes, BytesMut};
 use http_body::Body as _;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -23,7 +23,10 @@ use crate::worker_pool::{
 };
 
 use classify::{ExpectedSuccess, classify};
-use headers::{canonical_content_type, sanitize_response, validate_request};
+use headers::{
+    REQUEST_ID_HEADER, canonical_content_type, canonical_request_id, sanitize_response,
+    validate_request,
+};
 use request_body::{BufferedBody, DirectRequestBody, SharedUploadState, UploadState};
 use response_body::DirectResponseBody;
 
@@ -38,6 +41,11 @@ pub(crate) struct HttpGeneration {
     buffered_budget: Arc<Semaphore>,
     classification_slots: Arc<Semaphore>,
     request_timeout: std::time::Duration,
+}
+
+struct RelayMetadata {
+    expected: ExpectedSuccess,
+    request_id: HeaderValue,
 }
 
 impl HttpGeneration {
@@ -94,6 +102,7 @@ async fn handle(
     }
     let deadline = tokio::time::Instant::now() + generation.request_timeout;
     let framing = validate_request(request.headers())?;
+    let request_id = canonical_request_id(request.headers())?;
     let admission = generation
         .pool
         .try_admit(CapacityClass::GenerationHttp)
@@ -121,7 +130,18 @@ async fn handle(
             return Err(HttpFault::InternalError);
         };
         let lease = proof.dispatch(admission).map_err(map_dispatch)?;
-        return relay_direct(generation, request.into_body(), length, lease, deadline).await;
+        return relay_direct(
+            generation,
+            request.into_body(),
+            length,
+            lease,
+            RelayMetadata {
+                expected: ExpectedSuccess::Either,
+                request_id,
+            },
+            deadline,
+        )
+        .await;
     }
 
     if framing
@@ -156,7 +176,10 @@ async fn handle(
         bytes,
         budget,
         lease,
-        classified.expected_success,
+        RelayMetadata {
+            expected: classified.expected_success,
+            request_id,
+        },
         deadline,
     )
     .await
@@ -224,12 +247,12 @@ async fn relay_buffered(
     bytes: Bytes,
     budget: OwnedSemaphorePermit,
     lease: RequestLease,
-    expected: ExpectedSuccess,
+    metadata: RelayMetadata,
     deadline: tokio::time::Instant,
 ) -> Result<Response<Body>, HttpFault> {
     let length = u64::try_from(bytes.len()).map_err(|_| HttpFault::InternalError)?;
     let body = reqwest::Body::wrap(BufferedBody::new(bytes, budget));
-    send_once(generation, body, length, lease, expected, None, deadline).await
+    send_once(generation, body, length, lease, metadata, None, deadline).await
 }
 
 async fn relay_direct(
@@ -237,6 +260,7 @@ async fn relay_direct(
     body: Body,
     length: u64,
     lease: RequestLease,
+    metadata: RelayMetadata,
     deadline: tokio::time::Instant,
 ) -> Result<Response<Body>, HttpFault> {
     let state: SharedUploadState = Arc::new(Mutex::new(UploadState::Incomplete));
@@ -252,7 +276,7 @@ async fn relay_direct(
         reqwest::Body::wrap(direct),
         length,
         lease,
-        ExpectedSuccess::Either,
+        metadata,
         Some(state),
         deadline,
     )
@@ -264,10 +288,14 @@ async fn send_once(
     body: reqwest::Body,
     length: u64,
     lease: RequestLease,
-    expected: ExpectedSuccess,
+    metadata: RelayMetadata,
     upload: Option<SharedUploadState>,
     deadline: tokio::time::Instant,
 ) -> Result<Response<Body>, HttpFault> {
+    let RelayMetadata {
+        expected,
+        request_id,
+    } = metadata;
     let mut url = lease.target().base_url().clone();
     url.set_path(CHAT_PATH);
     url.set_query(None);
@@ -276,6 +304,7 @@ async fn send_once(
         .post(url)
         .header(CONTENT_TYPE, canonical_content_type())
         .header(CONTENT_LENGTH, length)
+        .header(REQUEST_ID_HEADER, request_id)
         .body(body);
     let _attempt =
         authorize_upstream_attempt_at(deadline, upload.as_ref(), tokio::time::Instant::now())?;

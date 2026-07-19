@@ -35,6 +35,7 @@ struct Capture {
     method: Method,
     uri: String,
     content_type: Option<String>,
+    request_id: Option<String>,
     body: Bytes,
 }
 
@@ -68,6 +69,11 @@ async fn http_worker(
         content_type: parts
             .headers
             .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
+        request_id: parts
+            .headers
+            .get("x-request-id")
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned),
         body: bytes,
@@ -114,6 +120,7 @@ async fn speech_ws(
                 method: Method::GET,
                 uri: String::from("/v1/audio/speech/stream"),
                 content_type: None,
+                request_id: None,
                 body: Bytes::copy_from_slice(text.as_bytes()),
             });
             let response = format!(r#"{{"type":"session.configured","worker":"{}"}}"#, state.id);
@@ -418,9 +425,17 @@ async fn exact_owner_voice_state_contract_over_real_sockets() {
     assert_eq!(response.status(), StatusCode::OK);
     let response = client
         .get(format!("{base}/v1/audio/voices?detail=1"))
+        .header("x-request-id", "client-voice-1")
         .send()
         .await
         .expect("voice list");
+    assert_eq!(
+        response
+            .headers()
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("client-voice-1")
+    );
     assert!(response.text().await.expect("list body").contains("owner"));
     let response = client
         .delete(format!("{base}/v1/audio/voices/Alice%20One?purge=1"))
@@ -454,7 +469,9 @@ async fn exact_owner_voice_state_contract_over_real_sockets() {
         Some("multipart/form-data; boundary=voice-boundary")
     );
     assert!(owner_captures.iter().any(|capture| {
-        capture.method == Method::GET && capture.uri == "/v1/audio/voices?detail=1"
+        capture.method == Method::GET
+            && capture.uri == "/v1/audio/voices?detail=1"
+            && capture.request_id.as_deref() == Some("client-voice-1")
     }));
     assert!(owner_captures.iter().any(|capture| {
         capture.method == Method::DELETE && capture.uri == "/v1/audio/voices/Alice%20One?purge=1"

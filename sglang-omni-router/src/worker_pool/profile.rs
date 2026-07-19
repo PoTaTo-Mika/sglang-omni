@@ -40,6 +40,30 @@ pub(crate) enum CapacityClass {
     Control,
 }
 
+impl CapacityClass {
+    pub(crate) const ALL: [Self; 7] = [
+        Self::GenerationHttp,
+        Self::SpeechHttp,
+        Self::TranscriptionHttp,
+        Self::SpeechBatch,
+        Self::SpeechWebsocket,
+        Self::RealtimeWebsocket,
+        Self::Control,
+    ];
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::GenerationHttp => "generation_http",
+            Self::SpeechHttp => "speech_http",
+            Self::TranscriptionHttp => "transcription_http",
+            Self::SpeechBatch => "speech_batch",
+            Self::SpeechWebsocket => "speech_websocket",
+            Self::RealtimeWebsocket => "realtime_websocket",
+            Self::Control => "control",
+        }
+    }
+}
+
 impl ServiceClass {
     pub(super) fn capacity(self) -> CapacityClass {
         match self {
@@ -551,7 +575,7 @@ impl ServiceProfile {
         }
     }
 
-    fn model_ids(&self) -> Option<&[String]> {
+    pub(crate) fn model_ids(&self) -> Option<&[String]> {
         match self {
             Self::GenerationHttp { model_ids, .. }
             | Self::SpeechHttp { model_ids, .. }

@@ -258,3 +258,26 @@ is enabled, readiness checks only the enabled media services in the exact
 `http_media.trust_domain`. Permit saturation does not change readiness. Worker
 health is status-only exact `GET /health` by default; response bodies are not
 parsed or buffered. No public `/health` alias is registered.
+
+When `server.listen` is loopback, the router also exposes three read-only local
+operations endpoints. `GET /v1/models` returns the immutable, sorted union of
+manifest profile model IDs and worker defaults in the direct SGLang-Omni model
+schema. `GET /metrics` renders fixed-label Prometheus 0.0.4 gauges from
+scrape-time lifecycle, readiness, admission, and exact worker-permit snapshots.
+`GET /diagnostics` returns the same bounded snapshot as redacted JSON, including
+only worker IDs, registration ordinals, health/disposition, and configured
+capacity. These endpoints are health-independent, accept only bodyless
+HTTP/1.1 GET requests without queries, and are not registered on non-loopback
+health-only listeners.
+
+Release one has no downstream authentication or TLS boundary. Deploy the
+router behind a trusted local proxy or sidecar and do not expose its inference
+or operations surface directly off-host. Every router response publishes one
+canonical `x-request-id`: a single 1–128 byte visible-ASCII client value is
+preserved, otherwise the router generates a process-local monotonic value;
+duplicate or malformed values are rejected. The same value is forwarded to
+the selected HTTP or WebSocket worker and any worker response value is
+overridden. HTTP relays continue to reconstruct their narrow content/framing
+headers. WebSocket upstream handshakes copy only validated `Origin` and the
+canonical request ID; client credentials, cookies, forwarding headers, routing
+hints, and arbitrary custom headers are never forwarded.
