@@ -20,6 +20,7 @@ const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 1_800_000;
 const DEFAULT_POOL_IDLE_TIMEOUT_MS: u64 = 90_000;
 const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 8;
+pub(crate) const VOICE_UPLOAD_MAX_BYTES: u64 = 10_551_296;
 const DEFAULT_MAX_CONNECTIONS: u32 = 1024;
 const MAX_CONNECTIONS: u32 = 65_535;
 const MAX_LOG_FILTER_BYTES: usize = 256;
@@ -490,6 +491,7 @@ impl Config {
         self.validate_http_generation()?;
         self.validate_http_media()?;
         self.validate_websocket()?;
+        self.validate_voice_state()?;
         validate_workers(
             &self.workers,
             &self.router.required_services,
@@ -895,6 +897,82 @@ impl Config {
                     "must contain at least one worker for every enabled media HTTP route",
                 ));
             }
+        }
+        Ok(())
+    }
+
+    fn validate_voice_state(&self) -> Result<(), ConfigError> {
+        let Some(owner) = self.router.voice_owner_worker_id.as_deref() else {
+            return Ok(());
+        };
+        if !self
+            .router
+            .required_services
+            .contains(&ServiceClass::VoiceControl)
+        {
+            return Err(ConfigError::invalid(
+                "router.required_services",
+                "must contain voice_control while voice state is enabled",
+            ));
+        }
+        if !self.server.listen.ip().is_loopback() {
+            return Err(ConfigError::invalid(
+                "server.listen",
+                "voice state requires a loopback listener",
+            ));
+        }
+        let media = self.http_media.clone().unwrap_or_default();
+        if media.buffered_request_total_bytes < VOICE_UPLOAD_MAX_BYTES {
+            return Err(ConfigError::invalid(
+                "http_media.buffered_request_total_bytes",
+                "must reserve the complete voice upload bound while voice state is enabled",
+            ));
+        }
+        let owner_has_managed = |service, trust: &str| {
+            self.workers.iter().any(|worker| {
+                worker.worker_id == owner
+                    && worker.trust_domain == trust
+                    && worker.service_profiles.iter().any(|profile| match profile {
+                        crate::worker_pool::profile::ServiceProfile::SpeechHttp {
+                            managed_voice,
+                            ..
+                        } if service == ServiceClass::SpeechHttp => *managed_voice,
+                        crate::worker_pool::profile::ServiceProfile::SpeechBatch {
+                            managed_voice,
+                            ..
+                        } if service == ServiceClass::SpeechBatch => *managed_voice,
+                        crate::worker_pool::profile::ServiceProfile::SpeechWebsocket {
+                            managed_voice,
+                            ..
+                        } if service == ServiceClass::SpeechWebsocket => *managed_voice,
+                        _ => false,
+                    })
+            })
+        };
+        if let Some(media) = self.http_media.as_ref() {
+            for service in media.routes.iter().filter_map(|route| match route {
+                HttpMediaRoute::Speech => Some(ServiceClass::SpeechHttp),
+                HttpMediaRoute::SpeechBatch => Some(ServiceClass::SpeechBatch),
+                HttpMediaRoute::Transcription => None,
+            }) {
+                if !owner_has_managed(service, &media.trust_domain) {
+                    return Err(ConfigError::invalid(
+                        "router.voice_owner_worker_id",
+                        "enabled speech HTTP routes require an owner-side managed_voice row in their trust domain",
+                    ));
+                }
+            }
+        }
+        if let Some(route) = self
+            .websocket
+            .as_ref()
+            .and_then(|websocket| websocket.speech.as_ref())
+            && !owner_has_managed(ServiceClass::SpeechWebsocket, &route.trust_domain)
+        {
+            return Err(ConfigError::invalid(
+                "router.voice_owner_worker_id",
+                "enabled speech WebSocket requires an owner-side managed_voice row in its trust domain",
+            ));
         }
         Ok(())
     }

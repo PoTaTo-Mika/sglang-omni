@@ -229,6 +229,85 @@ fn with_max_connections(config: String, max_connections: u32) -> String {
     )
 }
 
+fn voice_only_config() -> String {
+    let base = valid_config("127.0.0.1:30000", 30_000, "info");
+    let prefix = base
+        .split("[[workers]]")
+        .next()
+        .expect("valid fixture has a worker marker")
+        .replace(
+            "required_services = [\"generation_http\"]",
+            "required_services = [\"voice_control\"]\nvoice_owner_worker_id = \"owner\"",
+        )
+        .replace(
+            "[http_generation]\ntrust_domain = \"local\"\nbuffered_request_max_bytes = 8388608\nbuffered_request_total_bytes = 268435456\nstreamed_request_max_bytes = 536870912\nconnect_timeout_ms = 5000\nrequest_timeout_ms = 1800000\npool_idle_timeout_ms = 90000\npool_max_idle_per_host = 8\n\n",
+            "",
+        );
+    format!(
+        "{prefix}[[workers]]\nworker_id = \"owner\"\nbase_url = \"http://127.0.0.1:9\"\ntrust_domain = \"local\"\n\n[workers.capacity]\ncontrol = 1\n\n[[workers.service_profiles]]\nservice = \"voice_control\"\n"
+    )
+}
+
+fn voice_transcription_config() -> String {
+    let mut config = media_http_config(
+        &[MediaHttpRouteFixture::Transcription],
+        &[MediaHttpRouteFixture::Transcription],
+        &[MediaHttpRouteFixture::Transcription],
+        "local",
+        "local",
+    )
+    .replace(
+        "required_services = [\"transcription_http\"]",
+        "required_services = [\"transcription_http\", \"voice_control\"]\nvoice_owner_worker_id = \"worker-1\"",
+    )
+    .replace(
+        "[workers.capacity]\ntranscription_http = 4",
+        "[workers.capacity]\ntranscription_http = 4\ncontrol = 1",
+    );
+    config.push_str("\n[[workers.service_profiles]]\nservice = \"voice_control\"\n");
+    config
+}
+
+fn voice_http_config(managed_voice: bool, total: u64) -> String {
+    let mut config = voice_only_config()
+        .replace(
+            "required_services = [\"voice_control\"]",
+            "required_services = [\"voice_control\", \"speech_http\", \"speech_batch\", \"transcription_http\"]",
+        )
+        .replace(
+            "[workers.capacity]\ncontrol = 1",
+            "[workers.capacity]\ncontrol = 1\nspeech_http = 1\nspeech_batch = 1\ntranscription_http = 1",
+        )
+        .replace(
+            "trust_domain = \"local\"\n\n[workers.capacity]",
+            "trust_domain = \"local\"\ndefault_model_id = \"tts\"\n\n[workers.capacity]",
+        );
+    config.push_str(&format!(
+        "\n[[workers.service_profiles]]\nservice = \"speech_http\"\nmodel_ids = [\"tts\"]\nresponse_formats = [\"wav\"]\nstream_modes = [\"non_streaming\"]\ntasks = [\"text_to_speech\"]\nreference_forms = [\"none\"]\nmanaged_voice = {managed_voice}\n\n[[workers.service_profiles]]\nservice = \"speech_batch\"\nmodel_ids = [\"tts\"]\nresponse_formats = [\"wav\"]\ntasks = [\"text_to_speech\"]\nreference_forms = [\"none\"]\nmanaged_voice = {managed_voice}\nmax_batch_size = 1\neffective_features = [\"voice\"]\n\n[[workers.service_profiles]]\nservice = \"transcription_http\"\nmodel_ids = [\"tts\"]\nresponse_formats = [\"json\"]\nmedia_profiles = [\"audio\"]\nstream_modes = [\"non_streaming\"]\n\n[http_media]\nroutes = [\"speech\", \"speech_batch\", \"transcription\"]\ntrust_domain = \"local\"\nbuffered_request_max_bytes = 1000000\nbuffered_request_total_bytes = {total}\nstreamed_request_max_bytes = 1000000\nconnect_timeout_ms = 1000\nrequest_timeout_ms = 5000\npool_idle_timeout_ms = 1000\npool_max_idle_per_host = 1\n"
+    ));
+    config
+}
+
+fn voice_websocket_config(managed_voice: bool) -> String {
+    let mut config = voice_only_config()
+        .replace(
+            "required_services = [\"voice_control\"]",
+            "required_services = [\"voice_control\", \"speech_websocket\"]",
+        )
+        .replace(
+            "[workers.capacity]\ncontrol = 1",
+            "[workers.capacity]\ncontrol = 1\nspeech_websocket = 1",
+        )
+        .replace(
+            "trust_domain = \"local\"\n\n[workers.capacity]",
+            "trust_domain = \"local\"\ndefault_model_id = \"tts\"\n\n[workers.capacity]",
+        );
+    config.push_str(&format!(
+        "\n[[workers.service_profiles]]\nservice = \"speech_websocket\"\nmodel_ids = [\"tts\"]\ninput_profiles = [\"text\"]\nresponse_formats = [\"pcm\"]\nstream_modes = [\"non_streaming\"]\ntasks = [\"text_to_speech\"]\nreference_forms = [\"none\"]\nmanaged_voice = {managed_voice}\n\n[websocket.speech]\ntrust_domain = \"local\"\n"
+    ));
+    config
+}
+
 fn load_bytes(contents: &[u8]) -> Result<Config, ConfigError> {
     let directory = TestDir::new();
     Config::load(&directory.write(contents))
@@ -267,6 +346,35 @@ fn classification_concurrency_defaults_and_boundaries_are_validated() {
         );
         assert!(load_bytes(configured.as_bytes()).is_err());
     }
+}
+
+#[test]
+fn validates_voice_state_enablement_and_owner_surface_rows() {
+    load_bytes(voice_only_config().as_bytes())
+        .expect("voice-only mode uses internal media defaults");
+
+    let missing_required = voice_only_config().replace(
+        "required_services = [\"voice_control\"]",
+        "required_services = [\"generation_http\"]",
+    );
+    assert!(load_bytes(missing_required.as_bytes()).is_err());
+    assert!(
+        load_bytes(
+            voice_only_config()
+                .replace("127.0.0.1:30000", "0.0.0.0:30000")
+                .as_bytes()
+        )
+        .is_err()
+    );
+    load_bytes(voice_http_config(true, 10_551_296).as_bytes())
+        .expect("exact aggregate bound and owner-side managed rows are valid");
+    assert!(load_bytes(voice_http_config(false, 10_551_296).as_bytes()).is_err());
+    assert!(load_bytes(voice_http_config(true, 10_551_295).as_bytes()).is_err());
+    load_bytes(voice_transcription_config().as_bytes())
+        .expect("transcription-only media does not require managed speech rows");
+    load_bytes(voice_websocket_config(true).as_bytes())
+        .expect("owner-side managed WebSocket row is valid");
+    assert!(load_bytes(voice_websocket_config(false).as_bytes()).is_err());
 }
 
 #[test]

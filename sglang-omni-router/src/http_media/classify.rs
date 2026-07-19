@@ -61,7 +61,7 @@ pub(super) fn speech(
     )
     .ok_or(HttpFault::MalformedRequest)?;
     let references = reference_forms(&fields);
-    let managed_voice = classify_managed_voice(&fields, &references);
+    let managed_voice = pool.voice_state_enabled() && classify_managed_voice(&fields, &references);
     Ok(Classified {
         requirement: RouteRequirement::new(
             ProfileRequirement::SpeechHttp {
@@ -153,7 +153,8 @@ pub(super) fn batch(
             .clone()
             .flatten()
             .or_else(|| defaults.voice.clone().flatten());
-        managed_voice |= !explicit_reference
+        managed_voice |= pool.voice_state_enabled()
+            && !explicit_reference
             && voice
                 .is_some_and(|value| !value.is_empty() && !value.eq_ignore_ascii_case("default"));
     }
@@ -652,7 +653,7 @@ stream_modes = ["non_streaming", "streaming"]
                 br#"{"model":" ","input":"x","voice":" default "}"#.as_slice(),
                 false,
                 " ",
-                true,
+                false,
             ),
             (
                 br#"{"input":"x","voice":"DeFaUlT"}"#.as_slice(),
@@ -678,7 +679,7 @@ stream_modes = ["non_streaming", "streaming"]
             assert_eq!(*managed_voice, managed);
         }
 
-        for (voice, expected) in [("", false), ("DEFAULT", false), (" default ", true)] {
+        for voice in ["", "DEFAULT", " default "] {
             let body = format!(r#"{{"voice":"{voice}","items":[{{"input":"x"}}]}}"#);
             let classified =
                 batch(body.as_bytes(), &pool, &trust).expect("classify batch managed voice fact");
@@ -687,7 +688,7 @@ stream_modes = ["non_streaming", "streaming"]
             else {
                 panic!("batch requirement")
             };
-            assert_eq!(*managed_voice, expected);
+            assert!(!managed_voice, "voice state is disabled in this fixture");
         }
     }
 }

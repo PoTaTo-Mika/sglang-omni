@@ -1,6 +1,7 @@
 mod classify;
 mod headers;
 mod multipart;
+pub(crate) mod voice;
 
 use std::sync::{Arc, Mutex};
 
@@ -34,7 +35,7 @@ const TRANSCRIPTION_PATH: &str = "/v1/audio/transcriptions";
 pub(crate) struct HttpMedia {
     pool: Arc<WorkerPool>,
     client: reqwest::Client,
-    trust: TrustDomain,
+    ordinary_trust: Option<TrustDomain>,
     enabled_services: Box<[ServiceClass]>,
     buffered_max: u64,
     streamed_max: u64,
@@ -82,9 +83,10 @@ impl HttpMedia {
         pool: Arc<WorkerPool>,
         classification_slots: Arc<Semaphore>,
     ) -> Result<Option<Arc<Self>>, RouterError> {
-        let Some(media) = config.http_media.as_ref() else {
+        if config.http_media.is_none() && !pool.voice_state_enabled() {
             return Ok(None);
-        };
+        }
+        let media = config.http_media.clone().unwrap_or_default();
         let buffered_total = media.buffered_total_usize().map_err(RouterError::Config)?;
         let client = pool
             .media_client()
@@ -92,7 +94,10 @@ impl HttpMedia {
         Ok(Some(Arc::new(Self {
             pool,
             client,
-            trust: TrustDomain::new(media.trust_domain.clone()),
+            ordinary_trust: config
+                .http_media
+                .as_ref()
+                .map(|media| TrustDomain::new(media.trust_domain.clone())),
             enabled_services: media
                 .routes
                 .iter()
@@ -112,8 +117,14 @@ impl HttpMedia {
     }
 
     pub(crate) fn is_ready(&self) -> bool {
-        self.pool
-            .media_http_ready(&self.trust, &self.enabled_services)
+        self.ordinary_trust
+            .as_ref()
+            .is_none_or(|trust| self.pool.media_http_ready(trust, &self.enabled_services))
+            && self.pool.voice_owner_ready()
+    }
+
+    pub(crate) fn voice_routes_enabled(&self) -> bool {
+        self.pool.voice_state_enabled()
     }
 }
 
@@ -173,9 +184,13 @@ async fn handle(
             && !framing.has_route_hint
             && !framing.has_content_encoding
     }) {
-        media
-            .pool
-            .homogeneous_media_http(&media.trust, route.service_class())
+        media.pool.homogeneous_media_http(
+            media
+                .ordinary_trust
+                .as_ref()
+                .ok_or(HttpFault::InternalError)?,
+            route.service_class(),
+        )
     } else {
         None
     };
@@ -211,7 +226,10 @@ async fn handle(
     let content_type = framing.content_type;
     let boundary = framing.boundary;
     let classify_pool = Arc::clone(&media.pool);
-    let classify_trust = media.trust.clone();
+    let classify_trust = media
+        .ordinary_trust
+        .clone()
+        .ok_or(HttpFault::InternalError)?;
     let (bytes, budget, classified) =
         classify_with_cpu_slot(&media.classification_slots, deadline, move || {
             let classified = classify(

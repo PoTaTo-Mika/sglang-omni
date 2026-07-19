@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::Router;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use tokio::sync::{Semaphore, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{error, info};
@@ -275,6 +275,20 @@ fn route_table(
                 "/v1/audio/transcriptions",
                 post(http_media::transcription).with_state(Arc::clone(&media)),
             );
+        }
+        if media.voice_routes_enabled() {
+            app = app
+                .route(
+                    "/v1/audio/voices",
+                    get(http_media::voice::list)
+                        .post(http_media::voice::upload)
+                        .head(reject_head)
+                        .with_state(Arc::clone(&media)),
+                )
+                .route(
+                    "/v1/audio/voices/{name}",
+                    delete(http_media::voice::delete).with_state(media),
+                );
         }
     }
     if let Some(websocket) = websocket {

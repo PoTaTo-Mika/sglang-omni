@@ -4,8 +4,8 @@ This directory contains the standalone `sgl-omni-router` service. The
 worker-pool release validates one bounded static worker manifest, runs isolated
 bounded health probes, serves router-local liveness and readiness, and owns
 graceful process shutdown. Optional exact-byte relays serve chat generation,
-speech, speech batch, and transcription HTTP routes, plus terminating speech
-and realtime WebSocket gateways described below.
+speech, speech batch, transcription, and exact-owner voice-state HTTP routes,
+plus terminating speech and realtime WebSocket gateways described below.
 
 Run the service with:
 
@@ -198,6 +198,20 @@ rejected with `413`. Batch requests always select one worker and are never
 split. Responses remain direct backpressured bodies through clean EOF or
 truncation, with route-specific status, framing, content-type, and header
 validation.
+
+Setting `router.voice_owner_worker_id` enables `GET` and `POST`
+`/v1/audio/voices` plus `DELETE /v1/audio/voices/{name}`. The owner must expose
+`voice_control`, and each enabled speech trust scope must have a matching
+owner-side `managed_voice = true` row. Uploads are buffered once up to the
+fixed 10,551,296-byte direct-worker limit and mutations are never retried.
+Nonempty, non-`default` voices without explicit references are owner-pinned
+only while this switch is enabled; default voices and explicit references stay
+stateless.
+
+The router stores no voice bytes or revisions. Restart restoration is only the
+direct owner's best-effort behavior when the same owner retains the same
+`SPEAKER_SAMPLES_DIR` volume; there is no replication, owner failover, shared
+namespace, `fsync` guarantee, or ephemeral-volume recovery.
 
 `[websocket]` owns the fixed bounded transport policy. A route is registered
 only when its subsection is present:

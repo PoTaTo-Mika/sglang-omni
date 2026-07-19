@@ -194,19 +194,19 @@ impl WorkerPool {
             })
             .transpose()
             .map_err(crate::error::RouterError::GenerationClient)?;
-        let media_client = config
-            .http_media
-            .as_ref()
-            .map(|media| {
-                build_generation_client(
-                    Arc::clone(&resolver),
-                    media.connect_timeout(),
-                    media.pool_idle_timeout(),
-                    media.pool_max_idle_per_host,
-                )
-            })
-            .transpose()
-            .map_err(crate::error::RouterError::MediaClient)?;
+        let media_client = (config.http_media.is_some()
+            || config.router.voice_owner_worker_id.is_some())
+        .then(|| {
+            let media = config.http_media.clone().unwrap_or_default();
+            build_generation_client(
+                Arc::clone(&resolver),
+                media.connect_timeout(),
+                media.pool_idle_timeout(),
+                media.pool_max_idle_per_host,
+            )
+        })
+        .transpose()
+        .map_err(crate::error::RouterError::MediaClient)?;
         let gate = Arc::new(RwLock::new(Gate::open()));
         let classes = [
             config.admission.generation_http,
@@ -308,6 +308,64 @@ impl WorkerPool {
         let (profile_found, candidates) =
             build_policy_candidates(&self.records, requirement, self.voice_owner.as_ref());
         self.dispatch_candidates(admission, class, profile_found, candidates)
+    }
+
+    pub(crate) fn voice_state_enabled(&self) -> bool {
+        self.voice_owner.is_some()
+    }
+
+    pub(crate) fn dispatch_voice_control(
+        &self,
+        admission: AdmissionLease,
+    ) -> Result<RequestLease, DispatchError> {
+        let class = CapacityClass::Control;
+        if admission.class() != class {
+            return Err(DispatchError::AdmissionClassMismatch);
+        }
+        let owner = self.voice_owner.as_ref().ok_or(DispatchError::Internal)?;
+        let record = self
+            .records
+            .iter()
+            .find(|record| &record.worker_id == owner)
+            .ok_or(DispatchError::Internal)?;
+        if !record
+            .profiles
+            .iter()
+            .any(|profile| profile.service_class() == ServiceClass::VoiceControl)
+        {
+            return Err(DispatchError::Internal);
+        }
+        let gate = self.gate.read().map_err(|_| DispatchError::Internal)?;
+        if !gate.open {
+            return Err(DispatchError::Draining);
+        }
+        if !record.available_for_dispatch() {
+            return Err(DispatchError::Unavailable);
+        }
+        let slot = record.slot(class).ok_or(DispatchError::Internal)?;
+        let exact = Arc::clone(&slot.semaphore)
+            .try_acquire_owned()
+            .map_err(|_| DispatchError::Overloaded)?;
+        let record = Arc::clone(record);
+        drop(gate);
+        Ok(RequestLease::new(admission, exact, record, class))
+    }
+
+    pub(crate) fn voice_owner_ready(&self) -> bool {
+        let Some(owner) = self.voice_owner.as_ref() else {
+            return true;
+        };
+        self.gate.read().is_ok_and(|gate| {
+            gate.open
+                && self.records.iter().any(|record| {
+                    &record.worker_id == owner
+                        && record.available_for_dispatch()
+                        && record
+                            .profiles
+                            .iter()
+                            .any(|profile| profile.service_class() == ServiceClass::VoiceControl)
+                })
+        })
     }
 
     fn dispatch_candidates(
@@ -1267,6 +1325,51 @@ mod tests {
     fn fixture_pool(strategy: RoutingStrategy, size: usize, exact_limit: usize) -> WorkerPool {
         let records: Vec<_> = (0..size).map(|id| record(id, exact_limit)).collect();
         pool_with_records(strategy, ServiceClass::GenerationHttp, records)
+    }
+
+    #[test]
+    fn voice_control_dispatch_is_exact_and_policy_independent() {
+        for strategy in [RoutingStrategy::RoundRobin, RoutingStrategy::LeastRequests] {
+            let owner = record_with_profiles(
+                0,
+                CapacityClass::Control,
+                1,
+                vec![ServiceProfile::VoiceControl],
+            );
+            let other = record(1, 8);
+            let mut pool =
+                pool_with_records(strategy, ServiceClass::VoiceControl, vec![owner, other]);
+            pool.voice_owner = Some(WorkerId::new(String::from("worker-0")));
+            assert!(pool.voice_state_enabled());
+            assert!(pool.voice_owner_ready());
+
+            let lease = pool
+                .dispatch_voice_control(
+                    pool.try_admit(CapacityClass::Control)
+                        .expect("control admission"),
+                )
+                .expect("exact owner dispatch");
+            assert_eq!(lease.worker_id().as_str(), "worker-0");
+            assert_eq!(
+                pool.dispatch_voice_control(
+                    pool.try_admit(CapacityClass::Control)
+                        .expect("second control admission"),
+                )
+                .err(),
+                Some(DispatchError::Overloaded)
+            );
+            drop(lease);
+            pool.records[0].health.store(HealthState::Unhealthy);
+            assert!(!pool.voice_owner_ready());
+            assert_eq!(
+                pool.dispatch_voice_control(
+                    pool.try_admit(CapacityClass::Control)
+                        .expect("unavailable control admission"),
+                )
+                .err(),
+                Some(DispatchError::Unavailable)
+            );
+        }
     }
 
     #[test]
