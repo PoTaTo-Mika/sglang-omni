@@ -418,8 +418,12 @@ impl RouteRequirement {
         }
     }
 
-    pub(super) fn service_class(&self) -> ServiceClass {
+    pub(crate) fn service_class(&self) -> ServiceClass {
         self.profile.service_class()
+    }
+
+    pub(crate) fn profile(&self) -> &ProfileRequirement {
+        &self.profile
     }
 
     pub(super) fn capacity_class(&self) -> CapacityClass {
@@ -523,7 +527,7 @@ impl ProfileRequirement {
 }
 
 impl ServiceProfile {
-    pub(super) fn service_class(&self) -> ServiceClass {
+    pub(crate) fn service_class(&self) -> ServiceClass {
         match self {
             Self::GenerationHttp { .. } => ServiceClass::GenerationHttp,
             Self::SpeechHttp { .. } => ServiceClass::SpeechHttp,

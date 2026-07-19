@@ -44,6 +44,10 @@ harness = false
 name = "chat_relay"
 harness = false
 
+[[bench]]
+name = "media_relay"
+harness = false
+
 [lints.rust]
 missing_docs = "deny"
 unreachable_pub = "deny"

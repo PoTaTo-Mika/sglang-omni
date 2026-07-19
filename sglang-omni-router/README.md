@@ -3,8 +3,8 @@
 This directory contains the standalone `sgl-omni-router` service. The
 worker-pool release validates one bounded static worker manifest, runs isolated
 bounded health probes, serves router-local liveness and readiness, and owns
-graceful process shutdown. Its only inference route is the optional exact
-`POST /v1/chat/completions` relay described below.
+graceful process shutdown. Optional exact-byte relays serve chat generation,
+speech, speech batch, and transcription HTTP routes described below.
 
 Run the service with:
 
@@ -110,9 +110,8 @@ resolution, TTL refresh, and runtime discovery are not supported.
 
 The following speech rows are illustrative additions for workers that also
 declare the corresponding speech capacities. Speech HTTP and Speech-WebSocket
-profile rows require an explicit
-`stream_modes` set. For example, a worker approved for both completed and
-streaming raw-PCM requests can declare:
+profile rows require an explicit `stream_modes` set. For example, a worker
+approved for both completed and streaming raw-PCM requests can declare:
 
 ```toml
 [[workers.service_profiles]]
@@ -141,8 +140,9 @@ For HTTP, omitted or false `stream` maps to `non_streaming`, while true maps to
 `streaming` must contain only `pcm`; completed encoded formats such as `mp3`
 belong in a separate correlated row advertising only `non_streaming`. The mode
 is operator-approved eligibility for the public request behavior, not a
-promise of one universal chunk cadence. This branch records and matches these
-speech facts but exposes no speech HTTP request parser or WebSocket relay.
+promise of one universal chunk cadence. The `speech` media HTTP route uses the
+`speech_http` rows. Speech-WebSocket rows are recorded by the manifest but this
+router does not yet expose a Speech WebSocket relay.
 
 `POST /v1/chat/completions` is enabled only when `[http_generation]` is
 present. It accepts HTTP/1.1 JSON, selects one compatible generation row, and
@@ -153,11 +153,57 @@ deadline; it ends on upstream EOF/error, downstream drop, or process shutdown.
 The focused direct-dependency decisions for this relay are recorded in
 [`DEPENDENCIES.md`](DEPENDENCIES.md).
 
+`[http_media]` keeps one shared client, body budget, classifier slot, and
+transport policy while enabling an explicit subset of media HTTP routes. The
+`routes` field is required, nonempty, duplicate-free, and accepts only
+`speech`, `speech_batch`, and `transcription`:
+
+```toml
+[http_media]
+routes = ["speech", "speech_batch", "transcription"]
+trust_domain = "local"
+buffered_request_max_bytes = 8388608
+buffered_request_total_bytes = 268435456
+streamed_request_max_bytes = 536870912
+connect_timeout_ms = 5000
+request_timeout_ms = 1800000
+pool_idle_timeout_ms = 90000
+pool_max_idle_per_host = 8
+```
+
+The route-to-service mapping is:
+
+| Route value | Registered endpoint | Required service |
+| --- | --- | --- |
+| `speech` | `POST /v1/audio/speech` | `speech_http` |
+| `speech_batch` | `POST /v1/audio/speech/batch` | `speech_batch` |
+| `transcription` | `POST /v1/audio/transcriptions` | `transcription_http` |
+
+All seven nonempty subsets are valid. Each enabled route's service must appear
+in `router.required_services`, and at least one worker in the exact
+`http_media.trust_domain` must declare its matching profile and capacity.
+Disabled routes are not registered and return `404`; they need no profile or
+capacity. Additional entries in `router.required_services` retain their global
+meaning and must still be present somewhere in the worker manifest. Omitting
+`[http_media]` disables all media HTTP routes, while omitting `routes` from a
+present section is a configuration error. Route registration is fixed at
+startup rather than checked for every request.
+
+JSON and multipart requests at or below the buffered limit are completely
+classified and forwarded as their original bytes. Larger fixed-length bodies
+use the direct upload path only when every worker in the exact service/trust
+scope has the same default and correlated profile rows; otherwise they are
+rejected with `413`. Batch requests always select one worker and are never
+split. Responses remain direct backpressured bodies through clean EOF or
+truncation, with route-specific status, framing, content-type, and header
+validation.
+
 `GET /live` is worker-independent and remains logically live while serving or
 draining. `GET /ready` starts at `503` and returns `200` only while serving and
 every configured required service class has a healthy serving profile. When
 chat generation is enabled, readiness additionally requires a healthy serving
-generation worker in the exact `http_generation.trust_domain`. Permit
-saturation does not change readiness. Worker health is status-only exact
-`GET /health` by default; response bodies are not parsed or buffered. No public
-`/health` alias is registered.
+generation worker in the exact `http_generation.trust_domain`. When media HTTP
+is enabled, readiness checks only the enabled media services in the exact
+`http_media.trust_domain`. Permit saturation does not change readiness. Worker
+health is status-only exact `GET /health` by default; response bodies are not
+parsed or buffered. No public `/health` alias is registered.

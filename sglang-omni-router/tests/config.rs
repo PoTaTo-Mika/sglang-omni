@@ -122,6 +122,106 @@ fn speech_batch_config(stream_modes: Option<&str>) -> String {
     )
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MediaHttpRouteFixture {
+    Speech,
+    SpeechBatch,
+    Transcription,
+}
+
+impl MediaHttpRouteFixture {
+    const ALL: [Self; 3] = [Self::Speech, Self::SpeechBatch, Self::Transcription];
+
+    const fn route_name(self) -> &'static str {
+        match self {
+            Self::Speech => "speech",
+            Self::SpeechBatch => "speech_batch",
+            Self::Transcription => "transcription",
+        }
+    }
+
+    const fn service_name(self) -> &'static str {
+        match self {
+            Self::Speech => "speech_http",
+            Self::SpeechBatch => "speech_batch",
+            Self::Transcription => "transcription_http",
+        }
+    }
+
+    const fn profile(self) -> &'static str {
+        match self {
+            Self::Speech => {
+                "[[workers.service_profiles]]\nservice = \"speech_http\"\nmodel_ids = [\"media\"]\nresponse_formats = [\"wav\"]\nstream_modes = [\"non_streaming\"]\ntasks = [\"text_to_speech\"]\nreference_forms = [\"none\"]\nmanaged_voice = false\n"
+            }
+            Self::SpeechBatch => {
+                "[[workers.service_profiles]]\nservice = \"speech_batch\"\nmodel_ids = [\"media\"]\nresponse_formats = [\"wav\"]\ntasks = [\"text_to_speech\"]\nreference_forms = [\"none\"]\nmanaged_voice = false\nmax_batch_size = 4\neffective_features = [\"model\"]\n"
+            }
+            Self::Transcription => {
+                "[[workers.service_profiles]]\nservice = \"transcription_http\"\nmodel_ids = [\"media\"]\nresponse_formats = [\"json\"]\nmedia_profiles = [\"audio\"]\nstream_modes = [\"non_streaming\"]\n"
+            }
+        }
+    }
+}
+
+const MEDIA_HTTP_SUBSETS: [&[MediaHttpRouteFixture]; 7] = [
+    &[MediaHttpRouteFixture::Speech],
+    &[MediaHttpRouteFixture::SpeechBatch],
+    &[MediaHttpRouteFixture::Transcription],
+    &[
+        MediaHttpRouteFixture::Speech,
+        MediaHttpRouteFixture::SpeechBatch,
+    ],
+    &[
+        MediaHttpRouteFixture::Speech,
+        MediaHttpRouteFixture::Transcription,
+    ],
+    &[
+        MediaHttpRouteFixture::SpeechBatch,
+        MediaHttpRouteFixture::Transcription,
+    ],
+    &MediaHttpRouteFixture::ALL,
+];
+
+fn media_http_config(
+    routes: &[MediaHttpRouteFixture],
+    required_services: &[MediaHttpRouteFixture],
+    worker_routes: &[MediaHttpRouteFixture],
+    media_trust: &str,
+    worker_trust: &str,
+) -> String {
+    let first_required = required_services
+        .first()
+        .expect("media fixture requires at least one global service");
+    let required = required_services
+        .iter()
+        .map(|route| format!("\"{}\"", route.service_name()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let enabled = routes
+        .iter()
+        .map(|route| format!("\"{}\"", route.route_name()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut output = worker_config_prefix(first_required.service_name()).replace(
+        &format!(
+            "required_services = [\"{}\"]",
+            first_required.service_name()
+        ),
+        &format!("required_services = [{required}]"),
+    );
+    output.push_str(&format!(
+        "[http_media]\nroutes = [{enabled}]\ntrust_domain = \"{media_trust}\"\n\n[[workers]]\nworker_id = \"worker-1\"\nbase_url = \"http://127.0.0.1:9\"\ntrust_domain = \"{worker_trust}\"\ndefault_model_id = \"media\"\n\n[workers.capacity]\n"
+    ));
+    for route in worker_routes {
+        output.push_str(&format!("{} = 4\n", route.service_name()));
+    }
+    for route in worker_routes {
+        output.push('\n');
+        output.push_str(route.profile());
+    }
+    output
+}
+
 fn with_max_connections(config: String, max_connections: u32) -> String {
     config.replace(
         "listen = \"127.0.0.1:30000\"",
@@ -231,6 +331,90 @@ fn validates_chat_enablement_security_and_resource_bounds() {
     );
     load_bytes(disabled.as_bytes())
         .expect("omitted section disables chat without weakening other routes");
+}
+
+#[test]
+fn accepts_all_nonempty_media_http_route_subsets_with_only_matching_workers() {
+    for routes in MEDIA_HTTP_SUBSETS {
+        let contents = media_http_config(routes, routes, routes, "local", "local");
+        for disabled in MediaHttpRouteFixture::ALL
+            .into_iter()
+            .filter(|route| !routes.contains(route))
+        {
+            assert!(!contents.contains(&format!("\n{} = 4\n", disabled.service_name())));
+            assert!(!contents.contains(&format!("service = \"{}\"", disabled.service_name())));
+        }
+        load_bytes(contents.as_bytes())
+            .unwrap_or_else(|error| panic!("media subset {routes:?} must validate: {error}"));
+    }
+}
+
+#[test]
+fn rejects_missing_empty_duplicate_and_unknown_media_http_routes() {
+    let base = media_http_config(
+        &[MediaHttpRouteFixture::Speech],
+        &[MediaHttpRouteFixture::Speech],
+        &[MediaHttpRouteFixture::Speech],
+        "local",
+        "local",
+    );
+    let semantic_failures = [
+        base.replace("routes = [\"speech\"]\n", ""),
+        base.replace("routes = [\"speech\"]", "routes = []"),
+        base.replace("routes = [\"speech\"]", "routes = [\"speech\", \"speech\"]"),
+    ];
+    for contents in semantic_failures {
+        assert!(matches!(
+            load_bytes(contents.as_bytes()),
+            Err(ConfigError::InvalidField {
+                field: "http_media.routes",
+                ..
+            })
+        ));
+    }
+
+    let unknown = base.replace("routes = [\"speech\"]", "routes = [\"future_route\"]");
+    assert!(matches!(
+        load_bytes(unknown.as_bytes()),
+        Err(ConfigError::Parse(_))
+    ));
+}
+
+#[test]
+fn media_http_enablement_requires_matching_global_and_trust_scoped_services() {
+    let enabled = [
+        MediaHttpRouteFixture::Speech,
+        MediaHttpRouteFixture::SpeechBatch,
+    ];
+    let missing_required = media_http_config(
+        &enabled,
+        &[MediaHttpRouteFixture::Speech],
+        &enabled,
+        "local",
+        "local",
+    );
+    assert!(matches!(
+        load_bytes(missing_required.as_bytes()),
+        Err(ConfigError::InvalidField {
+            field: "router.required_services",
+            ..
+        })
+    ));
+
+    let wrong_trust = media_http_config(
+        &[MediaHttpRouteFixture::Transcription],
+        &[MediaHttpRouteFixture::Transcription],
+        &[MediaHttpRouteFixture::Transcription],
+        "local",
+        "remote",
+    );
+    assert!(matches!(
+        load_bytes(wrong_trust.as_bytes()),
+        Err(ConfigError::InvalidField {
+            field: "http_media.trust_domain",
+            ..
+        })
+    ));
 }
 
 #[test]

@@ -18,8 +18,10 @@ pub(crate) use health::{HealthState, HealthSupervisor, HealthTaskError};
 pub(crate) use permit::{AdmissionError, AdmissionLease, DispatchError, RequestLease};
 #[allow(unused_imports)] // Correlated requirement types are consumed by later route modules.
 pub(crate) use profile::{
-    CapacityClass, ChatAudioFormat, MediaPlacement, MessageContentForm, ModelSelection,
-    ProfileRequirement, RegistrationId, RouteRequirement, ServiceClass, TrustDomain, WorkerId,
+    BatchFeature, CapacityClass, ChatAudioFormat, MediaPlacement, MediaProfile, MessageContentForm,
+    ModelSelection, ProfileRequirement, ReferenceForm, RegistrationId, RouteRequirement,
+    ServiceClass, SpeechResponseFormat, SpeechTask, StreamMode, TranscriptionResponseFormat,
+    TrustDomain, WorkerId,
 };
 #[allow(unused_imports)]
 // Exact target is consumed by later route modules through RequestLease.
@@ -130,13 +132,21 @@ pub(crate) struct WorkerPool {
     admission: AdmissionController,
     selector: Selector,
     homogeneous_generation_http: Vec<HomogeneousGenerationCohort>,
+    homogeneous_media_http: Vec<HomogeneousMediaCohort>,
     realtime_defaults_unambiguous: bool,
     health_client: reqwest::Client,
     generation_client: Option<reqwest::Client>,
+    media_client: Option<reqwest::Client>,
 }
 
 struct HomogeneousGenerationCohort {
     trust_domain: TrustDomain,
+    records: Vec<Arc<WorkerRecord>>,
+}
+
+struct HomogeneousMediaCohort {
+    trust_domain: TrustDomain,
+    service: ServiceClass,
     records: Vec<Arc<WorkerRecord>>,
 }
 
@@ -176,7 +186,7 @@ impl WorkerPool {
             .as_ref()
             .map(|generation| {
                 build_generation_client(
-                    resolver,
+                    Arc::clone(&resolver),
                     generation.connect_timeout(),
                     generation.pool_idle_timeout(),
                     generation.pool_max_idle_per_host,
@@ -184,6 +194,19 @@ impl WorkerPool {
             })
             .transpose()
             .map_err(crate::error::RouterError::GenerationClient)?;
+        let media_client = config
+            .http_media
+            .as_ref()
+            .map(|media| {
+                build_generation_client(
+                    Arc::clone(&resolver),
+                    media.connect_timeout(),
+                    media.pool_idle_timeout(),
+                    media.pool_max_idle_per_host,
+                )
+            })
+            .transpose()
+            .map_err(crate::error::RouterError::MediaClient)?;
         let gate = Arc::new(RwLock::new(Gate::open()));
         let classes = [
             config.admission.generation_http,
@@ -224,6 +247,7 @@ impl WorkerPool {
             }));
         }
         let homogeneous_generation_http = build_homogeneous_generation_cohorts(&records);
+        let homogeneous_media_http = build_homogeneous_media_cohorts(&records);
         let realtime_defaults_unambiguous = compute_realtime_defaults_unambiguous(&records);
 
         Ok(Self {
@@ -238,9 +262,11 @@ impl WorkerPool {
             admission,
             selector: Selector::new(config.router.strategy),
             homogeneous_generation_http,
+            homogeneous_media_http,
             realtime_defaults_unambiguous,
             health_client,
             generation_client,
+            media_client,
         })
     }
 
@@ -257,6 +283,10 @@ impl WorkerPool {
 
     pub(crate) fn generation_client(&self) -> Option<reqwest::Client> {
         self.generation_client.clone()
+    }
+
+    pub(crate) fn media_client(&self) -> Option<reqwest::Client> {
+        self.media_client.clone()
     }
 
     pub(crate) fn try_admit(&self, class: CapacityClass) -> Result<AdmissionLease, AdmissionError> {
@@ -365,6 +395,23 @@ impl WorkerPool {
             .map(|cohort| HomogeneousGenerationHttp { pool: self, cohort })
     }
 
+    pub(crate) fn homogeneous_media_http(
+        &self,
+        trust: &TrustDomain,
+        service: ServiceClass,
+    ) -> Option<HomogeneousMediaHttp<'_>> {
+        if !matches!(
+            service,
+            ServiceClass::SpeechHttp | ServiceClass::SpeechBatch | ServiceClass::TranscriptionHttp
+        ) {
+            return None;
+        }
+        self.homogeneous_media_http
+            .iter()
+            .find(|cohort| &cohort.trust_domain == trust && cohort.service == service)
+            .map(|cohort| HomogeneousMediaHttp { pool: self, cohort })
+    }
+
     pub(crate) fn is_ready(&self) -> bool {
         self.gate.read().is_ok_and(|gate| {
             gate.open
@@ -395,6 +442,26 @@ impl WorkerPool {
         })
     }
 
+    pub(crate) fn media_http_ready(
+        &self,
+        trust: &TrustDomain,
+        enabled_services: &[ServiceClass],
+    ) -> bool {
+        self.gate.read().is_ok_and(|gate| {
+            gate.open
+                && enabled_services.iter().all(|service| {
+                    self.records.iter().any(|record| {
+                        &record.trust_domain == trust
+                            && record.available_for_dispatch()
+                            && record
+                                .profiles
+                                .iter()
+                                .any(|profile| profile.service_class() == *service)
+                    })
+                })
+        })
+    }
+
     pub(crate) fn drain(&self) -> Result<(), DispatchError> {
         let mut gate = self.gate.write().map_err(|_| DispatchError::Internal)?;
         if !gate.open {
@@ -409,6 +476,31 @@ impl WorkerPool {
             }
         }
         Ok(())
+    }
+}
+
+/// Opaque proof that media request classification cannot alter eligibility.
+pub(crate) struct HomogeneousMediaHttp<'a> {
+    pool: &'a WorkerPool,
+    cohort: &'a HomogeneousMediaCohort,
+}
+
+impl HomogeneousMediaHttp<'_> {
+    pub(crate) fn dispatch(self, admission: AdmissionLease) -> Result<RequestLease, DispatchError> {
+        let class = self.cohort.service.capacity();
+        if admission.class() != class {
+            return Err(DispatchError::AdmissionClassMismatch);
+        }
+        let candidates = self
+            .cohort
+            .records
+            .iter()
+            .filter(|record| record.available_for_dispatch())
+            .cloned()
+            .map(PolicyCandidate::new)
+            .collect();
+        self.pool
+            .dispatch_candidates(admission, class, true, candidates)
     }
 }
 
@@ -476,6 +568,61 @@ fn build_homogeneous_generation_cohorts(
     result
 }
 
+fn build_homogeneous_media_cohorts(records: &[Arc<WorkerRecord>]) -> Vec<HomogeneousMediaCohort> {
+    let mut result = Vec::new();
+    for service in [
+        ServiceClass::SpeechHttp,
+        ServiceClass::SpeechBatch,
+        ServiceClass::TranscriptionHttp,
+    ] {
+        let mut processed_scopes = Vec::with_capacity(records.len());
+        for record in records {
+            if !record
+                .profiles
+                .iter()
+                .any(|profile| profile.service_class() == service)
+                || processed_scopes
+                    .iter()
+                    .any(|trust_domain| *trust_domain == &record.trust_domain)
+            {
+                continue;
+            }
+            processed_scopes.push(&record.trust_domain);
+            let members: Vec<_> = records
+                .iter()
+                .filter(|candidate| {
+                    candidate.trust_domain == record.trust_domain
+                        && candidate
+                            .profiles
+                            .iter()
+                            .any(|profile| profile.service_class() == service)
+                })
+                .cloned()
+                .collect();
+            let first = &members[0];
+            let Some(shared_default) = first.default_model_id() else {
+                continue;
+            };
+            if members.iter().all(|candidate| {
+                candidate.default_model_id() == Some(shared_default)
+                    && service_rows_equal(&candidate.profiles, &first.profiles, service)
+                    && candidate
+                        .profiles
+                        .iter()
+                        .filter(|profile| profile.service_class() == service)
+                        .all(|profile| !profile.requires_owner())
+            }) {
+                result.push(HomogeneousMediaCohort {
+                    trust_domain: record.trust_domain.clone(),
+                    service,
+                    records: members,
+                });
+            }
+        }
+    }
+    result
+}
+
 fn generation_rows_equal(left: &[ServiceProfile], right: &[ServiceProfile]) -> bool {
     let generation_row =
         |profile: &&ServiceProfile| profile.service_class() == ServiceClass::GenerationHttp;
@@ -484,6 +631,21 @@ fn generation_rows_equal(left: &[ServiceProfile], right: &[ServiceProfile]) -> b
             right
                 .iter()
                 .filter(generation_row)
+                .any(|other| profile.semantically_eq(other))
+        })
+}
+
+fn service_rows_equal(
+    left: &[ServiceProfile],
+    right: &[ServiceProfile],
+    service: ServiceClass,
+) -> bool {
+    let rows = |profile: &&ServiceProfile| profile.service_class() == service;
+    left.iter().filter(rows).count() == right.iter().filter(rows).count()
+        && left.iter().filter(rows).all(|profile| {
+            right
+                .iter()
+                .filter(rows)
                 .any(|other| profile.semantically_eq(other))
         })
 }
@@ -578,7 +740,8 @@ pub(crate) mod benchmark {
         AdmissionController, CapacityClass, CapacitySlot, Disposition, Gate, HealthCell,
         HealthState, PolicyCandidate, RequestLease, ResolvedTarget, Selector, StaticResolver,
         WorkerPool, WorkerRecord, build_health_client, build_homogeneous_generation_cohorts,
-        build_policy_candidates, compute_realtime_defaults_unambiguous,
+        build_homogeneous_media_cohorts, build_policy_candidates,
+        compute_realtime_defaults_unambiguous,
     };
     use crate::config::RoutingStrategy;
 
@@ -661,6 +824,7 @@ pub(crate) mod benchmark {
             .map_err(|_| "health client must build")?;
             let dispatch_pool = WorkerPool {
                 homogeneous_generation_http: build_homogeneous_generation_cohorts(&records),
+                homogeneous_media_http: build_homogeneous_media_cohorts(&records),
                 realtime_defaults_unambiguous: compute_realtime_defaults_unambiguous(&records),
                 records: records.clone(),
                 required_services: vec![ServiceClass::GenerationHttp],
@@ -669,6 +833,7 @@ pub(crate) mod benchmark {
                 admission: AdmissionController::new(gate, 2, [2; 7]),
                 selector: Selector::new(strategy),
                 generation_client: Some(health_client.clone()),
+                media_client: None,
                 health_client,
             };
             Ok(Self {
@@ -804,7 +969,7 @@ mod tests {
     use super::{
         AdmissionError, CapacityClass, CapacitySlot, DispatchError, PolicyCandidate, Selector,
         WorkerPool, WorkerRecord, build_homogeneous_generation_cohorts,
-        compute_realtime_defaults_unambiguous,
+        build_homogeneous_media_cohorts, compute_realtime_defaults_unambiguous,
     };
 
     type ProfileMutation = fn(&mut ServiceProfile);
@@ -983,6 +1148,31 @@ mod tests {
         }
     }
 
+    fn media_speech_profile(
+        reference_forms: Vec<ReferenceForm>,
+        managed_voice: bool,
+    ) -> ServiceProfile {
+        ServiceProfile::SpeechHttp {
+            model_ids: vec![String::from("tts")],
+            response_formats: vec![SpeechResponseFormat::Wav],
+            stream_modes: vec![StreamMode::NonStreaming],
+            tasks: vec![SpeechTask::TextToSpeech],
+            reference_forms,
+            managed_voice,
+        }
+    }
+
+    fn transcription_profile(
+        response_formats: Vec<super::profile::TranscriptionResponseFormat>,
+    ) -> ServiceProfile {
+        ServiceProfile::TranscriptionHttp {
+            model_ids: vec![String::from("asr")],
+            response_formats,
+            media_profiles: vec![super::profile::MediaProfile::Audio],
+            stream_modes: vec![StreamMode::NonStreaming],
+        }
+    }
+
     fn add_capacity(record: &mut Arc<WorkerRecord>, class: CapacityClass, limit: usize) {
         Arc::get_mut(record)
             .expect("new test record must be unique")
@@ -1042,6 +1232,7 @@ mod tests {
         )
         .expect("test health client must build");
         let homogeneous_generation_http = build_homogeneous_generation_cohorts(&records);
+        let homogeneous_media_http = build_homogeneous_media_cohorts(&records);
         let realtime_defaults_unambiguous = compute_realtime_defaults_unambiguous(&records);
         WorkerPool {
             records,
@@ -1051,8 +1242,10 @@ mod tests {
             admission: AdmissionController::new(gate, 512, [512; 7]),
             selector: Selector::new(strategy),
             homogeneous_generation_http,
+            homogeneous_media_http,
             realtime_defaults_unambiguous,
             generation_client: Some(health_client.clone()),
+            media_client: None,
             health_client,
         }
     }
@@ -2666,5 +2859,299 @@ mod tests {
                 .available_permits(),
             1
         );
+    }
+
+    #[test]
+    fn media_cohorts_are_exactly_precomputed_by_service_and_trust() {
+        let local = TrustDomain::new(String::from("local"));
+        let remote = TrustDomain::new(String::from("remote"));
+        let baseline = media_speech_profile(vec![ReferenceForm::None], false);
+
+        let different_default = pool_with_records(
+            RoutingStrategy::RoundRobin,
+            ServiceClass::SpeechHttp,
+            vec![
+                record_with_default_class(
+                    0,
+                    CapacityClass::SpeechHttp,
+                    1,
+                    "local",
+                    "tts",
+                    vec![baseline.clone()],
+                ),
+                record_with_default_class(
+                    1,
+                    CapacityClass::SpeechHttp,
+                    1,
+                    "local",
+                    "other",
+                    vec![baseline.clone()],
+                ),
+            ],
+        );
+        assert!(
+            different_default
+                .homogeneous_media_http(&local, ServiceClass::SpeechHttp)
+                .is_none()
+        );
+
+        let different_profile = pool_with_records(
+            RoutingStrategy::RoundRobin,
+            ServiceClass::SpeechHttp,
+            vec![
+                record_with_default_class(
+                    0,
+                    CapacityClass::SpeechHttp,
+                    1,
+                    "local",
+                    "tts",
+                    vec![baseline.clone()],
+                ),
+                record_with_default_class(
+                    1,
+                    CapacityClass::SpeechHttp,
+                    1,
+                    "local",
+                    "tts",
+                    vec![media_speech_profile(
+                        vec![ReferenceForm::None, ReferenceForm::Direct],
+                        false,
+                    )],
+                ),
+            ],
+        );
+        assert!(
+            different_profile
+                .homogeneous_media_http(&local, ServiceClass::SpeechHttp)
+                .is_none()
+        );
+
+        let mut no_default = record_with_default_class(
+            0,
+            CapacityClass::SpeechHttp,
+            1,
+            "local",
+            "tts",
+            vec![baseline.clone()],
+        );
+        Arc::get_mut(&mut no_default)
+            .expect("unique no-default record")
+            .default_model_id = None;
+        let no_default = pool_with_records(
+            RoutingStrategy::RoundRobin,
+            ServiceClass::SpeechHttp,
+            vec![no_default],
+        );
+        assert!(
+            no_default
+                .homogeneous_media_http(&local, ServiceClass::SpeechHttp)
+                .is_none()
+        );
+
+        let managed = pool_with_records(
+            RoutingStrategy::RoundRobin,
+            ServiceClass::SpeechHttp,
+            vec![record_with_default_class(
+                0,
+                CapacityClass::SpeechHttp,
+                1,
+                "local",
+                "tts",
+                vec![media_speech_profile(vec![ReferenceForm::None], true)],
+            )],
+        );
+        assert!(
+            managed
+                .homogeneous_media_http(&local, ServiceClass::SpeechHttp)
+                .is_none()
+        );
+
+        let scoped = pool_with_records(
+            RoutingStrategy::RoundRobin,
+            ServiceClass::SpeechHttp,
+            vec![
+                record_with_default_class(
+                    0,
+                    CapacityClass::SpeechHttp,
+                    1,
+                    "local",
+                    "tts",
+                    vec![
+                        baseline.clone(),
+                        transcription_profile(vec![
+                            super::profile::TranscriptionResponseFormat::Json,
+                        ]),
+                    ],
+                ),
+                record_with_default_class(
+                    1,
+                    CapacityClass::SpeechHttp,
+                    1,
+                    "local",
+                    "tts",
+                    vec![
+                        baseline,
+                        transcription_profile(vec![
+                            super::profile::TranscriptionResponseFormat::Text,
+                        ]),
+                    ],
+                ),
+                record_with_default_class(
+                    2,
+                    CapacityClass::SpeechHttp,
+                    1,
+                    "remote",
+                    "tts",
+                    vec![media_speech_profile(vec![ReferenceForm::None], true)],
+                ),
+            ],
+        );
+        assert!(
+            scoped
+                .homogeneous_media_http(&local, ServiceClass::SpeechHttp)
+                .is_some()
+        );
+        assert!(
+            scoped
+                .homogeneous_media_http(&local, ServiceClass::TranscriptionHttp)
+                .is_none()
+        );
+        assert!(
+            scoped
+                .homogeneous_media_http(&remote, ServiceClass::SpeechHttp)
+                .is_none()
+        );
+        assert!(
+            scoped
+                .homogeneous_media_http(&local, ServiceClass::SpeechBatch)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn media_cohort_dispatch_uses_route_capacity_and_existing_policy() {
+        let pool = pool_with_records(
+            RoutingStrategy::LeastRequests,
+            ServiceClass::SpeechHttp,
+            vec![
+                record_with_default_class(
+                    0,
+                    CapacityClass::SpeechHttp,
+                    1,
+                    "local",
+                    "tts",
+                    vec![media_speech_profile(vec![ReferenceForm::None], false)],
+                ),
+                record_with_default_class(
+                    1,
+                    CapacityClass::SpeechHttp,
+                    3,
+                    "local",
+                    "tts",
+                    vec![media_speech_profile(vec![ReferenceForm::None], false)],
+                ),
+            ],
+        );
+        let trust = TrustDomain::new(String::from("local"));
+        let first = pool
+            .homogeneous_media_http(&trust, ServiceClass::SpeechHttp)
+            .expect("precomputed speech cohort")
+            .dispatch(
+                pool.try_admit(CapacityClass::SpeechHttp)
+                    .expect("first speech admission"),
+            )
+            .expect("first media cohort dispatch");
+        assert_eq!(first.worker_id().as_str(), "worker-0");
+        assert_eq!(first.capacity_class(), CapacityClass::SpeechHttp);
+        let second = pool
+            .homogeneous_media_http(&trust, ServiceClass::SpeechHttp)
+            .expect("reused speech cohort")
+            .dispatch(
+                pool.try_admit(CapacityClass::SpeechHttp)
+                    .expect("second speech admission"),
+            )
+            .expect("least occupied worker dispatch");
+        assert_eq!(second.worker_id().as_str(), "worker-1");
+        assert_eq!(second.capacity_class(), CapacityClass::SpeechHttp);
+        assert_eq!(
+            pool.records
+                .iter()
+                .map(|record| {
+                    record
+                        .slot(CapacityClass::SpeechHttp)
+                        .expect("speech capacity")
+                        .semaphore
+                        .available_permits()
+                })
+                .collect::<Vec<_>>(),
+            [0, 2]
+        );
+        drop((first, second));
+    }
+
+    #[test]
+    fn mixed_batch_reference_union_excludes_workers_missing_any_member() {
+        let batch_profile = |reference_forms| ServiceProfile::SpeechBatch {
+            model_ids: vec![String::from("tts")],
+            response_formats: vec![SpeechResponseFormat::Wav],
+            tasks: vec![SpeechTask::TextToSpeech],
+            reference_forms,
+            managed_voice: false,
+            max_batch_size: 4,
+            effective_features: vec![super::profile::BatchFeature::Reference],
+        };
+        let pool = pool_with_records(
+            RoutingStrategy::RoundRobin,
+            ServiceClass::SpeechBatch,
+            vec![
+                record_with_default_class(
+                    0,
+                    CapacityClass::SpeechBatch,
+                    1,
+                    "local",
+                    "tts",
+                    vec![batch_profile(vec![ReferenceForm::Direct])],
+                ),
+                record_with_default_class(
+                    1,
+                    CapacityClass::SpeechBatch,
+                    1,
+                    "local",
+                    "tts",
+                    vec![batch_profile(vec![
+                        ReferenceForm::None,
+                        ReferenceForm::Direct,
+                    ])],
+                ),
+            ],
+        );
+        let requirement = RouteRequirement::new(
+            ProfileRequirement::SpeechBatch {
+                models: vec![
+                    ModelSelection::WorkerDefault {
+                        expected_model_id: String::from("tts"),
+                    },
+                    ModelSelection::WorkerDefault {
+                        expected_model_id: String::from("tts"),
+                    },
+                ],
+                response_formats: vec![SpeechResponseFormat::Wav],
+                tasks: vec![SpeechTask::TextToSpeech],
+                reference_forms: vec![ReferenceForm::None, ReferenceForm::Direct],
+                managed_voice: false,
+                batch_size: 2,
+                effective_features: vec![super::profile::BatchFeature::Reference],
+            },
+            TrustDomain::new(String::from("local")),
+            false,
+        );
+        let lease = pool
+            .dispatch(
+                pool.try_admit(CapacityClass::SpeechBatch)
+                    .expect("mixed-reference batch admission"),
+                &requirement,
+            )
+            .expect("complete mixed-reference worker dispatch");
+        assert_eq!(lease.worker_id().as_str(), "worker-1");
     }
 }

@@ -8,9 +8,10 @@ use tokio::sync::{Semaphore, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{error, info};
 
-use crate::config::Config;
+use crate::config::{Config, HttpMediaRoute};
 use crate::error::RouterError;
 use crate::http_generation::{self, HttpGeneration};
+use crate::http_media::{self, HttpMedia};
 use crate::lifecycle::Lifecycle;
 use crate::shutdown;
 use crate::worker_pool::{HealthSupervisor, HealthTaskError, WorkerPool};
@@ -29,6 +30,7 @@ struct AppState {
     lifecycle: Arc<Lifecycle>,
     pool: Arc<WorkerPool>,
     generation: Option<Arc<HttpGeneration>>,
+    media: Option<Arc<HttpMedia>>,
 }
 
 pub(crate) async fn serve(config: Config) -> Result<(), RouterError> {
@@ -42,14 +44,21 @@ pub(crate) async fn serve(config: Config) -> Result<(), RouterError> {
         Arc::clone(&pool),
         Arc::clone(&classification_slots),
     )?;
+    let media = HttpMedia::build(
+        &config,
+        Arc::clone(&pool),
+        Arc::clone(&classification_slots),
+    )?;
     let mut signal_observer = shutdown::SignalObserver::install().map_err(RouterError::Signal)?;
     let app = route_table(
         AppState {
             lifecycle: Arc::clone(&lifecycle),
             pool: Arc::clone(&pool),
             generation: generation.clone(),
+            media: media.clone(),
         },
         generation,
+        media,
     );
     let listener = tokio::net::TcpListener::bind(config.server.listen)
         .await
@@ -182,19 +191,42 @@ pub(crate) async fn serve(config: Config) -> Result<(), RouterError> {
     Ok(())
 }
 
-fn route_table(state: AppState, generation: Option<Arc<HttpGeneration>>) -> Router {
-    let app = Router::new()
+fn route_table(
+    state: AppState,
+    generation: Option<Arc<HttpGeneration>>,
+    media: Option<Arc<HttpMedia>>,
+) -> Router {
+    let mut app = Router::new()
         .route("/live", get(live).head(reject_head))
         .route("/ready", get(ready).head(reject_head))
         .with_state(state);
     if let Some(generation) = generation {
-        app.route(
+        app = app.route(
             "/v1/chat/completions",
             post(http_generation::chat).with_state(generation),
-        )
-    } else {
-        app
+        );
     }
+    if let Some(media) = media {
+        if media.enables(HttpMediaRoute::Speech) {
+            app = app.route(
+                "/v1/audio/speech",
+                post(http_media::speech).with_state(Arc::clone(&media)),
+            );
+        }
+        if media.enables(HttpMediaRoute::SpeechBatch) {
+            app = app.route(
+                "/v1/audio/speech/batch",
+                post(http_media::batch).with_state(Arc::clone(&media)),
+            );
+        }
+        if media.enables(HttpMediaRoute::Transcription) {
+            app = app.route(
+                "/v1/audio/transcriptions",
+                post(http_media::transcription).with_state(Arc::clone(&media)),
+            );
+        }
+    }
+    app
 }
 
 async fn live(State(state): State<AppState>) -> (StatusCode, &'static str) {
@@ -212,6 +244,7 @@ async fn ready(State(state): State<AppState>) -> (StatusCode, &'static str) {
             .generation
             .as_ref()
             .is_none_or(|generation| generation.is_ready())
+        && state.media.as_ref().is_none_or(|media| media.is_ready())
     {
         (StatusCode::OK, READY_BODY)
     } else {

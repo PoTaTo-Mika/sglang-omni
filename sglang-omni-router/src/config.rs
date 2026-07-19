@@ -43,6 +43,7 @@ pub struct Config {
     pub(crate) admission: AdmissionConfig,
     pub(crate) health: HealthConfig,
     pub(crate) http_generation: Option<HttpGenerationConfig>,
+    pub(crate) http_media: Option<HttpMediaConfig>,
     pub(crate) workers: Vec<WorkerConfig>,
 }
 
@@ -101,6 +102,79 @@ impl HttpGenerationConfig {
         usize::try_from(self.buffered_request_total_bytes).map_err(|_| {
             ConfigError::invalid(
                 "http_generation.buffered_request_total_bytes",
+                "cannot be represented on this platform",
+            )
+        })
+    }
+}
+
+/// Bounded transport and buffering policy shared by all media HTTP routes.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct HttpMediaConfig {
+    pub(crate) routes: Vec<HttpMediaRoute>,
+    pub(crate) trust_domain: String,
+    pub(crate) buffered_request_max_bytes: u64,
+    pub(crate) buffered_request_total_bytes: u64,
+    pub(crate) streamed_request_max_bytes: u64,
+    connect_timeout_ms: u64,
+    request_timeout_ms: u64,
+    pool_idle_timeout_ms: u64,
+    pub(crate) pool_max_idle_per_host: usize,
+}
+
+impl Default for HttpMediaConfig {
+    fn default() -> Self {
+        Self {
+            routes: Vec::new(),
+            trust_domain: String::from("local"),
+            buffered_request_max_bytes: DEFAULT_BUFFERED_REQUEST_MAX_BYTES,
+            buffered_request_total_bytes: DEFAULT_BUFFERED_REQUEST_TOTAL_BYTES,
+            streamed_request_max_bytes: DEFAULT_STREAMED_REQUEST_MAX_BYTES,
+            connect_timeout_ms: DEFAULT_CONNECT_TIMEOUT_MS,
+            request_timeout_ms: DEFAULT_REQUEST_TIMEOUT_MS,
+            pool_idle_timeout_ms: DEFAULT_POOL_IDLE_TIMEOUT_MS,
+            pool_max_idle_per_host: DEFAULT_POOL_MAX_IDLE_PER_HOST,
+        }
+    }
+}
+
+/// Media HTTP routes enabled by the shared transport policy.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HttpMediaRoute {
+    Speech,
+    SpeechBatch,
+    Transcription,
+}
+
+impl HttpMediaRoute {
+    pub(crate) const fn service_class(self) -> ServiceClass {
+        match self {
+            Self::Speech => ServiceClass::SpeechHttp,
+            Self::SpeechBatch => ServiceClass::SpeechBatch,
+            Self::Transcription => ServiceClass::TranscriptionHttp,
+        }
+    }
+}
+
+impl HttpMediaConfig {
+    pub(crate) const fn connect_timeout(&self) -> Duration {
+        Duration::from_millis(self.connect_timeout_ms)
+    }
+
+    pub(crate) const fn request_timeout(&self) -> Duration {
+        Duration::from_millis(self.request_timeout_ms)
+    }
+
+    pub(crate) const fn pool_idle_timeout(&self) -> Duration {
+        Duration::from_millis(self.pool_idle_timeout_ms)
+    }
+
+    pub(crate) fn buffered_total_usize(&self) -> Result<usize, ConfigError> {
+        usize::try_from(self.buffered_request_total_bytes).map_err(|_| {
+            ConfigError::invalid(
+                "http_media.buffered_request_total_bytes",
                 "cannot be represented on this platform",
             )
         })
@@ -311,6 +385,7 @@ impl Config {
         self.validate_admission()?;
         self.validate_health()?;
         self.validate_http_generation()?;
+        self.validate_http_media()?;
         validate_workers(
             &self.workers,
             &self.router.required_services,
@@ -414,6 +489,122 @@ impl Config {
                 "http_generation.trust_domain",
                 "must contain at least one generation worker",
             ));
+        }
+        Ok(())
+    }
+
+    fn validate_http_media(&self) -> Result<(), ConfigError> {
+        let Some(media) = self.http_media.as_ref() else {
+            return Ok(());
+        };
+        if media.routes.is_empty() {
+            return Err(ConfigError::invalid(
+                "http_media.routes",
+                "must contain at least one route",
+            ));
+        }
+        if media
+            .routes
+            .iter()
+            .enumerate()
+            .any(|(index, route)| media.routes[..index].contains(route))
+        {
+            return Err(ConfigError::invalid(
+                "http_media.routes",
+                "must not contain duplicates",
+            ));
+        }
+        if media.trust_domain.is_empty() || media.trust_domain.len() > 128 {
+            return Err(ConfigError::invalid(
+                "http_media.trust_domain",
+                "must contain between 1 and 128 bytes",
+            ));
+        }
+        if !self.server.listen.ip().is_loopback() {
+            return Err(ConfigError::invalid(
+                "server.listen",
+                "media HTTP requires a loopback listener",
+            ));
+        }
+        if media
+            .routes
+            .iter()
+            .map(|route| route.service_class())
+            .any(|service| !self.router.required_services.contains(&service))
+        {
+            return Err(ConfigError::invalid(
+                "router.required_services",
+                "must contain every service enabled by http_media.routes",
+            ));
+        }
+        if !(1..=67_108_864).contains(&media.buffered_request_max_bytes) {
+            return Err(ConfigError::invalid(
+                "http_media.buffered_request_max_bytes",
+                "must be between 1 and 67108864",
+            ));
+        }
+        if media.buffered_request_total_bytes < media.buffered_request_max_bytes
+            || media.buffered_request_total_bytes > 2_147_483_647
+        {
+            return Err(ConfigError::invalid(
+                "http_media.buffered_request_total_bytes",
+                "must be at least the per-request limit and at most 2147483647",
+            ));
+        }
+        let buffered_total = media.buffered_total_usize()?;
+        if buffered_total > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(ConfigError::invalid(
+                "http_media.buffered_request_total_bytes",
+                "exceeds the platform semaphore permit limit",
+            ));
+        }
+        if media.streamed_request_max_bytes < media.buffered_request_max_bytes
+            || media.streamed_request_max_bytes > 4_294_967_296
+        {
+            return Err(ConfigError::invalid(
+                "http_media.streamed_request_max_bytes",
+                "must be at least the buffered limit and at most 4294967296",
+            ));
+        }
+        if !(1..=60_000).contains(&media.connect_timeout_ms) {
+            return Err(ConfigError::invalid(
+                "http_media.connect_timeout_ms",
+                "must be between 1 and 60000",
+            ));
+        }
+        if media.request_timeout_ms < media.connect_timeout_ms
+            || media.request_timeout_ms > 3_600_000
+        {
+            return Err(ConfigError::invalid(
+                "http_media.request_timeout_ms",
+                "must be at least connect_timeout_ms and at most 3600000",
+            ));
+        }
+        if !(1_000..=300_000).contains(&media.pool_idle_timeout_ms) {
+            return Err(ConfigError::invalid(
+                "http_media.pool_idle_timeout_ms",
+                "must be between 1000 and 300000",
+            ));
+        }
+        if !(1..=256).contains(&media.pool_max_idle_per_host) {
+            return Err(ConfigError::invalid(
+                "http_media.pool_max_idle_per_host",
+                "must be between 1 and 256",
+            ));
+        }
+        for service in media.routes.iter().map(|route| route.service_class()) {
+            if !self.workers.iter().any(|worker| {
+                worker.trust_domain == media.trust_domain
+                    && worker
+                        .service_profiles
+                        .iter()
+                        .any(|profile| profile.service_class() == service)
+            }) {
+                return Err(ConfigError::invalid(
+                    "http_media.trust_domain",
+                    "must contain at least one worker for every enabled media HTTP route",
+                ));
+            }
         }
         Ok(())
     }

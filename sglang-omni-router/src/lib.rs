@@ -15,11 +15,12 @@
 //!
 //! This crate owns strict startup configuration, a static correlated worker
 //! pool, isolated health, router-local liveness/readiness, and joined process
-//! shutdown. It intentionally contains no inference transport route.
+//! shutdown, and bounded HTTP inference relays.
 
 mod config;
 mod error;
 mod http_generation;
+mod http_media;
 mod lifecycle;
 mod server;
 mod shutdown;

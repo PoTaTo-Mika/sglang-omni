@@ -90,6 +90,9 @@ pub enum RouterError {
     /// The isolated generation data-plane client failed to build.
     #[error("failed to initialize the generation HTTP client")]
     GenerationClient(#[source] reqwest::Error),
+    /// The isolated media data-plane client failed to build.
+    #[error("failed to initialize the media HTTP client")]
+    MediaClient(#[source] reqwest::Error),
     /// Validated worker-pool data could not be reconstructed internally.
     #[error("the validated worker-pool invariant failed")]
     WorkerPoolInvariant,
@@ -116,6 +119,7 @@ impl RouterError {
             | Self::Signal(_)
             | Self::HealthClient(_)
             | Self::GenerationClient(_)
+            | Self::MediaClient(_)
             | Self::WorkerPoolInvariant
             | Self::HealthTask => 1,
         }

@@ -149,6 +149,10 @@ same sequential-poll invariant.
 
 ## Reproducible graph evidence
 
+The media HTTP relay adds no dependency. Its bounded multipart scanner operates
+only on complete buffered bytes, and its direct request/response paths reuse the
+existing `bytes`, `http-body`, `serde_json`, and `sync_wrapper` decisions above.
+
 Run from `sglang-omni-router`:
 
 ```text

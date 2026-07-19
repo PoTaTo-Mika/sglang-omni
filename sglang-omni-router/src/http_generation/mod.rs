@@ -1,7 +1,7 @@
 mod classify;
-mod headers;
-mod request_body;
-mod response_body;
+pub(crate) mod headers;
+pub(crate) mod request_body;
+pub(crate) mod response_body;
 
 use std::future::poll_fn;
 use std::sync::{Arc, Mutex};
@@ -161,7 +161,7 @@ async fn handle(
     .await
 }
 
-fn reserve_budget(
+pub(crate) fn reserve_budget(
     semaphore: &Arc<Semaphore>,
     bytes: u64,
 ) -> Result<OwnedSemaphorePermit, HttpFault> {
@@ -171,7 +171,7 @@ fn reserve_budget(
         .map_err(|_| HttpFault::RouterOverloaded)
 }
 
-async fn read_buffered(
+pub(crate) async fn read_buffered(
     mut body: Body,
     expected: Option<u64>,
     maximum: u64,
@@ -359,7 +359,7 @@ fn finish_buffered_classification<T>(
     classified
 }
 
-async fn classify_with_cpu_slot<T>(
+pub(crate) async fn classify_with_cpu_slot<T>(
     slots: &Arc<Semaphore>,
     deadline: tokio::time::Instant,
     operation: impl FnOnce() -> Result<T, HttpFault> + Send + 'static,
@@ -411,7 +411,7 @@ fn check_precommit_deadline_at(
     }
 }
 
-fn snapshot_upload(state: &SharedUploadState) -> Result<UploadState, HttpFault> {
+pub(crate) fn snapshot_upload(state: &SharedUploadState) -> Result<UploadState, HttpFault> {
     state
         .lock()
         .map(|state| *state)
