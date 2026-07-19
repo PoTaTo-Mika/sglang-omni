@@ -667,6 +667,66 @@ fn validates_speech_stream_modes_and_pcm_correlation() {
 }
 
 #[test]
+fn validates_optional_websocket_routes_and_shared_bounds() {
+    let speech = speech_config(
+        SpeechSurface::Websocket,
+        "[\"pcm\"]",
+        Some("[\"non_streaming\", \"streaming\"]"),
+    );
+    let enabled = speech.replace(
+        "[[workers]]",
+        "[websocket.speech]\ntrust_domain = \"local\"\n\n[[workers]]",
+    );
+    load_bytes(enabled.as_bytes()).expect("speech WebSocket subsection enables the route");
+
+    let rejected = [
+        enabled.replace(
+            "[websocket.speech]\ntrust_domain = \"local\"",
+            "[websocket.speech]\ntrust_domain = \"remote\"",
+        ),
+        enabled.replace(
+            "required_services = [\"speech_websocket\"]",
+            "required_services = [\"generation_http\"]",
+        ),
+        enabled.replace(
+            "[websocket.speech]",
+            "[websocket]\nframe_max_bytes = 0\n\n[websocket.speech]",
+        ),
+        enabled.replace(
+            "[websocket.speech]",
+            "[websocket]\nframe_max_bytes = 16777217\n\n[websocket.speech]",
+        ),
+        enabled.replace("127.0.0.1:30000", "0.0.0.0:30000"),
+    ];
+    for contents in rejected {
+        assert!(load_bytes(contents.as_bytes()).is_err());
+    }
+}
+
+#[test]
+fn realtime_websocket_requires_one_trust_scoped_default() {
+    let prefix = worker_config_prefix("realtime_websocket");
+    let worker = |id: &str, default: &str, port: u16| {
+        format!(
+            "[[workers]]\nworker_id = \"{id}\"\nbase_url = \"http://127.0.0.1:{port}\"\ntrust_domain = \"local\"\ndefault_model_id = \"{default}\"\n\n[workers.capacity]\nrealtime_websocket = 2\n\n[[workers.service_profiles]]\nservice = \"realtime_websocket\"\nprotocols = [\"openai_realtime_v1\"]\n"
+        )
+    };
+    let route = "[websocket.realtime]\ntrust_domain = \"local\"\n\n";
+    let unique = format!(
+        "{prefix}{route}{}{}",
+        worker("a", "omni", 9),
+        worker("b", "omni", 10)
+    );
+    load_bytes(unique.as_bytes()).expect("matching realtime defaults are unambiguous");
+    let ambiguous = format!(
+        "{prefix}{route}{}{}",
+        worker("a", "omni-a", 9),
+        worker("b", "omni-b", 10)
+    );
+    assert!(load_bytes(ambiguous.as_bytes()).is_err());
+}
+
+#[test]
 fn validates_static_dns_pins_and_canonical_authority_rules() {
     let accepted = [
         config_with_generation_workers(&[(

@@ -15,6 +15,7 @@ use http_body::Body as _;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::error;
 
+use crate::classification;
 use crate::config::Config;
 use crate::error::{HttpFault, RouterError};
 use crate::worker_pool::{
@@ -371,21 +372,33 @@ where
     let slot = tokio::select! {
         biased;
         () = tokio::time::sleep_until(deadline) => return Err(HttpFault::UpstreamTimeout),
-        result = Arc::clone(slots).acquire_owned() => {
-            result.map_err(|_| HttpFault::InternalError)?
-        }
-    };
-    let classified = tokio::task::spawn_blocking(move || {
-        let _slot = slot;
+        result = classification::acquire(slots) => result,
+    }
+    .map_err(|source| {
+        log_classification_error(source);
+        HttpFault::InternalError
+    })?;
+    let classified = classification::run_with_slot(slot, move || {
         check_precommit_deadline_at(deadline, None, tokio::time::Instant::now())?;
         operation()
     })
     .await
     .map_err(|source| {
-        error!(error = %source, "classification task failed");
+        log_classification_error(source);
         HttpFault::InternalError
     })?;
     finish_buffered_classification(classified, deadline, tokio::time::Instant::now())
+}
+
+fn log_classification_error(source: classification::ClassificationError) {
+    match source {
+        classification::ClassificationError::Unavailable => {
+            error!("classification semaphore closed");
+        }
+        classification::ClassificationError::Join(source) => {
+            error!(error = %source, "classification task failed");
+        }
+    }
 }
 
 struct UpstreamAttemptAuthorization;
@@ -651,6 +664,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn started_classification_is_joined_before_post_deadline_check() {
+        let slots = Arc::new(Semaphore::new(1));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let task_slots = Arc::clone(&slots);
+        let classifier = tokio::spawn(async move {
+            super::classify_with_cpu_slot(
+                &task_slots,
+                tokio::time::Instant::now() + Duration::from_millis(50),
+                move || {
+                    entered_tx.send(()).expect("announce classifier entry");
+                    release_rx.recv().expect("release blocking classifier");
+                    Ok(())
+                },
+            )
+            .await
+        });
+        entered_rx.await.expect("classifier entered");
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        assert!(
+            !classifier.is_finished(),
+            "an acquired classifier is joined even after its HTTP deadline"
+        );
+
+        release_tx.send(()).expect("release classifier");
+        assert_eq!(
+            classifier.await.expect("join classification fixture"),
+            Err(HttpFault::UpstreamTimeout)
+        );
+    }
+
+    #[tokio::test]
     async fn blocking_classification_does_not_stall_the_reactor() {
         let slots = Arc::new(Semaphore::new(1));
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
@@ -683,49 +728,5 @@ mod tests {
             classifier.await.expect("join classification fixture"),
             Ok(())
         );
-    }
-
-    #[tokio::test]
-    async fn cancelled_waiter_does_not_release_running_classifier_slot() {
-        let slots = Arc::new(Semaphore::new(1));
-        let budget = Arc::new(Semaphore::new(1));
-        let budget_permit = Arc::clone(&budget)
-            .try_acquire_owned()
-            .expect("reserve buffered memory");
-        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
-        let task_slots = Arc::clone(&slots);
-        let classifier = tokio::spawn(async move {
-            super::classify_with_cpu_slot(
-                &task_slots,
-                tokio::time::Instant::now() + Duration::from_secs(1),
-                move || {
-                    let _budget = budget_permit;
-                    entered_tx.send(()).expect("announce classifier entry");
-                    release_rx.recv().expect("release blocking classifier");
-                    Ok(())
-                },
-            )
-            .await
-        });
-        entered_rx.await.expect("classifier entered");
-        classifier.abort();
-        assert!(
-            classifier
-                .await
-                .expect_err("waiter is cancelled")
-                .is_cancelled()
-        );
-        assert_eq!(slots.available_permits(), 0);
-        assert_eq!(budget.available_permits(), 0);
-
-        release_tx.send(()).expect("release classifier");
-        let permit =
-            tokio::time::timeout(Duration::from_secs(1), Arc::clone(&slots).acquire_owned())
-                .await
-                .expect("blocking closure eventually releases the slot")
-                .expect("classification semaphore remains open");
-        drop(permit);
-        assert_eq!(budget.available_permits(), 1);
     }
 }

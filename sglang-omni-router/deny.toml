@@ -36,6 +36,8 @@ deny = [
   { name = "openssl-sys", reason = "Native OpenSSL is outside the router trust boundary" },
 ]
 skip = [
+  { name = "getrandom", version = "=0.3.4", reason = "tungstenite 0.29 uses rand 0.9 for client handshake keys; ring retains getrandom 0.2.17" },
+  { name = "webpki-roots", version = "=0.26.11", reason = "tokio-tungstenite 0.29 pins the compatibility wrapper over the reqwest TLS graph's webpki-roots 1.0.8" },
   { name = "windows-sys", version = "=0.52.0", reason = "ring 0.17.14 pins this target-only line; Tokio and Criterion use 0.61.2" },
 ]
 skip-tree = []
@@ -46,7 +48,7 @@ deny = ["fs", "full", "io-std", "io-uring", "parking_lot", "process", "taskdump"
 
 [[bans.features]]
 name = "axum"
-deny = ["default", "form", "http2", "json", "macros", "multipart", "query", "ws"]
+deny = ["default", "form", "http2", "json", "macros", "multipart", "query"]
 
 [[bans.features]]
 name = "clap"
@@ -78,6 +80,8 @@ allow-build-scripts = [
   { name = "httparse", version = "=1.10.1" },
   { name = "libc", version = "=0.2.186" },
   { name = "crunchy", version = "=0.2.4" },
+  { name = "generic-array", version = "=0.14.7" },
+  { name = "getrandom", version = "=0.3.4" },
   { name = "icu_normalizer_data", version = "=2.2.0" },
   { name = "icu_properties_data", version = "=2.2.0" },
   { name = "num-traits", version = "=0.2.19" },
@@ -93,6 +97,7 @@ allow-build-scripts = [
   { name = "valuable", version = "=0.1.1" },
   { name = "wasm-bindgen", version = "=0.2.126" },
   { name = "wasm-bindgen-shared", version = "=0.2.126" },
+  { name = "wit-bindgen", version = "=0.57.1" },
   { name = "windows_aarch64_gnullvm", version = "=0.52.6" },
   { name = "windows_aarch64_msvc", version = "=0.52.6" },
   { name = "windows_i686_gnu", version = "=0.52.6" },
@@ -176,6 +181,11 @@ allow-globs = [
 name = "windows_aarch64_gnullvm"
 version = "=0.52.6"
 allow-globs = ["lib/libwindows.0.52.0.a"]
+
+[[bans.build.bypass]]
+name = "wit-bindgen"
+version = "=0.57.1"
+allow-globs = ["src/rt/libwit_bindgen_cabi.a"]
 
 [[bans.build.bypass]]
 name = "windows_aarch64_msvc"

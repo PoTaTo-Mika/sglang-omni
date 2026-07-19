@@ -5,6 +5,8 @@
 
 //! Media classifier and direct-body mechanism smoke benchmarks.
 
+#[path = "../src/classification.rs"]
+mod classification;
 #[path = "../src/config.rs"]
 mod config;
 #[path = "../src/error.rs"]
@@ -13,6 +15,8 @@ mod error;
 mod http_generation;
 #[path = "../src/http_media/mod.rs"]
 mod http_media;
+#[path = "../src/speech_facts.rs"]
+mod speech_facts;
 #[path = "../src/worker_pool/mod.rs"]
 mod worker_pool;
 

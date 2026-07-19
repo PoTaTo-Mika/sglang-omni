@@ -19,9 +19,9 @@ pub(crate) use permit::{AdmissionError, AdmissionLease, DispatchError, RequestLe
 #[allow(unused_imports)] // Correlated requirement types are consumed by later route modules.
 pub(crate) use profile::{
     BatchFeature, CapacityClass, ChatAudioFormat, MediaPlacement, MediaProfile, MessageContentForm,
-    ModelSelection, ProfileRequirement, ReferenceForm, RegistrationId, RouteRequirement,
-    ServiceClass, SpeechResponseFormat, SpeechTask, StreamMode, TranscriptionResponseFormat,
-    TrustDomain, WorkerId,
+    ModelSelection, ProfileRequirement, RealtimeProtocol, ReferenceForm, RegistrationId,
+    RouteRequirement, ServiceClass, SpeechResponseFormat, SpeechTask, SpeechWebsocketInput,
+    StreamMode, TranscriptionResponseFormat, TrustDomain, WorkerId,
 };
 #[allow(unused_imports)]
 // Exact target is consumed by later route modules through RequestLease.
@@ -458,6 +458,20 @@ impl WorkerPool {
                                 .iter()
                                 .any(|profile| profile.service_class() == *service)
                     })
+                })
+        })
+    }
+
+    pub(crate) fn service_ready(&self, trust: &TrustDomain, service: ServiceClass) -> bool {
+        self.gate.read().is_ok_and(|gate| {
+            gate.open
+                && self.records.iter().any(|record| {
+                    &record.trust_domain == trust
+                        && record.available_for_dispatch()
+                        && record
+                            .profiles
+                            .iter()
+                            .any(|profile| profile.service_class() == service)
                 })
         })
     }

@@ -725,6 +725,9 @@ fn production_relay_is_structurally_task_channel_free_and_one_send() {
             .unwrap_or_else(|error| panic!("read {file}: {error}"));
         combined.push_str(source.split("#[cfg(test)]").next().unwrap_or(&source));
     }
+    let classification =
+        fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/classification.rs"))
+            .expect("read shared classification primitive");
     for forbidden in [
         "tokio::spawn(",
         "tokio::task::spawn(",
@@ -740,7 +743,13 @@ fn production_relay_is_structurally_task_channel_free_and_one_send() {
         );
     }
     assert_eq!(
-        combined.matches("tokio::task::spawn_blocking(").count(),
+        combined.matches("tokio::task::spawn_blocking(").count()
+            + classification
+                .split("#[cfg(test)]")
+                .next()
+                .unwrap_or(&classification)
+                .matches("tokio::task::spawn_blocking(")
+                .count(),
         1,
         "classification must have one bounded blocking task site"
     );

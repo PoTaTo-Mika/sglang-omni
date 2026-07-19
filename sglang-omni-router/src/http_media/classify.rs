@@ -3,10 +3,15 @@ use std::fmt;
 use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 
 use crate::error::HttpFault;
+use crate::speech_facts::{
+    SpeechFields, exceeds_nesting_limit, managed_voice as classify_managed_voice,
+    read_field as read_speech_field, reference_forms, response_format as classify_response_format,
+    task as classify_task,
+};
 use crate::worker_pool::{
     BatchFeature, DefaultModelResolution, MediaProfile, ModelSelection, ProfileRequirement,
-    ReferenceForm, RouteRequirement, ServiceClass, SpeechResponseFormat, SpeechTask, StreamMode,
-    TranscriptionResponseFormat, TrustDomain, WorkerPool,
+    ReferenceForm, RouteRequirement, ServiceClass, StreamMode, TranscriptionResponseFormat,
+    TrustDomain, WorkerPool,
 };
 
 use super::headers::SuccessProfile;
@@ -15,23 +20,6 @@ use super::multipart;
 pub(super) struct Classified {
     pub(super) requirement: RouteRequirement,
     pub(super) success: SuccessProfile,
-}
-
-#[derive(Default)]
-struct SpeechFields {
-    model: Option<Option<String>>,
-    response_format: Option<Option<String>>,
-    stream: Option<Option<bool>>,
-    task: Option<Option<String>>,
-    voice: Option<Option<String>>,
-    ref_audio: Option<Option<String>>,
-    references: Option<Option<ReferenceFlags>>,
-}
-
-#[derive(Clone, Copy, Default)]
-struct ReferenceFlags {
-    list: bool,
-    vq_codes: bool,
 }
 
 pub(super) fn speech(
@@ -46,13 +34,14 @@ pub(super) fn speech(
         trust,
         ServiceClass::SpeechHttp,
     )?;
-    let format = speech_format(
+    let format = classify_response_format(
         fields
             .response_format
             .as_ref()
             .and_then(Option::as_deref)
             .unwrap_or("wav"),
-    )?;
+    )
+    .ok_or(HttpFault::MalformedRequest)?;
     let stream_mode = if fields
         .stream
         .as_ref()
@@ -63,20 +52,16 @@ pub(super) fn speech(
     } else {
         StreamMode::NonStreaming
     };
-    let task = speech_task(
+    let task = classify_task(
         fields
             .task
             .as_ref()
             .and_then(Option::as_deref)
             .unwrap_or("Base"),
-    )?;
+    )
+    .ok_or(HttpFault::MalformedRequest)?;
     let references = reference_forms(&fields);
-    let explicit_reference = references != [ReferenceForm::None];
-    let managed_voice = !explicit_reference
-        && fields
-            .voice
-            .flatten()
-            .is_some_and(|voice| !voice.is_empty() && !voice.eq_ignore_ascii_case("default"));
+    let managed_voice = classify_managed_voice(&fields, &references);
     Ok(Classified {
         requirement: RouteRequirement::new(
             ProfileRequirement::SpeechHttp {
@@ -138,23 +123,25 @@ pub(super) fn batch(
             trust,
             ServiceClass::SpeechBatch,
         )?);
-        let format = speech_format(
+        let format = classify_response_format(
             item.response_format
                 .clone()
                 .flatten()
                 .or_else(|| defaults.response_format.clone().flatten())
                 .as_deref()
                 .unwrap_or("wav"),
-        )?;
+        )
+        .ok_or(HttpFault::MalformedRequest)?;
         insert_once(&mut formats, format);
-        let task = speech_task(
+        let task = classify_task(
             item.task
                 .clone()
                 .flatten()
                 .or_else(|| defaults.task.clone().flatten())
                 .as_deref()
                 .unwrap_or("Base"),
-        )?;
+        )
+        .ok_or(HttpFault::MalformedRequest)?;
         insert_once(&mut tasks, task);
         let effective = merge_reference_fields(&defaults, &item);
         for form in reference_forms(&effective) {
@@ -258,47 +245,6 @@ fn model_selection(
     }
 }
 
-fn speech_format(value: &str) -> Result<SpeechResponseFormat, HttpFault> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "mp3" => Ok(SpeechResponseFormat::Mp3),
-        "opus" => Ok(SpeechResponseFormat::Opus),
-        "aac" => Ok(SpeechResponseFormat::Aac),
-        "flac" => Ok(SpeechResponseFormat::Flac),
-        "wav" => Ok(SpeechResponseFormat::Wav),
-        "pcm" => Ok(SpeechResponseFormat::Pcm),
-        _ => Err(HttpFault::MalformedRequest),
-    }
-}
-
-fn speech_task(value: &str) -> Result<SpeechTask, HttpFault> {
-    let normalized = value.trim().replace(['_', '-'], "").to_ascii_lowercase();
-    match normalized.as_str() {
-        "base" => Ok(SpeechTask::TextToSpeech),
-        "customvoice" => Ok(SpeechTask::VoiceClone),
-        "voicedesign" => Ok(SpeechTask::VoiceDesign),
-        _ => Err(HttpFault::MalformedRequest),
-    }
-}
-
-fn reference_forms(fields: &SpeechFields) -> Vec<ReferenceForm> {
-    let mut result = Vec::with_capacity(3);
-    if fields.ref_audio.as_ref().is_some_and(Option::is_some) {
-        result.push(ReferenceForm::Direct);
-    }
-    if let Some(Some(flags)) = fields.references {
-        if flags.list {
-            result.push(ReferenceForm::List);
-        }
-        if flags.vq_codes {
-            result.push(ReferenceForm::VqCodes);
-        }
-    }
-    if result.is_empty() {
-        result.push(ReferenceForm::None);
-    }
-    result
-}
-
 fn merge_reference_fields(defaults: &SpeechFields, item: &SpeechFields) -> SpeechFields {
     SpeechFields {
         ref_audio: item
@@ -380,28 +326,14 @@ impl<'de> Visitor<'de> for RootVisitor {
         let mut items = None;
         while let Some(key) = map.next_key::<String>()? {
             match key.as_str() {
-                "model" => set_once(&mut fields.model, map.next_value()?, "model")?,
-                "response_format" => set_once(
-                    &mut fields.response_format,
-                    map.next_value()?,
-                    "response_format",
-                )?,
                 "stream" => set_once(&mut fields.stream, map.next_value()?, "stream")?,
-                "task_type" => set_once(&mut fields.task, map.next_value()?, "task_type")?,
-                "voice" | "speaker" => {
-                    set_once(&mut fields.voice, map.next_value()?, "voice/speaker")?
-                }
-                "ref_audio" => set_once(&mut fields.ref_audio, map.next_value()?, "ref_audio")?,
-                "references" => set_once(
-                    &mut fields.references,
-                    map.next_value_seed(NullableReferencesSeed)?,
-                    "references",
-                )?,
                 "items" if matches!(self.0, RootMode::Batch) => {
                     set_once(&mut items, map.next_value_seed(ItemsSeed)?, "items")?
                 }
                 _ => {
-                    let _ignored = map.next_value::<IgnoredAny>()?;
+                    if !read_speech_field(&key, &mut map, &mut fields)? {
+                        let _ignored = map.next_value::<IgnoredAny>()?;
+                    }
                 }
             }
         }
@@ -469,130 +401,14 @@ impl<'de> DeserializeSeed<'de> for ItemSeed {
             {
                 let mut fields = SpeechFields::default();
                 while let Some(key) = map.next_key::<String>()? {
-                    match key.as_str() {
-                        "model" => set_once(&mut fields.model, map.next_value()?, "model")?,
-                        "response_format" => set_once(
-                            &mut fields.response_format,
-                            map.next_value()?,
-                            "response_format",
-                        )?,
-                        "task_type" => set_once(&mut fields.task, map.next_value()?, "task_type")?,
-                        "voice" | "speaker" => {
-                            set_once(&mut fields.voice, map.next_value()?, "voice/speaker")?
-                        }
-                        "ref_audio" => {
-                            set_once(&mut fields.ref_audio, map.next_value()?, "ref_audio")?
-                        }
-                        "references" => set_once(
-                            &mut fields.references,
-                            map.next_value_seed(NullableReferencesSeed)?,
-                            "references",
-                        )?,
-                        _ => {
-                            let _ignored = map.next_value::<IgnoredAny>()?;
-                        }
+                    if !read_speech_field(&key, &mut map, &mut fields)? {
+                        let _ignored = map.next_value::<IgnoredAny>()?;
                     }
                 }
                 Ok(fields)
             }
         }
         deserializer.deserialize_map(ItemVisitor)
-    }
-}
-
-struct NullableReferencesSeed;
-
-impl<'de> DeserializeSeed<'de> for NullableReferencesSeed {
-    type Value = Option<ReferenceFlags>;
-
-    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct OptionalVisitor;
-        impl<'de> Visitor<'de> for OptionalVisitor {
-            type Value = Option<ReferenceFlags>;
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("null or a reference array")
-            }
-            fn visit_none<E>(self) -> Result<Self::Value, E> {
-                Ok(None)
-            }
-            fn visit_unit<E>(self) -> Result<Self::Value, E> {
-                Ok(None)
-            }
-            fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-            where
-                D: serde::Deserializer<'de>,
-            {
-                deserializer.deserialize_seq(ReferencesVisitor).map(Some)
-            }
-        }
-        deserializer.deserialize_option(OptionalVisitor)
-    }
-}
-
-struct ReferencesVisitor;
-
-impl<'de> Visitor<'de> for ReferencesVisitor {
-    type Value = ReferenceFlags;
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a reference array")
-    }
-    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
-    where
-        A: SeqAccess<'de>,
-    {
-        let mut flags = ReferenceFlags::default();
-        while let Some(entry) = sequence.next_element_seed(ReferenceSeed)? {
-            flags.list |= entry.list;
-            flags.vq_codes |= entry.vq_codes;
-        }
-        Ok(flags)
-    }
-}
-
-struct ReferenceSeed;
-
-impl<'de> DeserializeSeed<'de> for ReferenceSeed {
-    type Value = ReferenceFlags;
-    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct ReferenceVisitor;
-        impl<'de> Visitor<'de> for ReferenceVisitor {
-            type Value = ReferenceFlags;
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("a speech reference object")
-            }
-            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-            where
-                A: MapAccess<'de>,
-            {
-                let mut flags = ReferenceFlags::default();
-                let mut seen_audio = false;
-                let mut seen_vq = false;
-                while let Some(key) = map.next_key::<String>()? {
-                    if matches!(key.as_str(), "audio_path" | "ref_audio" | "audio" | "data") {
-                        let present = map.next_value::<Option<IgnoredAny>>()?.is_some();
-                        flags.list |= present;
-                        seen_audio |= present;
-                    } else if key == "vq_codes" {
-                        if seen_vq {
-                            return Err(de::Error::duplicate_field("vq_codes"));
-                        }
-                        seen_vq = true;
-                        flags.vq_codes = map.next_value::<Option<IgnoredAny>>()?.is_some();
-                    } else {
-                        let _ignored = map.next_value::<IgnoredAny>()?;
-                    }
-                }
-                let _seen_audio = seen_audio;
-                Ok(flags)
-            }
-        }
-        deserializer.deserialize_map(ReferenceVisitor)
     }
 }
 
@@ -605,36 +421,6 @@ where
     }
     *slot = Some(value);
     Ok(())
-}
-
-fn exceeds_nesting_limit(bytes: &[u8]) -> bool {
-    let mut depth = 0_u16;
-    let mut string = false;
-    let mut escaped = false;
-    for byte in bytes {
-        if string {
-            if escaped {
-                escaped = false;
-            } else if *byte == b'\\' {
-                escaped = true;
-            } else if *byte == b'"' {
-                string = false;
-            }
-            continue;
-        }
-        match *byte {
-            b'"' => string = true,
-            b'{' | b'[' => {
-                depth = depth.saturating_add(1);
-                if depth > 128 {
-                    return true;
-                }
-            }
-            b'}' | b']' => depth = depth.saturating_sub(1),
-            _ => {}
-        }
-    }
-    false
 }
 
 #[allow(dead_code)]

@@ -169,3 +169,61 @@ packages. The feature trees show each promoted package at exactly one version;
 the release gate reruns both host and all-target inspection so target-only
 platform packages are reported separately rather than mistaken for host
 runtime duplication.
+
+## Branch 5 WebSocket dependency delta
+
+### `tokio-tungstenite` 0.29.0
+
+Purpose and owner: `websocket::upstream` owns one terminating client handshake
+over an already-connected pinned `TcpStream`, bounded framing, and the direct
+message sink/stream used by the session supervisor. The direct declaration
+disables defaults and requests only `rustls-tls-webpki-roots`; Axum 0.8.9's
+`ws` feature also depends on this exact package with its `default`/`connect`
+features, so those features are enabled in the unified graph. Production code
+never calls `connect_async`: TCP always targets `ResolvedTarget::socket_addr()`
+while the original `ws`/`wss` URI supplies Host, certificate identity, and SNI.
+
+The crate and its aligned `tungstenite` 0.29.0 dependency are hot-path protocol
+code. They add no native library or proc macro. Their graph adds pure-Rust SHA-1
+handshake, random key generation, data encoding, and WebPKI roots; rustls/ring
+remain the existing reviewed TLS/native-code line. Internal unsafe is confined
+to reviewed dependencies. Both crates are MIT OR Apache-2.0 from crates.io and
+are aligned with the local SGLang Model Gateway family. Remove them if the
+terminating WebSocket routes are removed or Axum exposes an equivalent pinned
+outbound client API.
+
+Branch 5 deliberately adds no Criterion relay target. A truthful full-duplex
+benchmark needs the integrated downstream upgrade, pinned upstream socket, and
+session supervisor; black-boxing payloads without those owners would not
+measure the production path. Fixed-base relay latency/throughput/RSS evidence
+belongs to the operations qualification branch, not a synthetic branch-local
+benchmark framework.
+
+The removal audit records two unavoidable aligned duplicates:
+`getrandom` 0.3.4 is selected by tungstenite's rand 0.9 handshake-key path
+while ring retains 0.2.17, and `webpki-roots` 0.26.11 is the
+tokio-tungstenite compatibility wrapper over the TLS graph's 1.0 line. The
+deny configuration permits only those exact versions. It also permits the
+pure-Rust target/configuration build scripts in `generic-array` 0.14.7,
+`getrandom` 0.3.4, and target-only `wit-bindgen` 0.57.1; none compiles or links
+a host native library. Cargo-deny narrowly permits wit-bindgen's packaged
+target-only `libwit_bindgen_cabi.a` runtime archive.
+
+### `futures-util` 0.3.32
+
+Purpose and owner: `websocket::session` names only `SinkExt` and `StreamExt` to
+drive source and destination directly under one supervisor. Defaults are
+disabled; only `sink` and `std` are requested. There is no executor, channel,
+bridge task, proc macro, native code, or build script. The dependency is MIT OR
+Apache-2.0 from crates.io, and its futures-core/task/slab family was already in
+the graph. Remove it when both WebSocket implementations provide equivalent
+stable direct poll/send methods without an adapter.
+
+### Axum `ws` reviewed feature
+
+Axum remains exactly 0.8.9 with defaults disabled. The newly enabled `ws`
+feature owns only downstream RFC 6455 extraction, bounded frame/message
+configuration, and upgrade I/O. It unifies on tungstenite 0.29.0 and introduces
+no second WebSocket stack. The prior deny-list entry for `ws` is removed; all
+other forbidden Axum features remain denied. Remove this feature with the two
+terminating routes.

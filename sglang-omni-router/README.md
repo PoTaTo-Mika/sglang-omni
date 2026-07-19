@@ -4,7 +4,8 @@ This directory contains the standalone `sgl-omni-router` service. The
 worker-pool release validates one bounded static worker manifest, runs isolated
 bounded health probes, serves router-local liveness and readiness, and owns
 graceful process shutdown. Optional exact-byte relays serve chat generation,
-speech, speech batch, and transcription HTTP routes described below.
+speech, speech batch, and transcription HTTP routes, plus terminating speech
+and realtime WebSocket gateways described below.
 
 Run the service with:
 
@@ -140,9 +141,9 @@ For HTTP, omitted or false `stream` maps to `non_streaming`, while true maps to
 `streaming` must contain only `pcm`; completed encoded formats such as `mp3`
 belong in a separate correlated row advertising only `non_streaming`. The mode
 is operator-approved eligibility for the public request behavior, not a
-promise of one universal chunk cadence. The `speech` media HTTP route uses the
-`speech_http` rows. Speech-WebSocket rows are recorded by the manifest but this
-router does not yet expose a Speech WebSocket relay.
+promise of one universal chunk cadence. The `speech` media HTTP route uses
+`speech_http` rows, while Speech WebSocket uses `speech_websocket` rows. Both
+request classifiers share the same bounded speech-fact vocabulary.
 
 `POST /v1/chat/completions` is enabled only when `[http_generation]` is
 present. It accepts HTTP/1.1 JSON, selects one compatible generation row, and
@@ -197,6 +198,42 @@ rejected with `413`. Batch requests always select one worker and are never
 split. Responses remain direct backpressured bodies through clean EOF or
 truncation, with route-specific status, framing, content-type, and header
 validation.
+
+`[websocket]` owns the fixed bounded transport policy. A route is registered
+only when its subsection is present:
+
+```toml
+[websocket]
+uri_max_bytes = 2048
+header_max_fields = 64
+header_max_bytes = 32768
+frame_max_bytes = 16777216
+worker_message_max_bytes = 67108864
+speech_config_max_bytes = 15029592
+speech_message_max_bytes = 131072
+realtime_message_max_bytes = 16777216
+connect_timeout_ms = 5000
+handshake_timeout_ms = 5000
+speech_config_timeout_ms = 10000
+speech_idle_timeout_ms = 30000
+close_timeout_ms = 5000
+
+[websocket.speech]
+trust_domain = "local"
+
+[websocket.realtime]
+trust_domain = "local"
+```
+
+Speech upgrades before its first `session.config`, classifies the exact text
+without reserialization, pins one compatible worker, replays that text once,
+and directly relays control text and binary audio. Realtime pins and upgrades
+one unique-default worker before returning the downstream `101`, then forwards
+the worker's exact initial `session.created` before polling client application
+input. Both connectors dial only the configured `resolved_ip` while preserving
+the original worker authority for `Host`, TLS certificate identity, and SNI.
+Subprotocol and compression negotiation, proxies, DNS fallback, retry,
+reconnect, and worker failover are unsupported.
 
 `GET /live` is worker-independent and remains logically live while serving or
 draining. `GET /ready` starts at `503` and returns `200` only while serving and

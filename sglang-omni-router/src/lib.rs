@@ -17,6 +17,7 @@
 //! pool, isolated health, router-local liveness/readiness, and joined process
 //! shutdown, and bounded HTTP inference relays.
 
+mod classification;
 mod config;
 mod error;
 mod http_generation;
@@ -24,6 +25,8 @@ mod http_media;
 mod lifecycle;
 mod server;
 mod shutdown;
+mod speech_facts;
+mod websocket;
 mod worker_pool;
 
 use std::path::Path;

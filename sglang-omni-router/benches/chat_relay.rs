@@ -5,6 +5,8 @@
 
 //! Chat classification and relay mechanism microbenchmarks.
 
+#[path = "../src/classification.rs"]
+mod classification;
 #[path = "../src/config.rs"]
 mod config;
 #[path = "../src/error.rs"]

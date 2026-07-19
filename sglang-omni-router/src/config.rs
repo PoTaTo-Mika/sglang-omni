@@ -27,6 +27,19 @@ const SCHEMA_VERSION: u32 = 1;
 const MAX_GLOBAL_ADMISSION: u32 = 1_000_000;
 const MAX_CLASS_ADMISSION: u32 = 65_535;
 const DEFAULT_MAX_CONCURRENT_CLASSIFICATIONS: u8 = 4;
+const DEFAULT_WS_URI_MAX_BYTES: u64 = 2_048;
+const DEFAULT_WS_HEADER_MAX_FIELDS: u64 = 64;
+const DEFAULT_WS_HEADER_MAX_BYTES: u64 = 32 * 1_024;
+const DEFAULT_WS_FRAME_MAX_BYTES: u64 = 16 * 1_024 * 1_024;
+const DEFAULT_WS_WORKER_MESSAGE_MAX_BYTES: u64 = 64 * 1_024 * 1_024;
+const DEFAULT_WS_SPEECH_CONFIG_MAX_BYTES: u64 = 15_029_592;
+const DEFAULT_WS_SPEECH_MESSAGE_MAX_BYTES: u64 = 131_072;
+const DEFAULT_WS_REALTIME_MESSAGE_MAX_BYTES: u64 = 16 * 1_024 * 1_024;
+const DEFAULT_WS_CONNECT_TIMEOUT_MS: u64 = 5_000;
+const DEFAULT_WS_HANDSHAKE_TIMEOUT_MS: u64 = 5_000;
+const DEFAULT_WS_SPEECH_CONFIG_TIMEOUT_MS: u64 = 10_000;
+const DEFAULT_WS_SPEECH_IDLE_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_WS_CLOSE_TIMEOUT_MS: u64 = 5_000;
 
 /// Fully parsed and validated process configuration.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -44,7 +57,97 @@ pub struct Config {
     pub(crate) health: HealthConfig,
     pub(crate) http_generation: Option<HttpGenerationConfig>,
     pub(crate) http_media: Option<HttpMediaConfig>,
+    pub(crate) websocket: Option<WebsocketConfig>,
     pub(crate) workers: Vec<WorkerConfig>,
+}
+
+/// Bounded policy shared by the terminating WebSocket routes.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct WebsocketConfig {
+    pub(crate) speech: Option<WebsocketRouteConfig>,
+    pub(crate) realtime: Option<WebsocketRouteConfig>,
+    pub(crate) uri_max_bytes: u64,
+    pub(crate) header_max_fields: u64,
+    pub(crate) header_max_bytes: u64,
+    pub(crate) frame_max_bytes: u64,
+    pub(crate) worker_message_max_bytes: u64,
+    pub(crate) speech_config_max_bytes: u64,
+    pub(crate) speech_message_max_bytes: u64,
+    pub(crate) realtime_message_max_bytes: u64,
+    connect_timeout_ms: u64,
+    handshake_timeout_ms: u64,
+    speech_config_timeout_ms: u64,
+    speech_idle_timeout_ms: u64,
+    close_timeout_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WebsocketRouteConfig {
+    pub(crate) trust_domain: String,
+}
+
+impl Default for WebsocketConfig {
+    fn default() -> Self {
+        Self {
+            speech: None,
+            realtime: None,
+            uri_max_bytes: DEFAULT_WS_URI_MAX_BYTES,
+            header_max_fields: DEFAULT_WS_HEADER_MAX_FIELDS,
+            header_max_bytes: DEFAULT_WS_HEADER_MAX_BYTES,
+            frame_max_bytes: DEFAULT_WS_FRAME_MAX_BYTES,
+            worker_message_max_bytes: DEFAULT_WS_WORKER_MESSAGE_MAX_BYTES,
+            speech_config_max_bytes: DEFAULT_WS_SPEECH_CONFIG_MAX_BYTES,
+            speech_message_max_bytes: DEFAULT_WS_SPEECH_MESSAGE_MAX_BYTES,
+            realtime_message_max_bytes: DEFAULT_WS_REALTIME_MESSAGE_MAX_BYTES,
+            connect_timeout_ms: DEFAULT_WS_CONNECT_TIMEOUT_MS,
+            handshake_timeout_ms: DEFAULT_WS_HANDSHAKE_TIMEOUT_MS,
+            speech_config_timeout_ms: DEFAULT_WS_SPEECH_CONFIG_TIMEOUT_MS,
+            speech_idle_timeout_ms: DEFAULT_WS_SPEECH_IDLE_TIMEOUT_MS,
+            close_timeout_ms: DEFAULT_WS_CLOSE_TIMEOUT_MS,
+        }
+    }
+}
+
+impl WebsocketConfig {
+    pub(crate) const fn connect_timeout(&self) -> Duration {
+        Duration::from_millis(self.connect_timeout_ms)
+    }
+
+    pub(crate) const fn handshake_timeout(&self) -> Duration {
+        Duration::from_millis(self.handshake_timeout_ms)
+    }
+
+    pub(crate) const fn speech_config_timeout(&self) -> Duration {
+        Duration::from_millis(self.speech_config_timeout_ms)
+    }
+
+    pub(crate) const fn speech_idle_timeout(&self) -> Duration {
+        Duration::from_millis(self.speech_idle_timeout_ms)
+    }
+
+    pub(crate) const fn close_timeout(&self) -> Duration {
+        Duration::from_millis(self.close_timeout_ms)
+    }
+
+    pub(crate) fn frame_max_usize(&self) -> Result<usize, ConfigError> {
+        usize::try_from(self.frame_max_bytes).map_err(|_| {
+            ConfigError::invalid(
+                "websocket.frame_max_bytes",
+                "cannot be represented on this platform",
+            )
+        })
+    }
+
+    pub(crate) fn worker_message_max_usize(&self) -> Result<usize, ConfigError> {
+        usize::try_from(self.worker_message_max_bytes).map_err(|_| {
+            ConfigError::invalid(
+                "websocket.worker_message_max_bytes",
+                "cannot be represented on this platform",
+            )
+        })
+    }
 }
 
 /// Bounded transport and buffering policy for chat generation HTTP.
@@ -386,11 +489,198 @@ impl Config {
         self.validate_health()?;
         self.validate_http_generation()?;
         self.validate_http_media()?;
+        self.validate_websocket()?;
         validate_workers(
             &self.workers,
             &self.router.required_services,
             self.router.voice_owner_worker_id.as_deref(),
         )?;
+        Ok(())
+    }
+
+    fn validate_websocket(&self) -> Result<(), ConfigError> {
+        let Some(websocket) = self.websocket.as_ref() else {
+            return Ok(());
+        };
+        if websocket.speech.is_none() && websocket.realtime.is_none() {
+            return Err(ConfigError::invalid(
+                "websocket",
+                "must enable speech or realtime",
+            ));
+        }
+        if !self.server.listen.ip().is_loopback() {
+            return Err(ConfigError::invalid(
+                "server.listen",
+                "WebSocket routes require a loopback listener",
+            ));
+        }
+        let bounded = [
+            ("websocket.uri_max_bytes", websocket.uri_max_bytes, 2_048),
+            (
+                "websocket.header_max_fields",
+                websocket.header_max_fields,
+                64,
+            ),
+            (
+                "websocket.header_max_bytes",
+                websocket.header_max_bytes,
+                32 * 1_024,
+            ),
+            (
+                "websocket.frame_max_bytes",
+                websocket.frame_max_bytes,
+                16 * 1_024 * 1_024,
+            ),
+            (
+                "websocket.worker_message_max_bytes",
+                websocket.worker_message_max_bytes,
+                64 * 1_024 * 1_024,
+            ),
+            (
+                "websocket.speech_config_max_bytes",
+                websocket.speech_config_max_bytes,
+                15_029_592,
+            ),
+            (
+                "websocket.speech_message_max_bytes",
+                websocket.speech_message_max_bytes,
+                131_072,
+            ),
+            (
+                "websocket.realtime_message_max_bytes",
+                websocket.realtime_message_max_bytes,
+                16 * 1_024 * 1_024,
+            ),
+        ];
+        for (field, value, maximum) in bounded {
+            if value == 0 || value > maximum {
+                return Err(ConfigError::invalid(
+                    field,
+                    "must be positive and not exceed the accepted maximum",
+                ));
+            }
+            if usize::try_from(value).is_err() {
+                return Err(ConfigError::invalid(
+                    field,
+                    "cannot be represented on this platform",
+                ));
+            }
+        }
+        if websocket.frame_max_bytes > websocket.worker_message_max_bytes
+            || websocket.frame_max_bytes > websocket.realtime_message_max_bytes
+            || websocket.speech_message_max_bytes > websocket.worker_message_max_bytes
+            || websocket.speech_config_max_bytes > websocket.worker_message_max_bytes
+        {
+            return Err(ConfigError::invalid(
+                "websocket",
+                "message limits must be at least their frame or route limits",
+            ));
+        }
+        for (field, value, maximum) in [
+            (
+                "websocket.connect_timeout_ms",
+                websocket.connect_timeout_ms,
+                60_000,
+            ),
+            (
+                "websocket.handshake_timeout_ms",
+                websocket.handshake_timeout_ms,
+                60_000,
+            ),
+            (
+                "websocket.speech_config_timeout_ms",
+                websocket.speech_config_timeout_ms,
+                60_000,
+            ),
+            (
+                "websocket.speech_idle_timeout_ms",
+                websocket.speech_idle_timeout_ms,
+                300_000,
+            ),
+            (
+                "websocket.close_timeout_ms",
+                websocket.close_timeout_ms,
+                60_000,
+            ),
+        ] {
+            if value == 0 || value > maximum {
+                return Err(ConfigError::invalid(
+                    field,
+                    "must be positive and not exceed the accepted maximum",
+                ));
+            }
+        }
+        if let Some(route) = websocket.speech.as_ref() {
+            self.validate_websocket_route(
+                route,
+                ServiceClass::SpeechWebsocket,
+                "websocket.speech",
+            )?;
+        }
+        if let Some(route) = websocket.realtime.as_ref() {
+            self.validate_websocket_route(
+                route,
+                ServiceClass::RealtimeWebsocket,
+                "websocket.realtime",
+            )?;
+            let mut default = None;
+            for worker in self.workers.iter().filter(|worker| {
+                worker.trust_domain == route.trust_domain
+                    && worker
+                        .service_profiles
+                        .iter()
+                        .any(|profile| profile.service_class() == ServiceClass::RealtimeWebsocket)
+            }) {
+                let Some(candidate) = worker.default_model_id.as_deref() else {
+                    return Err(ConfigError::invalid(
+                        "websocket.realtime.trust_domain",
+                        "realtime workers require one unambiguous default model",
+                    ));
+                };
+                if default.is_some_and(|current| current != candidate) {
+                    return Err(ConfigError::invalid(
+                        "websocket.realtime.trust_domain",
+                        "realtime default model is ambiguous",
+                    ));
+                }
+                default = Some(candidate);
+            }
+        }
+        let _frame = websocket.frame_max_usize()?;
+        let _message = websocket.worker_message_max_usize()?;
+        Ok(())
+    }
+
+    fn validate_websocket_route(
+        &self,
+        route: &WebsocketRouteConfig,
+        service: ServiceClass,
+        field: &'static str,
+    ) -> Result<(), ConfigError> {
+        if route.trust_domain.is_empty() || route.trust_domain.len() > 128 {
+            return Err(ConfigError::invalid(
+                field,
+                "trust_domain must contain between 1 and 128 bytes",
+            ));
+        }
+        if !self.router.required_services.contains(&service) {
+            return Err(ConfigError::invalid(
+                "router.required_services",
+                "must contain every enabled WebSocket service",
+            ));
+        }
+        if !self.workers.iter().any(|worker| {
+            worker.trust_domain == route.trust_domain
+                && worker
+                    .service_profiles
+                    .iter()
+                    .any(|profile| profile.service_class() == service)
+        }) {
+            return Err(ConfigError::invalid(
+                field,
+                "trust domain has no compatible configured worker",
+            ));
+        }
         Ok(())
     }
 
