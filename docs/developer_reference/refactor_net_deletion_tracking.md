@@ -68,6 +68,10 @@ may add shared infrastructure before later PRs delete model-local code.
 
 ## HTML Dashboard
 
+The current dashboard is published at
+[TTS Refactor Progress](https://sgl-project.github.io/sglang-omni/tts-refactor/).
+The docs workflow rebuilds it from `main` on every documentation deployment.
+
 The same script can write a static dashboard. Serve the output directory with a
 plain local HTTP server, then expose that localhost port with
 [Cloudflare Quick Tunnels](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/trycloudflare/)
