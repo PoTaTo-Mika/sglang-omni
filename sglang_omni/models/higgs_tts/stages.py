@@ -57,9 +57,8 @@ from sglang_omni.preprocessing.cache_key import (
 )
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.reference_encoder import (
-    ReferenceEncodeHook,
-    ReferenceEncodeKey,
     ReferenceEncodeService,
+    TensorReferenceEncodeHook,
 )
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 from sglang_omni.scheduling.speaker_cache import (
@@ -159,35 +158,23 @@ class _HiggsReferenceInput:
         self.content_key = content_key
 
 
-class _HiggsReferenceEncodeHook(
-    ReferenceEncodeHook[_HiggsReferenceInput, torch.Tensor, torch.Tensor]
-):
-    """M4a hook: delayed reference codes for a 24 kHz waveform.
+class _HiggsReferenceEncodeHook(TensorReferenceEncodeHook[_HiggsReferenceInput]):
+    """Encode delayed 24 kHz reference codes keyed by waveform content."""
 
-    Keys are waveform-content hashes (computed once in preprocessing), so
-    identical reference audio hits across request ids and source forms.
-    Waveform-content keys cannot go stale, so the default revalidate applies.
-    """
+    model_revision = ""
+    encoder_id = "higgs_codec_delayed"
+    artifact_kind = "reference_codes"
+    storage_dtype = torch.int32
+    output_dtype = torch.long
 
     def __init__(self, codec: Any, *, num_codebooks: int, model_identity: str):
         self._codec = codec
         self._num_codebooks = int(num_codebooks)
-        self._model_identity = str(model_identity)
+        self.model_id = str(model_identity)
+        self.encoder_config_hash = f"nq{self._num_codebooks}"
 
-    def normalize_input(self, raw_input: Any) -> _HiggsReferenceInput:
-        return raw_input
-
-    def cache_key(self, item: _HiggsReferenceInput) -> ReferenceEncodeKey | None:
-        if item.content_key is None:
-            return None
-        return ReferenceEncodeKey(
-            model_id=self._model_identity,
-            model_revision="",
-            encoder_id="higgs_codec_delayed",
-            encoder_config_hash=f"nq{self._num_codebooks}",
-            artifact_kind="reference_codes",
-            input_key=item.content_key,
-        )
+    def input_key(self, item: _HiggsReferenceInput) -> str | None:
+        return item.content_key
 
     def encode_one(self, item: _HiggsReferenceInput) -> torch.Tensor:
         ref_codes_TN = self._codec.encode_reference(
@@ -199,12 +186,6 @@ class _HiggsReferenceEncodeHook(
                 f"{tuple(ref_codes_TN.shape)}"
             )
         return apply_delay_pattern(ref_codes_TN)
-
-    def store_artifact(self, artifact: torch.Tensor) -> torch.Tensor:
-        return artifact.detach().to("cpu", torch.int32)
-
-    def load_artifact(self, stored: torch.Tensor) -> torch.Tensor:
-        return stored.detach().clone().to(torch.long)
 
 
 def create_preprocessing_executor(
