@@ -14,6 +14,9 @@ from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.models.moss_transcribe_diarize import (  # noqa: F401
     hf_config as _hf_config,
 )
+from sglang_omni.models.moss_transcribe_diarize.encoder_service import (
+    BatchedAudioEncoderService,
+)
 from sglang_omni.models.moss_transcribe_diarize.request_builders import (
     make_moss_transcribe_diarize_scheduler_adapters,
     make_moss_transcribe_diarize_stream_output_builder,
@@ -35,7 +38,7 @@ from sglang_omni.scheduling.sglang_backend import (
 # we don't hit; pad-to-power-of-2 would tax a compute-bound encoder with
 # no cross-request batching yet.
 # Cap tuned to p99 audio duration ([1,8] covers up to ~4min)
-_DEFAULT_ENCODER_GRAPH_CHUNK_BUCKETS = list(range(1, 9))
+_DEFAULT_ENCODER_CHUNK_BUCKETS = list(range(1, 9))
 
 
 @contextmanager
@@ -101,8 +104,11 @@ def create_sglang_moss_transcribe_diarize_executor(
     # note (yichi): async on by default for MOSS-TD; --decode-mode sync to opt out.
     enable_async_decode: bool = True,
     async_decode_min_batch_size: int = 2,
-    encoder_graph_chunk_buckets: list[int] | None = None,
-    request_build_max_workers: int = 2,
+    encoder_chunk_buckets: list[int] | None = None,
+    encoder_torch_compile: bool = False,
+    # note (yichi): 8 parallel mel extractions measured optimal; fewer starve
+    # the encoder feed, more oversubscribe the CPU.
+    request_build_max_workers: int = 8,
     request_build_max_pending: int | None = 16,
     stream_emit_interval_s: float = 0.05,
     server_args_overrides: dict[str, Any] | None = None,
@@ -163,12 +169,16 @@ def create_sglang_moss_transcribe_diarize_executor(
 
     if want_cuda_graph:
         model_worker.model_runner.init_device_graphs()
-        buckets = (
-            encoder_graph_chunk_buckets
-            if encoder_graph_chunk_buckets is not None
-            else _DEFAULT_ENCODER_GRAPH_CHUNK_BUCKETS
-        )
-        input_feature_len = int(processor.feature_extractor.nb_max_frames)
+
+    buckets = (
+        encoder_chunk_buckets
+        if encoder_chunk_buckets is not None
+        else _DEFAULT_ENCODER_CHUNK_BUCKETS
+    )
+    input_feature_len = int(processor.feature_extractor.nb_max_frames)
+    if encoder_torch_compile:
+        model_worker.model_runner.model.compile_encoder(buckets, input_feature_len)
+    elif want_cuda_graph:
         model_worker.model_runner.model.init_encoder_graphs(buckets, input_feature_len)
 
     init_mm_embedding_cache(mm_embedding_cache_size_bytes)
@@ -179,10 +189,13 @@ def create_sglang_moss_transcribe_diarize_executor(
         capture_hidden_layers=None,
         model=model_worker.model_runner.model,
     )
+    audio_encoder_service = BatchedAudioEncoderService(model_worker.model_runner.model)
+
     request_builder, result_adapter = make_moss_transcribe_diarize_scheduler_adapters(
         processor=processor,
         tokenizer=tokenizer,
         max_new_tokens=resolved_max_new_tokens,
+        audio_encoder_service=audio_encoder_service,
     )
     stream_output_builder = make_moss_transcribe_diarize_stream_output_builder(
         tokenizer=tokenizer,

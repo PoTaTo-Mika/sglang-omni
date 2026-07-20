@@ -17,6 +17,11 @@ tests/
     ├── benchmarks/
     │   └── test_dataset_regressions.py
     ├── test_tune_ci_thresholds.py
+    ├── quantization/
+    │   ├── test_autoround.py
+    │   ├── test_fp8.py
+    │   ├── test_integration.py
+    │   └── test_weight_preprocess.py
     ├── fixtures/
     │   ├── fish_fakes.py
     │   ├── pipeline_fakes.py
@@ -25,6 +30,8 @@ tests/
     │   └── test_audio.py
     ├── pipeline/
     │   ├── helpers.py
+    │   ├── test_comm_engine_ack.py
+    │   ├── test_comm_router.py
     │   ├── test_compile.py
     │   ├── test_coordinator.py
     │   ├── test_gpu_memory.py
@@ -37,6 +44,9 @@ tests/
     │   ├── test_stage.py
     │   ├── test_stage_process_env.py
     │   └── test_stage_streaming.py
+    ├── relay/
+    │   ├── test_cuda_ipc_relay.py
+    │   └── test_shm_relay.py
     ├── models/
     │   └── test_model_capabilities.py
     ├── qwen3_omni/
@@ -48,7 +58,6 @@ tests/
     │   ├── test_example_launcher.py
     │   ├── test_logit_shaping.py
     │   ├── test_pipeline.py
-    │   ├── test_quantization.py
     │   ├── test_sglang_ar_budget.py
     │   ├── test_streaming.py
     │   ├── test_talker.py
@@ -65,7 +74,16 @@ tests/
     │   ├── test_tokenizer.py
     │   ├── test_tp.py
     │   └── test_vision_patch_embed_linear.py
+    ├── ming_tts/
+    │   ├── test_audio_decode.py
+    │   ├── test_engine_io.py
+    │   ├── test_model_runner.py
+    │   ├── test_reference_encode.py
+    │   └── test_request_builders.py
     ├── qwen3_asr/
+    │   ├── test_pipeline.py
+    │   └── test_request_builders.py
+    ├── fun_asr/
     │   ├── test_pipeline.py
     │   └── test_request_builders.py
     ├── moss_transcribe_diarize/
@@ -106,6 +124,7 @@ tests/
     │   ├── test_engine_factory.py
     │   ├── test_pipeline_state.py
     │   ├── test_reference_encoder.py
+    │   ├── test_stage_cache.py
     │   └── test_streaming_vocoder.py
     ├── fishaudio_s2_pro/
     │   ├── test_pipeline.py
@@ -279,6 +298,8 @@ that happened to contain an older version of the test.
   - runtime schema/adapter behavior
   - coordinator behavior
   - stage routing
+  - centralized comm router selection, data-reference serialization, ack
+    lifecycle, and sender backpressure release
   - local-object fan-out selector contracts, including negative coverage for
     shared mutable payload containers while preserving tensor leaf sharing
   - stage process environment
@@ -292,6 +313,13 @@ that happened to contain an older version of the test.
   - scheduler concurrency
   - scheduler callable contracts, including sync wrappers and callable objects
     that return awaitables.
+- `unit_test/relay/`: Low-level data-plane relay tests:
+  - shared-memory relay byte movement, cleanup, and handle lifecycle on CPU
+  - CUDA-IPC relay metadata/open/close behavior for GPU tensor handoff; CUDA
+    tests require CUDA and multi-GPU coverage is hardware-gated
+  - these tests prove transport mechanics, not full pipeline throughput,
+    NVLink selection, or production backpressure behavior; keep those covered
+    in `unit_test/pipeline/` integration tests and GPU benchmarks.
 - `unit_test/benchmarks/`: Benchmark dataset/loading regression tests.
 - `unit_test/test_tune_ci_thresholds.py`: Unit tests for
   `.claude/skills/tune-ci-thresholds/tune.py` calibration tooling — sample-scope
@@ -313,12 +341,21 @@ that happened to contain an older version of the test.
 - `unit_test/scheduling/`: Shared scheduling-service unit tests:
   - `ReferenceEncodeService` cache, same-key single-flight, timeout, failure,
     and revalidation semantics.
+  - `StageOutputCache` thread safety: concurrent get/put byte-accounting,
+    the `remove_if` eviction predicate evaluated outside the lock (re-entrant
+    and deadlock-free), and concurrent remove_if/put state integrity.
 - `unit_test/qwen3_asr/`: Qwen3-ASR unit tests:
   - pipeline config and stage factory concurrency defaults
   - single-source audio token length formula used by both processor and
     request builder paths
   - token-level result adapter marker handling, avoiding decode/encode
     text round-trips for byte-level BPE output.
+- `unit_test/fun_asr/`: Fun-ASR-Nano unit tests:
+  - pipeline config and stage factory: single `asr` stage, `max_running_requests=32`,
+    auto static KV budget, disabled multimodal embedding cache and torch.compile,
+    and `FunAsrNanoForConditionalGeneration` registry wiring
+  - request builder: inclusive audio offset recording, language-prompt prefix
+    construction, and result adapter direct-transcript decoding.
 - `unit_test/moss_transcribe_diarize/`: MOSS-Transcribe-Diarize unit tests:
   - pipeline config and stage factory default routing/memory contracts
   - request builder audio-source resolution, single-audio enforcement, audio
@@ -375,6 +412,16 @@ that happened to contain an older version of the test.
     talker, terminal talker-stream stage, thinker/talker GPU-range collision
     rejection, streaming variant exposure).
 
+- `unit_test/ming_tts/`: Ming-TTS unit tests:
+  - request builder rejection for unsupported seed inputs until the FlowLoss RNG
+    contract is exposed
+  - request/result adapter finish semantics for empty latent output, stop-head
+    finish, SGLang length finish, max-step length finish, and terminal cleanup
+  - TP tail-failure propagation and idempotent abort cleanup without loading a
+    model checkpoint
+  - reference-audio content-cache identity and invalidation
+  - audio decode behavior for zero generated latents without invoking AudioVAE.
+
 - `unit_test/qwen3_tts/`: Qwen3-TTS unit tests:
   - pipeline config and registry contracts
   - OmniScheduler-backed AR stage factory wiring
@@ -386,6 +433,7 @@ that happened to contain an older version of the test.
 
 - `unit_test/higgs_tts/`: Higgs TTS unit tests:
   - OmniScheduler-backed AR stage factory wiring
+  - upstream Transformers codec binding and bundled-config state-dict structure
   - sampler-driven finish handling for eager and CUDA-graph paths
   - request builder sampling normalization and server-side token caps
   - model slot cleanup and engine timing in scheduler result adapters
@@ -424,7 +472,7 @@ that happened to contain an older version of the test.
   - streaming response framing and failure semantics.
 
 - `unit_test/fishaudio_s2_pro/`: FishAudio S2-Pro unit tests:
-  - tokenizer/state contracts
+  - inference prompt segmentation, reference VQ edge cases, and state contracts
   - TTS scheduler behavior
   - model-runner state transitions
   - vocoder batching/trim behavior
@@ -441,6 +489,23 @@ that happened to contain an older version of the test.
   - concurrent emit safety under multiple threads
   - lifecycle (start / stop / run_id mismatch / stage substitution)
   - timeline reconstruction, stage breakdown, hop breakdown, malformed-line tolerance.
+
+- `unit_test/quantization/`: Tests for the compatibility layer on top of
+  SGLang's native quantization (`sglang_omni/quantization.py`):
+  - `resolve_quant_config` discovery from root/nested sub-configs and
+    `compression_config`, plus edge cases (missing/empty quantization_config)
+  - FP8 detection (with/without weight_block_size), weight_scale_inv reciprocal
+    conversion, and error handling (empty/zero/non-finite/non-float scale tensors)
+  - AutoRound stage-prefix normalization for block_name_to_quantize (string
+    input is rejoined as a string; list input is normalized in place and
+    stays a list) and extra_config regex keys via `normalize_quant_config`
+  - `get_weight_preprocessor` contract: identity by default (native block-FP8,
+    AutoRound), FP8 reciprocal preprocessor only when `fp8_scale_inverted=True`,
+    nested config traversal
+  - model_worker integration: `_apply_omni_quantization_adapters` triggers
+    stage-local normalization from hf_config and nested text_config only when
+    needed
+
 
 - `unit_test/fixtures/`: Shared fakes. Single-test
   helpers should stay local until a second test needs them.
