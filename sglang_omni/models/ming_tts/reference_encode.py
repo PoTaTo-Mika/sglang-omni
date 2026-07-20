@@ -199,9 +199,7 @@ class MingTTSReferenceEncoder:
         # note (luojiaxuan): keep artifacts on CPU float32 so the shared cache
         # never pins device memory and typed_tensor emits float32 unchanged.
         return {
-            "spk_emb": speaker_embedding.detach().to(
-                device="cpu", dtype=torch.float32
-            ),
+            "spk_emb": speaker_embedding.detach().to(device="cpu", dtype=torch.float32),
             "prompt_latent": prompt_latent.detach().to(
                 device="cpu", dtype=torch.float32
             ),
