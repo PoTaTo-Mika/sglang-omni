@@ -12,7 +12,6 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Sequence
 
-
 TEST_DIRECTORY_NAMES = frozenset(
     {
         "test",
@@ -246,7 +245,9 @@ def build_report(
     )
 
 
-def format_text(report: Report, list_test_files: bool, list_non_test_files: bool) -> str:
+def format_text(
+    report: Report, list_test_files: bool, list_non_test_files: bool
+) -> str:
     lines = [
         "Refactor net deletion tracking",
         f"Repo: {report.repo}",
@@ -923,7 +924,9 @@ def _format_html_resource_item(
 
 
 def _matching_paths(files: Sequence[FileStat], is_test: bool) -> tuple[str, ...]:
-    return tuple(file_stat.display_path for file_stat in files if file_stat.is_test is is_test)
+    return tuple(
+        file_stat.display_path for file_stat in files if file_stat.is_test is is_test
+    )
 
 
 def _format_file_list(files: Sequence[FileStat], is_test: bool) -> list[str]:

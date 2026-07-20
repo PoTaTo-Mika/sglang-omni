@@ -4,8 +4,9 @@ import importlib.util
 import sys
 from pathlib import Path
 
-
-SCRIPT_PATH = Path(__file__).resolve().parents[3] / "scripts" / "refactor_net_deletions.py"
+SCRIPT_PATH = (
+    Path(__file__).resolve().parents[3] / "scripts" / "refactor_net_deletions.py"
+)
 SPEC = importlib.util.spec_from_file_location("refactor_net_deletions", SCRIPT_PATH)
 assert SPEC is not None
 refactor_net_deletions = importlib.util.module_from_spec(SPEC)
@@ -17,7 +18,9 @@ SPEC.loader.exec_module(refactor_net_deletions)
 def test_detects_repo_test_paths() -> None:
     assert refactor_net_deletions.is_test_path("tests/utils.py")
     assert refactor_net_deletions.is_test_path("tests/data/query_to_draw.wav")
-    assert refactor_net_deletions.is_test_path("tests/unit_test/serve/test_openai_api.py")
+    assert refactor_net_deletions.is_test_path(
+        "tests/unit_test/serve/test_openai_api.py"
+    )
     assert refactor_net_deletions.is_test_path(
         "sglang_omni/models/foo/test_request_builders.py"
     )
@@ -29,8 +32,12 @@ def test_detects_repo_test_paths() -> None:
 def test_does_not_treat_non_test_names_as_tests() -> None:
     assert not refactor_net_deletions.is_test_path("docs/developer_reference/main.md")
     assert not refactor_net_deletions.is_test_path(".github/workflows/test.yaml")
-    assert not refactor_net_deletions.is_test_path("sglang_omni/models/moss_tts/stages.py")
-    assert not refactor_net_deletions.is_test_path("scripts/ci/utils/slash_command_handler.py")
+    assert not refactor_net_deletions.is_test_path(
+        "sglang_omni/models/moss_tts/stages.py"
+    )
+    assert not refactor_net_deletions.is_test_path(
+        "scripts/ci/utils/slash_command_handler.py"
+    )
 
 
 def test_parse_numstat_z_handles_regular_and_renamed_files() -> None:
@@ -131,7 +138,10 @@ def test_format_html_dashboard_escapes_paths_and_lists_test_files() -> None:
     assert '<meta http-equiv="refresh" content="300">' in rendered
     assert "https://github.com/sgl-project/sglang-omni/issues/985" in rendered
     assert "TTS refactor design doc" in rendered
-    assert "https://osgbw74w8zwb.sg.larksuite.com/docx/L3XId4GHYoJqSKxwXYqlXaBrgNd" in rendered
+    assert (
+        "https://osgbw74w8zwb.sg.larksuite.com/docx/L3XId4GHYoJqSKxwXYqlXaBrgNd"
+        in rendered
+    )
     assert "Reusable shared surfaces" in rendered
     assert "sglang_omni/scheduling/reference_encoder.py" in rendered
     assert "sglang_omni/foo&lt;bar&gt;.py" in rendered

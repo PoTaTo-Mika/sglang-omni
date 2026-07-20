@@ -18,6 +18,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -38,6 +40,35 @@ jobs:
       - name: Add .nojekyll file
         run: |
           touch ./docs/_build/html/.nojekyll
+
+      - name: Build TTS refactor dashboard
+        run: |
+          python3 scripts/refactor_net_deletions.py \
+            --base '4e4c98a^1' \
+            --head HEAD \
+            --format html \
+            --output docs/_build/html/tts-refactor/index.html \
+            --title 'TTS Refactor Progress' \
+            --refresh-seconds 300 \
+            --path sglang_omni/models/fishaudio_s2_pro \
+            --path sglang_omni/models/higgs_tts \
+            --path sglang_omni/models/moss_tts \
+            --path sglang_omni/models/moss_tts_local \
+            --path sglang_omni/models/qwen3_tts \
+            --path sglang_omni/models/voxtral_tts \
+            --path sglang_omni/pipeline \
+            --path sglang_omni/scheduling \
+            --path sglang_omni/serve \
+            --path tests/unit_test/fishaudio_s2_pro \
+            --path tests/unit_test/higgs_tts \
+            --path tests/unit_test/moss_tts \
+            --path tests/unit_test/moss_tts_local \
+            --path tests/unit_test/qwen3_tts \
+            --path tests/unit_test/voxtral_tts \
+            --path tests/test_model/test_tts_ci.py \
+            --path tests/test_model/tts_ci_config.py \
+            --list-test-files \
+            --list-non-test-files
 
       - name: Deploy
         uses: peaceiris/actions-gh-pages@v4
