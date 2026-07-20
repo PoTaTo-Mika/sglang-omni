@@ -16,8 +16,6 @@ from sglang_omni.models.ming_tts.audio_config import AudioVAEconfig
 from sglang_omni.models.ming_tts.audio_decode import MingAudioDecoder
 from sglang_omni.models.ming_tts.payload_types import (
     MING_TTS_SAMPLE_RATE,
-    encode_prompt_latent,
-    encode_speaker_embedding,
     load_ming_tts_state,
     store_ming_tts_state,
 )
@@ -198,11 +196,17 @@ class MingTTSReferenceEncoder:
         frames = int(prompt_latent.shape[1])
         speaker_embedding = self.speaker_encoder(speaker_waveform)
 
-        artifact: dict[str, Any] = {}
-        artifact.update(encode_speaker_embedding(speaker_embedding))
-        artifact.update(encode_prompt_latent(prompt_latent))
-        artifact["prompt_latent_token_count"] = frames // self.patch_size
-        return artifact
+        # note (luojiaxuan): keep artifacts on CPU float32 so the shared cache
+        # never pins device memory and typed_tensor emits float32 unchanged.
+        return {
+            "spk_emb": speaker_embedding.detach().to(
+                device="cpu", dtype=torch.float32
+            ),
+            "prompt_latent": prompt_latent.detach().to(
+                device="cpu", dtype=torch.float32
+            ),
+            "prompt_latent_token_count": frames // self.patch_size,
+        }
 
     def encode_payload(
         self,
@@ -221,12 +225,9 @@ class MingTTSReferenceEncoder:
         else:
             artifact = self._encode_reference(ref_audio)
 
-        prompt_latent_token_count = int(artifact["prompt_latent_token_count"])
-        for field_name, value in artifact.items():
-            if field_name == "prompt_latent_token_count":
-                continue
-            setattr(state, field_name, value)
-        state.prompt_latent_token_count = prompt_latent_token_count
+        state.spk_emb = artifact["spk_emb"]
+        state.prompt_latent = artifact["prompt_latent"]
+        state.prompt_latent_token_count = int(artifact["prompt_latent_token_count"])
         state.prompt_text = str(state.ref_text)
 
         plan = build_ming_tts_prompt(

@@ -267,19 +267,16 @@ def test_tts_pipeline_state_round_trips_preserve_payload_fields() -> None:
                 audio_token_position=3,
                 prompt_latent_start_position=4,
                 prompt_latent_token_count=2,
-                spk_emb_bytes=b"\x00" * 8,
-                spk_emb_shape=[1, 2],
-                spk_emb_dtype="float32",
-                prompt_latent_bytes=b"\x00" * 8,
-                prompt_latent_shape=[1, 1, 2],
-                prompt_latent_dtype="float32",
+                spk_emb=torch.zeros(1, 2),
+                prompt_latent=torch.zeros(1, 1, 2),
                 max_decode_steps=16,
                 cfg=1.5,
                 sigma=0.2,
                 temperature=0.7,
-                generated_latents_bytes=b"\x00" * 16,
-                generated_latents_shape=[2, 1, 2],
-                generated_latents_dtype="float32",
+                generated_latents=torch.tensor(
+                    [[[0.5, -1.25]], [[2.0, 0.0]]],
+                    dtype=torch.float32,
+                ),
                 generated_last_chunk=[False, True],
                 stop_step=1,
                 finish_reason="stop",
@@ -405,6 +402,26 @@ def test_typed_tensor_picks_int32_for_large_values() -> None:
 
     assert data["audio_codes_dtype"] == "int32"
     assert decode_typed_tensor(data, key="audio_codes").tolist() == [[70000, 1]]
+
+
+def test_typed_tensor_float_round_trip_transports_as_float32() -> None:
+    latents = torch.tensor([[0.5, -1.25], [2.0, 0.0]], dtype=torch.bfloat16)
+
+    data = encode_typed_tensor(latents, key="latents")
+
+    assert data["latents_dtype"] == "float32"
+    restored = decode_typed_tensor(data, key="latents")
+    assert restored.dtype == torch.float32
+    assert restored.tolist() == [[0.5, -1.25], [2.0, 0.0]]
+
+
+def test_typed_tensor_empty_float_round_trip_keeps_shape() -> None:
+    data = encode_typed_tensor(torch.empty((0, 2, 3)), key="latents")
+
+    assert data["latents_dtype"] == "float32"
+    restored = decode_typed_tensor(data, key="latents")
+    assert restored.shape == (0, 2, 3)
+    assert restored.dtype == torch.float32
 
 
 def test_typed_tensor_legacy_list_fallback_and_missing() -> None:
