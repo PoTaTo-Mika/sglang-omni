@@ -5,10 +5,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import binascii
 import json
 import logging
-import math
 from pathlib import Path
 from typing import Any
 
@@ -39,82 +37,31 @@ from sglang_omni.proto import StagePayload
 logger = logging.getLogger(__name__)
 
 
-_MULTIMODAL_TENSOR_DTYPES: dict[str, torch.dtype] = {
-    "bool": torch.bool,
-    "uint8": torch.uint8,
-    "int8": torch.int8,
-    "int16": torch.int16,
-    "int32": torch.int32,
-    "int64": torch.int64,
-    "float16": torch.float16,
-    "bfloat16": torch.bfloat16,
-    "float32": torch.float32,
-    "float64": torch.float64,
-}
-_MULTIMODAL_TENSOR_NAMES = frozenset(
-    {
-        "pixel_values",
-        "image_grid_thw",
-        "input_features",
-        "feature_attention_mask",
-        "audio_feature_lengths",
-        "pixel_values_videos",
-        "video_grid_thw",
-        "video_second_per_grid",
-    }
-)
-
-
-def _deserialize_multimodal_train_inputs(bundle: Any) -> dict[str, torch.Tensor]:
+def _deserialize_multimodal_train_inputs(
+    bundle: dict[str, Any],
+) -> dict[str, torch.Tensor]:
     """Restore the exact processor tensor kwargs serialized by Miles."""
-    if not isinstance(bundle, dict) or bundle.get("version") != 1:
-        raise ValueError("multimodal_train_inputs must use version 1")
-    encoded_tensors = bundle.get("tensors")
-    if not isinstance(encoded_tensors, dict) or not encoded_tensors:
-        raise ValueError("multimodal_train_inputs.tensors must not be empty")
-    unknown = sorted(set(encoded_tensors) - _MULTIMODAL_TENSOR_NAMES)
-    if unknown:
-        raise ValueError(
-            "unsupported multimodal processor tensor fields: " + ", ".join(unknown)
-        )
-
     tensors: dict[str, torch.Tensor] = {}
-    for name, spec in encoded_tensors.items():
-        if not isinstance(spec, dict):
-            raise ValueError(f"invalid multimodal tensor entry for {name!r}")
-        dtype_name = spec.get("dtype")
-        dtype = _MULTIMODAL_TENSOR_DTYPES.get(dtype_name)
-        if dtype is None:
+    for name, spec in bundle["tensors"].items():
+        dtype_name = spec["dtype"]
+        dtype = getattr(torch, dtype_name, None)
+        if not isinstance(dtype, torch.dtype):
             raise ValueError(
                 f"unsupported multimodal tensor dtype for {name!r}: {dtype_name!r}"
             )
-        shape = spec.get("shape")
-        if not isinstance(shape, list) or any(
-            type(dimension) is not int or dimension < 0 for dimension in shape
-        ):
+        shape = spec["shape"]
+        if any(dimension < 0 for dimension in shape):
             raise ValueError(f"invalid multimodal tensor shape for {name!r}")
-        data = spec.get("data")
-        if not isinstance(data, str):
-            raise ValueError(f"missing base64 multimodal tensor data for {name!r}")
-        try:
-            raw = base64.b64decode(data, validate=True)
-        except (binascii.Error, ValueError) as exc:
-            raise ValueError(
-                f"invalid base64 multimodal tensor data for {name!r}"
-            ) from exc
 
-        expected_bytes = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
-        if len(raw) != expected_bytes:
-            raise ValueError(
-                f"multimodal tensor {name!r} has {len(raw)} bytes, "
-                f"expected {expected_bytes} for shape={shape} dtype={dtype_name}"
-            )
-        if expected_bytes == 0:
-            tensor = torch.empty(shape, dtype=dtype)
-        else:
+        try:
+            raw = base64.b64decode(spec["data"], validate=True)
             tensor = (
                 torch.frombuffer(bytearray(raw), dtype=dtype).clone().reshape(shape)
             )
+        except (ValueError, RuntimeError) as exc:
+            raise ValueError(
+                f"invalid multimodal tensor data for {name!r}: {exc}"
+            ) from exc
         tensors[name] = tensor
     return tensors
 
@@ -128,15 +75,6 @@ def _processed_modalities(inputs: dict[str, torch.Tensor]) -> set[str]:
     if "pixel_values_videos" in inputs:
         modalities.add("video")
     return modalities
-
-
-def _media_token_ids(processor: Any) -> dict[str, int]:
-    tokenizer = processor.tokenizer
-    return {
-        "image": int(tokenizer.convert_tokens_to_ids(processor.image_token)),
-        "audio": int(tokenizer.convert_tokens_to_ids(processor.audio_token)),
-        "video": int(tokenizer.convert_tokens_to_ids(processor.video_token)),
-    }
 
 
 def _resolve_local_model_dir(model_path: str) -> str:
@@ -461,22 +399,8 @@ class Qwen3OmniPreprocessor:
         """Bypass media loading and reuse Miles' processor tensors directly."""
         flat_inputs = _deserialize_multimodal_train_inputs(bundle)
         actual_modalities = _processed_modalities(flat_inputs)
-        declared_modalities = set(bundle.get("modalities") or [])
-        if not actual_modalities or actual_modalities != declared_modalities:
-            raise ValueError(
-                "multimodal_train_inputs modalities do not match encoder tensors: "
-                f"declared={sorted(declared_modalities)}, "
-                f"actual={sorted(actual_modalities)}"
-            )
 
         input_ids = torch.tensor(token_ids, dtype=torch.long)
-        for modality, token_id in _media_token_ids(self.processor).items():
-            token_count = int((input_ids == token_id).sum().item())
-            if (modality in actual_modalities) != (token_count > 0):
-                raise ValueError(
-                    f"processed {modality} tensors and prompt media tokens disagree "
-                    f"(token_count={token_count})"
-                )
         attention_mask = torch.ones_like(input_ids)
         validate_prompt_seq_len(
             input_ids,

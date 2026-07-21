@@ -173,8 +173,6 @@ class RolloutMessage(BaseModel):
 class SerializedMultimodalTensor(BaseModel):
     """One processor tensor encoded for JSON transport."""
 
-    model_config = ConfigDict(extra="forbid")
-
     dtype: str = Field(min_length=1)
     shape: list[int]
     data: str
@@ -182,8 +180,6 @@ class SerializedMultimodalTensor(BaseModel):
 
 class SerializedMultimodalInputs(BaseModel):
     """Processor outputs shared by Miles training and SGLang Omni rollout."""
-
-    model_config = ConfigDict(extra="forbid")
 
     version: Literal[1] = 1
     modalities: list[Literal["image", "audio", "video"]] = Field(min_length=1)
