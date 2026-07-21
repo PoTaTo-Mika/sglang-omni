@@ -80,10 +80,11 @@ AISHELL4_LONG_LATENCY_P95_S_REF = 209.864
 AISHELL4_LONG_RTF_MEAN_REF = 0.0702
 AISHELL4_LONG_RTF_P95_REF = 0.0931
 
-# Initial refs from a single-H100 full-set run (c=16). Re-calibrate on DP=2
-# via tune-ci-thresholds when a CI-comparable observation is available.
+
 GOOGLETIME_CER_PERCENT_REF = 32.74965881799057
 GOOGLETIME_CER_NO_SPK_PERCENT_REF = 32.74965881799057
+GOOGLETIME_CER_NO_SPK_BELOW_50_PERCENT_REF: float | None = 31.565897059706742
+GOOGLETIME_N_ABOVE_50_CER_REF: int | None = 1
 GOOGLETIME_CP_CER_PERCENT_REF = 33.57481272236426
 GOOGLETIME_DELTA_CER_PERCENT_REF = 0.8251539043736822
 GOOGLETIME_SPEAKER_TIMESTAMP_DER_PERCENT_REF = 30.982957808789042
@@ -282,6 +283,19 @@ GOOGLETIME_CER_PERCENT_MAX: float | None = round(
 )
 GOOGLETIME_CER_NO_SPK_PERCENT_MAX: float | None = round(
     GOOGLETIME_CER_NO_SPK_PERCENT_REF * GOOGLETIME_THRESHOLD_SLACK_LOWER, 4
+)
+GOOGLETIME_CER_NO_SPK_BELOW_50_PERCENT_MAX: float | None = (
+    round(
+        GOOGLETIME_CER_NO_SPK_BELOW_50_PERCENT_REF * GOOGLETIME_THRESHOLD_SLACK_LOWER, 4
+    )
+    if GOOGLETIME_CER_NO_SPK_BELOW_50_PERCENT_REF is not None
+    else None
+)
+GOOGLETIME_N_ABOVE_50_CER_MIN: int | None = 0
+GOOGLETIME_N_ABOVE_50_CER_MAX: int | None = (
+    math.ceil(GOOGLETIME_N_ABOVE_50_CER_REF * GOOGLETIME_THRESHOLD_SLACK_LOWER)
+    if GOOGLETIME_N_ABOVE_50_CER_REF is not None
+    else None
 )
 GOOGLETIME_CP_CER_PERCENT_MAX: float | None = round(
     GOOGLETIME_CP_CER_PERCENT_REF * GOOGLETIME_THRESHOLD_SLACK_LOWER, 4
@@ -1021,6 +1035,13 @@ def _assert_googletime_results(checks: MetricCheckCollector, results) -> None:
         diarization_percent.get("cer_no_spk"),
         GOOGLETIME_CER_NO_SPK_PERCENT_MAX,
         unit="%",
+    )
+    assert_cer_partitioned(
+        diarization_percent,
+        max_cer_no_spk_below_50_percent=GOOGLETIME_CER_NO_SPK_BELOW_50_PERCENT_MAX,
+        min_n_above_50_cer=GOOGLETIME_N_ABOVE_50_CER_MIN,
+        max_n_above_50_cer=GOOGLETIME_N_ABOVE_50_CER_MAX,
+        collector=checks,
     )
     _check_optional_max(
         checks,

@@ -7,8 +7,8 @@ multi_speaker_diarization:
   context_vars:
     - MOSS_TD_CI_SAMPLES
     - MOSS_TD_LONG_MAX_NEW_TOKENS
-  test_file_sha256: c8e2329105d998def23c63c02535f48b92df319fa0fda4b0ad55e81bbf6aab0d
-  last_discovered_at: 2026-07-21T20:02:59Z
+  test_file_sha256: 3558cf2790c5849cd925da8c6b802677f7d397d7bf30b924a8acdea2c764ce63
+  last_discovered_at: 2026-07-21T20:09:09Z
   expected_samples: 800
   sample_counts:
     total:
@@ -47,6 +47,16 @@ multi_speaker_diarization:
         label: "CER no-spk ≤50% corpus (%)"
         scale: 1
         digits: 2
+      status: OK
+    n_above_50_pct_cer:
+      source: "MOSS_TD_N_ABOVE_50_CER_REF"
+      json_file: "test_moss_transcribe_diarize_m0/moss_transcribe_diarize_results.json"
+      json_path: "diarization_metrics_percent.n_above_50_pct_cer"
+      worst: max
+      display:
+        label: "Samples >50% CER"
+        scale: 1
+        digits: 0
       status: OK
     cp_cer_percent:
       source: "MOSS_TD_CP_CER_PERCENT_REF"
@@ -116,8 +126,8 @@ multi_speaker_speed:
   context_vars:
     - MOSS_TD_CI_SAMPLES
     - MOSS_TD_LONG_MAX_NEW_TOKENS
-  test_file_sha256: c8e2329105d998def23c63c02535f48b92df319fa0fda4b0ad55e81bbf6aab0d
-  last_discovered_at: 2026-07-21T20:02:59Z
+  test_file_sha256: 3558cf2790c5849cd925da8c6b802677f7d397d7bf30b924a8acdea2c764ce63
+  last_discovered_at: 2026-07-21T20:09:09Z
   expected_samples: 800
   sample_counts:
     total:
@@ -184,8 +194,8 @@ aishell4_long_diarization:
   extra_env: {}
   context_vars:
     - MOSS_TD_AISHELL4_LONG_CI_SAMPLES
-  test_file_sha256: c8e2329105d998def23c63c02535f48b92df319fa0fda4b0ad55e81bbf6aab0d
-  last_discovered_at: 2026-07-21T20:02:59Z
+  test_file_sha256: 3558cf2790c5849cd925da8c6b802677f7d397d7bf30b924a8acdea2c764ce63
+  last_discovered_at: 2026-07-21T20:09:09Z
   expected_samples: 20
   sample_counts:
     total:
@@ -252,8 +262,8 @@ aishell4_long_speed:
   extra_env: {}
   context_vars:
     - MOSS_TD_AISHELL4_LONG_CI_SAMPLES
-  test_file_sha256: c8e2329105d998def23c63c02535f48b92df319fa0fda4b0ad55e81bbf6aab0d
-  last_discovered_at: 2026-07-21T20:02:59Z
+  test_file_sha256: 3558cf2790c5849cd925da8c6b802677f7d397d7bf30b924a8acdea2c764ce63
+  last_discovered_at: 2026-07-21T20:09:09Z
   expected_samples: 20
   sample_counts:
     total:
@@ -320,8 +330,8 @@ googletime_diarization:
   extra_env: {}
   context_vars:
     - MOSS_TD_GOOGLETIME_CI_SAMPLES
-  test_file_sha256: c8e2329105d998def23c63c02535f48b92df319fa0fda4b0ad55e81bbf6aab0d
-  last_discovered_at: 2026-07-21T20:02:59Z
+  test_file_sha256: 3558cf2790c5849cd925da8c6b802677f7d397d7bf30b924a8acdea2c764ce63
+  last_discovered_at: 2026-07-21T20:09:09Z
   expected_samples: 25
   sample_counts:
     total:
@@ -350,6 +360,26 @@ googletime_diarization:
         label: "CER no-spk (%)"
         scale: 1
         digits: 2
+      status: OK
+    cer_no_spk_below_50_corpus:
+      source: "GOOGLETIME_CER_NO_SPK_BELOW_50_PERCENT_REF"
+      json_file: "test_moss_transcribe_diarize_m0/moss_transcribe_diarize_googletime_results.json"
+      json_path: "diarization_metrics_percent.cer_no_spk_below_50_corpus"
+      worst: max
+      display:
+        label: "CER no-spk ≤50% corpus (%)"
+        scale: 1
+        digits: 2
+      status: OK
+    n_above_50_pct_cer:
+      source: "GOOGLETIME_N_ABOVE_50_CER_REF"
+      json_file: "test_moss_transcribe_diarize_m0/moss_transcribe_diarize_googletime_results.json"
+      json_path: "diarization_metrics_percent.n_above_50_pct_cer"
+      worst: max
+      display:
+        label: "Samples >50% CER"
+        scale: 1
+        digits: 0
       status: OK
     cp_cer_percent:
       source: "GOOGLETIME_CP_CER_PERCENT_REF"
@@ -388,8 +418,8 @@ googletime_speed:
   extra_env: {}
   context_vars:
     - MOSS_TD_GOOGLETIME_CI_SAMPLES
-  test_file_sha256: c8e2329105d998def23c63c02535f48b92df319fa0fda4b0ad55e81bbf6aab0d
-  last_discovered_at: 2026-07-21T20:02:59Z
+  test_file_sha256: 3558cf2790c5849cd925da8c6b802677f7d397d7bf30b924a8acdea2c764ce63
+  last_discovered_at: 2026-07-21T20:09:09Z
   expected_samples: 25
   sample_counts:
     total:
@@ -457,8 +487,8 @@ multi_speaker_stream_diarization:
   context_vars:
     - MOSS_TD_CI_SAMPLES
   variant: "stream"
-  test_file_sha256: c8e2329105d998def23c63c02535f48b92df319fa0fda4b0ad55e81bbf6aab0d
-  last_discovered_at: 2026-07-21T20:02:59Z
+  test_file_sha256: 3558cf2790c5849cd925da8c6b802677f7d397d7bf30b924a8acdea2c764ce63
+  last_discovered_at: 2026-07-21T20:09:09Z
   expected_samples: 800
   sample_counts:
     total:
@@ -566,8 +596,8 @@ multi_speaker_stream_speed:
   context_vars:
     - MOSS_TD_CI_SAMPLES
   variant: "stream"
-  test_file_sha256: c8e2329105d998def23c63c02535f48b92df319fa0fda4b0ad55e81bbf6aab0d
-  last_discovered_at: 2026-07-21T20:02:59Z
+  test_file_sha256: 3558cf2790c5849cd925da8c6b802677f7d397d7bf30b924a8acdea2c764ce63
+  last_discovered_at: 2026-07-21T20:09:09Z
   expected_samples: 800
   sample_counts:
     total:
@@ -656,7 +686,7 @@ fun_asr_en_wer:
     - SEEDTTS_FUN_ASR_EN_SAMPLES
   variant: "en"
   test_file_sha256: ec5284531db40dd28f52a5c0a2024f5a4a869792e17e170e4d49c3647e097638
-  last_discovered_at: 2026-07-21T20:02:59Z
+  last_discovered_at: 2026-07-21T20:09:09Z
   expected_samples: 1088
   sample_counts:
     total:
@@ -695,7 +725,7 @@ fun_asr_en_speed:
     - SEEDTTS_FUN_ASR_EN_SAMPLES
   variant: "en"
   test_file_sha256: ec5284531db40dd28f52a5c0a2024f5a4a869792e17e170e4d49c3647e097638
-  last_discovered_at: 2026-07-21T20:02:59Z
+  last_discovered_at: 2026-07-21T20:09:09Z
   expected_samples: 1088
   sample_counts:
     total:
@@ -764,7 +794,7 @@ fun_asr_zh_wer:
     - SEEDTTS_FUN_ASR_ZH_SAMPLES
   variant: "zh"
   test_file_sha256: ec5284531db40dd28f52a5c0a2024f5a4a869792e17e170e4d49c3647e097638
-  last_discovered_at: 2026-07-21T20:02:59Z
+  last_discovered_at: 2026-07-21T20:09:09Z
   expected_samples: 2020
   sample_counts:
     total:

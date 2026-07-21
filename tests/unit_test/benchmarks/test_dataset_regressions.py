@@ -284,6 +284,16 @@ def test_tune_ci_threshold_asr_config_tracks_current_asr_ci_stages() -> None:
         == "GOOGLETIME_CER_PERCENT_REF"
     )
     assert (
+        stages["googletime_diarization"]["metrics"]["n_above_50_pct_cer"]["source"]
+        == "GOOGLETIME_N_ABOVE_50_CER_REF"
+    )
+    assert (
+        stages["googletime_diarization"]["metrics"]["cer_no_spk_below_50_corpus"][
+            "source"
+        ]
+        == "GOOGLETIME_CER_NO_SPK_BELOW_50_PERCENT_REF"
+    )
+    assert (
         stages["googletime_speed"]["metrics"]["throughput_qps"]["source"]
         == "GOOGLETIME_THROUGHPUT_QPS_REF"
     )

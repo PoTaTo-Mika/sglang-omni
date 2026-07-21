@@ -127,6 +127,8 @@ metric_sources:
         paths:
           cer_percent: "diarization_metrics_percent.cer"
           cer_no_spk_percent: "diarization_metrics_percent.cer_no_spk"
+          cer_no_spk_below_50_corpus: "diarization_metrics_percent.cer_no_spk_below_50_corpus"
+          n_above_50_pct_cer: "diarization_metrics_percent.n_above_50_pct_cer"
           cp_cer_percent: "diarization_metrics_percent.cp_cer"
           delta_cer_percent: "diarization_metrics_percent.delta_cer"
           speaker_timestamp_der_percent: "diarization_metrics_percent.speaker_timestamp_der"
