@@ -31,6 +31,7 @@ class FunASRPipelineConfig(PipelineConfig):
                 "enable_pre_lm_encoder": True,
                 "pre_lm_cache_max_entries": 4096,
                 "pre_lm_cache_size_bytes": 2 * 1024**3,
+                "enable_encoder_torch_compile": False,
                 "request_build_max_workers": 8,
                 "request_build_max_pending": 16,
             },
