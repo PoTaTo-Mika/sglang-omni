@@ -12,7 +12,7 @@ tests/
 │   ├── test_qwen3_omni_videoamme_talker_tp2_ci.py
 │   ├── test_tts_ci.py
 │   ├── test_asr_ci_multi_speaker.py
-│   └── test_asr_ci_seedtts.py
+│   └── test_asr_ci_fun_asr.py
 └── unit_test/
     ├── benchmarks/
     │   └── test_dataset_regressions.py
@@ -203,12 +203,13 @@ Relevant model CI ownership:
   reuses the movies800 benchmark path, writes
   `moss_transcribe_diarize_results.json`, and enforces calibrated
   accuracy/speed thresholds generated from `tune-ci-thresholds`.
-- `test_asr_ci_seedtts.py`: Qwen3-ASR correctness + speed via SGLang Omni
-  router (`/v1/audio/transcriptions`). Uses the full 1088-sample English
-  SeedTTS set; writes `qwen3_asr_results.json` for threshold calibration
-  (`asr` in `tune-ci-thresholds`). Its stdout uses the same boxed
-  summary style as the other benchmark stages: `ASR WER Benchmark Result`
-  followed by `ASR Speed Benchmark Result`.
+- `test_asr_ci_fun_asr.py`: Fun-ASR-Nano correctness + speed via SGLang Omni
+  router (`/v1/audio/transcriptions`). Gates the full 1088-sample English and
+  2020-sample Chinese SeedTTS splits. It writes `fun_asr_results.json` and
+  `fun_asr_zh_results.json` for threshold calibration (`asr` in
+  `tune-ci-thresholds`). Its stdout uses the same boxed summary style as the
+  other benchmark stages: `ASR WER Benchmark Result` followed by
+  `ASR Speed Benchmark Result`.
 - `utils.py`: shared fixture/helpers for talker/TTS WER CI —
   stops the upstream model server, runs `delete_gpu_process.sh --kill-orphans`, then launches
   a Qwen3-ASR router. It also owns the WER ASR concurrency constant
