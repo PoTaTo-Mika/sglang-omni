@@ -113,6 +113,5 @@ Supported Models
    developer_reference/config.md
    developer_reference/communication.md
    developer_reference/reference_encode_service.md
-   developer_reference/refactor_net_deletion_tracking.md
    developer_reference/profiler.md
    developer_reference/rl_admin_control.md
