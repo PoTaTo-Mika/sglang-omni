@@ -34,19 +34,14 @@ sgl-omni serve \
 
 ## Synthesizing Speech
 
-### Preset Voice
+### Zero-shot
 
-Voxtral ships preset voices with the checkpoint. Use `cheerful_female` for the
-default preset voice.
+With no voice specified, Voxtral falls back to its default voice (`cheerful_female`).
 
 ```bash
 curl -X POST http://localhost:8000/v1/audio/speech \
   -H "Content-Type: application/json" \
-  -d '{
-    "model": "mistralai/Voxtral-4B-TTS-2603",
-    "voice": "cheerful_female",
-    "input": "SGLang-Omni is a great project!"
-  }' \
+  -d '{"input": "SGLang-Omni is a great project!"}' \
   --output output.wav
 ```
 
@@ -59,9 +54,8 @@ one with the `voice` field:
 curl -X POST http://localhost:8000/v1/audio/speech \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "mistralai/Voxtral-4B-TTS-2603",
-    "voice": "casual_male",
     "input": "Get the trust fund to the bank early.",
+    "voice": "casual_male",
     "max_new_tokens": 4096
   }' \
   --output output.wav
@@ -82,9 +76,8 @@ import requests
 resp = requests.post(
     "http://localhost:8000/v1/audio/speech",
     json={
-        "model": "mistralai/Voxtral-4B-TTS-2603",
-        "voice": "casual_male",
         "input": "Get the trust fund to the bank early.",
+        "voice": "casual_male",
         "max_new_tokens": 4096,
     },
 )
@@ -102,9 +95,8 @@ chunks in real time:
 curl -N -X POST http://localhost:8000/v1/audio/speech \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "mistralai/Voxtral-4B-TTS-2603",
-    "voice": "casual_male",
     "input": "Get the trust fund to the bank early.",
+    "voice": "casual_male",
     "stream": true,
     "response_format": "pcm"
   }' \
@@ -119,9 +111,8 @@ for a full Python raw PCM consumer.
 
 | Parameter | Default | Notes |
 |---|---|---|
-| `model` | served model | Served model identifier |
 | `input` | (required) | Text to synthesize |
-| `voice` | `default` | Preset voice name from the checkpoint's `voice_embedding/` directory |
+| `voice` | `cheerful_female` | Preset voice name from the checkpoint's `voice_embedding/` directory |
 | `max_new_tokens` | `4096` | Maximum number of generated acoustic tokens |
 | `response_format` | `wav` | Output container (`wav`, `mp3`, `flac`, `opus`, `aac`, `pcm`) |
 | `stream` | `false` | Stream raw PCM audio chunks |

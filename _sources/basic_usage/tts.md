@@ -1,6 +1,6 @@
 # TTS Model Usage
 
-This guide uses [Fish Speech S2-Pro](https://huggingface.co/fishaudio/s2-pro) as an example TTS (text-to-speech) model with SGLang-Omni and the OpenAI-compatible API. The same `/v1/audio/speech` endpoint also supports Voxtral TTS, Qwen3-TTS, Ming-Omni-TTS, and MOSS-TTS.
+This guide uses [Fish Speech S2-Pro](https://huggingface.co/fishaudio/s2-pro) as an example TTS (text-to-speech) model with SGLang-Omni and the OpenAI-compatible API. The same `/v1/audio/speech` endpoint also supports Voxtral TTS, Qwen3-TTS, and MOSS-TTS.
 
 ## Prerequisites
 
@@ -25,9 +25,8 @@ uv pip install --no-deps qwen-tts==0.1.1
 | [Fish Speech S2-Pro](../cookbook/fishaudio_s2_pro.md) | `examples/configs/s2pro_tts.yaml` | Supports plain TTS and voice cloning with `references` |
 | [Voxtral TTS](../cookbook/voxtral_tts.md) | `examples/configs/voxtral_tts.yaml` | Uses `input`, `voice`, `response_format`, and `max_new_tokens`. Use `--no-ref-audio` for SeedTTS benchmarking |
 | [Qwen3-TTS Base](../cookbook/qwen3_tts.md) | `examples/configs/qwen3_tts_0_6b.yaml`, `examples/configs/qwen3_tts_1_7b.yaml` | Requires reference audio through `ref_audio` or `references[0].audio_path`. `language` defaults to `auto` |
-| [Qwen3-TTS CustomVoice](../cookbook/qwen3_tts.md) | `examples/configs/qwen3_tts_0_6b_customvoice.yaml` | Text-only requests use the checkpoint speaker table. Set `voice` to the desired checkpoint speaker |
+| [Qwen3-TTS CustomVoice](../cookbook/qwen3_tts.md) | `examples/configs/qwen3_tts_0_6b_customvoice.yaml` | Text-only requests use the checkpoint speaker table. Missing `voice` defaults to `Vivian` |
 | [Qwen3-TTS VoiceDesign](../cookbook/qwen3_tts.md) | `examples/configs/qwen3_tts_1_7b_voicedesign.yaml` | Requires `task_type="VoiceDesign"` and non-empty `instructions`. No reference audio is required |
-| [Ming-Omni-TTS](../cookbook/ming_tts.md) | `examples/configs/ming_omni_tts.yaml` | Text-only synthesis or one local reference clip with its transcript; TP1 is supported and the provided config uses TP2 |
 | [MOSS-TTS](../cookbook/moss_tts.md) | `examples/configs/moss_tts.yaml` | Voice cloning via `ref_audio` or `references[0].audio_path` (+ `text`). Duration via `${token:N}` or `token_count`. Benchmark at `--max-concurrency 8` |
 
 ## Launch the Server
@@ -114,15 +113,6 @@ sgl-omni serve \
   --port 8000
 ```
 
-For Ming-Omni-TTS on two 80 GB GPUs:
-
-```bash
-sgl-omni serve \
-  --model-path inclusionAI/Ming-omni-tts-16.8B-A3B \
-  --config examples/configs/ming_omni_tts.yaml \
-  --port 8000
-```
-
 ## Use Curl
 
 Generate speech from text without any reference audio. This is valid for
@@ -131,11 +121,7 @@ Qwen3-TTS CustomVoice, Voxtral, and S2-Pro. It is not valid for Qwen3-TTS Base.
 ```bash
 curl -X POST http://localhost:8000/v1/audio/speech \
     -H "Content-Type: application/json" \
-    -d '{
-      "model": "fishaudio/s2-pro",
-      "voice": "default",
-      "input": "Hello, how are you?"
-    }' \
+    -d '{"input": "Hello, how are you?"}' \
     --output output.wav
 ```
 
@@ -145,8 +131,6 @@ Qwen3-TTS Base requires reference audio:
 curl -X POST http://localhost:8000/v1/audio/speech \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
-    "voice": "default",
     "input": "Get the trust fund to the bank early.",
     "ref_audio": "https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini/resolve/main/en/prompt-wavs/common_voice_en_10119832.wav",
     "ref_text": "We asked over twenty different people, and they all said it was his."
@@ -160,8 +144,6 @@ Qwen3-TTS VoiceDesign uses text plus voice instructions:
 curl -X POST http://localhost:8000/v1/audio/speech \
     -H "Content-Type: application/json" \
     -d '{
-      "model": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
-      "voice": "default",
       "input": "Hello, how are you?",
       "task_type": "VoiceDesign",
       "instructions": "A warm, natural young adult voice."
@@ -181,8 +163,6 @@ The examples below use a sample clip from [`seed-tts-eval-mini`](https://hugging
 curl -X POST http://localhost:8000/v1/audio/speech \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "fishaudio/s2-pro",
-    "voice": "default",
     "input": "Get the trust fund to the bank early.",
     "references": [{
       "audio_path": "https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini/resolve/main/en/prompt-wavs/common_voice_en_10119832.wav",
@@ -201,8 +181,6 @@ requires both `"stream": true` and `"response_format": "pcm"`:
 curl -N -X POST http://localhost:8000/v1/audio/speech \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "fishaudio/s2-pro",
-    "voice": "default",
     "input": "Get the trust fund to the bank early.",
     "references": [{
       "audio_path": "https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini/resolve/main/en/prompt-wavs/common_voice_en_10119832.wav",
@@ -232,8 +210,6 @@ path.
 curl -X POST http://localhost:8000/v1/audio/speech/batch \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "fishaudio/s2-pro",
-    "voice": "default",
     "response_format": "wav",
     "items": [
       {"input": "First sentence."},
@@ -278,7 +254,6 @@ async def main():
         await ws.send(json.dumps({
             "type": "session.config",
             "session": {
-                "model": "fishaudio/s2-pro",
                 "voice": "default",
                 "response_format": "pcm",
                 "stream_audio": True,
@@ -347,7 +322,6 @@ Use the uploaded voice by name:
 curl -X POST http://localhost:8000/v1/audio/speech \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "fishaudio/s2-pro",
     "input": "The uploaded voice can now be reused without resending audio.",
     "voice": "narrator",
     "response_format": "wav"
@@ -378,11 +352,7 @@ import requests
 
 resp = requests.post(
     "http://localhost:8000/v1/audio/speech",
-    json={
-        "model": "fishaudio/s2-pro",
-        "voice": "default",
-        "input": "Hello, how are you?",
-    },
+    json={"input": "Hello, how are you?"},
 )
 resp.raise_for_status()
 with open("output.wav", "wb") as f:
@@ -427,8 +397,6 @@ import requests
 resp = requests.post(
     "http://localhost:8000/v1/audio/speech",
     json={
-        "model": "fishaudio/s2-pro",
-        "voice": "default",
         "input": SPEECH_INPUT,
         "references": [{"audio_path": REFERENCE_AUDIO, "text": REFERENCE_TEXT}],
     },
@@ -446,8 +414,6 @@ import wave
 import requests
 
 payload = {
-    "model": "fishaudio/s2-pro",
-    "voice": "default",
     "input": SPEECH_INPUT,
     "references": [{"audio_path": REFERENCE_AUDIO, "text": REFERENCE_TEXT}],
     "stream": True,
@@ -480,7 +446,6 @@ The table below lists all parameters accepted by the `/v1/audio/speech` endpoint
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `model` | string | served model | Served model identifier |
 | `input` | string | (required) | Text to synthesize |
 | `voice` | string | `"default"` | Preset or uploaded voice identifier |
 | `response_format` | string | `"wav"` | Output audio format: `wav`, `mp3`, `flac`, `pcm`, `aac`, or `opus` |

@@ -8,7 +8,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
-    <title>Architecture &#8212; SGLang</title>
+    <title>Audar-TTS 重构前后接入 LOC 对比 &#8212; SGLang</title>
   
   
   
@@ -49,15 +49,13 @@
     <script src="../_static/copybutton.js?v=ccdb6887"></script>
     <script src="../_static/scripts/sphinx-book-theme.js?v=fab101a9"></script>
     <script crossorigin="anonymous" integrity="sha256-Ae2Vz/4ePdIu6ZyI/5ZGsYnb+m0JlOmKPjt6XZ9JJkA=" src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.4/require.min.js"></script>
-    <script>DOCUMENTATION_OPTIONS.pagename = 'developer_reference/main';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'developer_reference/audar_tts_refactor_loc_comparison';</script>
     <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
     <script src="../_static/js/qwen3_omni_server_generator.js?v=621ec60e"></script>
     <script src="../_static/js/ming_omni_server_generator.js?v=694b1473"></script>
     <link rel="icon" href="../_static/logo.ico"/>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="API Server Design" href="apiserver_design.html" />
-    <link rel="prev" title="Benchmark Relay" href="../benchmarks/relay.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.1.0" />
@@ -160,6 +158,8 @@
       
       
       
+        
+      
       <dialog id="pst-primary-sidebar-modal"></dialog>
       <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
         
@@ -233,8 +233,8 @@
 <li class="toctree-l1"><a class="reference internal" href="../benchmarks/relay.html">Benchmark Relay</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Reference</span></p>
-<ul class="current nav bd-sidenav">
-<li class="toctree-l1 current active"><a class="current reference internal" href="#">Architecture</a></li>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="main.html">Architecture</a></li>
 <li class="toctree-l1"><a class="reference internal" href="apiserver_design.html">API Server Design</a></li>
 <li class="toctree-l1"><a class="reference internal" href="pipeline.html">Pipeline Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="config.html">Config</a></li>
@@ -319,7 +319,7 @@
       
       
       
-      <li><a href="https://github.com/sgl-project/sglang-omni/blob/main/docs/developer_reference/main.md?plain=1" target="_blank"
+      <li><a href="https://github.com/sgl-project/sglang-omni/blob/main/docs/developer_reference/audar_tts_refactor_loc_comparison.md?plain=1" target="_blank"
    class="btn btn-sm btn-source-file-button dropdown-item"
    title="Show source"
    data-bs-placement="left" data-bs-toggle="tooltip"
@@ -336,7 +336,7 @@
       
       
       
-      <li><a href="https://github.com/sgl-project/sglang-omni/edit/main/docs/developer_reference/main.md" target="_blank"
+      <li><a href="https://github.com/sgl-project/sglang-omni/edit/main/docs/developer_reference/audar_tts_refactor_loc_comparison.md" target="_blank"
    class="btn btn-sm btn-source-edit-button dropdown-item"
    title="Suggest edit"
    data-bs-placement="left" data-bs-toggle="tooltip"
@@ -353,7 +353,7 @@
       
       
       
-      <li><a href="https://github.com/sgl-project/sglang-omni/issues/new?title=Issue%20on%20page%20%2Fdeveloper_reference/main.html&body=Your%20issue%20content%20here." target="_blank"
+      <li><a href="https://github.com/sgl-project/sglang-omni/issues/new?title=Issue%20on%20page%20%2Fdeveloper_reference/audar_tts_refactor_loc_comparison.html&body=Your%20issue%20content%20here." target="_blank"
    class="btn btn-sm btn-source-issues-button dropdown-item"
    title="Open an issue"
    data-bs-placement="left" data-bs-toggle="tooltip"
@@ -383,7 +383,7 @@
       
       
       
-      <li><a href="../_sources/developer_reference/main.md" target="_blank"
+      <li><a href="../_sources/developer_reference/audar_tts_refactor_loc_comparison.md" target="_blank"
    class="btn btn-sm btn-download-source-button dropdown-item"
    title="Download source file"
    data-bs-placement="left" data-bs-toggle="tooltip"
@@ -466,7 +466,7 @@
               
 
 <div id="jb-print-docs-body" class="onlyprint">
-    <h1>Architecture</h1>
+    <h1>Audar-TTS 重构前后接入 LOC 对比</h1>
     <!-- Table of contents -->
     <div id="print-main-content">
         <div id="jb-print-toc">
@@ -476,9 +476,13 @@
             </div>
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#system-overview">System Overview</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#directory-layout">Directory Layout</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#model-directory-convention">Model Directory Convention</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#id1">结论</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#id2">固定快照</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#id3">能力口径</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#loc">LOC 来源</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#id4">复现统计</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#k">3k 行说法的边界</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#source-of-truth">Source of Truth</a></li>
 </ul>
             </nav>
         </div>
@@ -490,87 +494,266 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section class="tex2jax_ignore mathjax_ignore" id="architecture">
-<h1>Architecture<a class="headerlink" href="#architecture" title="Link to this heading">#</a></h1>
-<p>SGLang-Omni is the multi-stage runtime for omni models: models that accept
-mixed text, image, audio, and video inputs and may emit text, audio, or other
-modalities.</p>
-<section id="system-overview">
-<h2>System Overview<a class="headerlink" href="#system-overview" title="Link to this heading">#</a></h2>
-<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>HTTP API -&gt; Client -&gt; Coordinator -&gt; Stage -&gt; Scheduler -&gt; ModelRunner -&gt; model forward
-</pre></div>
-</div>
+  <section class="tex2jax_ignore mathjax_ignore" id="audar-tts-loc">
+<h1>Audar-TTS 重构前后接入 LOC 对比<a class="headerlink" href="#audar-tts-loc" title="Link to this heading">#</a></h1>
+<p>本记录用同一个 <code class="docutils literal notranslate"><span class="pre">llama.cpp</span> <span class="pre">+</span> <span class="pre">NeuCodec</span></code> 后端，分别构造 T1 前与最新
+<code class="docutils literal notranslate"><span class="pre">main</span></code> 的最小接入和生产增强接入。目标是回答两个不同问题：</p>
+<ol class="arabic simple">
+<li><p>只把模型正确接进 <code class="docutils literal notranslate"><span class="pre">/v1/audio/speech</span></code>，重构能省多少代码？</p></li>
+<li><p>补齐 reference cache、并发请求管理、single-flight、失败传播和文件重校验后，
+重构能省多少代码？</p></li>
+</ol>
+<section id="id1">
+<h2>结论<a class="headerlink" href="#id1" title="Link to this heading">#</a></h2>
+<p>主口径排除所有测试文件和 Markdown/RST 文档，只统计接入所需代码与配置。</p>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
-<tr class="row-odd"><th class="head"><p>Layer</p></th>
-<th class="head"><p>Duty</p></th>
+<tr class="row-odd"><th class="head"><p>能力层级</p></th>
+<th class="head text-right"><p>T1 前</p></th>
+<th class="head text-right"><p>最新 main</p></th>
+<th class="head text-right"><p>节省</p></th>
+<th class="head text-right"><p>降幅</p></th>
 </tr>
 </thead>
 <tbody>
-<tr class="row-even"><td><p><a class="reference internal" href="apiserver_design.html"><span class="std std-doc">HTTP API</span></a></p></td>
-<td><p>OpenAI-compatible request and response schemas, SSE framing, HTTP errors</p></td>
+<tr class="row-even"><td><p>最小接入</p></td>
+<td class="text-right"><p>575</p></td>
+<td class="text-right"><p>543</p></td>
+<td class="text-right"><p>32</p></td>
+<td class="text-right"><p>5.6%</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="apiserver_design.html"><span class="std std-doc">Client</span></a></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">GenerateRequest</span></code> to <code class="docutils literal notranslate"><span class="pre">OmniRequest</span></code>, result aggregation, audio encoding</p></td>
+<tr class="row-odd"><td><p>生产增强接入</p></td>
+<td class="text-right"><p>797</p></td>
+<td class="text-right"><p>633</p></td>
+<td class="text-right"><p>164</p></td>
+<td class="text-right"><p>20.6%</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="pipeline.html"><span class="std std-doc">Coordinator</span></a></p></td>
-<td><p>Request lifecycle, entry-stage submission, terminal result collection, abort broadcast</p></td>
-</tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="pipeline.html"><span class="std std-doc">Stage</span></a></p></td>
-<td><p>Control-plane IO, relay IO, fan-in, stream routing, scheduler inbox/outbox bridging</p></td>
-</tr>
-<tr class="row-even"><td><p><a class="reference internal" href="pipeline.html"><span class="std std-doc">Scheduler</span></a></p></td>
-<td><p>Per-stage execution loop and failure propagation to stage outbox</p></td>
-</tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="pipeline.html"><span class="std std-doc">ModelRunner</span></a></p></td>
-<td><p>AR forward preparation, model forward dispatch, output extraction</p></td>
-</tr>
-<tr class="row-even"><td><p><a class="reference internal" href="communication.html"><span class="std std-doc">Communication</span></a></p></td>
-<td><p>Control-plane messages and relay data transfer between stages</p></td>
-</tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="tts_model_integration.html"><span class="std std-doc">TTS Integration</span></a></p></td>
-<td><p>Checklist and lifecycle rules for adding TTS model families</p></td>
-</tr>
-<tr class="row-even"><td><p><a class="reference internal" href="refactor_net_deletion_tracking.html"><span class="std std-doc">Refactor Net Deletion Tracking</span></a></p></td>
-<td><p>Non-test line deletion tracking for refactor PRs</p></td>
+<tr class="row-even"><td><p>从最小到生产的额外成本</p></td>
+<td class="text-right"><p>222</p></td>
+<td class="text-right"><p>90</p></td>
+<td class="text-right"><p>132</p></td>
+<td class="text-right"><p>59.5%</p></td>
 </tr>
 </tbody>
 </table>
 </div>
-<p>Refer to the layer-specific document for specific design details.</p>
+<p>只排除测试、但包含模型 README 的仓库变更口径如下：</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>能力层级</p></th>
+<th class="head text-right"><p>T1 前</p></th>
+<th class="head text-right"><p>最新 main</p></th>
+<th class="head text-right"><p>节省</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>最小接入</p></td>
+<td class="text-right"><p>609</p></td>
+<td class="text-right"><p>577</p></td>
+<td class="text-right"><p>32</p></td>
+</tr>
+<tr class="row-odd"><td><p>生产增强接入</p></td>
+<td class="text-right"><p>833</p></td>
+<td class="text-right"><p>669</p></td>
+<td class="text-right"><p>164</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>这解释了为什么第一次只做简单接入时几乎看不到收益：最小接入没有使用
+<code class="docutils literal notranslate"><span class="pre">ReferenceEncodeService</span></code>，主要只得到声明式状态的收益。当生产增强能力一致时，
+共享架构把新增能力的成本从 222 行降到 90 行。</p>
 </section>
-<section id="directory-layout">
-<h2>Directory Layout<a class="headerlink" href="#directory-layout" title="Link to this heading">#</a></h2>
-<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>sglang_omni/
-|-- pipeline/       # Inter-stage orchestration, stages, coordinator, processes
-|-- scheduling/     # Scheduler loops and inbox/outbox message types
-|-- model_runner/   # Shared model runner abstractions for AR stages
-|-- models/         # Model-specific configs, stages, request builders, modules
-|-- config/         # PipelineConfig, StageConfig, config manager, topology
-|-- relay/          # Data transfer backends
-|-- serve/          # HTTP server and OpenAI-compatible API adapter
-|-- client/         # Internal client used by API adapters
-`-- proto/          # Request, payload, stage, and control-plane message types
+<section id="id2">
+<h2>固定快照<a class="headerlink" href="#id2" title="Link to this heading">#</a></h2>
+<p>T1 前基线是 PR #807 squash commit <code class="docutils literal notranslate"><span class="pre">4e4c98a5</span></code> 的唯一父提交：</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>角色</p></th>
+<th class="head"><p>分支</p></th>
+<th class="head"><p>固定提交</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>T1 前基线</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">main</span></code> snapshot</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">efad7215aaaf054d3597a4678e29e3370231b45a</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>最新基线</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">main</span></code> snapshot</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">98b634332517ad2c9a88ff7f96880aae251a375c</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>T1 前最小接入</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">luojiaxuan/audar-tts-pre-t1-minimal</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">0f75f44c65d336031ba9fdc7b3b74ca621618459</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>T1 前生产增强</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">luojiaxuan/audar-tts-pre-t1-production</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ec25335e9815ef53daa9c60239a1859804282270</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>最新最小接入</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">luojiaxuan/audar-tts-latest-minimal</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">2bf6e2cbdfbb4c006df44aa6e54d96421ad0e849</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>最新生产增强</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">luojiaxuan/audar-tts-latest-production</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">49cde765101bf3c4501dc1838f47ec23dbbf225b</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>最新基线固定于 2026-07-18，当时 <code class="docutils literal notranslate"><span class="pre">main</span></code> 顶部是 PR #1070。四个实验分支都从
+各自基线直接分出，不把共享架构本身的历史 LOC 算进新模型接入成本。</p>
+</section>
+<section id="id3">
+<h2>能力口径<a class="headerlink" href="#id3" title="Link to this heading">#</a></h2>
+<p>最小接入包含：</p>
+<ul class="simple">
+<li><p>Audar 请求校验、Arabic/English 文本和一组 5-15 秒 reference + transcript。</p></li>
+<li><p>官方 prompt/speech-token 协议、采样参数和 seed。</p></li>
+<li><p>GGUF 下载及 <code class="docutils literal notranslate"><span class="pre">llama-cpp-python</span></code> 推理。</p></li>
+<li><p>NeuCodec reference encode 和 24 kHz waveform decode。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">/v1/audio/speech</span></code> 输出和 usage 字段。</p></li>
+</ul>
+<p>生产增强接入在此基础上增加：</p>
+<ul class="simple">
+<li><p>按 item 数和 byte 数限制的 reference LRU cache。</p></li>
+<li><p>包含 model、revision、encoder、config 和 input 的复合 cache key。</p></li>
+<li><p>同 reference 并发请求 single-flight，含 follower 失败传播和超时。</p></li>
+<li><p>不同 reference 请求可并发排队；共享 NeuCodec forward 由模型级锁串行保护。</p></li>
+<li><p>reference path 编码后的内容重校验，避免文件中途变化后写入旧 key。</p></li>
+<li><p>cache hit/miss/merged/failure/eviction 统计与周期日志。</p></li>
+<li><p>vocoder 无 batch wait；NeuCodec 当前接口没有实现张量级 batch decode。</p></li>
+</ul>
+<p>两边的生产增强行为相同。T1 前版本在 Audar 模型目录内实现上述 reference
+service；最新版本复用 <code class="docutils literal notranslate"><span class="pre">ReferenceEncodeService</span></code>、声明式 pipeline state 和
+usage helper。</p>
+</section>
+<section id="loc">
+<h2>LOC 来源<a class="headerlink" href="#loc" title="Link to this heading">#</a></h2>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>文件</p></th>
+<th class="head text-right"><p>T1 前最小</p></th>
+<th class="head text-right"><p>最新最小</p></th>
+<th class="head text-right"><p>T1 前生产</p></th>
+<th class="head text-right"><p>最新生产</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">payload_types.py</span></code></p></td>
+<td class="text-right"><p>64</p></td>
+<td class="text-right"><p>20</p></td>
+<td class="text-right"><p>64</p></td>
+<td class="text-right"><p>20</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">stages.py</span></code></p></td>
+<td class="text-right"><p>272</p></td>
+<td class="text-right"><p>271</p></td>
+<td class="text-right"><p>494</p></td>
+<td class="text-right"><p>361</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">__init__.py</span></code></p></td>
+<td class="text-right"><p>2</p></td>
+<td class="text-right"><p>14</p></td>
+<td class="text-right"><p>2</p></td>
+<td class="text-right"><p>14</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">config.py</span></code></p></td>
+<td class="text-right"><p>60</p></td>
+<td class="text-right"><p>61</p></td>
+<td class="text-right"><p>60</p></td>
+<td class="text-right"><p>61</p></td>
+</tr>
+<tr class="row-even"><td><p>其余代码/配置</p></td>
+<td class="text-right"><p>177</p></td>
+<td class="text-right"><p>177</p></td>
+<td class="text-right"><p>177</p></td>
+<td class="text-right"><p>177</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>合计</strong></p></td>
+<td class="text-right"><p><strong>575</strong></p></td>
+<td class="text-right"><p><strong>543</strong></p></td>
+<td class="text-right"><p><strong>797</strong></p></td>
+<td class="text-right"><p><strong>633</strong></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>声明式 state 直接省 44 行；生产版本的共享 reference 层再省 133 行。
+最新架构新增 capability 声明和配置元数据 13 行，因此最终净节省 164 行。</p>
+</section>
+<section id="id4">
+<h2>复现统计<a class="headerlink" href="#id4" title="Link to this heading">#</a></h2>
+<p>使用仓库现有统计脚本，并通过 Git pathspec 排除文档：</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python3<span class="w"> </span>scripts/refactor_net_deletions.py<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--base<span class="w"> </span>&lt;baseline-sha&gt;<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--head<span class="w"> </span>&lt;integration-sha&gt;<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--mode<span class="w"> </span>direct<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--path<span class="w"> </span><span class="s1">&#39;:(exclude)**/*.md&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--path<span class="w"> </span><span class="s1">&#39;:(exclude)**/*.rst&#39;</span>
 </pre></div>
 </div>
-</section>
-<section id="model-directory-convention">
-<h2>Model Directory Convention<a class="headerlink" href="#model-directory-convention" title="Link to this heading">#</a></h2>
-<p>Model-specific code should stay under <code class="docutils literal notranslate"><span class="pre">sglang_omni/models/&lt;model&gt;/</span></code>.</p>
-<p>Recommended layout:</p>
-<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>models/&lt;model&gt;/
-|-- config.py             # PipelineConfig subclass and StageConfig list
-|-- stages.py             # stage factories
-|-- routing.py            # optional data-driven routing helpers
-|-- request_builders.py   # inter-stage payload transforms
-|-- payload_types.py      # typed model-specific payload state
-|-- callbacks.py          # feedback callbacks or strategy, when needed
-`-- components/           # model modules, processors, vocoders, adapters
-</pre></div>
+<p><code class="docutils literal notranslate"><span class="pre">scripts/refactor_net_deletions.py</span></code> 会另外识别并排除 <code class="docutils literal notranslate"><span class="pre">tests/</span></code>、<code class="docutils literal notranslate"><span class="pre">test/</span></code>、
+<code class="docutils literal notranslate"><span class="pre">unit_test/</span></code>、<code class="docutils literal notranslate"><span class="pre">integration_test/</span></code>、<code class="docutils literal notranslate"><span class="pre">test_*.py</span></code>、<code class="docutils literal notranslate"><span class="pre">*_test.py</span></code>、<code class="docutils literal notranslate"><span class="pre">conftest.py</span></code>
+等测试路径。去掉两个文档 pathspec 即可复现“只排除测试”的第二口径。</p>
+<p>验证结果：</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>分支</p></th>
+<th class="head"><p>命令范围</p></th>
+<th class="head text-right"><p>结果</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>T1 前最小</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">tests/unit_test/audar_tts</span></code></p></td>
+<td class="text-right"><p>8 passed</p></td>
+</tr>
+<tr class="row-odd"><td><p>T1 前生产</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">tests/unit_test/audar_tts</span></code></p></td>
+<td class="text-right"><p>14 passed</p></td>
+</tr>
+<tr class="row-even"><td><p>最新最小</p></td>
+<td><p>Audar + pipeline-state + capabilities</p></td>
+<td class="text-right"><p>55 passed</p></td>
+</tr>
+<tr class="row-odd"><td><p>最新生产</p></td>
+<td><p>Audar + pipeline-state + capabilities</p></td>
+<td class="text-right"><p>65 passed</p></td>
+</tr>
+</tbody>
+</table>
 </div>
-<p>Only model-local behavior belongs here. The framework-owned layers are still
-<code class="docutils literal notranslate"><span class="pre">Stage</span></code>, <code class="docutils literal notranslate"><span class="pre">Coordinator</span></code>, schedulers, model-runner bases, relay, runtime prep, and
-runners.</p>
+<p>四个分支的 Audar 文件均通过 <code class="docutils literal notranslate"><span class="pre">ruff</span> <span class="pre">format</span> <span class="pre">--check</span></code> 和 <code class="docutils literal notranslate"><span class="pre">ruff</span> <span class="pre">check</span></code>。</p>
+</section>
+<section id="k">
+<h2>3k 行说法的边界<a class="headerlink" href="#k" title="Link to this heading">#</a></h2>
+<p><a class="reference external" href="https://huggingface.co/audarai/Audar-TTS-V1-Turbo">Audar-TTS-V1-Turbo</a>
+只发布 GGUF，官方示例也是 <code class="docutils literal notranslate"><span class="pre">llama.cpp</span></code>；本实验因此把 1.64B Qwen2 backbone
+和 NeuCodec 实现留在 <code class="docutils literal notranslate"><span class="pre">llama-cpp-python</span></code>/<code class="docutils literal notranslate"><span class="pre">neucodec</span></code> 依赖中，不 vendoring、也不
+计入 SGLang-Omni 接入 LOC。</p>
+<p>截至 2026-07-18，Sandy 的公开 fork、上游 PR 和远端分支中没有可核验的
+Audar 3k 行实现。因此不能把这里的 633 行直接解释成“同一份 3k 实现被重构
+压到 633 行”。如果 3k 包含原生 PyTorch/SGLang model、GGUF weight loader、
+model runner 或 continuous batching，它属于不同 backend 和能力口径，必须拿到
+分支后按同一 manifest 重新比较。</p>
+<p>当前“生产增强”仍使用单个 <code class="docutils literal notranslate"><span class="pre">llama_cpp.Llama</span></code> 和串行 AR <code class="docutils literal notranslate"><span class="pre">SimpleScheduler</span></code>。
+它补齐的是 reference/vocoder 侧的生产能力，不包含 SGLang 原生 AR continuous
+batching、TP 或 streaming。这个限制在重构前后完全相同，所以 LOC 对比公平，
+但不能用来证明原生 SGLang 接入只需 633 行。</p>
+</section>
+<section id="source-of-truth">
+<h2>Source of Truth<a class="headerlink" href="#source-of-truth" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p>代码与轻量结果：上述四个 Git 分支和本文件。</p></li>
+<li><p>模型：<a class="reference external" href="https://huggingface.co/audarai/Audar-TTS-V1-Turbo"><code class="docutils literal notranslate"><span class="pre">audarai/Audar-TTS-V1-Turbo</span></code></a>，官方 Hugging Face 仓库。</p></li>
+<li><p>轻量 benchmark 汇总在 latest production 分支的
+<code class="docutils literal notranslate"><span class="pre">benchmarks/audar_tts/RESULTS.md</span></code> 和 <code class="docutils literal notranslate"><span class="pre">comparison.json</span></code>。</p></li>
+<li><p>28 次请求的原始输出暂存于 H100
+<code class="docutils literal notranslate"><span class="pre">/data/jaxan/audar-results-production-equal-final</span></code>。计划上传到正确 owner 的
+Hugging Face dataset repo；当前缺少对应 credential，状态为 pending。</p></li>
+</ul>
 </section>
 </section>
 
@@ -585,24 +768,6 @@ runners.</p>
                 <footer class="prev-next-footer d-print-none">
                   
 <div class="prev-next-area">
-    <a class="left-prev"
-       href="../benchmarks/relay.html"
-       title="previous page">
-      <i class="fa-solid fa-angle-left"></i>
-      <div class="prev-next-info">
-        <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">Benchmark Relay</p>
-      </div>
-    </a>
-    <a class="right-next"
-       href="apiserver_design.html"
-       title="next page">
-      <div class="prev-next-info">
-        <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">API Server Design</p>
-      </div>
-      <i class="fa-solid fa-angle-right"></i>
-    </a>
 </div>
                 </footer>
               
@@ -621,9 +786,13 @@ runners.</p>
   </div>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#system-overview">System Overview</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#directory-layout">Directory Layout</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#model-directory-convention">Model Directory Convention</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#id1">结论</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#id2">固定快照</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#id3">能力口径</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#loc">LOC 来源</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#id4">复现统计</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#k">3k 行说法的边界</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#source-of-truth">Source of Truth</a></li>
 </ul>
   </nav></div>
 

@@ -651,10 +651,10 @@
                                 class="box-sched"
                             />
                             <text x="445" y="375" class="label-title">
-                                OmniScheduler
+                                FishScheduler
                             </text>
                             <text x="445" y="391" class="label-sub">
-                                shared AR scheduler
+                                S2 Pro-specific (Omni-family)
                             </text>
                             <text x="445" y="410" class="label-tiny">
                                 Reuses SGLang core: KV cache, batch,
