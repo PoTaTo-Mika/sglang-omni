@@ -12,7 +12,7 @@ tests/
 │   ├── test_qwen3_omni_videoamme_talker_tp2_ci.py
 │   ├── test_tts_ci.py
 │   ├── test_asr_ci_multi_speaker.py
-│   └── test_asr_ci_seedtts.py
+│   └── test_asr_ci_fun_asr.py
 └── unit_test/
     ├── benchmarks/
     │   └── test_dataset_regressions.py
@@ -30,6 +30,8 @@ tests/
     │   └── test_audio.py
     ├── pipeline/
     │   ├── helpers.py
+    │   ├── test_comm_engine_ack.py
+    │   ├── test_comm_router.py
     │   ├── test_compile.py
     │   ├── test_coordinator.py
     │   ├── test_gpu_memory.py
@@ -42,6 +44,9 @@ tests/
     │   ├── test_stage.py
     │   ├── test_stage_process_env.py
     │   └── test_stage_streaming.py
+    ├── relay/
+    │   ├── test_cuda_ipc_relay.py
+    │   └── test_shm_relay.py
     ├── models/
     │   └── test_model_capabilities.py
     ├── qwen3_omni/
@@ -69,7 +74,16 @@ tests/
     │   ├── test_tokenizer.py
     │   ├── test_tp.py
     │   └── test_vision_patch_embed_linear.py
+    ├── ming_tts/
+    │   ├── test_audio_decode.py
+    │   ├── test_engine_io.py
+    │   ├── test_model_runner.py
+    │   ├── test_reference_encode.py
+    │   └── test_request_builders.py
     ├── qwen3_asr/
+    │   ├── test_pipeline.py
+    │   └── test_request_builders.py
+    ├── fun_asr/
     │   ├── test_pipeline.py
     │   └── test_request_builders.py
     ├── moss_transcribe_diarize/
@@ -110,6 +124,7 @@ tests/
     │   ├── test_engine_factory.py
     │   ├── test_pipeline_state.py
     │   ├── test_reference_encoder.py
+    │   ├── test_stage_cache.py
     │   └── test_streaming_vocoder.py
     ├── fishaudio_s2_pro/
     │   ├── test_pipeline.py
@@ -188,12 +203,13 @@ Relevant model CI ownership:
   reuses the movies800 benchmark path, writes
   `moss_transcribe_diarize_results.json`, and enforces calibrated
   accuracy/speed thresholds generated from `tune-ci-thresholds`.
-- `test_asr_ci_seedtts.py`: Qwen3-ASR correctness + speed via SGLang Omni
-  router (`/v1/audio/transcriptions`). Uses the full 1088-sample English
-  SeedTTS set; writes `qwen3_asr_results.json` for threshold calibration
-  (`asr` in `tune-ci-thresholds`). Its stdout uses the same boxed
-  summary style as the other benchmark stages: `ASR WER Benchmark Result`
-  followed by `ASR Speed Benchmark Result`.
+- `test_asr_ci_fun_asr.py`: Fun-ASR-Nano correctness + speed via SGLang Omni
+  router (`/v1/audio/transcriptions`). Gates the full 1088-sample English and
+  2020-sample Chinese SeedTTS splits. It writes `fun_asr_results.json` and
+  `fun_asr_zh_results.json` for threshold calibration (`asr` in
+  `tune-ci-thresholds`). Its stdout uses the same boxed summary style as the
+  other benchmark stages: `ASR WER Benchmark Result` followed by
+  `ASR Speed Benchmark Result`.
 - `utils.py`: shared fixture/helpers for talker/TTS WER CI —
   stops the upstream model server, runs `delete_gpu_process.sh --kill-orphans`, then launches
   a Qwen3-ASR router. It also owns the WER ASR concurrency constant
@@ -283,6 +299,8 @@ that happened to contain an older version of the test.
   - runtime schema/adapter behavior
   - coordinator behavior
   - stage routing
+  - centralized comm router selection, data-reference serialization, ack
+    lifecycle, and sender backpressure release
   - local-object fan-out selector contracts, including negative coverage for
     shared mutable payload containers while preserving tensor leaf sharing
   - stage process environment
@@ -296,6 +314,13 @@ that happened to contain an older version of the test.
   - scheduler concurrency
   - scheduler callable contracts, including sync wrappers and callable objects
     that return awaitables.
+- `unit_test/relay/`: Low-level data-plane relay tests:
+  - shared-memory relay byte movement, cleanup, and handle lifecycle on CPU
+  - CUDA-IPC relay metadata/open/close behavior for GPU tensor handoff; CUDA
+    tests require CUDA and multi-GPU coverage is hardware-gated
+  - these tests prove transport mechanics, not full pipeline throughput,
+    NVLink selection, or production backpressure behavior; keep those covered
+    in `unit_test/pipeline/` integration tests and GPU benchmarks.
 - `unit_test/benchmarks/`: Benchmark dataset/loading regression tests.
 - `unit_test/test_tune_ci_thresholds.py`: Unit tests for
   `.claude/skills/tune-ci-thresholds/tune.py` calibration tooling — sample-scope
@@ -317,12 +342,21 @@ that happened to contain an older version of the test.
 - `unit_test/scheduling/`: Shared scheduling-service unit tests:
   - `ReferenceEncodeService` cache, same-key single-flight, timeout, failure,
     and revalidation semantics.
+  - `StageOutputCache` thread safety: concurrent get/put byte-accounting,
+    the `remove_if` eviction predicate evaluated outside the lock (re-entrant
+    and deadlock-free), and concurrent remove_if/put state integrity.
 - `unit_test/qwen3_asr/`: Qwen3-ASR unit tests:
   - pipeline config and stage factory concurrency defaults
   - single-source audio token length formula used by both processor and
     request builder paths
   - token-level result adapter marker handling, avoiding decode/encode
     text round-trips for byte-level BPE output.
+- `unit_test/fun_asr/`: Fun-ASR-Nano unit tests:
+  - pipeline config and stage factory: single `asr` stage, `max_running_requests=32`,
+    auto static KV budget, disabled multimodal embedding cache and torch.compile,
+    and `FunAsrNanoForConditionalGeneration` registry wiring
+  - request builder: inclusive audio offset recording, language-prompt prefix
+    construction, and result adapter direct-transcript decoding.
 - `unit_test/moss_transcribe_diarize/`: MOSS-Transcribe-Diarize unit tests:
   - pipeline config and stage factory default routing/memory contracts
   - request builder audio-source resolution, single-audio enforcement, audio
@@ -379,6 +413,16 @@ that happened to contain an older version of the test.
     talker, terminal talker-stream stage, thinker/talker GPU-range collision
     rejection, streaming variant exposure).
 
+- `unit_test/ming_tts/`: Ming-TTS unit tests:
+  - request builder rejection for unsupported seed inputs until the FlowLoss RNG
+    contract is exposed
+  - request/result adapter finish semantics for empty latent output, stop-head
+    finish, SGLang length finish, max-step length finish, and terminal cleanup
+  - TP tail-failure propagation and idempotent abort cleanup without loading a
+    model checkpoint
+  - reference-audio content-cache identity and invalidation
+  - audio decode behavior for zero generated latents without invoking AudioVAE.
+
 - `unit_test/qwen3_tts/`: Qwen3-TTS unit tests:
   - pipeline config and registry contracts
   - OmniScheduler-backed AR stage factory wiring
@@ -429,7 +473,7 @@ that happened to contain an older version of the test.
   - streaming response framing and failure semantics.
 
 - `unit_test/fishaudio_s2_pro/`: FishAudio S2-Pro unit tests:
-  - tokenizer/state contracts
+  - inference prompt segmentation, reference VQ edge cases, and state contracts
   - TTS scheduler behavior
   - model-runner state transitions
   - vocoder batching/trim behavior

@@ -24,6 +24,8 @@ def _fake_data(*, return_logprob, return_omni_rollout=True, t_raw=6):
     action_mask = delay_pattern_codec_content_mask(delayed)
     action_mask[t_raw, 0] = True
     return SimpleNamespace(
+        output_code_buffer=None,
+        output_code_count=0,
         output_codes=list(delayed.unbind(0)),
         output_action_masks=list(action_mask.unbind(0)),
         output_logprobs=list(torch.randn(*delayed.shape).unbind(0)),
