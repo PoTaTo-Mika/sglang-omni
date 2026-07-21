@@ -555,15 +555,7 @@ def assert_cer_partitioned(
     min_n_above_50_cer: int | None = None,
     collector: MetricCheckCollector | None = None,
 ) -> None:
-    """Verify partitioned CER metrics from transcribe-diarize eval output.
-
-    max_cer_no_spk_below_50_percent bounds corpus-level CER computed only
-    over samples whose per-sample CER is at most 50% (percent units, e.g. 6.75).
-
-    min_n_above_50_cer / max_n_above_50_cer bound the count of samples with
-    per-sample CER above 50% (catastrophic outliers such as runaway decoding
-    loops or wrong-language transcripts).
-    """
+    """Verify partitioned CER metrics from transcribe-diarize eval output."""
     checks = _metric_collector(collector, "partitioned CER")
     if max_cer_no_spk_below_50_percent is not None:
         cer_below_50 = diarization_metrics_percent.get("cer_no_spk_below_50_corpus")
