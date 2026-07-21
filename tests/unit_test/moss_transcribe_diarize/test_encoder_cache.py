@@ -9,6 +9,9 @@ import torch
 pytest.importorskip("sglang")
 
 from sglang_omni.models.moss_transcribe_diarize import sglang_model  # noqa: E402
+from sglang_omni.models.moss_transcribe_diarize.encoder_service import (  # noqa: E402
+    BatchedAudioEncoderService,
+)
 
 _ENCODER_CACHE_MAX_ENTRIES = sglang_model._ENCODER_CACHE_MAX_ENTRIES
 MossModel = sglang_model.MossTranscribeDiarizeForConditionalGeneration
@@ -107,3 +110,16 @@ def test_hit_returns_model_device_tensors() -> None:
     cached = model.get_audio_feature([_item(42)], forward_batch=None)
 
     assert cached.device == expected_device
+
+
+def test_pre_lm_encoder_close_stops_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "Stream", lambda **_kwargs: object())
+    model = SimpleNamespace(whisper_encoder=torch.nn.Linear(2, 2))
+    service = BatchedAudioEncoderService(model)
+
+    service.close()
+    service.close()
+
+    assert not service._thread.is_alive()

@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 _CACHE_MAX_ENTRIES = 4096
 _CACHE_MAX_BYTES = 2 * 1024**3
+_SHUTDOWN = object()
 
 
 class BatchedAudioEncoderService:
@@ -35,13 +36,30 @@ class BatchedAudioEncoderService:
             max_bytes=_CACHE_MAX_BYTES,
             cache_device="cpu",
         )
-        self._queue: queue.Queue[tuple[Any, concurrent.futures.Future]] = queue.Queue()
+        self._queue: queue.Queue[Any] = queue.Queue()
+        self._lifecycle_lock = threading.Lock()
+        self._closed = False
         self._batch_count = 0
         self._item_count = 0
         self._thread = threading.Thread(
             target=self._worker, name="moss-td-audio-encode", daemon=True
         )
         self._thread.start()
+
+    def close(self) -> None:
+        """Stop the encoder worker after all queued requests finish."""
+        with self._lifecycle_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._queue.put(_SHUTDOWN)
+        self._thread.join(timeout=5)
+
+    def _enqueue(self, item: Any, future: concurrent.futures.Future) -> None:
+        with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError("MOSS-TD pre-LM encoder service is closed")
+            self._queue.put((item, future))
 
     def encode_item(self, item: Any) -> None:
         """Blocks until item.precomputed_embeddings is attached."""
@@ -54,22 +72,34 @@ class BatchedAudioEncoderService:
             item.feature = None
             return
         future: concurrent.futures.Future = concurrent.futures.Future()
-        self._queue.put((item, future))
+        self._enqueue(item, future)
         future.result(timeout=self.ENCODE_TIMEOUT_S)
 
-    def _drain_batch(self) -> list[tuple[Any, concurrent.futures.Future]]:
+    def _drain_batch(
+        self,
+    ) -> tuple[list[tuple[Any, concurrent.futures.Future]], bool]:
         # note (yichi): never wait — a window costs 8~16ms at low concurrency, buys <=5ms at high.
-        batch = [self._queue.get()]
+        first = self._queue.get()
+        if first is _SHUTDOWN:
+            return [], True
+        batch = [first]
+        shutdown = False
         while True:
             try:
-                batch.append(self._queue.get_nowait())
+                queued = self._queue.get_nowait()
             except queue.Empty:
                 break
-        return batch
+            if queued is _SHUTDOWN:
+                shutdown = True
+                break
+            batch.append(queued)
+        return batch, shutdown
 
     def _worker(self) -> None:
         while True:
-            batch = self._drain_batch()
+            batch, shutdown = self._drain_batch()
+            if not batch:
+                return
             items = [item for item, _ in batch]
             try:
                 self._encode_batch(items)
@@ -84,6 +114,8 @@ class BatchedAudioEncoderService:
                         future.set_result(None)
                     except Exception as item_exc:
                         future.set_exception(item_exc)
+                if shutdown:
+                    return
                 continue
             for _, future in batch:
                 future.set_result(None)
@@ -96,6 +128,8 @@ class BatchedAudioEncoderService:
                     f"{self._item_count / self._batch_count:.2f} items/batch, "
                     f"last batch: {len(items)})"
                 )
+            if shutdown:
+                return
 
     def _encode_batch(self, items: list[Any]) -> None:
         with torch.cuda.stream(self._stream):
