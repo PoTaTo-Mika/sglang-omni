@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from sglang_omni.distributed.weight_ipc import runtime
+from sglang_omni.distributed.weight_ipc import lifecycle, runtime
 from sglang_omni.distributed.weight_ipc.compat import validate_weight_ipc_compatibility
 from sglang_omni.distributed.weight_ipc.config import (
     apply_weight_ipc_cli_env,
@@ -44,7 +44,20 @@ _HIGGS_ARCHITECTURE = "HiggsMultimodalQwen3ForConditionalGeneration"
 
 def _clear_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for key in _ENV_KEYS:
-        monkeypatch.delenv(key, raising=False)
+        monkeypatch.setenv(key, "")
+
+
+def test_pid_is_alive_rejects_zombie(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(lifecycle.os, "kill", lambda _pid, _signal: None)
+    monkeypatch.setattr(
+        lifecycle.Path,
+        "read_text",
+        lambda _path, encoding=None: "123 (weight-ipc-leader) Z 1",
+    )
+
+    assert not lifecycle.pid_is_alive(123)
 
 
 def _meta(name: str, shape: tuple[int, ...] = (2, 2)) -> IpcTensorMeta:

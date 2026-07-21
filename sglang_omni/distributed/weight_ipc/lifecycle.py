@@ -7,8 +7,25 @@ import logging
 import os
 import threading
 import time
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+def _is_zombie(pid: int) -> bool:
+    try:
+        stat_line = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError:
+        return False
+
+    # Note (guozhihao): /proc/<pid>/stat stores the process state after (comm);
+    # Z means zombie, which can still pass kill(pid, 0) until it is reaped.
+    closing_paren = stat_line.rfind(")")
+    return (
+        closing_paren >= 0
+        and len(stat_line) > closing_paren + 2
+        and stat_line[closing_paren + 2] == "Z"
+    )
 
 
 def pid_is_alive(pid: int) -> bool:
@@ -20,7 +37,7 @@ def pid_is_alive(pid: int) -> bool:
         return False
     except PermissionError:
         return True
-    return True
+    return not _is_zombie(pid)
 
 
 class LeaderLivenessMonitor:

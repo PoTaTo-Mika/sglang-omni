@@ -11,6 +11,7 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang_omni.distributed.weight_ipc import (
     LeaderLivenessMonitor,
     WeightIpcConfig,
+    WeightIpcRole,
     export_leader_weights,
     materialize_follower_weights,
     validate_weight_ipc_compatibility,
@@ -24,6 +25,17 @@ from sglang_omni.utils.gpu_memory import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_weight_ipc_kv_cap(
+    role: WeightIpcRole,
+    max_total_tokens: int | None,
+) -> None:
+    if role == "follower" and max_total_tokens is None:
+        raise ValueError(
+            "weight IPC follower requires an explicit --max-total-tokens value "
+            "because post-alias memory profiling cannot derive a stable KV budget"
+        )
 
 
 def filter_weights_by_prefix(
@@ -63,6 +75,10 @@ class SGLModelRunner(ModelRunner):
         self._weight_ipc_config = weight_ipc
         self._weight_ipc_leader_monitor: LeaderLivenessMonitor | None = None
         if weight_ipc.role != "off":
+            _validate_weight_ipc_kv_cap(
+                weight_ipc.role,
+                server_args.max_total_tokens,
+            )
             architectures = (
                 [model_arch_override]
                 if model_arch_override is not None

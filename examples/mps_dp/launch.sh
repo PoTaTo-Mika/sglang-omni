@@ -23,9 +23,9 @@
 #   BASE_PORT (8801), PYTHON_BIN (python),
 #   CORE_BLOCKS: N non-overlapping CPU blocks on the GPU's NUMA node, required.
 #   NUMA_NODE: explicit override when the PCI-derived NUMA node is unavailable.
-#   MAX_TOTAL_TOKENS: optional common positive token-cap override. For N > 1,
-#     set it here or in CONFIG's generation-stage server arguments. The environment
-#     value takes precedence when both are set.
+#   MAX_TOTAL_TOKENS: common positive token-cap override. Required when WEIGHT_IPC=1
+#     and for N > 1. Set it here or in CONFIG's generation-stage server arguments.
+#     The environment value takes precedence when both are set.
 #   MF: optional explicit --mem-fraction-static override (unset = pipeline default).
 #   WEIGHT_IPC: 0|1 (default 0). When 1, replica 0 exports AR weights via CUDA IPC
 #     and replicas 1..N-1 alias them.
@@ -249,25 +249,35 @@ teardown_state() {
   # Note (jiaxin): these GPUs are shared; teardown only signals processes recorded
   # in this run's state, never scans the whole GPU, and keeps the state directory
   # whenever cleanup cannot be confirmed, so nothing is hidden from inspection.
-  # Followers must fully exit before the leader releases their aliased CUDA storage.
-  local state=$1 keep=${2:-} idx leader_pid pgid leader_start t live raw control_pid=""
+  local state=$1 keep=${2:-} idx leader_pid pgid leader_start t live raw
+  local control_pid="" weight_ipc
   [ -n "$state" ] && [ -f "$state/replicas.tsv" ] || die "invalid or missing run state '$state'"
+  [ -r "$state/manifest" ] || die "missing run manifest '$state/manifest'"
+  weight_ipc=$(awk -F= '$1 == "weight_ipc" {print $2; exit}' "$state/manifest")
+  case "$weight_ipc" in
+    0|1) ;;
+    *) die "invalid weight_ipc value in '$state/manifest': '$weight_ipc'" ;;
+  esac
   control_pid=$(mps_control_pid "$state" || true)
   while IFS=$'\t' read -r idx leader_pid pgid _ _ leader_start; do
     [ "$idx" = 0 ] && continue
     leader_identity_matches "$leader_pid" "$leader_start" || continue
     kill -TERM -- "-$pgid" 2>/dev/null || true
   done < <(tac "$state/replicas.tsv")
-  for ((t=1; t<=DRAIN_TRIES; t++)); do
+  if [ "$weight_ipc" = 1 ]; then
+    # Note (guozhihao): followers must exit before the leader releases aliased
+    # CUDA storage; non-IPC replicas keep the normal force-cleanup path.
+    for ((t=1; t<=DRAIN_TRIES; t++)); do
+      live=$(tracked_follower_pids "$state")
+      [ -z "${live// /}" ] && break
+      sleep "$DRAIN_INTERVAL"
+    done
     live=$(tracked_follower_pids "$state")
-    [ -z "${live// /}" ] && break
-    sleep "$DRAIN_INTERVAL"
-  done
-  live=$(tracked_follower_pids "$state")
-  if [ -n "${live// /}" ]; then
-    echo "error: follower processes did not exit after TERM:$live" >&2
-    echo "leader left running to preserve aliased CUDA storage; state kept at $state" >&2
-    return 1
+    if [ -n "${live// /}" ]; then
+      echo "error: follower processes did not exit after TERM:$live" >&2
+      echo "leader left running to preserve aliased CUDA storage; state kept at $state" >&2
+      return 1
+    fi
   fi
   while IFS=$'\t' read -r idx leader_pid pgid _ _ leader_start; do
     [ "$idx" = 0 ] || continue

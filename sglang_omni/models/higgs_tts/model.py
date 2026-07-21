@@ -547,17 +547,16 @@ class HiggsTTSModel(nn.Module):
         to :meth:`Qwen3ForCausalLM.load_weights`, which does qkv / gate_up
         stacking and lm_head tying internally.
 
-        When weight IPC follower mode is active, checkpoint materialization is
-        skipped; ``SGLModelRunner.load_model`` aliases leader storages before
-        KV profiling.
+        Weight IPC follower loading is coordinated by ``SGLModelRunner``;
+        calling this method in follower mode is therefore an invalid path.
         """
         from sglang_omni.distributed.weight_ipc.config import is_weight_ipc_follower
 
         if is_weight_ipc_follower():
-            # Consume the iterator so the loader does not warn about unread weights.
-            for _name, _tensor in weights:
-                pass
-            return set()
+            raise RuntimeError(
+                "HiggsTTSModel.load_weights() must not be called by a "
+                "weight IPC follower"
+            )
 
         mapper = DiscreteWeightMapper(
             text_prefix_map=_BACKBONE_PREFIX_MAP,

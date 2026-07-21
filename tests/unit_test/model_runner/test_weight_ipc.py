@@ -10,7 +10,11 @@ import pytest
 
 from sglang_omni.distributed.weight_ipc.types import WeightIpcConfig, WeightIpcRole
 from sglang_omni.model_runner.model_worker import ModelWorker
-from sglang_omni.model_runner.sglang_model_runner import SGLModelRunner
+from sglang_omni.model_runner.sglang_model_runner import (
+    SGLModelRunner,
+    _validate_weight_ipc_kv_cap,
+)
+from sglang_omni.models.higgs_tts.model import HiggsTTSModel
 
 
 def _runner(role: WeightIpcRole, store_dir: str | None = None) -> SGLModelRunner:
@@ -65,6 +69,27 @@ def test_load_model_normally_when_ipc_is_off(
     SGLModelRunner.load_model(runner)
 
     assert calls == ["load"]
+
+
+def test_follower_requires_explicit_kv_cap() -> None:
+    with pytest.raises(ValueError, match="explicit --max-total-tokens"):
+        _validate_weight_ipc_kv_cap("follower", None)
+
+
+def test_leader_and_ipc_off_allow_automatic_kv_cap() -> None:
+    _validate_weight_ipc_kv_cap("leader", None)
+    _validate_weight_ipc_kv_cap("off", None)
+
+
+def test_higgs_load_weights_rejects_follower_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("WEIGHT_IPC_ROLE", "follower")
+    monkeypatch.setenv("WEIGHT_IPC_STORE", str(tmp_path))
+    model = object.__new__(HiggsTTSModel)
+
+    with pytest.raises(RuntimeError, match="must not be called"):
+        HiggsTTSModel.load_weights(model, [])
 
 
 def test_leader_loads_then_exports(
