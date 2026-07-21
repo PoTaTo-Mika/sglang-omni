@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
 import logging
+import math
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +37,106 @@ from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.proto import StagePayload
 
 logger = logging.getLogger(__name__)
+
+
+_MULTIMODAL_TENSOR_DTYPES: dict[str, torch.dtype] = {
+    "bool": torch.bool,
+    "uint8": torch.uint8,
+    "int8": torch.int8,
+    "int16": torch.int16,
+    "int32": torch.int32,
+    "int64": torch.int64,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "float32": torch.float32,
+    "float64": torch.float64,
+}
+_MULTIMODAL_TENSOR_NAMES = frozenset(
+    {
+        "pixel_values",
+        "image_grid_thw",
+        "input_features",
+        "feature_attention_mask",
+        "audio_feature_lengths",
+        "pixel_values_videos",
+        "video_grid_thw",
+        "video_second_per_grid",
+    }
+)
+
+
+def _deserialize_multimodal_train_inputs(bundle: Any) -> dict[str, torch.Tensor]:
+    """Restore the exact processor tensor kwargs serialized by Miles."""
+    if not isinstance(bundle, dict) or bundle.get("version") != 1:
+        raise ValueError("multimodal_train_inputs must use version 1")
+    encoded_tensors = bundle.get("tensors")
+    if not isinstance(encoded_tensors, dict) or not encoded_tensors:
+        raise ValueError("multimodal_train_inputs.tensors must not be empty")
+    unknown = sorted(set(encoded_tensors) - _MULTIMODAL_TENSOR_NAMES)
+    if unknown:
+        raise ValueError(
+            "unsupported multimodal processor tensor fields: " + ", ".join(unknown)
+        )
+
+    tensors: dict[str, torch.Tensor] = {}
+    for name, spec in encoded_tensors.items():
+        if not isinstance(spec, dict):
+            raise ValueError(f"invalid multimodal tensor entry for {name!r}")
+        dtype_name = spec.get("dtype")
+        dtype = _MULTIMODAL_TENSOR_DTYPES.get(dtype_name)
+        if dtype is None:
+            raise ValueError(
+                f"unsupported multimodal tensor dtype for {name!r}: {dtype_name!r}"
+            )
+        shape = spec.get("shape")
+        if not isinstance(shape, list) or any(
+            type(dimension) is not int or dimension < 0 for dimension in shape
+        ):
+            raise ValueError(f"invalid multimodal tensor shape for {name!r}")
+        data = spec.get("data")
+        if not isinstance(data, str):
+            raise ValueError(f"missing base64 multimodal tensor data for {name!r}")
+        try:
+            raw = base64.b64decode(data, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError(
+                f"invalid base64 multimodal tensor data for {name!r}"
+            ) from exc
+
+        expected_bytes = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+        if len(raw) != expected_bytes:
+            raise ValueError(
+                f"multimodal tensor {name!r} has {len(raw)} bytes, "
+                f"expected {expected_bytes} for shape={shape} dtype={dtype_name}"
+            )
+        if expected_bytes == 0:
+            tensor = torch.empty(shape, dtype=dtype)
+        else:
+            tensor = (
+                torch.frombuffer(bytearray(raw), dtype=dtype).clone().reshape(shape)
+            )
+        tensors[name] = tensor
+    return tensors
+
+
+def _processed_modalities(inputs: dict[str, torch.Tensor]) -> set[str]:
+    modalities = set()
+    if "pixel_values" in inputs:
+        modalities.add("image")
+    if "input_features" in inputs:
+        modalities.add("audio")
+    if "pixel_values_videos" in inputs:
+        modalities.add("video")
+    return modalities
+
+
+def _media_token_ids(processor: Any) -> dict[str, int]:
+    tokenizer = processor.tokenizer
+    return {
+        "image": int(tokenizer.convert_tokens_to_ids(processor.image_token)),
+        "audio": int(tokenizer.convert_tokens_to_ids(processor.audio_token)),
+        "video": int(tokenizer.convert_tokens_to_ids(processor.video_token)),
+    }
 
 
 def _resolve_local_model_dir(model_path: str) -> str:
@@ -349,11 +452,97 @@ class Qwen3OmniPreprocessor:
             },
         )
 
+    def _preprocess_multimodal_train_inputs(
+        self,
+        payload: StagePayload,
+        token_ids: list[int],
+        bundle: dict[str, Any],
+    ) -> StagePayload:
+        """Bypass media loading and reuse Miles' processor tensors directly."""
+        flat_inputs = _deserialize_multimodal_train_inputs(bundle)
+        actual_modalities = _processed_modalities(flat_inputs)
+        declared_modalities = set(bundle.get("modalities") or [])
+        if not actual_modalities or actual_modalities != declared_modalities:
+            raise ValueError(
+                "multimodal_train_inputs modalities do not match encoder tensors: "
+                f"declared={sorted(declared_modalities)}, "
+                f"actual={sorted(actual_modalities)}"
+            )
+
+        input_ids = torch.tensor(token_ids, dtype=torch.long)
+        for modality, token_id in _media_token_ids(self.processor).items():
+            token_count = int((input_ids == token_id).sum().item())
+            if (modality in actual_modalities) != (token_count > 0):
+                raise ValueError(
+                    f"processed {modality} tensors and prompt media tokens disagree "
+                    f"(token_count={token_count})"
+                )
+        attention_mask = torch.ones_like(input_ids)
+        validate_prompt_seq_len(
+            input_ids,
+            max_seq_len=self.max_seq_len,
+            max_new_tokens=payload.request.params.get(
+                "max_new_tokens", DEFAULT_THINKER_MAX_NEW_TOKENS
+            ),
+            request_id=payload.request_id,
+        )
+
+        full_mm_inputs: dict[str, Any] = {
+            "image": build_image_mm_inputs(flat_inputs),
+            "audio": build_audio_mm_inputs(flat_inputs),
+            "video": build_video_mm_inputs(flat_inputs),
+        }
+        image_encoder_inputs = {
+            name: value
+            for name, value in {
+                **full_mm_inputs["image"],
+                **full_mm_inputs["video"],
+            }.items()
+            if value is not None
+        }
+        audio_encoder_inputs = {
+            name: value
+            for name, value in full_mm_inputs["audio"].items()
+            if value is not None
+        }
+        encoder_inputs = {
+            "image_encoder": (
+                image_encoder_inputs
+                if actual_modalities & {"image", "video"}
+                else {"_skip": True, "_result": {}}
+            ),
+            "audio_encoder": (
+                audio_encoder_inputs
+                if "audio" in actual_modalities
+                else {"_skip": True, "_result": {}}
+            ),
+        }
+        return self._finalize_state(
+            payload,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            prompt_text="",
+            full_mm_inputs=full_mm_inputs,
+            encoder_inputs=encoder_inputs,
+        )
+
     async def _call_impl(self, payload: StagePayload) -> StagePayload:
         inputs = payload.request.inputs
         if _is_pretokenized_prompt(inputs):
             return self._preprocess_pretokenized(payload, inputs)
         if isinstance(inputs, dict):
+            multimodal_train_inputs = inputs.get("multimodal_train_inputs")
+            if multimodal_train_inputs is not None:
+                token_ids = inputs.get("input_ids")
+                if not _is_pretokenized_prompt(token_ids):
+                    raise ValueError(
+                        "multimodal_train_inputs requires non-empty integer input_ids"
+                    )
+                return self._preprocess_multimodal_train_inputs(
+                    payload,
+                    list(token_ids),
+                    multimodal_train_inputs,
+                )
             messages = inputs.get("messages", [])
             raw_images = inputs.get("images")
             raw_videos = inputs.get("videos") or inputs.get("video")

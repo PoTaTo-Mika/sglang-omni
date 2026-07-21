@@ -15,12 +15,29 @@ from fastapi.testclient import TestClient
 from sglang_omni_router import proxy as proxy_module
 from sglang_omni_router.app import _broadcast_admin_request, create_app
 from sglang_omni_router.config import RouterConfig, WorkerConfig
+from sglang_omni_router.route_metadata import _infer_payload_capabilities
 from sglang_omni_router.selector import WorkerSelector
 from sglang_omni_router.worker import build_workers
 
 
 def _request_netloc(request: httpx.Request) -> str:
     return f"{request.url.host}:{request.url.port}"
+
+
+def test_processed_multimodal_inputs_infer_router_capabilities() -> None:
+    capabilities = _infer_payload_capabilities(
+        "/generate",
+        {
+            "input_ids": [1, 2, 3],
+            "multimodal_train_inputs": {
+                "version": 1,
+                "modalities": ["audio", "video"],
+                "tensors": {"payload": {}},
+            },
+        },
+    )
+
+    assert capabilities == {"audio_input", "video_input"}
 
 
 def _router_config(

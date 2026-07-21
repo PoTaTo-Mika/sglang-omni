@@ -999,6 +999,18 @@ def _register_generate(app: FastAPI) -> None:
                 status_code=400,
                 detail="stream=true is not supported by /generate yet",
             )
+        if req.multimodal_train_inputs is not None and req.input_ids is None:
+            raise HTTPException(
+                status_code=400,
+                detail="multimodal_train_inputs requires input_ids",
+            )
+        if req.multimodal_train_inputs is not None and any(
+            (req.metadata or {}).get(field) for field in ("images", "audios", "videos")
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="multimodal_train_inputs cannot be combined with raw media",
+            )
 
         request_id = str(uuid.uuid4())
         audio_format = "wav"
@@ -1089,6 +1101,11 @@ def _build_rollout_generate_request(req: RolloutGenerateRequest) -> GenerateRequ
         max_tokens=sampling.max_new_tokens,
         output_modalities=(
             req.output_modalities if req.output_modalities is not None else ["text"]
+        ),
+        multimodal_train_inputs=(
+            req.multimodal_train_inputs.model_dump()
+            if req.multimodal_train_inputs is not None
+            else None
         ),
         metadata=metadata,
     )

@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
@@ -170,6 +170,26 @@ class RolloutMessage(BaseModel):
     content: str | list[Any]
 
 
+class SerializedMultimodalTensor(BaseModel):
+    """One processor tensor encoded for JSON transport."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    dtype: str = Field(min_length=1)
+    shape: list[int]
+    data: str
+
+
+class SerializedMultimodalInputs(BaseModel):
+    """Processor outputs shared by Miles training and SGLang Omni rollout."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    version: Literal[1] = 1
+    modalities: list[Literal["image", "audio", "video"]] = Field(min_length=1)
+    tensors: dict[str, SerializedMultimodalTensor] = Field(min_length=1)
+
+
 class RolloutGenerateRequest(BaseModel):
     """Rollout request for ``POST /generate``; set exactly one of
     ``input_ids``, ``prompt``, ``messages``."""
@@ -189,6 +209,8 @@ class RolloutGenerateRequest(BaseModel):
     stage_sampling: dict[str, RolloutSamplingParams] | None = None
     stage_params: dict[str, dict[str, Any]] | None = None
     output_modalities: list[str] | None = None
+
+    multimodal_train_inputs: SerializedMultimodalInputs | None = None
 
     metadata: dict[str, Any] | None = None
 

@@ -7,6 +7,7 @@ from typing import Any
 
 from fastapi.testclient import TestClient
 
+from sglang_omni.client import Client
 from sglang_omni.client.types import (
     CompletionAudio,
     CompletionResult,
@@ -77,6 +78,67 @@ def test_generate_returns_miles_meta_info() -> None:
     assert meta["weight_version"] == "v3"
     assert meta["output_token_logprobs"] == [[-0.1, 11], [-0.2, 22]]
     assert meta["request_metadata"] == {"rollout_id": 42, "group_id": 1}
+
+
+def test_generate_accepts_miles_multimodal_train_inputs() -> None:
+    bundle = {
+        "version": 1,
+        "modalities": ["audio", "video"],
+        "tensors": {
+            "input_features": {
+                "dtype": "float32",
+                "shape": [1],
+                "data": "AAAAAA==",
+            },
+            "pixel_values_videos": {
+                "dtype": "float16",
+                "shape": [1],
+                "data": "AAA=",
+            },
+        },
+    }
+    client = _RolloutClient(_text_result())
+    tc = TestClient(create_app(client, model_name="qwen3-omni"))
+
+    resp = tc.post(
+        "/generate",
+        json={
+            "input_ids": [1, 102, 103, 2],
+            "multimodal_train_inputs": bundle,
+        },
+    )
+
+    assert resp.status_code == 200
+    request = client.requests[0]
+    assert request.prompt_token_ids == [1, 102, 103, 2]
+    assert request.multimodal_train_inputs == bundle
+
+
+def test_generate_requires_input_ids_for_processed_multimodal_inputs() -> None:
+    client = _RolloutClient(_text_result())
+    tc = TestClient(create_app(client, model_name="qwen3-omni"))
+
+    resp = tc.post(
+        "/generate",
+        json={
+            "prompt": "hi",
+            "multimodal_train_inputs": {
+                "version": 1,
+                "modalities": ["video"],
+                "tensors": {
+                    "pixel_values_videos": {
+                        "dtype": "float16",
+                        "shape": [1],
+                        "data": "AAA=",
+                    }
+                },
+            },
+        },
+    )
+
+    assert resp.status_code == 400
+    assert "requires input_ids" in resp.text
+    assert client.requests == []
 
 
 def test_generate_returns_omni_rollout_when_present() -> None:
@@ -412,6 +474,31 @@ def test_converter_maps_input_ids_to_prompt_token_ids() -> None:
     assert gen.sampling.max_new_tokens == 8
     assert gen.stream is False
     assert gen.extra_params["return_logprob"] is True
+
+
+def test_converter_threads_processed_multimodal_inputs_to_pipeline() -> None:
+    bundle = {
+        "version": 1,
+        "modalities": ["video"],
+        "tensors": {
+            "video_grid_thw": {
+                "dtype": "int64",
+                "shape": [1, 3],
+                "data": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            }
+        },
+    }
+    req = RolloutRequest(
+        input_ids=[1, 103, 2],
+        multimodal_train_inputs=bundle,
+    )
+
+    omni = Client._build_omni_request(_build_rollout_generate_request(req))
+
+    assert omni.inputs == {
+        "input_ids": [1, 103, 2],
+        "multimodal_train_inputs": bundle,
+    }
 
 
 def test_converter_omits_explicit_params_when_sampling_omitted() -> None:

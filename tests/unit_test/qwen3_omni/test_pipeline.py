@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import base64
 import inspect
 from types import SimpleNamespace
 
@@ -298,6 +300,77 @@ def test_qwen_preprocess_pretokenized_builds_state_and_releases_inputs() -> None
         "output_modalities": ["text"],
         "trace": "keep",
     }
+
+
+def test_qwen_accepts_miles_audio_video_processor_tensors() -> None:
+    from sglang_omni.models.qwen3_omni.components import (
+        preprocessor as preprocessor_mod,
+    )
+
+    class _Tokenizer:
+        @staticmethod
+        def convert_tokens_to_ids(token):
+            return {"<image>": 101, "<audio>": 102, "<video>": 103}[token]
+
+    class _Processor:
+        tokenizer = _Tokenizer()
+        image_token = "<image>"
+        audio_token = "<audio>"
+        video_token = "<video>"
+
+    def _encode(tensor: torch.Tensor) -> dict[str, object]:
+        tensor = tensor.contiguous()
+        raw = tensor.reshape(-1).view(torch.uint8).numpy().tobytes()
+        return {
+            "dtype": str(tensor.dtype).removeprefix("torch."),
+            "shape": list(tensor.shape),
+            "data": base64.b64encode(raw).decode("ascii"),
+        }
+
+    processor_tensors = {
+        "input_features": torch.arange(6, dtype=torch.float32).reshape(1, 2, 3),
+        "feature_attention_mask": torch.ones((1, 2), dtype=torch.long),
+        "pixel_values_videos": torch.arange(12, dtype=torch.bfloat16).reshape(2, 2, 3),
+        "video_grid_thw": torch.tensor([[1, 2, 3]], dtype=torch.long),
+        "video_second_per_grid": torch.tensor([0.5], dtype=torch.float32),
+    }
+    pre = object.__new__(preprocessor_mod.Qwen3OmniPreprocessor)
+    pre.processor = _Processor()
+    pre.max_seq_len = None
+    payload = StagePayload(
+        request_id="req-processed-mm",
+        request=OmniRequest(
+            inputs={
+                "input_ids": [7, 102, 103, 8],
+                "multimodal_train_inputs": {
+                    "version": 1,
+                    "modalities": ["audio", "video"],
+                    "tensors": {
+                        name: _encode(tensor)
+                        for name, tensor in processor_tensors.items()
+                    },
+                },
+            },
+            params={"max_new_tokens": 16},
+        ),
+        data={},
+    )
+
+    out = asyncio.run(pre._call_impl(payload))
+    state = Qwen3OmniPipelineState.from_dict(out.data)
+
+    assert state.prompt["input_ids"].tolist() == [7, 102, 103, 8]
+    assert torch.equal(
+        state.encoder_inputs["audio_encoder"]["input_features"],
+        processor_tensors["input_features"],
+    )
+    assert torch.equal(
+        state.encoder_inputs["image_encoder"]["pixel_values_videos"],
+        processor_tensors["pixel_values_videos"],
+    )
+    assert state.mm_inputs["audio"]["audio_feature_lengths"].tolist() == [2]
+    assert state.mm_inputs["video"]["video_grid_thw"].tolist() == [[1, 2, 3]]
+    assert out.request.inputs is None
 
 
 def test_qwen_preprocessor_retries_without_special_token_compat(
