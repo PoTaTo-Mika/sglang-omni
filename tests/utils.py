@@ -31,13 +31,6 @@ stop_server = benchmark_utils.stop_server
 wait_for_gpu_memory_release = benchmark_utils.wait_for_gpu_memory_release
 wait_healthy = benchmark_utils.wait_healthy
 start_server_from_cmd = benchmark_utils.start_server_from_cmd
-
-# Default ASR backbone that transcribes generated speech for WER scoring in the
-# TTS and Qwen3-Omni CI stages. This is the single knob for the WER backbone:
-# reassign it to any ASR model path (e.g. a stronger model imported from
-# benchmarks.tasks.asr) and every WER number in those stages moves with it. The
-# ASR stages calibrate this same model directly. Do not hardcode a model path in
-# the stage tests; import this constant instead.
 DEFAULT_WER_ASR_MODEL_PATH = FUN_ASR_MODEL_PATH
 WER_ASR_CONCURRENCY = DEFAULT_ASR_TRANSCRIBE_CONCURRENCY
 WER_ASR_ROUTER_STARTUP_TIMEOUT = 600
