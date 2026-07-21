@@ -114,33 +114,6 @@ def test_generate_accepts_miles_multimodal_train_inputs() -> None:
     assert request.multimodal_train_inputs == bundle
 
 
-def test_generate_requires_input_ids_for_processed_multimodal_inputs() -> None:
-    client = _RolloutClient(_text_result())
-    tc = TestClient(create_app(client, model_name="qwen3-omni"))
-
-    resp = tc.post(
-        "/generate",
-        json={
-            "prompt": "hi",
-            "multimodal_train_inputs": {
-                "version": 1,
-                "modalities": ["video"],
-                "tensors": {
-                    "pixel_values_videos": {
-                        "dtype": "float16",
-                        "shape": [1],
-                        "data": "AAA=",
-                    }
-                },
-            },
-        },
-    )
-
-    assert resp.status_code == 400
-    assert "requires input_ids" in resp.text
-    assert client.requests == []
-
-
 def test_generate_returns_omni_rollout_when_present() -> None:
     result = _text_result()
     result.output_token_logprobs = None

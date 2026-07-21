@@ -457,14 +457,9 @@ class Qwen3OmniPreprocessor:
         if isinstance(inputs, dict):
             multimodal_train_inputs = inputs.get("multimodal_train_inputs")
             if multimodal_train_inputs is not None:
-                token_ids = inputs.get("input_ids")
-                if not _is_pretokenized_prompt(token_ids):
-                    raise ValueError(
-                        "multimodal_train_inputs requires non-empty integer input_ids"
-                    )
                 return self._preprocess_multimodal_train_inputs(
                     payload,
-                    list(token_ids),
+                    inputs["input_ids"],
                     multimodal_train_inputs,
                 )
             messages = inputs.get("messages", [])

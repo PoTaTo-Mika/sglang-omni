@@ -599,14 +599,8 @@ def _extract_inputs(request: GenerateRequest) -> Any:
             "prompt, prompt_token_ids, or messages."
         )
     if request.multimodal_train_inputs is not None:
-        if request.prompt_token_ids is None:
-            raise ValueError("multimodal_train_inputs requires prompt_token_ids")
-        if any(request.metadata.get(field) for field in ("images", "audios", "videos")):
-            raise ValueError(
-                "multimodal_train_inputs cannot be combined with raw media"
-            )
         return {
-            "input_ids": list(request.prompt_token_ids),
+            "input_ids": request.prompt_token_ids,
             "multimodal_train_inputs": request.multimodal_train_inputs,
         }
     if request.prompt is not None:
