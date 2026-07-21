@@ -25,7 +25,7 @@ from sglang_omni.models.zonos2.request_builders import (
     ref_audio_to_encoder_input,
 )
 from sglang_omni.proto import StagePayload
-from sglang_omni.scheduling.pipeline_state import build_usage
+from sglang_omni.scheduling.pipeline_state import build_usage, store_state
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 from sglang_omni.utils.audio_payload import audio_waveform_payload
 
@@ -45,12 +45,6 @@ _DEFAULT_QUALITY_BUCKETS = {"trailing_silence_s": 3}
 
 def _default_quality_list() -> list[int | None]:
     return [_DEFAULT_QUALITY_BUCKETS.get(f) for f in _QUALITY_FEATURES]
-
-
-def _store(payload: StagePayload, state: Zonos2State) -> StagePayload:
-    return StagePayload(
-        request_id=payload.request_id, request=payload.request, data=state.to_dict()
-    )
 
 
 # ---- preprocessing (text frontend) ----
@@ -75,7 +69,7 @@ def create_preprocessing_executor(
             normalize=tts_norm,
         )
         state.input_ids = rows.to(torch.long)
-        return _store(payload, state)
+        return store_state(payload, state)
 
     return SimpleScheduler(_preprocess, max_concurrency=max_concurrency)
 
@@ -106,7 +100,7 @@ def create_speaker_encode_executor(
             ref = ref_audio_to_encoder_input(state.ref_audio)
             state.speaker_emb = encoder.encode(ref)
             state.speaker_fingerprint = encoder.fingerprint()
-        return _store(payload, state)
+        return store_state(payload, state)
 
     return SimpleScheduler(_speaker, max_concurrency=max_concurrency)
 

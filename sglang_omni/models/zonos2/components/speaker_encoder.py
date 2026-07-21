@@ -24,9 +24,8 @@ import torchaudio
 from transformers import AutoModel
 
 from sglang_omni.scheduling.reference_encoder import (
-    ReferenceEncodeHook,
-    ReferenceEncodeKey,
     ReferenceEncodeService,
+    TensorReferenceEncodeHook,
 )
 
 SPEAKER_EMBEDDING_DIM = 2048
@@ -231,13 +230,20 @@ class _Zonos2RefInput:
     sr: int | None = None
 
 
-class SpeakerEncoder(ReferenceEncodeHook[_Zonos2RefInput, torch.Tensor, torch.Tensor]):
+class SpeakerEncoder(TensorReferenceEncodeHook[_Zonos2RefInput]):
     """Turns reference audio into the raw 2048-d ZONOS2 speaker embedding.
 
     The Qwen3 model is loaded lazily on first :meth:`encode`. Caching and
     single-flight dedup run on the shared :class:`ReferenceEncodeService` keyed by
     a content hash, so a repeated reference audio costs at most one forward.
     """
+
+    model_id = "zonos2"
+    model_revision = "v1"
+    encoder_id = Qwen3SpeakerEmbedding.MODEL_NAME
+    encoder_config_hash = _ENCODER_CONFIG_HASH
+    artifact_kind = "zonos2_speaker_embedding"
+    storage_dtype = torch.float32
 
     def __init__(
         self,
@@ -323,15 +329,8 @@ class SpeakerEncoder(ReferenceEncodeHook[_Zonos2RefInput, torch.Tensor, torch.Te
             kind="raw", raw=raw, input_key="raw:" + hashlib.sha256(raw).hexdigest()
         )
 
-    def cache_key(self, item: _Zonos2RefInput) -> ReferenceEncodeKey:
-        return ReferenceEncodeKey(
-            model_id="zonos2",
-            model_revision="v1",
-            encoder_id=Qwen3SpeakerEmbedding.MODEL_NAME,
-            encoder_config_hash=_ENCODER_CONFIG_HASH,
-            artifact_kind="zonos2_speaker_embedding",
-            input_key=item.input_key,
-        )
+    def input_key(self, item: _Zonos2RefInput) -> str:
+        return item.input_key
 
     def encode_one(self, item: _Zonos2RefInput) -> torch.Tensor:
         if item.kind == "raw":
@@ -342,13 +341,6 @@ class SpeakerEncoder(ReferenceEncodeHook[_Zonos2RefInput, torch.Tensor, torch.Te
         with torch.inference_mode():
             output = embedder(wav, sr)
         return self._select_embedding(output)
-
-    def store_artifact(self, artifact: torch.Tensor) -> torch.Tensor:
-        return artifact.detach().to("cpu", torch.float32).contiguous()
-
-    def load_artifact(self, stored: torch.Tensor) -> torch.Tensor:
-        # clone so callers can't mutate the cached tensor
-        return stored.clone()
 
     @staticmethod
     def _to_bytes(ref_audio: Any) -> bytes:
