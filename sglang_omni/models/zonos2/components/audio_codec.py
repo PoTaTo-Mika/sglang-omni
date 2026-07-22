@@ -15,17 +15,16 @@ DAC_HOP_LENGTH = 512
 _MAX_VALID_CODE = 1023
 _AUDIO_PAD_ID = 1025
 
-_dac_model = None
-_dac_device: str | None = None
+_dac_cache: tuple[str, torch.nn.Module] | None = None
 
 
 def _get_dac(device: str):
     """Lazily load and cache the DAC 44 kHz model on ``device``."""
-    global _dac_model, _dac_device
-    if _dac_model is None or _dac_device != device:
+    global _dac_cache
+    if _dac_cache is None or _dac_cache[0] != device:
         import dac as dac_module
 
-        _dac_model = (
+        dac_model = (
             dac_module.DAC.load(dac_module.utils.download(model_type="44khz"))
             .eval()
             .to(device)
@@ -34,13 +33,14 @@ def _get_dac(device: str):
         # recomputes g*v/||v|| every forward. For inference the reparam is fixed,
         # so fold it into the conv weight once at load -> ~2e-4 fp-reassoc on the
         # output (WER-neutral, verified), fewer ops per (streaming) vocoder call.
-        for _m in _dac_model.modules():
+        for _m in dac_model.modules():
             try:
                 torch.nn.utils.remove_weight_norm(_m)
             except (ValueError, RuntimeError):
+                # Modules without weight normalization raise here.
                 pass
-        _dac_device = device
-    return _dac_model
+        _dac_cache = (device, dac_model)
+    return _dac_cache[1]
 
 
 def shear_up(codes: torch.Tensor, pad_id: int = _AUDIO_PAD_ID) -> torch.Tensor:

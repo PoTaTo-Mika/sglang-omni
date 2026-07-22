@@ -10,7 +10,6 @@ the delay/flush tail until ``stream_done``.
 
 from __future__ import annotations
 
-import logging
 import math
 from dataclasses import dataclass
 from typing import Any, Mapping
@@ -34,11 +33,8 @@ from sglang_omni.scheduling.streaming_vocoder import (
 )
 from sglang_omni.utils.audio_payload import audio_waveform_payload
 
-logger = logging.getLogger(__name__)
-
 # Process-wide cache: load the DAC checkpoint at most once per device.
-_vocoder: Zonos2DACVocoder | None = None
-_vocoder_device: str | None = None
+_vocoder_cache: tuple[str, Zonos2DACVocoder] | None = None
 
 # New streaming-chunk constants (not changes to existing values). At 86.1328125
 # fps (44100/512) one frame = DAC_HOP_LENGTH=512 PCM samples.
@@ -57,11 +53,10 @@ _STREAM_EOS_GUARD_FRAMES = N_CODEBOOKS + 1
 
 
 def _get_vocoder(device: str) -> Zonos2DACVocoder:
-    global _vocoder, _vocoder_device
-    if _vocoder is None or _vocoder_device != device:
-        _vocoder = Zonos2DACVocoder(device=device)
-        _vocoder_device = device
-    return _vocoder
+    global _vocoder_cache
+    if _vocoder_cache is None or _vocoder_cache[0] != device:
+        _vocoder_cache = (device, Zonos2DACVocoder(device=device))
+    return _vocoder_cache[1]
 
 
 def decode_to_pcm(

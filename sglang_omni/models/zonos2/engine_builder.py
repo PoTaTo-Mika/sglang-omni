@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import atexit
 import json
+import logging
 import os
 import shutil
 import tempfile
@@ -16,6 +17,8 @@ from sglang_omni.models.zonos2.hf_config import (
 )
 from sglang_omni.scheduling.engine_factory import TtsEngineBuilder
 from sglang_omni.utils.checkpoint import resolve_checkpoint
+
+logger = logging.getLogger(__name__)
 
 
 def _build_config_shim(model_path: str, cfg: Zonos2Config) -> str:
@@ -93,7 +96,7 @@ def _install_tuned_moe_configs() -> None:
                 if not os.path.exists(dst):
                     shutil.copy2(os.path.join(sdir, fn), dst)
     except Exception:
-        pass
+        logger.warning("Failed to install tuned ZONOS2 MoE configs", exc_info=True)
 
 
 def _cuda_graph_buckets(max_bs: int) -> list[int]:

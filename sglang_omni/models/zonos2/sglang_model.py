@@ -238,7 +238,6 @@ class Zonos2SGLangModel(nn.Module):
             torch.empty(self.audio_vocab * self.n_codebooks, cfg.dim)
         )
 
-        max_bs = 1
         try:
             from sglang.srt.server_args import get_global_server_args
 
@@ -456,7 +455,6 @@ class Zonos2SGLangModel(nn.Module):
             if ".parametrizations." in k and ".original" in k:
                 k = k.replace(".parametrizations.", ".").replace(".original", "")
             fixed[k] = v
-        params = dict(self.named_parameters())
         used: set[str] = set()
 
         def copy(name: str, dst: torch.Tensor, src: torch.Tensor):
