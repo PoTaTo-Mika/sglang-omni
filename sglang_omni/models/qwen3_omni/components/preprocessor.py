@@ -66,17 +66,6 @@ def _deserialize_multimodal_train_inputs(
     return tensors
 
 
-def _processed_modalities(inputs: dict[str, torch.Tensor]) -> set[str]:
-    modalities = set()
-    if "pixel_values" in inputs:
-        modalities.add("image")
-    if "input_features" in inputs:
-        modalities.add("audio")
-    if "pixel_values_videos" in inputs:
-        modalities.add("video")
-    return modalities
-
-
 def _resolve_local_model_dir(model_path: str) -> str:
     """Resolve a local model directory without eagerly hydrating full snapshots."""
     path = Path(model_path)
@@ -359,46 +348,16 @@ class Qwen3OmniPreprocessor:
             payload.request.metadata.pop(key, None)
         return payload
 
-    def _preprocess_pretokenized(
-        self, payload: StagePayload, token_ids: list[int]
-    ) -> StagePayload:
-        """Build thinker state directly from pre-tokenized prompt ids.
-
-        Skips the chat template + HF processor so the thinker runs the exact
-        tokens the RL trainer computes gradients on (text-only; multimodal ids
-        still go through the normal messages path).
-        """
-        input_ids = torch.tensor(token_ids, dtype=torch.long)
-        attention_mask = torch.ones_like(input_ids)
-        validate_prompt_seq_len(
-            input_ids,
-            max_seq_len=self.max_seq_len,
-            max_new_tokens=payload.request.params.get(
-                "max_new_tokens", DEFAULT_THINKER_MAX_NEW_TOKENS
-            ),
-            request_id=payload.request_id,
-        )
-        return self._finalize_state(
-            payload,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            prompt_text="",
-            full_mm_inputs={},
-            encoder_inputs={
-                "image_encoder": {"_skip": True, "_result": {}},
-                "audio_encoder": {"_skip": True, "_result": {}},
-            },
-        )
-
-    def _preprocess_multimodal_train_inputs(
+    def _preprocess_train_inputs(
         self,
         payload: StagePayload,
         token_ids: list[int],
-        bundle: dict[str, Any],
+        bundle: dict[str, Any] | None = None,
     ) -> StagePayload:
-        """Bypass media loading and reuse Miles' processor tensors directly."""
-        flat_inputs = _deserialize_multimodal_train_inputs(bundle)
-        actual_modalities = _processed_modalities(flat_inputs)
+        """Use Miles' exact token ids and optional processor tensors."""
+        flat_inputs = (
+            _deserialize_multimodal_train_inputs(bundle) if bundle is not None else {}
+        )
 
         input_ids = torch.tensor(token_ids, dtype=torch.long)
         attention_mask = torch.ones_like(input_ids)
@@ -429,35 +388,26 @@ class Qwen3OmniPreprocessor:
             for name, value in full_mm_inputs["audio"].items()
             if value is not None
         }
-        encoder_inputs = {
-            "image_encoder": (
-                image_encoder_inputs
-                if actual_modalities & {"image", "video"}
-                else {"_skip": True, "_result": {}}
-            ),
-            "audio_encoder": (
-                audio_encoder_inputs
-                if "audio" in actual_modalities
-                else {"_skip": True, "_result": {}}
-            ),
-        }
         return self._finalize_state(
             payload,
             input_ids=input_ids,
             attention_mask=attention_mask,
             prompt_text="",
             full_mm_inputs=full_mm_inputs,
-            encoder_inputs=encoder_inputs,
+            encoder_inputs={
+                "image_encoder": image_encoder_inputs or {"_skip": True, "_result": {}},
+                "audio_encoder": audio_encoder_inputs or {"_skip": True, "_result": {}},
+            },
         )
 
     async def _call_impl(self, payload: StagePayload) -> StagePayload:
         inputs = payload.request.inputs
         if _is_pretokenized_prompt(inputs):
-            return self._preprocess_pretokenized(payload, inputs)
+            return self._preprocess_train_inputs(payload, inputs)
         if isinstance(inputs, dict):
             multimodal_train_inputs = inputs.get("multimodal_train_inputs")
             if multimodal_train_inputs is not None:
-                return self._preprocess_multimodal_train_inputs(
+                return self._preprocess_train_inputs(
                     payload,
                     inputs["input_ids"],
                     multimodal_train_inputs,

@@ -287,7 +287,7 @@ def test_qwen_preprocess_pretokenized_builds_state_and_releases_inputs() -> None
         data=None,
     )
 
-    out = pre._preprocess_pretokenized(payload, [5, 6, 7])
+    out = asyncio.run(pre._call_impl(payload))
 
     state = Qwen3OmniPipelineState.from_dict(out.data)
     assert state.prompt["input_ids"].tolist() == [5, 6, 7]
@@ -307,17 +307,6 @@ def test_qwen_accepts_miles_audio_video_processor_tensors() -> None:
         preprocessor as preprocessor_mod,
     )
 
-    class _Tokenizer:
-        @staticmethod
-        def convert_tokens_to_ids(token):
-            return {"<image>": 101, "<audio>": 102, "<video>": 103}[token]
-
-    class _Processor:
-        tokenizer = _Tokenizer()
-        image_token = "<image>"
-        audio_token = "<audio>"
-        video_token = "<video>"
-
     def _encode(tensor: torch.Tensor) -> dict[str, object]:
         tensor = tensor.contiguous()
         raw = tensor.reshape(-1).view(torch.uint8).numpy().tobytes()
@@ -335,7 +324,6 @@ def test_qwen_accepts_miles_audio_video_processor_tensors() -> None:
         "video_second_per_grid": torch.tensor([0.5], dtype=torch.float32),
     }
     pre = object.__new__(preprocessor_mod.Qwen3OmniPreprocessor)
-    pre.processor = _Processor()
     pre.max_seq_len = None
     payload = StagePayload(
         request_id="req-processed-mm",
