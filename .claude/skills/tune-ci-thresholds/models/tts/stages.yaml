@@ -12,8 +12,8 @@ tts_higgs_nonstream_wer:
   hf_model_ids:
     - "bosonai/higgs-tts-3-4b"
     - "FunAudioLLM/Fun-ASR-Nano-2512-hf"
-  test_file_sha256: 6c7c390c671439eca6d2366ac76b0050b6ab2f6ed85d592806584cdfa7bd1e3a
-  last_discovered_at: 2026-07-21T22:54:42Z
+  test_file_sha256: f0306a2a53fa71504fd27c60994b754fb521b0a2a92f468305ac1232837b3912
+  last_discovered_at: 2026-07-21T23:35:59Z
   expected_samples: 1088
   threshold_file: "tests/test_model/tts_ci_config.py"
   threshold_file_sha256: e3ceca3503b159412e41e1233dd7188c2e67301fb48f61e440af5fc582e48775
@@ -48,8 +48,8 @@ tts_higgs_nonstream_similarity:
   hf_model_ids:
     - "bosonai/higgs-tts-3-4b"
     - "FunAudioLLM/Fun-ASR-Nano-2512-hf"
-  test_file_sha256: 6c7c390c671439eca6d2366ac76b0050b6ab2f6ed85d592806584cdfa7bd1e3a
-  last_discovered_at: 2026-07-21T22:54:42Z
+  test_file_sha256: f0306a2a53fa71504fd27c60994b754fb521b0a2a92f468305ac1232837b3912
+  last_discovered_at: 2026-07-21T23:35:59Z
   expected_samples: 50
   threshold_file: "tests/test_model/tts_ci_config.py"
   threshold_file_sha256: e3ceca3503b159412e41e1233dd7188c2e67301fb48f61e440af5fc582e48775
@@ -84,8 +84,8 @@ tts_higgs_nonstream_utmos:
   hf_model_ids:
     - "bosonai/higgs-tts-3-4b"
     - "FunAudioLLM/Fun-ASR-Nano-2512-hf"
-  test_file_sha256: 6c7c390c671439eca6d2366ac76b0050b6ab2f6ed85d592806584cdfa7bd1e3a
-  last_discovered_at: 2026-07-21T22:54:42Z
+  test_file_sha256: f0306a2a53fa71504fd27c60994b754fb521b0a2a92f468305ac1232837b3912
+  last_discovered_at: 2026-07-21T23:35:59Z
   expected_samples: 1088
   threshold_file: "tests/test_model/tts_ci_config.py"
   threshold_file_sha256: e3ceca3503b159412e41e1233dd7188c2e67301fb48f61e440af5fc582e48775
@@ -120,8 +120,8 @@ tts_higgs_nonstream_speed:
   hf_model_ids:
     - "bosonai/higgs-tts-3-4b"
     - "FunAudioLLM/Fun-ASR-Nano-2512-hf"
-  test_file_sha256: 6c7c390c671439eca6d2366ac76b0050b6ab2f6ed85d592806584cdfa7bd1e3a
-  last_discovered_at: 2026-07-21T22:54:42Z
+  test_file_sha256: f0306a2a53fa71504fd27c60994b754fb521b0a2a92f468305ac1232837b3912
+  last_discovered_at: 2026-07-21T23:35:59Z
   expected_samples: 1088
   threshold_file: "tests/test_model/tts_ci_config.py"
   threshold_file_sha256: e3ceca3503b159412e41e1233dd7188c2e67301fb48f61e440af5fc582e48775
@@ -186,8 +186,8 @@ tts_moss_nonstream_wer:
   hf_model_ids:
     - "OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5"
     - "FunAudioLLM/Fun-ASR-Nano-2512-hf"
-  test_file_sha256: 6c7c390c671439eca6d2366ac76b0050b6ab2f6ed85d592806584cdfa7bd1e3a
-  last_discovered_at: 2026-07-21T22:54:42Z
+  test_file_sha256: f0306a2a53fa71504fd27c60994b754fb521b0a2a92f468305ac1232837b3912
+  last_discovered_at: 2026-07-21T23:35:59Z
   expected_samples: 1088
   threshold_file: "tests/test_model/tts_ci_config.py"
   threshold_file_sha256: e3ceca3503b159412e41e1233dd7188c2e67301fb48f61e440af5fc582e48775
@@ -222,8 +222,8 @@ tts_moss_nonstream_similarity:
   hf_model_ids:
     - "OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5"
     - "FunAudioLLM/Fun-ASR-Nano-2512-hf"
-  test_file_sha256: 6c7c390c671439eca6d2366ac76b0050b6ab2f6ed85d592806584cdfa7bd1e3a
-  last_discovered_at: 2026-07-21T22:54:42Z
+  test_file_sha256: f0306a2a53fa71504fd27c60994b754fb521b0a2a92f468305ac1232837b3912
+  last_discovered_at: 2026-07-21T23:35:59Z
   expected_samples: 50
   threshold_file: "tests/test_model/tts_ci_config.py"
   threshold_file_sha256: e3ceca3503b159412e41e1233dd7188c2e67301fb48f61e440af5fc582e48775
@@ -258,8 +258,8 @@ tts_moss_nonstream_utmos:
   hf_model_ids:
     - "OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5"
     - "FunAudioLLM/Fun-ASR-Nano-2512-hf"
-  test_file_sha256: 6c7c390c671439eca6d2366ac76b0050b6ab2f6ed85d592806584cdfa7bd1e3a
-  last_discovered_at: 2026-07-21T22:54:42Z
+  test_file_sha256: f0306a2a53fa71504fd27c60994b754fb521b0a2a92f468305ac1232837b3912
+  last_discovered_at: 2026-07-21T23:35:59Z
   expected_samples: 1088
   threshold_file: "tests/test_model/tts_ci_config.py"
   threshold_file_sha256: e3ceca3503b159412e41e1233dd7188c2e67301fb48f61e440af5fc582e48775
@@ -294,8 +294,8 @@ tts_moss_nonstream_speed:
   hf_model_ids:
     - "OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5"
     - "FunAudioLLM/Fun-ASR-Nano-2512-hf"
-  test_file_sha256: 6c7c390c671439eca6d2366ac76b0050b6ab2f6ed85d592806584cdfa7bd1e3a
-  last_discovered_at: 2026-07-21T22:54:42Z
+  test_file_sha256: f0306a2a53fa71504fd27c60994b754fb521b0a2a92f468305ac1232837b3912
+  last_discovered_at: 2026-07-21T23:35:59Z
   expected_samples: 1088
   threshold_file: "tests/test_model/tts_ci_config.py"
   threshold_file_sha256: e3ceca3503b159412e41e1233dd7188c2e67301fb48f61e440af5fc582e48775
@@ -360,8 +360,8 @@ tts_higgs_stream_wer:
   hf_model_ids:
     - "bosonai/higgs-tts-3-4b"
     - "FunAudioLLM/Fun-ASR-Nano-2512-hf"
-  test_file_sha256: 6c7c390c671439eca6d2366ac76b0050b6ab2f6ed85d592806584cdfa7bd1e3a
-  last_discovered_at: 2026-07-21T22:54:42Z
+  test_file_sha256: f0306a2a53fa71504fd27c60994b754fb521b0a2a92f468305ac1232837b3912
+  last_discovered_at: 2026-07-21T23:35:59Z
   expected_samples: 1088
   threshold_file: "tests/test_model/tts_ci_config.py"
   threshold_file_sha256: e3ceca3503b159412e41e1233dd7188c2e67301fb48f61e440af5fc582e48775
@@ -396,8 +396,8 @@ tts_higgs_stream_speed:
   hf_model_ids:
     - "bosonai/higgs-tts-3-4b"
     - "FunAudioLLM/Fun-ASR-Nano-2512-hf"
-  test_file_sha256: 6c7c390c671439eca6d2366ac76b0050b6ab2f6ed85d592806584cdfa7bd1e3a
-  last_discovered_at: 2026-07-21T22:54:42Z
+  test_file_sha256: f0306a2a53fa71504fd27c60994b754fb521b0a2a92f468305ac1232837b3912
+  last_discovered_at: 2026-07-21T23:35:59Z
   expected_samples: 1088
   threshold_file: "tests/test_model/tts_ci_config.py"
   threshold_file_sha256: e3ceca3503b159412e41e1233dd7188c2e67301fb48f61e440af5fc582e48775
@@ -452,8 +452,8 @@ tts_moss_stream_wer:
   hf_model_ids:
     - "OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5"
     - "FunAudioLLM/Fun-ASR-Nano-2512-hf"
-  test_file_sha256: 6c7c390c671439eca6d2366ac76b0050b6ab2f6ed85d592806584cdfa7bd1e3a
-  last_discovered_at: 2026-07-21T22:54:42Z
+  test_file_sha256: f0306a2a53fa71504fd27c60994b754fb521b0a2a92f468305ac1232837b3912
+  last_discovered_at: 2026-07-21T23:35:59Z
   expected_samples: 1088
   threshold_file: "tests/test_model/tts_ci_config.py"
   threshold_file_sha256: e3ceca3503b159412e41e1233dd7188c2e67301fb48f61e440af5fc582e48775
@@ -488,8 +488,8 @@ tts_moss_stream_speed:
   hf_model_ids:
     - "OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5"
     - "FunAudioLLM/Fun-ASR-Nano-2512-hf"
-  test_file_sha256: 6c7c390c671439eca6d2366ac76b0050b6ab2f6ed85d592806584cdfa7bd1e3a
-  last_discovered_at: 2026-07-21T22:54:42Z
+  test_file_sha256: f0306a2a53fa71504fd27c60994b754fb521b0a2a92f468305ac1232837b3912
+  last_discovered_at: 2026-07-21T23:35:59Z
   expected_samples: 1088
   threshold_file: "tests/test_model/tts_ci_config.py"
   threshold_file_sha256: e3ceca3503b159412e41e1233dd7188c2e67301fb48f61e440af5fc582e48775

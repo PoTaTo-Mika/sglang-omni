@@ -14,6 +14,7 @@ import concurrent.futures
 import functools
 import io
 import logging
+import math
 import os
 import string
 import time
@@ -53,6 +54,13 @@ FUN_ASR_MODEL_PATH = "FunAudioLLM/Fun-ASR-Nano-2512-hf"
 DEFAULT_ASR_TRANSCRIBE_CONCURRENCY = 32
 # note (aaron): warmup requests sent before the timed window, per unit of concurrency.
 ASR_WARMUP_MULTIPLIER = 2
+# Fun-ASR and Whisper-family encoders accept at most ~30s of audio per request
+# (the router rejects anything strictly longer than 30.0s). Model-generated
+# TTS/talker audio occasionally exceeds this (e.g. long concatenated SeedTTS
+# prompts), so audio above this bound is split into balanced sub-segments,
+# transcribed independently, and the transcripts concatenated for WER. The
+# margin below 30.0 keeps every segment safely under the router's guard.
+ASR_MAX_SEGMENT_S = 28.0
 
 
 @functools.lru_cache(maxsize=1)
@@ -116,6 +124,44 @@ def _wav_bytes_from_mono_16k(audio: torch.Tensor) -> bytes:
         wav_file.setframerate(OMNI_WHISPER_SAMPLE_RATE)
         wav_file.writeframes(pcm16.numpy().tobytes())
     return buffer.getvalue()
+
+
+def _load_mono_16k_from_bytes(audio_bytes: bytes) -> torch.Tensor:
+    import torchaudio
+
+    audio, sample_rate = torchaudio.load(io.BytesIO(audio_bytes))
+    if audio.ndim == 2 and audio.shape[0] > 1:
+        audio = audio.mean(dim=0, keepdim=True)
+    audio = audio.squeeze(0).to(torch.float32)
+    if sample_rate != OMNI_WHISPER_SAMPLE_RATE:
+        audio = torchaudio.functional.resample(
+            audio, sample_rate, OMNI_WHISPER_SAMPLE_RATE
+        )
+    return audio
+
+
+def _segment_wav_bytes(
+    audio_bytes: bytes, max_seconds: float = ASR_MAX_SEGMENT_S
+) -> list[bytes]:
+    """Split audio into balanced, in-order mono-16k WAV chunks of <= max_seconds.
+
+    Fun-ASR/Whisper encoders reject audio longer than ~30s per request, so long
+    generations are chunked and their transcripts concatenated for WER. Chunks
+    are balanced (near-equal length) so the split never leaves a tiny tail
+    segment. Callers should only invoke this when the audio exceeds the bound.
+    """
+    audio = _load_mono_16k_from_bytes(audio_bytes)
+    total_samples = int(audio.shape[0])
+    max_samples = int(max_seconds * OMNI_WHISPER_SAMPLE_RATE)
+    num_chunks = max(1, math.ceil(total_samples / max_samples))
+    chunk_samples = math.ceil(total_samples / num_chunks)
+    segments: list[bytes] = []
+    for start in range(0, total_samples, chunk_samples):
+        piece = audio[start : start + chunk_samples]
+        if piece.numel() == 0:
+            continue
+        segments.append(_wav_bytes_from_mono_16k(piece))
+    return segments
 
 
 def _post_omni_whisper_transcription(
@@ -216,27 +262,45 @@ def load_router_asr(
     return load_qwen3_asr(router_port, model_path=model_path)
 
 
+def _post_router_transcription(
+    asr: dict, audio_bytes: bytes, filename: str, lang: str
+) -> str:
+    response = requests.post(
+        f"http://127.0.0.1:{asr['router_port']}/v1/audio/transcriptions",
+        data={
+            "model": asr["model_path"],
+            "language": "en" if lang == "en" else lang,
+            "response_format": "json",
+        },
+        files={"file": (filename, audio_bytes, "audio/wav")},
+        timeout=QWEN3_ASR_REQUEST_TIMEOUT_S,
+        proxies={"http": None, "https": None},
+    )
+    response.raise_for_status()
+    return str(response.json()["text"])
+
+
 def _transcribe_qwen3_asr(asr: dict, wav_path: str, lang: str) -> str:
-    """Transcribe one wav via the Qwen3-ASR server's /v1/audio/transcriptions.
+    """Transcribe one wav via the router's /v1/audio/transcriptions.
 
     Note: do not send temperature=0 because Qwen3-ASR degenerates under pure
     greedy (the server bumps it to 0.01). The language field selects the
-    forced prefix. max_new_tokens comes from the Qwen3 ASR pipeline config.
+    forced prefix. max_new_tokens comes from the ASR pipeline config. Audio
+    longer than ``ASR_MAX_SEGMENT_S`` is split into balanced sub-segments
+    (Fun-ASR/Whisper encoders reject longer audio) and the transcripts joined.
     """
     with open(wav_path, "rb") as audio_file:
-        response = requests.post(
-            f"http://127.0.0.1:{asr['router_port']}/v1/audio/transcriptions",
-            data={
-                "model": asr["model_path"],
-                "language": "en" if lang == "en" else lang,
-                "response_format": "json",
-            },
-            files={"file": (os.path.basename(wav_path), audio_file, "audio/wav")},
-            timeout=QWEN3_ASR_REQUEST_TIMEOUT_S,
-            proxies={"http": None, "https": None},
-        )
-    response.raise_for_status()
-    return str(response.json()["text"])
+        audio_bytes = audio_file.read()
+    basename = os.path.basename(wav_path)
+    if get_wav_duration(audio_bytes) <= ASR_MAX_SEGMENT_S:
+        return _post_router_transcription(asr, audio_bytes, basename, lang)
+    texts = [
+        _post_router_transcription(
+            asr, segment, f"{basename}.chunk{idx}.wav", lang
+        ).strip()
+        for idx, segment in enumerate(_segment_wav_bytes(audio_bytes))
+    ]
+    return " ".join(text for text in texts if text)
 
 
 def _resolve_asr_backend(
@@ -314,17 +378,46 @@ def transcribe_and_compute_wer(
     return apply_wer(output, hyp_text, lang)
 
 
+class _AsrTranscriptionError(RuntimeError):
+    """Non-200 response from the ASR transcription endpoint."""
+
+
+async def _post_asr_transcription(
+    session: aiohttp.ClientSession,
+    api_url: str,
+    *,
+    model_name: str,
+    lang: str,
+    audio_bytes: bytes,
+    filename: str,
+) -> str:
+    form = aiohttp.FormData()
+    form.add_field("model", model_name)
+    form.add_field("language", "en" if lang == "en" else lang)
+    form.add_field("response_format", "json")
+    form.add_field("file", audio_bytes, filename=filename, content_type="audio/wav")
+    async with session.post(api_url, data=form) as response:
+        if response.status != 200:
+            raise _AsrTranscriptionError(
+                f"HTTP {response.status}: {await response.text()}"
+            )
+        payload = await response.json()
+        return str(payload.get("text", ""))
+
+
 def make_asr_send_fn(
     model_name: str,
     api_url: str,
     lang: str = "en",
 ) -> SendFn:
     """Return a send_fn(session, sample) -> RequestResult that transcribes one
-    SeedTTS reference clip via the Omni /v1/audio/transcriptions endpoint.
+    clip via the Omni /v1/audio/transcriptions endpoint.
 
     Note: do not send temperature=0 because Qwen3-ASR degenerates under pure
     greedy (the server bumps it to 0.01). The language field selects the
-    forced prefix. max_new_tokens comes from the Qwen3 ASR pipeline config.
+    forced prefix. max_new_tokens comes from the ASR pipeline config. Audio
+    longer than ``ASR_MAX_SEGMENT_S`` is split into balanced sub-segments
+    (Fun-ASR/Whisper encoders reject longer audio) and the transcripts joined.
     """
 
     async def send_fn(
@@ -338,27 +431,35 @@ def make_asr_send_fn(
             result.error = str(exc)
             return result
         result.audio_duration_s = get_wav_duration(audio_bytes)
-
-        form = aiohttp.FormData()
-        form.add_field("model", model_name)
-        form.add_field("language", "en" if lang == "en" else lang)
-        form.add_field("response_format", "json")
-        form.add_field(
-            "file",
-            audio_bytes,
-            filename=os.path.basename(sample.ref_audio),
-            content_type="audio/wav",
-        )
+        basename = os.path.basename(sample.ref_audio)
 
         start_time = time.perf_counter()
         try:
-            async with session.post(api_url, data=form) as response:
-                if response.status != 200:
-                    result.error = f"HTTP {response.status}: {await response.text()}"
-                else:
-                    payload = await response.json()
-                    result.text = str(payload.get("text", ""))
-                    result.is_success = True
+            if result.audio_duration_s <= ASR_MAX_SEGMENT_S:
+                result.text = await _post_asr_transcription(
+                    session,
+                    api_url,
+                    model_name=model_name,
+                    lang=lang,
+                    audio_bytes=audio_bytes,
+                    filename=basename,
+                )
+            else:
+                texts: list[str] = []
+                for idx, segment in enumerate(_segment_wav_bytes(audio_bytes)):
+                    chunk_text = await _post_asr_transcription(
+                        session,
+                        api_url,
+                        model_name=model_name,
+                        lang=lang,
+                        audio_bytes=segment,
+                        filename=f"{basename}.chunk{idx}.wav",
+                    )
+                    texts.append(chunk_text.strip())
+                result.text = " ".join(text for text in texts if text)
+            result.is_success = True
+        except _AsrTranscriptionError as exc:
+            result.error = str(exc)
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             result.error = str(exc)
         finally:
