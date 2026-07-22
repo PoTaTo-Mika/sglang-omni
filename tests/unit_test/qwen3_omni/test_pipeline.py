@@ -333,7 +333,6 @@ def test_qwen_accepts_miles_audio_video_processor_tensors() -> None:
         request = RolloutGenerateRequest(
             input_ids=[7, 102, 103, 8],
             multimodal_train_inputs={
-                "modalities": ["audio", "video"],
                 "tensors": {name: _encode(tensor) for name, tensor in tensors.items()},
             },
         )

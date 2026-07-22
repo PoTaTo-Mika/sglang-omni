@@ -182,7 +182,6 @@ class SerializedMultimodalInputs(BaseModel):
     """Processor outputs shared by Miles training and SGLang Omni rollout."""
 
     version: Literal[1] = 1
-    modalities: list[Literal["image", "audio", "video"]] = Field(min_length=1)
     tensors: dict[str, SerializedMultimodalTensor] = Field(min_length=1)
 
 
