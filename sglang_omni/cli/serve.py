@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import Annotated, Literal, NoReturn
 
 import typer
@@ -37,7 +38,8 @@ _ASYNC_DECODE_FACTORIES = frozenset(
     }
 )
 _ASYNC_DECODE_SUPPORTED_MODELS = (
-    "Higgs TTS, MOSS-TTS-Local, MOSS-Transcribe-Diarize, Fun-ASR, and Qwen3-ASR"
+    "Higgs TTS, MOSS-TTS-Local, MOSS-Transcribe-Diarize, Fun-ASR, "
+    "Qwen3-ASR, and the Qwen3-Omni thinker"
 )
 _QWEN_PARTIAL_START_TALKER_FACTORY = (
     "sglang_omni.models.qwen3_omni.stages.create_talker_ar_executor_from_config"
@@ -875,11 +877,20 @@ def apply_prefill_coalesce_cli_overrides(
             raise typer.BadParameter("--prefill-coalesce-requests must be >= 0")
         updates["prefill_coalesce_requests"] = int(prefill_coalesce_requests)
     if prefill_coalesce_wait_ms is not None:
-        if prefill_coalesce_wait_ms <= 0:
-            raise typer.BadParameter("--prefill-coalesce-wait-ms must be > 0")
+        if not (
+            math.isfinite(prefill_coalesce_wait_ms) and prefill_coalesce_wait_ms > 0
+        ):
+            raise typer.BadParameter(
+                "--prefill-coalesce-wait-ms must be a finite value > 0"
+            )
         updates["prefill_coalesce_wait_ms"] = float(prefill_coalesce_wait_ms)
     if not updates:
         return pipeline_config
+    if prefill_coalesce_requests is None:
+        logger.warning(
+            "--prefill-coalesce-wait-ms alone does not enable coalescing; the "
+            "gate engages only when --prefill-coalesce-requests is >= 2"
+        )
     matching_stages = [
         stage
         for stage in pipeline_config.stages

@@ -14,6 +14,7 @@ inheriting from ``SGLangScheduler``.
 from __future__ import annotations
 
 import logging
+import math
 import queue as _queue_mod
 import threading
 import time
@@ -289,8 +290,13 @@ class OmniScheduler:
                 "break lockstep scheduling"
             )
             prefill_coalesce_requests = 0
+        if int(prefill_coalesce_requests) < 0:
+            raise ValueError("prefill_coalesce_requests must be >= 0")
+        wait_ms = float(prefill_coalesce_wait_ms)
+        if not (math.isfinite(wait_ms) and wait_ms > 0):
+            raise ValueError("prefill_coalesce_wait_ms must be a finite value > 0")
         self.prefill_coalesce_requests = int(prefill_coalesce_requests)
-        self.prefill_coalesce_wait_s = float(prefill_coalesce_wait_ms) / 1e3
+        self.prefill_coalesce_wait_s = wait_ms / 1e3
         self.prefill_coalesce_when_idle = bool(prefill_coalesce_when_idle)
 
         # Token / memory info (upstream reads from tp_worker.get_worker_info)
