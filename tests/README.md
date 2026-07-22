@@ -200,8 +200,11 @@ Relevant model CI ownership:
   stopped, then transcribes through Qwen3-ASR at concurrency 32.
 - `test_asr_ci_multi_speaker.py`: MOSS-Transcribe-Diarize multi-speaker
   ASR/diarization correctness + speed via the managed router at DP=2. It
-  reuses the movies800 benchmark path, writes
-  `moss_transcribe_diarize_results.json`, and enforces calibrated
+  runs movies800times (non-stream + stream), aishell4_long, and googletime,
+  writes `moss_transcribe_diarize_results.json`,
+  `moss_transcribe_diarize_stream_results.json`,
+  `moss_transcribe_diarize_aishell4_long_results.json`, and
+  `moss_transcribe_diarize_googletime_results.json`, and enforces calibrated
   accuracy/speed thresholds generated from `tune-ci-thresholds`.
 - `test_asr_ci_fun_asr.py`: Fun-ASR-Nano correctness + speed via SGLang Omni
   router (`/v1/audio/transcriptions`). Gates the full 1088-sample English and
