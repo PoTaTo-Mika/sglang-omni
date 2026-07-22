@@ -839,6 +839,9 @@ def test_higgs_model_runner_collect_streaming_uses_preallocated_buffer() -> None
     runner.model = SimpleNamespace(
         _rid_to_row={"req": 0},
         _output_codes={"req": []},
+        _output_action_masks={
+            "req": [torch.tensor([True, True, True], dtype=torch.bool)]
+        },
         _sampler_pool=SimpleNamespace(generation_done=torch.tensor([False])),
     )
     req = SimpleNamespace(
@@ -851,6 +854,7 @@ def test_higgs_model_runner_collect_streaming_uses_preallocated_buffer() -> None
         output_codes=[],
         output_code_buffer=None,
         output_code_count=0,
+        output_action_masks=[],
         output_logprobs=[],
         return_omni_rollout=False,
         return_logprob=False,
