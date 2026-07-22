@@ -321,40 +321,65 @@ def test_qwen_accepts_miles_audio_video_processor_tensors() -> None:
 
     processor_tensors = {
         "input_features": torch.ones((1, 2, 3)),
+        "feature_attention_mask": torch.ones((1, 2), dtype=torch.long),
         "pixel_values_videos": torch.ones((2, 2, 3), dtype=torch.bfloat16),
+        "video_grid_thw": torch.tensor([[1, 2, 3]], dtype=torch.long),
+        "video_second_per_grid": torch.tensor([0.5]),
     }
     pre = object.__new__(preprocessor_mod.Qwen3OmniPreprocessor)
     pre.max_seq_len = None
-    payload = StagePayload(
-        request_id="req-processed-mm",
-        request=Client._build_omni_request(
-            _build_rollout_generate_request(
-                RolloutGenerateRequest(
-                    input_ids=[7, 102, 103, 8],
-                    multimodal_train_inputs={
-                        "modalities": ["audio", "video"],
-                        "tensors": {
-                            name: _encode(tensor)
-                            for name, tensor in processor_tensors.items()
-                        },
-                    },
-                ),
-            )
-        ),
-        data={},
-    )
 
-    out = asyncio.run(pre._call_impl(payload))
-    state = Qwen3OmniPipelineState.from_dict(out.data)
+    def _preprocess(tensors: dict[str, torch.Tensor]) -> Qwen3OmniPipelineState:
+        request = RolloutGenerateRequest(
+            input_ids=[7, 102, 103, 8],
+            multimodal_train_inputs={
+                "modalities": ["audio", "video"],
+                "tensors": {name: _encode(tensor) for name, tensor in tensors.items()},
+            },
+        )
+        payload = StagePayload(
+            request_id="req-processed-mm",
+            request=Client._build_omni_request(
+                _build_rollout_generate_request(request)
+            ),
+            data={},
+        )
+        return Qwen3OmniPipelineState.from_dict(
+            asyncio.run(pre._call_impl(payload)).data
+        )
+
+    state = _preprocess(processor_tensors)
 
     assert state.prompt["input_ids"].tolist() == [7, 102, 103, 8]
+    audio_inputs = state.encoder_inputs["audio_encoder"]
+    video_inputs = state.encoder_inputs["image_encoder"]
     assert torch.equal(
-        state.encoder_inputs["audio_encoder"]["input_features"],
-        processor_tensors["input_features"],
+        audio_inputs["input_features"], processor_tensors["input_features"]
     )
     assert torch.equal(
-        state.encoder_inputs["image_encoder"]["pixel_values_videos"],
+        audio_inputs["feature_attention_mask"],
+        processor_tensors["feature_attention_mask"],
+    )
+    assert torch.equal(
+        video_inputs["pixel_values_videos"],
         processor_tensors["pixel_values_videos"],
+    )
+    assert torch.equal(
+        video_inputs["video_grid_thw"], processor_tensors["video_grid_thw"]
+    )
+    assert audio_inputs["cache_key"].startswith("processed:")
+    assert video_inputs["cache_key"].startswith("processed:")
+
+    changed_tensors = {
+        **processor_tensors,
+        "pixel_values_videos": torch.zeros_like(
+            processor_tensors["pixel_values_videos"]
+        ),
+    }
+    changed_state = _preprocess(changed_tensors)
+    assert (
+        changed_state.encoder_inputs["image_encoder"]["cache_key"]
+        != video_inputs["cache_key"]
     )
 
 

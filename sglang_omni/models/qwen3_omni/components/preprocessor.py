@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import xxhash
 from transformers.models.qwen3_omni_moe.processing_qwen3_omni_moe import (
     Qwen3OmniMoeProcessor,
 )
@@ -327,16 +328,31 @@ class Qwen3OmniPreprocessor:
     ) -> StagePayload:
         """Use Miles' exact token ids and optional processor tensors."""
         flat_inputs: dict[str, torch.Tensor] = {}
+        processed_cache_key = None
         if bundle is not None:
-            for name, spec in bundle["tensors"].items():
+            cache_parts = []
+            for name in sorted(bundle["tensors"]):
+                spec = bundle["tensors"][name]
+                raw = base64.b64decode(spec["data"])
+                cache_parts.append(
+                    (
+                        name,
+                        spec["dtype"],
+                        spec["shape"],
+                        xxhash.xxh3_64_hexdigest(raw),
+                    )
+                )
                 flat_inputs[name] = (
                     torch.frombuffer(
-                        bytearray(base64.b64decode(spec["data"])),
+                        bytearray(raw),
                         dtype=getattr(torch, spec["dtype"]),
                     )
                     .clone()
                     .reshape(spec["shape"])
                 )
+            processed_cache_key = "processed:" + xxhash.xxh3_64_hexdigest(
+                json.dumps(cache_parts, separators=(",", ":")).encode()
+            )
 
         input_ids = torch.tensor(token_ids, dtype=torch.long)
         attention_mask = torch.ones_like(input_ids)
@@ -367,6 +383,11 @@ class Qwen3OmniPreprocessor:
             for name, value in full_mm_inputs["audio"].items()
             if value is not None
         }
+        if processed_cache_key is not None:
+            if image_encoder_inputs:
+                image_encoder_inputs["cache_key"] = processed_cache_key
+            if audio_encoder_inputs:
+                audio_encoder_inputs["cache_key"] = processed_cache_key
         return self._finalize_state(
             payload,
             input_ids=input_ids,
