@@ -254,6 +254,10 @@ teardown_state() {
   [ -n "$state" ] && [ -f "$state/replicas.tsv" ] || die "invalid or missing run state '$state'"
   [ -r "$state/manifest" ] || die "missing run manifest '$state/manifest'"
   weight_ipc=$(awk -F= '$1 == "weight_ipc" {print $2; exit}' "$state/manifest")
+  if [ -z "$weight_ipc" ]; then
+    echo "warning: legacy run manifest has no weight_ipc; assuming weight_ipc=0" >&2
+    weight_ipc=0
+  fi
   case "$weight_ipc" in
     0|1) ;;
     *) die "invalid weight_ipc value in '$state/manifest': '$weight_ipc'" ;;
