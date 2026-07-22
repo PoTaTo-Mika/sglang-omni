@@ -3,9 +3,12 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
+import math
 from typing import Any, Literal
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
 
 class UsageResponse(BaseModel):
@@ -170,12 +173,45 @@ class RolloutMessage(BaseModel):
     content: str | list[Any]
 
 
+_SERIALIZED_DTYPE_ITEMSIZE = {
+    "float64": 8,
+    "float32": 4,
+    "float16": 2,
+    "bfloat16": 2,
+    "int64": 8,
+    "int32": 4,
+    "int16": 2,
+    "int8": 1,
+    "uint8": 1,
+    "bool": 1,
+}
+
+
 class SerializedMultimodalTensor(BaseModel):
     """One processor tensor encoded for JSON transport."""
 
     dtype: str = Field(min_length=1)
     shape: list[int]
     data: str
+
+    @model_validator(mode="after")
+    def _validate_payload(self) -> SerializedMultimodalTensor:
+        itemsize = _SERIALIZED_DTYPE_ITEMSIZE.get(self.dtype)
+        if itemsize is None:
+            raise ValueError(f"unsupported tensor dtype {self.dtype!r}")
+        if any(dim < 0 for dim in self.shape):
+            raise ValueError(f"invalid tensor shape {self.shape}")
+        try:
+            raw_len = len(base64.b64decode(self.data, validate=True))
+        except binascii.Error as exc:
+            raise ValueError("tensor data is not valid base64") from exc
+        expected = math.prod(self.shape) * itemsize
+        if raw_len != expected:
+            raise ValueError(
+                f"tensor data has {raw_len} bytes, expected {expected} "
+                f"for shape={self.shape} dtype={self.dtype}"
+            )
+        return self
 
 
 class SerializedMultimodalInputs(BaseModel):
