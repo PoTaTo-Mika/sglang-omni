@@ -37,35 +37,6 @@ from sglang_omni.proto import StagePayload
 logger = logging.getLogger(__name__)
 
 
-def _deserialize_multimodal_train_inputs(
-    bundle: dict[str, Any],
-) -> dict[str, torch.Tensor]:
-    """Restore the exact processor tensor kwargs serialized by Miles."""
-    tensors: dict[str, torch.Tensor] = {}
-    for name, spec in bundle["tensors"].items():
-        dtype_name = spec["dtype"]
-        dtype = getattr(torch, dtype_name, None)
-        if not isinstance(dtype, torch.dtype):
-            raise ValueError(
-                f"unsupported multimodal tensor dtype for {name!r}: {dtype_name!r}"
-            )
-        shape = spec["shape"]
-        if any(dimension < 0 for dimension in shape):
-            raise ValueError(f"invalid multimodal tensor shape for {name!r}")
-
-        try:
-            raw = base64.b64decode(spec["data"], validate=True)
-            tensor = (
-                torch.frombuffer(bytearray(raw), dtype=dtype).clone().reshape(shape)
-            )
-        except (ValueError, RuntimeError) as exc:
-            raise ValueError(
-                f"invalid multimodal tensor data for {name!r}: {exc}"
-            ) from exc
-        tensors[name] = tensor
-    return tensors
-
-
 def _resolve_local_model_dir(model_path: str) -> str:
     """Resolve a local model directory without eagerly hydrating full snapshots."""
     path = Path(model_path)
@@ -355,9 +326,32 @@ class Qwen3OmniPreprocessor:
         bundle: dict[str, Any] | None = None,
     ) -> StagePayload:
         """Use Miles' exact token ids and optional processor tensors."""
-        flat_inputs = (
-            _deserialize_multimodal_train_inputs(bundle) if bundle is not None else {}
-        )
+        flat_inputs: dict[str, torch.Tensor] = {}
+        if bundle is not None:
+            for name, spec in bundle["tensors"].items():
+                dtype_name = spec["dtype"]
+                dtype = getattr(torch, dtype_name, None)
+                if not isinstance(dtype, torch.dtype):
+                    raise ValueError(
+                        f"unsupported multimodal tensor dtype for {name!r}: "
+                        f"{dtype_name!r}"
+                    )
+                shape = spec["shape"]
+                if any(dimension < 0 for dimension in shape):
+                    raise ValueError(f"invalid multimodal tensor shape for {name!r}")
+
+                try:
+                    raw = base64.b64decode(spec["data"], validate=True)
+                    tensor = (
+                        torch.frombuffer(bytearray(raw), dtype=dtype)
+                        .clone()
+                        .reshape(shape)
+                    )
+                except (ValueError, RuntimeError) as exc:
+                    raise ValueError(
+                        f"invalid multimodal tensor data for {name!r}: {exc}"
+                    ) from exc
+                flat_inputs[name] = tensor
 
         input_ids = torch.tensor(token_ids, dtype=torch.long)
         attention_mask = torch.ones_like(input_ids)

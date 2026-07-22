@@ -441,14 +441,6 @@ def _infer_payload_capabilities(
 ) -> set[Capability]:
     capabilities: set[Capability] = set()
     capabilities.update(_infer_input_field_capabilities(payload))
-    processed_inputs = payload.get("multimodal_train_inputs")
-    if isinstance(processed_inputs, dict):
-        modalities = processed_inputs.get("modalities")
-        if isinstance(modalities, list):
-            for modality in modalities:
-                capability = INPUT_FIELD_CAPABILITIES.get(f"{modality}s")
-                if capability is not None:
-                    capabilities.add(capability)
     if path == "/v1/audio/speech" and _speech_uses_reference_audio(payload):
         capabilities.add("audio_input")
     if _modalities_include_audio(payload) or _has_non_empty(payload.get("audio")):

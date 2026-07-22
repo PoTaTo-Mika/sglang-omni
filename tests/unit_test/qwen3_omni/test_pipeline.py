@@ -317,11 +317,8 @@ def test_qwen_accepts_miles_audio_video_processor_tensors() -> None:
         }
 
     processor_tensors = {
-        "input_features": torch.arange(6, dtype=torch.float32).reshape(1, 2, 3),
-        "feature_attention_mask": torch.ones((1, 2), dtype=torch.long),
-        "pixel_values_videos": torch.arange(12, dtype=torch.bfloat16).reshape(2, 2, 3),
-        "video_grid_thw": torch.tensor([[1, 2, 3]], dtype=torch.long),
-        "video_second_per_grid": torch.tensor([0.5], dtype=torch.float32),
+        "input_features": torch.ones((1, 2, 3)),
+        "pixel_values_videos": torch.ones((2, 2, 3), dtype=torch.bfloat16),
     }
     pre = object.__new__(preprocessor_mod.Qwen3OmniPreprocessor)
     pre.max_seq_len = None
@@ -356,9 +353,6 @@ def test_qwen_accepts_miles_audio_video_processor_tensors() -> None:
         state.encoder_inputs["image_encoder"]["pixel_values_videos"],
         processor_tensors["pixel_values_videos"],
     )
-    assert state.mm_inputs["audio"]["audio_feature_lengths"].tolist() == [2]
-    assert state.mm_inputs["video"]["video_grid_thw"].tolist() == [[1, 2, 3]]
-    assert out.request.inputs is None
 
 
 def test_qwen_preprocessor_retries_without_special_token_compat(

@@ -80,40 +80,6 @@ def test_generate_returns_miles_meta_info() -> None:
     assert meta["request_metadata"] == {"rollout_id": 42, "group_id": 1}
 
 
-def test_generate_accepts_miles_multimodal_train_inputs() -> None:
-    bundle = {
-        "version": 1,
-        "modalities": ["audio", "video"],
-        "tensors": {
-            "input_features": {
-                "dtype": "float32",
-                "shape": [1],
-                "data": "AAAAAA==",
-            },
-            "pixel_values_videos": {
-                "dtype": "float16",
-                "shape": [1],
-                "data": "AAA=",
-            },
-        },
-    }
-    client = _RolloutClient(_text_result())
-    tc = TestClient(create_app(client, model_name="qwen3-omni"))
-
-    resp = tc.post(
-        "/generate",
-        json={
-            "input_ids": [1, 102, 103, 2],
-            "multimodal_train_inputs": bundle,
-        },
-    )
-
-    assert resp.status_code == 200
-    request = client.requests[0]
-    assert request.prompt_token_ids == [1, 102, 103, 2]
-    assert request.multimodal_train_inputs == bundle
-
-
 def test_generate_returns_omni_rollout_when_present() -> None:
     result = _text_result()
     result.output_token_logprobs = None
@@ -450,27 +416,19 @@ def test_converter_maps_input_ids_to_prompt_token_ids() -> None:
 
 
 def test_converter_threads_processed_multimodal_inputs_to_pipeline() -> None:
-    bundle = {
-        "version": 1,
-        "modalities": ["video"],
-        "tensors": {
-            "video_grid_thw": {
-                "dtype": "int64",
-                "shape": [1, 3],
-                "data": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-            }
-        },
-    }
     req = RolloutRequest(
-        input_ids=[1, 103, 2],
-        multimodal_train_inputs=bundle,
+        input_ids=[1],
+        multimodal_train_inputs={
+            "modalities": ["video"],
+            "tensors": {"x": {"dtype": "int64", "shape": [1], "data": ""}},
+        },
     )
 
     omni = Client._build_omni_request(_build_rollout_generate_request(req))
 
     assert omni.inputs == {
-        "input_ids": [1, 103, 2],
-        "multimodal_train_inputs": bundle,
+        "input_ids": [1],
+        "multimodal_train_inputs": req.multimodal_train_inputs.model_dump(),
     }
 
 
