@@ -329,29 +329,14 @@ class Qwen3OmniPreprocessor:
         flat_inputs: dict[str, torch.Tensor] = {}
         if bundle is not None:
             for name, spec in bundle["tensors"].items():
-                dtype_name = spec["dtype"]
-                dtype = getattr(torch, dtype_name, None)
-                if not isinstance(dtype, torch.dtype):
-                    raise ValueError(
-                        f"unsupported multimodal tensor dtype for {name!r}: "
-                        f"{dtype_name!r}"
+                flat_inputs[name] = (
+                    torch.frombuffer(
+                        bytearray(base64.b64decode(spec["data"])),
+                        dtype=getattr(torch, spec["dtype"]),
                     )
-                shape = spec["shape"]
-                if any(dimension < 0 for dimension in shape):
-                    raise ValueError(f"invalid multimodal tensor shape for {name!r}")
-
-                try:
-                    raw = base64.b64decode(spec["data"], validate=True)
-                    tensor = (
-                        torch.frombuffer(bytearray(raw), dtype=dtype)
-                        .clone()
-                        .reshape(shape)
-                    )
-                except (ValueError, RuntimeError) as exc:
-                    raise ValueError(
-                        f"invalid multimodal tensor data for {name!r}: {exc}"
-                    ) from exc
-                flat_inputs[name] = tensor
+                    .clone()
+                    .reshape(spec["shape"])
+                )
 
         input_ids = torch.tensor(token_ids, dtype=torch.long)
         attention_mask = torch.ones_like(input_ids)

@@ -7,7 +7,6 @@ from typing import Any
 
 from fastapi.testclient import TestClient
 
-from sglang_omni.client import Client
 from sglang_omni.client.types import (
     CompletionAudio,
     CompletionResult,
@@ -413,23 +412,6 @@ def test_converter_maps_input_ids_to_prompt_token_ids() -> None:
     assert gen.sampling.max_new_tokens == 8
     assert gen.stream is False
     assert gen.extra_params["return_logprob"] is True
-
-
-def test_converter_threads_processed_multimodal_inputs_to_pipeline() -> None:
-    req = RolloutRequest(
-        input_ids=[1],
-        multimodal_train_inputs={
-            "modalities": ["video"],
-            "tensors": {"x": {"dtype": "int64", "shape": [1], "data": ""}},
-        },
-    )
-
-    omni = Client._build_omni_request(_build_rollout_generate_request(req))
-
-    assert omni.inputs == {
-        "input_ids": [1],
-        "multimodal_train_inputs": req.multimodal_train_inputs.model_dump(),
-    }
 
 
 def test_converter_omits_explicit_params_when_sampling_omitted() -> None:

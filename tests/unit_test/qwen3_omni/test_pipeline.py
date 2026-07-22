@@ -303,9 +303,12 @@ def test_qwen_preprocess_pretokenized_builds_state_and_releases_inputs() -> None
 
 
 def test_qwen_accepts_miles_audio_video_processor_tensors() -> None:
+    from sglang_omni.client import Client
     from sglang_omni.models.qwen3_omni.components import (
         preprocessor as preprocessor_mod,
     )
+    from sglang_omni.serve.openai_api import _build_rollout_generate_request
+    from sglang_omni.serve.protocol import RolloutGenerateRequest
 
     def _encode(tensor: torch.Tensor) -> dict[str, object]:
         tensor = tensor.contiguous()
@@ -324,19 +327,19 @@ def test_qwen_accepts_miles_audio_video_processor_tensors() -> None:
     pre.max_seq_len = None
     payload = StagePayload(
         request_id="req-processed-mm",
-        request=OmniRequest(
-            inputs={
-                "input_ids": [7, 102, 103, 8],
-                "multimodal_train_inputs": {
-                    "version": 1,
-                    "modalities": ["audio", "video"],
-                    "tensors": {
-                        name: _encode(tensor)
-                        for name, tensor in processor_tensors.items()
+        request=Client._build_omni_request(
+            _build_rollout_generate_request(
+                RolloutGenerateRequest(
+                    input_ids=[7, 102, 103, 8],
+                    multimodal_train_inputs={
+                        "modalities": ["audio", "video"],
+                        "tensors": {
+                            name: _encode(tensor)
+                            for name, tensor in processor_tensors.items()
+                        },
                     },
-                },
-            },
-            params={"max_new_tokens": 16},
+                ),
+            )
         ),
         data={},
     )
