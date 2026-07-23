@@ -791,7 +791,6 @@ class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
             1, 2
         )
 
-        # Use SDPA with native GQA (no materialized KV expansion)
         attn_output = torch.nn.functional.scaled_dot_product_attention(
             q,
             k,
