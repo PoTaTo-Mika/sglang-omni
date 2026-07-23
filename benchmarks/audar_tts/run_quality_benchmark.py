@@ -9,9 +9,7 @@ import hashlib
 import json
 import subprocess
 import time
-import unicodedata
 import wave
-from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +17,8 @@ from huggingface_hub import hf_hub_download
 
 AUDAR_REVISION = "51f5635f32de3ab45ff28a4b958464532225b247"
 CODEC_REVISION = "30c1fdd19e68aee65d542cf043750d4c0165893e"
-FLEURS_REVISION = "ab93cf03f9d0cd083c853fad065a6377067408aa"
+DATASET_REPO = "zhaochenyang20/sglang-omni-arabic-tts-smoke"
+DATASET_REVISION = "65835c3a1047037f9e0cd4947652722c0a58c304"
 REFERENCE_FILE = "samples/demo_male_1_ar.wav"
 REFERENCE_TEXT = (
     "لا يمكنني الانتظار لأخبرك — [excited] لقد أنجزنا المشروع أخيراً بعد كلّ "
@@ -33,8 +32,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--model-path", default="audarai/Audar-TTS-V1-Turbo")
     parser.add_argument("--reference-path", type=Path)
     parser.add_argument("--samples", type=int, default=50)
-    parser.add_argument("--min-words", type=int, default=6)
-    parser.add_argument("--max-words", type=int, default=20)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--max-new-tokens", type=int, default=1024)
     parser.add_argument("--gpu-id", type=int, default=0)
@@ -52,72 +49,19 @@ def _git_commit() -> str:
     ).stdout.strip()
 
 
-def _is_arabic_text(text: str) -> bool:
-    letters = [char for char in text if char.isalpha()]
-    if not letters:
-        return False
-    arabic_letters = [
-        char for char in letters if "ARABIC" in unicodedata.name(char, "")
-    ]
-    return len(arabic_letters) / len(letters) >= 0.9
-
-
-def _select_targets(
-    rows: Iterable[Mapping[str, Any]],
-    *,
-    samples: int,
-    min_words: int,
-    max_words: int,
-) -> list[dict[str, Any]]:
-    selected: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for row_index, row in enumerate(rows):
-        text = " ".join(str(row["transcription"]).split())
-        word_count = len(text.split())
-        if not min_words <= word_count <= max_words:
-            continue
-        if any(char.isdigit() for char in text):
-            continue
-        if not _is_arabic_text(text) or text in seen:
-            continue
-        seen.add(text)
-        selected.append(
-            {
-                "sample_id": f"fleurs-ar-eg-{row_index:04d}",
-                "dataset_row_index": row_index,
-                "dataset_id": str(row.get("id", row_index)),
-                "target_text": text,
-                "word_count": word_count,
-            }
-        )
-        if len(selected) == samples:
-            break
-    if len(selected) != samples:
-        raise ValueError(f"selected {len(selected)} of {samples} requested texts")
-    return selected
-
-
 def _load_targets(args: argparse.Namespace) -> list[dict[str, Any]]:
     from datasets import load_dataset
 
-    dataset_file = "ar_eg/test-00000-of-00001.parquet"
-    parquet_path = hf_hub_download(
-        "google/fleurs",
-        dataset_file,
-        revision=FLEURS_REVISION,
-        repo_type="dataset",
-    )
     dataset = load_dataset(
-        "parquet",
-        data_files=str(parquet_path),
-        split="train",
-    ).select_columns(["id", "transcription"])
-    return _select_targets(
-        dataset,
-        samples=args.samples,
-        min_words=args.min_words,
-        max_words=args.max_words,
+        DATASET_REPO,
+        split="test",
+        revision=DATASET_REVISION,
     )
+    if args.samples > len(dataset):
+        raise ValueError(
+            f"requested {args.samples} samples from a {len(dataset)}-row dataset"
+        )
+    return [dict(row) for row in dataset.select(range(args.samples))]
 
 
 def _sync() -> None:
@@ -183,8 +127,6 @@ def main() -> None:
     args = _parse_args()
     if args.samples < 2:
         raise ValueError("--samples must be at least 2")
-    if args.min_words <= 0 or args.max_words < args.min_words:
-        raise ValueError("invalid word-count range")
 
     import numpy as np
 
@@ -301,17 +243,14 @@ def main() -> None:
         "codec_revision": CODEC_REVISION,
         "reference_file": REFERENCE_FILE,
         "dataset": {
-            "repo": "google/fleurs",
-            "config": "ar_eg",
+            "repo": DATASET_REPO,
             "split": "test",
-            "revision": FLEURS_REVISION,
-            "selection": {
-                "samples": args.samples,
-                "min_words": args.min_words,
-                "max_words": args.max_words,
-                "minimum_arabic_letter_fraction": 0.9,
-                "exclude_digits": True,
-                "text_column": "transcription",
+            "revision": DATASET_REVISION,
+            "source": {
+                "repo": "google/fleurs",
+                "config": "ar_eg",
+                "split": "test",
+                "revision": "ab93cf03f9d0cd083c853fad065a6377067408aa",
             },
         },
         "seed": args.seed,

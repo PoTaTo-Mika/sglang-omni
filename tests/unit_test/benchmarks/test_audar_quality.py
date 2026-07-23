@@ -2,10 +2,16 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from benchmarks.audar_tts.run_quality_benchmark import _is_arabic_text, _select_targets
+from benchmarks.audar_tts.prepare_fleurs_dataset import _is_arabic_text, _select_targets
+from benchmarks.audar_tts.run_quality_benchmark import (
+    DATASET_REPO,
+    DATASET_REVISION,
+    _load_targets,
+)
 from benchmarks.audar_tts.summarize_quality import _quality_metrics
 from benchmarks.benchmarker.data import RequestResult
 from benchmarks.eval.benchmark_tts_seedtts import (
@@ -45,12 +51,48 @@ def test_select_targets_keeps_fixed_arabic_subset() -> None:
         max_words=20,
     )
 
-    assert [sample["dataset_id"] for sample in selected] == ["2", "4"]
+    assert [sample["source_id"] for sample in selected] == ["2", "4"]
     assert [sample["sample_id"] for sample in selected] == [
         "fleurs-ar-eg-0001",
         "fleurs-ar-eg-0003",
     ]
     assert _is_arabic_text(selected[0]["target_text"])
+
+
+def test_quality_runner_loads_pinned_hf_dataset(monkeypatch) -> None:
+    class FakeDataset:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def __len__(self):
+            return len(self.rows)
+
+        def select(self, indices):
+            return FakeDataset([self.rows[index] for index in indices])
+
+        def __iter__(self):
+            return iter(self.rows)
+
+    calls = []
+
+    def fake_load_dataset(repo, *, split, revision):
+        calls.append((repo, split, revision))
+        return FakeDataset(
+            [
+                {"sample_id": "one", "target_text": "النص الأول"},
+                {"sample_id": "two", "target_text": "النص الثاني"},
+            ]
+        )
+
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "datasets",
+        SimpleNamespace(load_dataset=fake_load_dataset),
+    )
+    targets = _load_targets(SimpleNamespace(samples=1))
+
+    assert calls == [(DATASET_REPO, "test", DATASET_REVISION)]
+    assert targets == [{"sample_id": "one", "target_text": "النص الأول"}]
 
 
 def test_arabic_quality_uses_target_and_asr_text_directly() -> None:

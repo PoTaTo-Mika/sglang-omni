@@ -177,7 +177,7 @@ python -m benchmarks.eval.benchmark_omni_seedtts \
 
 | Script | Task | Model | API |
 |--------|------|-------|-----|
-| `audar_tts/run_quality_benchmark.py` | Informal Arabic intelligibility smoke benchmark on FLEURS | Audar-TTS-V1 Turbo | Direct pipeline stages, then shared ASR pipeline |
+| `audar_tts/run_quality_benchmark.py` | Informal Arabic intelligibility smoke benchmark on a fixed FLEURS-derived HF set | Audar-TTS-V1 Turbo | Direct pipeline stages, then shared ASR pipeline |
 | `eval/benchmark_tts_seedtts.py` | TTS speed + WER (unified) | e.g. S2-Pro, Voxtral, Higgs TTS | `/v1/audio/speech` |
 | `eval/benchmark_tts_serving.py` | TTS serving contract | OpenAI-compatible TTS models | `/v1/audio/speech`, raw PCM streaming, WebSocket, voice and batch contracts |
 | `eval/benchmark_omni_seedtts.py` | TTS speed + WER (unified) | Qwen3-Omni | `/v1/chat/completions` |

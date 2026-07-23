@@ -1,10 +1,10 @@
 # Audar Arabic intelligibility smoke benchmark
 
 This workflow provides a reproducible Arabic smoke benchmark for
-Audar-TTS-V1 Turbo. It selects 50 target texts from the pinned FLEURS `ar_eg`
-test split, synthesizes each target with the same official Audar reference,
-transcribes the generated WAVs with Qwen3-ASR-1.7B, and directly compares the
-normalized Arabic target and hypothesis.
+Audar-TTS-V1 Turbo. It loads a fixed 50-sentence Arabic target-text dataset
+from Hugging Face, synthesizes each target with the same official Audar
+reference, transcribes the generated WAVs with Qwen3-ASR-1.7B, and directly
+compares the normalized Arabic target and hypothesis.
 
 This is not a standard Arabic TTS benchmark or a substitute for evaluation from
 the Audar authors. It checks intelligibility and is useful for regressions. It
@@ -22,6 +22,13 @@ python -m benchmarks.audar_tts.run_quality_benchmark \
   --output-dir results/audar-arabic \
   --samples 50
 ```
+
+The runner reads
+[`zhaochenyang20/sglang-omni-arabic-tts-smoke`](https://huggingface.co/datasets/zhaochenyang20/sglang-omni-arabic-tts-smoke)
+at immutable revision
+`65835c3a1047037f9e0cd4947652722c0a58c304`. The dataset contains only target
+text and FLEURS provenance, so the same set can be reused by other Arabic TTS
+models.
 
 By default the script downloads the pinned official
 `samples/demo_male_1_ar.wav` reference and uses its matching transcript. Pass
@@ -74,3 +81,18 @@ independent quality measurements.
 The original 50-sentence run produced 5.43% WER, 1.46% CER, 88.75 BLEU, and
 95.57 chrF++. Treat these values as a smoke-test reference, not a vendor
 comparison or quality threshold.
+
+## Source of truth
+
+- Dataset:
+  [`zhaochenyang20/sglang-omni-arabic-tts-smoke`](https://huggingface.co/datasets/zhaochenyang20/sglang-omni-arabic-tts-smoke)
+- Dataset revision: `65835c3a1047037f9e0cd4947652722c0a58c304`
+- Dataset manifest:
+  [`manifest.json`](https://huggingface.co/datasets/zhaochenyang20/sglang-omni-arabic-tts-smoke/blob/65835c3a1047037f9e0cd4947652722c0a58c304/manifest.json)
+- Materialization command:
+
+```bash
+python -m benchmarks.audar_tts.prepare_fleurs_dataset \
+  --output-dir /tmp/sglang-omni-arabic-tts-smoke \
+  --samples 50
+```
