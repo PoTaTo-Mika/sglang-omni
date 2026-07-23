@@ -19,6 +19,7 @@ AUDAR_REVISION = "51f5635f32de3ab45ff28a4b958464532225b247"
 CODEC_REVISION = "30c1fdd19e68aee65d542cf043750d4c0165893e"
 DATASET_REPO = "zhaochenyang20/sglang-omni-arabic-tts-smoke"
 DATASET_REVISION = "65835c3a1047037f9e0cd4947652722c0a58c304"
+DATASET_SIZE = 50
 REFERENCE_FILE = "samples/demo_male_1_ar.wav"
 REFERENCE_TEXT = (
     "لا يمكنني الانتظار لأخبرك — [excited] لقد أنجزنا المشروع أخيراً بعد كلّ "
@@ -38,15 +39,16 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _git_commit() -> str:
+def _git_commit() -> str | None:
     repository = Path(__file__).resolve().parents[2]
-    return subprocess.run(
+    completed = subprocess.run(
         ["git", "rev-parse", "HEAD"],
         cwd=repository,
-        check=True,
+        check=False,
         capture_output=True,
         text=True,
-    ).stdout.strip()
+    )
+    return completed.stdout.strip() if completed.returncode == 0 else None
 
 
 def _load_targets(args: argparse.Namespace) -> list[dict[str, Any]]:
@@ -57,6 +59,8 @@ def _load_targets(args: argparse.Namespace) -> list[dict[str, Any]]:
         split="test",
         revision=DATASET_REVISION,
     )
+    if len(dataset) != DATASET_SIZE:
+        raise ValueError(f"expected {DATASET_SIZE} dataset rows, found {len(dataset)}")
     if args.samples > len(dataset):
         raise ValueError(
             f"requested {args.samples} samples from a {len(dataset)}-row dataset"
@@ -127,6 +131,7 @@ def main() -> None:
     args = _parse_args()
     if args.samples < 2:
         raise ValueError("--samples must be at least 2")
+    commit = _git_commit()
 
     import numpy as np
 
@@ -237,7 +242,7 @@ def main() -> None:
 
     result = {
         "schema_version": 1,
-        "commit": _git_commit(),
+        "commit": commit,
         "model_path": args.model_path,
         "audar_revision": AUDAR_REVISION,
         "codec_revision": CODEC_REVISION,
@@ -246,6 +251,8 @@ def main() -> None:
             "repo": DATASET_REPO,
             "split": "test",
             "revision": DATASET_REVISION,
+            "available_samples": DATASET_SIZE,
+            "selected_samples": len(targets),
             "source": {
                 "repo": "google/fleurs",
                 "config": "ar_eg",

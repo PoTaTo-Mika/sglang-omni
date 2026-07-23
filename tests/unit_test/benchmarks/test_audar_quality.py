@@ -10,6 +10,7 @@ from benchmarks.audar_tts.prepare_fleurs_dataset import _is_arabic_text, _select
 from benchmarks.audar_tts.run_quality_benchmark import (
     DATASET_REPO,
     DATASET_REVISION,
+    DATASET_SIZE,
     _load_targets,
 )
 from benchmarks.audar_tts.summarize_quality import _quality_metrics
@@ -79,8 +80,11 @@ def test_quality_runner_loads_pinned_hf_dataset(monkeypatch) -> None:
         calls.append((repo, split, revision))
         return FakeDataset(
             [
-                {"sample_id": "one", "target_text": "النص الأول"},
-                {"sample_id": "two", "target_text": "النص الثاني"},
+                {
+                    "sample_id": f"sample-{index}",
+                    "target_text": f"النص العربي {index}",
+                }
+                for index in range(DATASET_SIZE)
             ]
         )
 
@@ -92,7 +96,7 @@ def test_quality_runner_loads_pinned_hf_dataset(monkeypatch) -> None:
     targets = _load_targets(SimpleNamespace(samples=1))
 
     assert calls == [(DATASET_REPO, "test", DATASET_REVISION)]
-    assert targets == [{"sample_id": "one", "target_text": "النص الأول"}]
+    assert targets == [{"sample_id": "sample-0", "target_text": "النص العربي 0"}]
 
 
 def test_arabic_quality_uses_target_and_asr_text_directly() -> None:
