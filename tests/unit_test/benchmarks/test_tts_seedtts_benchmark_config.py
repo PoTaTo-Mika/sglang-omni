@@ -48,9 +48,17 @@ def test_seedtts_benchmark_batch_args_are_independent() -> None:
 
 
 def test_seedtts_benchmark_accepts_arabic() -> None:
-    config = _config_from_cli("--lang", "ar")
+    config = _config_from_cli(
+        "--transcribe-only",
+        "--skip-gpu-cleanup",
+        "--meta",
+        "google/fleurs",
+        "--lang",
+        "ar",
+    )
 
     assert config.lang == "ar"
+    assert config.meta == "google/fleurs"
 
 
 def test_arabic_wer_normalization() -> None:
