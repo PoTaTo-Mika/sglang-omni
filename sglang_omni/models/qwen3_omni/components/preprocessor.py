@@ -37,6 +37,14 @@ from sglang_omni.proto import StagePayload
 
 logger = logging.getLogger(__name__)
 
+_TRAIN_INPUT_TENSOR_NAMES = frozenset(
+    {
+        **build_image_mm_inputs({}),
+        **build_audio_mm_inputs({}),
+        **build_video_mm_inputs({}),
+    }
+)
+
 
 def _resolve_local_model_dir(model_path: str) -> str:
     """Resolve a local model directory without eagerly hydrating full snapshots."""
@@ -330,6 +338,12 @@ class Qwen3OmniPreprocessor:
         flat_inputs: dict[str, torch.Tensor] = {}
         processed_cache_key = None
         if bundle is not None:
+            unknown_names = set(bundle["tensors"]) - _TRAIN_INPUT_TENSOR_NAMES
+            if unknown_names:
+                raise ValueError(
+                    "unknown multimodal_train_inputs tensors: "
+                    + ", ".join(sorted(unknown_names))
+                )
             cache_parts = []
             for name in sorted(bundle["tensors"]):
                 spec = bundle["tensors"][name]
@@ -383,6 +397,21 @@ class Qwen3OmniPreprocessor:
             for name, value in full_mm_inputs["audio"].items()
             if value is not None
         }
+        has_image_payload = (
+            image_encoder_inputs.get("pixel_values") is not None
+            or image_encoder_inputs.get("pixel_values_videos") is not None
+        )
+        has_audio_payload = audio_encoder_inputs.get("input_features") is not None
+        if image_encoder_inputs and not has_image_payload:
+            raise ValueError(
+                "multimodal_train_inputs provides image/video metadata "
+                "without pixel_values or pixel_values_videos"
+            )
+        if audio_encoder_inputs and not has_audio_payload:
+            raise ValueError(
+                "multimodal_train_inputs provides audio metadata "
+                "without input_features"
+            )
         if processed_cache_key is not None:
             if image_encoder_inputs:
                 image_encoder_inputs["cache_key"] = processed_cache_key
@@ -395,8 +424,16 @@ class Qwen3OmniPreprocessor:
             prompt_text="",
             full_mm_inputs=full_mm_inputs,
             encoder_inputs={
-                "image_encoder": image_encoder_inputs or {"_skip": True, "_result": {}},
-                "audio_encoder": audio_encoder_inputs or {"_skip": True, "_result": {}},
+                "image_encoder": (
+                    image_encoder_inputs
+                    if has_image_payload
+                    else {"_skip": True, "_result": {}}
+                ),
+                "audio_encoder": (
+                    audio_encoder_inputs
+                    if has_audio_payload
+                    else {"_skip": True, "_result": {}}
+                ),
             },
         )
 
