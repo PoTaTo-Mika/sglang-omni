@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import math
 from typing import Annotated, Literal, NoReturn
 
 import typer
@@ -16,6 +15,7 @@ from sglang_omni.config.manager import ConfigManager
 from sglang_omni.preprocessing.resource_connector import (
     resolve_allowed_local_media_path,
 )
+from sglang_omni.scheduling.prefill_coalesce import validate_prefill_coalesce_args
 from sglang_omni.serve.protocol import DEFAULT_TTS_BATCH_MAX_ITEMS
 from sglang_omni.utils.gpu_compat import should_disable_custom_all_reduce_for_gpus
 
@@ -871,19 +871,19 @@ def apply_prefill_coalesce_cli_overrides(
     prefill_coalesce_requests: int | None,
     prefill_coalesce_wait_ms: float | None,
 ) -> PipelineConfig:
+    try:
+        requests, wait_ms = validate_prefill_coalesce_args(
+            prefill_coalesce_requests,
+            prefill_coalesce_wait_ms,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
     updates: dict[str, object] = {}
-    if prefill_coalesce_requests is not None:
-        if prefill_coalesce_requests < 0:
-            raise typer.BadParameter("--prefill-coalesce-requests must be >= 0")
-        updates["prefill_coalesce_requests"] = int(prefill_coalesce_requests)
-    if prefill_coalesce_wait_ms is not None:
-        if not (
-            math.isfinite(prefill_coalesce_wait_ms) and prefill_coalesce_wait_ms > 0
-        ):
-            raise typer.BadParameter(
-                "--prefill-coalesce-wait-ms must be a finite value > 0"
-            )
-        updates["prefill_coalesce_wait_ms"] = float(prefill_coalesce_wait_ms)
+    if requests is not None:
+        updates["prefill_coalesce_requests"] = requests
+    if wait_ms is not None:
+        updates["prefill_coalesce_wait_ms"] = wait_ms
     if not updates:
         return pipeline_config
     if prefill_coalesce_requests is None:
