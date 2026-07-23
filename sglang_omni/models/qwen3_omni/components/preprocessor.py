@@ -356,14 +356,10 @@ class Qwen3OmniPreprocessor:
                         xxhash.xxh3_64_hexdigest(raw),
                     )
                 )
-                flat_inputs[name] = (
-                    torch.frombuffer(
-                        bytearray(raw),
-                        dtype=getattr(torch, spec["dtype"]),
-                    )
-                    .clone()
-                    .reshape(spec["shape"])
-                )
+                flat_inputs[name] = torch.frombuffer(
+                    bytearray(raw),
+                    dtype=getattr(torch, spec["dtype"]),
+                ).reshape(spec["shape"])
             processed_cache_key = "processed:" + xxhash.xxh3_64_hexdigest(
                 json.dumps(cache_parts, separators=(",", ":")).encode()
             )
