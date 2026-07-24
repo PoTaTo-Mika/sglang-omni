@@ -22,3 +22,16 @@ def test_validate_prefill_coalesce_args_normalizes_values():
 def test_validate_prefill_coalesce_args_rejects_invalid_values(requests, wait_ms):
     with pytest.raises(ValueError):
         validate_prefill_coalesce_args(requests, wait_ms)
+
+
+def test_validate_prefill_coalesce_args_warns_on_one(caplog):
+    # 1 passes validation but the gate only engages at >= 2, so it must warn
+    # the user that coalescing stays disabled; 0 stays silent (explicit off).
+    with caplog.at_level("WARNING", logger="sglang_omni.scheduling.prefill_coalesce"):
+        assert validate_prefill_coalesce_args(1, 60.0) == (1, 60.0)
+    assert any("disables coalescing" in r.message for r in caplog.records)
+
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="sglang_omni.scheduling.prefill_coalesce"):
+        assert validate_prefill_coalesce_args(0, 60.0) == (0, 60.0)
+    assert not caplog.records

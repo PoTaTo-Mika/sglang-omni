@@ -281,12 +281,23 @@ class OmniScheduler:
             )
 
         # Note: (maydomine) coalescing gate: hold prefill until K requests wait
-        # or the oldest has waited T ms; 0 disables.
+        # or the oldest has waited T ms; the gate engages at K >= 2 (0 and 1
+        # both leave it off — validate_prefill_coalesce_args warns on 1).
         requests, wait_ms = validate_prefill_coalesce_args(
             prefill_coalesce_requests,
             prefill_coalesce_wait_ms,
         )
-        assert requests is not None and wait_ms is not None
+        if requests is None or wait_ms is None:
+            # The factory defaults are concrete; None can only reach here from
+            # an explicit null in a config file (e.g. prefill_coalesce_requests:
+            # null in YAML), where the intent is ambiguous — fail loudly rather
+            # than guess.
+            raise ValueError(
+                "prefill_coalesce_requests and prefill_coalesce_wait_ms must "
+                "be concrete values at the scheduler (got "
+                f"requests={requests!r}, wait_ms={wait_ms!r}); use 0 to "
+                "disable coalescing instead of null"
+            )
         if requests > 1 and int(server_args.tp_size) > 1:
             logger.warning(
                 "Prefill admission coalescing is disabled for "

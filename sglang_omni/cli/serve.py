@@ -41,6 +41,21 @@ _ASYNC_DECODE_SUPPORTED_MODELS = (
     "Higgs TTS, MOSS-TTS-Local, MOSS-Transcribe-Diarize, Fun-ASR, "
     "Qwen3-ASR, and the Qwen3-Omni thinker"
 )
+_PREFILL_COALESCE_FACTORIES = frozenset(
+    {
+        "sglang_omni.models.higgs_tts.stages.create_sglang_tts_engine_executor",
+        "sglang_omni.models.moss_tts_local.stages.create_sglang_tts_engine_executor",
+        "sglang_omni.models.qwen3_omni.stages."
+        "create_sglang_thinker_executor_from_config",
+        "sglang_omni.models.moss_transcribe_diarize.stages."
+        "create_sglang_moss_transcribe_diarize_executor",
+        "sglang_omni.models.fun_asr.stages.create_sglang_fun_asr_executor",
+    }
+)
+_PREFILL_COALESCE_SUPPORTED_MODELS = (
+    "Higgs TTS, MOSS-TTS-Local, MOSS-Transcribe-Diarize, Fun-ASR, "
+    "and the Qwen3-Omni thinker"
+)
 _QWEN_PARTIAL_START_TALKER_FACTORY = (
     "sglang_omni.models.qwen3_omni.stages.create_talker_ar_executor_from_config"
 )
@@ -894,13 +909,13 @@ def apply_prefill_coalesce_cli_overrides(
     matching_stages = [
         stage
         for stage in pipeline_config.stages
-        if stage.factory in _ASYNC_DECODE_FACTORIES
+        if stage.factory in _PREFILL_COALESCE_FACTORIES
     ]
     if not matching_stages:
         raise typer.BadParameter(
             "--prefill-coalesce-requests/--prefill-coalesce-wait-ms currently "
-            f"support only {_ASYNC_DECODE_SUPPORTED_MODELS}; no stage in this "
-            "pipeline uses a supported factory"
+            f"support only {_PREFILL_COALESCE_SUPPORTED_MODELS}; no stage in "
+            "this pipeline uses a supported factory"
         )
     _apply_factory_args_updates(pipeline_config, matching_stages, updates)
     return pipeline_config
@@ -1261,8 +1276,10 @@ def serve(
             help=(
                 "Hold prefill admission until this many requests are waiting "
                 "(or the oldest has waited --prefill-coalesce-wait-ms), "
-                "amortizing the per-step host cost. 0 disables (default). "
-                f"Available for {_ASYNC_DECODE_SUPPORTED_MODELS}."
+                "amortizing the per-step host cost. The gate engages at >= 2; "
+                "0 disables (default), and 1 is likewise a no-op (logs a "
+                "warning). "
+                f"Available for {_PREFILL_COALESCE_SUPPORTED_MODELS}."
             ),
         ),
     ] = None,
