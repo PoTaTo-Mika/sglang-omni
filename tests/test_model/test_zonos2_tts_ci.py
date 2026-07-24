@@ -66,16 +66,16 @@ STARTUP_TIMEOUT = 600
 # WER gate fixed by the task: corpus WER < 2% (wer_corpus is a fraction).
 VC_WER_MAX_CORPUS = 0.02
 
-# note (luojiaxuan): This conservative c=16 envelope uses the cold H100
-# full-set repeats reported on PR 779 plus the matching 50-sample CI run. The
-# 50-sample run is the worst observed point: 5.167 qps, 2.827 s latency, and
-# 0.8212 RTF. output_tok_per_req_s is omitted because those runs did not expose
-# a reliable per-request engine time.
+# note (luojiaxuan): Three cold H100 runs at 892fc5e9 completed 150/150 requests
+# at c=16. QPS was 5.632/5.763/5.647, mean latency was 2.594/2.528/2.562 s,
+# and mean RTF was 0.7620/0.7316/0.7301. This envelope uses the lowest QPS and
+# highest latency/RTF; output_tok_per_req_s remains omitted because it is not a
+# stable end-to-end metric.
 _VC_NON_STREAM_P95 = {
     CONCURRENCY: {
-        "throughput_qps": 5.167,
-        "latency_mean_s": 2.827,
-        "rtf_mean": 0.8212,
+        "throughput_qps": 5.632,
+        "latency_mean_s": 2.594,
+        "rtf_mean": 0.762,
     }
 }
 VC_NON_STREAM_THRESHOLDS = apply_slack(_VC_NON_STREAM_P95)
