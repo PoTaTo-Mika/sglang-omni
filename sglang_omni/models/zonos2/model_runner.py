@@ -160,10 +160,15 @@ class Zonos2ModelRunner(ModelRunner):
         text_pad = model.config.text_vocab
         cb_size = model.config.codebook_size
 
+        b = len(requests)
         hidden = self._last_token_hidden(
             result.logits_output.hidden_states, forward_batch, is_prefill
         )
-        b = len(requests)
+        if hidden.shape[0] < b:
+            raise ValueError(
+                f"hidden batch size ({hidden.shape[0]}) < len(requests) ({b})"
+            )
+        hidden = hidden[:b]
         pool = model._decode_state_pool
         row_t = pool.prepare_active_rows(requests)
         # Per-request sampling params (preserves the ZH-CER fix): each request's

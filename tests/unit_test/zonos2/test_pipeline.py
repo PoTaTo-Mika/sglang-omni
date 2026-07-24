@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from sglang_omni.client import Client
 from sglang_omni.config import (
@@ -10,7 +11,7 @@ from sglang_omni.config import (
     build_stage_placement_plan,
     resolve_stage_factory_args,
 )
-from sglang_omni.models.zonos2 import engine_builder as eb
+from sglang_omni.models.zonos2 import callbacks, engine_builder as eb
 from sglang_omni.models.zonos2.components import text_frontend
 from sglang_omni.models.zonos2.config import (
     Zonos2MultiGPUPipelineConfig,
@@ -20,6 +21,40 @@ from sglang_omni.models.zonos2.engine_builder import Zonos2EngineBuilder
 from sglang_omni.models.zonos2.request_builders import build_zonos2_state
 from sglang_omni.proto import StagePayload
 from sglang_omni.serve.speech_service import SpeechRequestValidator
+
+
+def test_zonos2_decode_buffers_pad_async_lookahead_rows() -> None:
+    feedback = torch.arange(12, dtype=torch.float32).reshape(6, 2)
+
+    class _Pool:
+        feedback_embeds = feedback
+
+        def release_inactive(self, request_ids: set[str]) -> None:
+            assert request_ids == {"r0", "r1"}
+
+        def prepare_active_rows(self, requests: list) -> torch.Tensor:
+            assert [request.request_id for request in requests] == ["r0", "r1"]
+            return torch.tensor([1, 4])
+
+    weight = torch.full((4, 2), -1.0)
+    runner = SimpleNamespace(
+        model=SimpleNamespace(
+            _decode_input_embedding=SimpleNamespace(weight=weight),
+            _decode_state_pool=_Pool(),
+        )
+    )
+    forward_batch = SimpleNamespace(batch_size=4, input_ids=None, input_embeds=object())
+    requests = [
+        SimpleNamespace(request_id="r0"),
+        SimpleNamespace(request_id="r1"),
+    ]
+
+    callbacks.write_zonos2_buffers(runner, forward_batch, None, requests)
+
+    assert torch.equal(weight[:2], feedback[torch.tensor([1, 4])])
+    assert torch.count_nonzero(weight[2:]) == 0
+    assert torch.equal(forward_batch.input_ids, torch.arange(4))
+    assert forward_batch.input_embeds is None
 
 
 def test_zonos2_streaming_pipeline_routes_chunks_to_vocoder() -> None:

@@ -27,9 +27,14 @@ def write_zonos2_buffers(
     runner, forward_batch, schedule_batch, requests, *, is_lookahead=False
 ):
     del schedule_batch, is_lookahead
-    bs = len(requests)
-    if bs == 0:
+    n_real = len(requests)
+    if n_real == 0:
         return
+    bs = int(forward_batch.batch_size)
+    if bs < n_real:
+        raise ValueError(
+            f"forward_batch.batch_size ({bs}) < len(requests) ({n_real})"
+        )
     buf = runner.model._decode_input_embedding.weight
     # note (Yue Yin): gather each request's last feedback from its on-device
     # pool row into the positional decode buffer (buf[i] = request i), instead
@@ -39,7 +44,8 @@ def write_zonos2_buffers(
     pool.release_inactive({sr.request_id for sr in requests})
     row_t = pool.prepare_active_rows(requests)
     with torch.no_grad():
-        buf[:bs].copy_(pool.feedback_embeds[row_t])
+        buf[:n_real].copy_(pool.feedback_embeds[row_t])
+        buf[n_real:bs].zero_()
     # Decode reads the staged buffer by row index -> stable input for graph replay.
     forward_batch.input_ids = torch.arange(bs, device=buf.device, dtype=torch.long)
     forward_batch.input_embeds = None
