@@ -11,7 +11,8 @@ from sglang_omni.config import (
     build_stage_placement_plan,
     resolve_stage_factory_args,
 )
-from sglang_omni.models.zonos2 import callbacks, engine_builder as eb
+from sglang_omni.models.zonos2 import callbacks
+from sglang_omni.models.zonos2 import engine_builder as eb
 from sglang_omni.models.zonos2.components import text_frontend
 from sglang_omni.models.zonos2.config import (
     Zonos2MultiGPUPipelineConfig,

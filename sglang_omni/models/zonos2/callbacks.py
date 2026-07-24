@@ -32,9 +32,7 @@ def write_zonos2_buffers(
         return
     bs = int(forward_batch.batch_size)
     if bs < n_real:
-        raise ValueError(
-            f"forward_batch.batch_size ({bs}) < len(requests) ({n_real})"
-        )
+        raise ValueError(f"forward_batch.batch_size ({bs}) < len(requests) ({n_real})")
     buf = runner.model._decode_input_embedding.weight
     # note (Yue Yin): gather each request's last feedback from its on-device
     # pool row into the positional decode buffer (buf[i] = request i), instead
