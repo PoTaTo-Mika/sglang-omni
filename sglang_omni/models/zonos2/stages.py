@@ -80,7 +80,7 @@ def create_preprocessing_executor(
 def create_speaker_encode_executor(
     model_path: str,
     *,
-    device: str = "cuda:0",
+    gpu_id: int | None = 0,
     speaker_cache_max_items: int = 256,
     max_concurrency: int = 4,
     spk_compile: bool = False,
@@ -89,7 +89,7 @@ def create_speaker_encode_executor(
     from sglang_omni.models.zonos2.components.speaker_encoder import SpeakerEncoder
 
     encoder = SpeakerEncoder(
-        device=device,
+        device=_device(gpu_id),
         cache_max_items=speaker_cache_max_items,
         compile_forward=spk_compile,
     )
@@ -98,8 +98,9 @@ def create_speaker_encode_executor(
         state = Zonos2State.from_dict(payload.data)
         if state.ref_audio is not None:
             ref = ref_audio_to_encoder_input(state.ref_audio)
-            state.speaker_emb = encoder.encode(ref)
-            state.speaker_fingerprint = encoder.fingerprint()
+            state.speaker_emb, state.speaker_fingerprint = (
+                encoder.encode_with_fingerprint(ref)
+            )
         return store_state(payload, state)
 
     return SimpleScheduler(_speaker, max_concurrency=max_concurrency)
@@ -111,7 +112,7 @@ def create_speaker_encode_executor(
 def create_vocoder_executor(
     model_path: str,
     *,
-    device: str = "cuda:0",
+    gpu_id: int | None = 0,
     dac_batch: bool = False,
     vocoder_warmup: bool = False,
     **_: Any,
@@ -121,6 +122,8 @@ def create_vocoder_executor(
         decode_batch,
         decode_to_pcm,
     )
+
+    device = _device(gpu_id)
 
     def _result_payload(
         payload: StagePayload, state: Zonos2State, pcm: Any
@@ -208,6 +211,10 @@ def create_vocoder_executor(
         except Exception:  # noqa: BLE001 - warmup must never block server start
             logger.warning("ZONOS2 vocoder warmup failed", exc_info=True)
     return scheduler
+
+
+def _device(gpu_id: int | None) -> str:
+    return f"cuda:{gpu_id}" if gpu_id is not None else "cpu"
 
 
 # ---- AR engine stage (OmniScheduler-backed ZONOS2 backbone) ----

@@ -269,8 +269,6 @@ class SpeakerEncoder(TensorReferenceEncodeHook[_Zonos2RefInput]):
             max_bytes=None,
             log_prefix="ZONOS2 speaker cache",
         )
-        self._last_fingerprint: str | None = None
-        self._fp_lock = threading.Lock()
 
     def _get_embedder(self) -> Qwen3SpeakerEmbedding:
         if self._embedder is None:
@@ -287,14 +285,15 @@ class SpeakerEncoder(TensorReferenceEncodeHook[_Zonos2RefInput]):
         ``ref_audio`` may be a file path, raw audio bytes, or a
         ``(waveform, sample_rate)`` pair.
         """
-        item = self.normalize_input((ref_audio, sample_rate))
-        with self._fp_lock:
-            self._last_fingerprint = item.input_key
-        return self._service.get_or_encode(item)
+        embedding, _ = self.encode_with_fingerprint(ref_audio, sample_rate)
+        return embedding
 
-    def fingerprint(self) -> str | None:
-        """Content-hash string of the most recent :meth:`encode` call."""
-        return self._last_fingerprint
+    def encode_with_fingerprint(
+        self, ref_audio: Any, sample_rate: int | None = None
+    ) -> tuple[torch.Tensor, str]:
+        """Return an embedding and the fingerprint of the same normalized input."""
+        item = self.normalize_input((ref_audio, sample_rate))
+        return self._service.get_or_encode(item), item.input_key
 
     # ---- ReferenceEncodeHook ----
 

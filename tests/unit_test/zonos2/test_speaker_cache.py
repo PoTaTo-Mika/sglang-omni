@@ -8,6 +8,9 @@ and clone isolation of returned embeddings. The Qwen3 embedder is stubbed, so no
 model checkpoint or GPU is needed (the module still imports torchaudio/transformers).
 """
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 
 pytest.importorskip("torchaudio")
@@ -44,14 +47,46 @@ def _make_encoder(max_items: int = 256):
 def test_repeated_reference_hits_cache() -> None:
     enc, fake = _make_encoder()
     ref = (torch.zeros(1, 100), 16000)
-    first = enc.encode(ref)
-    fp1 = enc.fingerprint()
-    second = enc.encode(ref)
-    fp2 = enc.fingerprint()
+    first, fp1 = enc.encode_with_fingerprint(ref)
+    second, fp2 = enc.encode_with_fingerprint(ref)
     assert fake.calls == 1  # second call served from cache, no extra forward
     assert torch.equal(first, second)
     assert first.shape == (SPEAKER_EMBEDDING_DIM,)
-    assert fp1 is not None and fp1 == fp2 and fp1.startswith("wav:")
+    assert fp1 == fp2 and fp1.startswith("wav:")
+
+
+def test_concurrent_references_keep_their_own_fingerprints() -> None:
+    first_started = threading.Event()
+    release_first = threading.Event()
+    enc = SpeakerEncoder(device="cpu")
+
+    class _InterleavingEmbedder:
+        def __call__(self, wav: torch.Tensor, sr: int) -> torch.Tensor:
+            marker = int(wav.reshape(-1)[0].item())
+            if marker == 0:
+                first_started.set()
+                assert release_first.wait(timeout=2)
+            else:
+                assert first_started.wait(timeout=2)
+                release_first.set()
+            return torch.full((1, SPEAKER_EMBEDDING_DIM), float(marker + 1))
+
+    enc._get_embedder = lambda: _InterleavingEmbedder()  # type: ignore[assignment]
+    first_ref = (torch.zeros(1, 100), 16000)
+    second_ref = (torch.ones(1, 100), 16000)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first_future = pool.submit(enc.encode_with_fingerprint, first_ref)
+        assert first_started.wait(timeout=2)
+        second_future = pool.submit(enc.encode_with_fingerprint, second_ref)
+        second_embedding, second_fingerprint = second_future.result(timeout=2)
+        first_embedding, first_fingerprint = first_future.result(timeout=2)
+
+    assert torch.equal(first_embedding, torch.ones(SPEAKER_EMBEDDING_DIM))
+    assert torch.equal(second_embedding, torch.full((SPEAKER_EMBEDDING_DIM,), 2.0))
+    assert first_fingerprint == enc.normalize_input(first_ref).input_key
+    assert second_fingerprint == enc.normalize_input(second_ref).input_key
+    assert first_fingerprint != second_fingerprint
 
 
 def test_distinct_references_miss() -> None:

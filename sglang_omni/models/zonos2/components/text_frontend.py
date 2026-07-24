@@ -83,7 +83,6 @@ class TTSSamplingParams:
     min_p: float = 0.18
     repetition_penalty: float = 1.2
     max_tokens: int = 1024
-    seed: int | None = None
     ignore_eos: bool = False
     n_codebooks: int = N_CODEBOOKS
     eoa_id: int = EOA_ID
@@ -91,8 +90,17 @@ class TTSSamplingParams:
     repetition_codebooks: int = 8
 
 
-# Server language codes -> NeMo text_normalization language packages.
+# Speech API names and legacy server codes -> NeMo language packages.
 _SERVER_TO_NEMO_LANG: dict[str, str] = {
+    "English": "en",
+    "French": "fr",
+    "German": "de",
+    "Spanish": "es",
+    "Italian": "it",
+    "Portuguese": "pt",
+    "Japanese": "ja",
+    "Chinese": "zh",
+    "Korean": "ko",
     "en_us": "en",
     "en_gb": "en",
     "fr_fr": "fr",
@@ -270,6 +278,8 @@ def normalize_text(text: str, language: str | None) -> str:
     Gated by the preprocessing stage's ``tts_norm`` factory arg (via
     ``build_prompt_rows(normalize=...)``); not called at all when disabled.
     """
+    # note (luojiaxuan): Auto and languages without a NeMo package intentionally
+    # bypass normalization so model-side language inference still receives raw text.
     if not language or language not in _SERVER_TO_NEMO_LANG:
         return text
     key = (text, language)

@@ -15,7 +15,7 @@ from sglang_omni.config import PipelineConfig, StageConfig
 _PKG = "sglang_omni.models.zonos2"
 
 
-def _stages(*, codec_device: str, speaker_device: str) -> list[StageConfig]:
+def _stages(*, auxiliary_gpu: int, auxiliary_process: str) -> list[StageConfig]:
     return [
         StageConfig(
             name="preprocessing",
@@ -33,15 +33,14 @@ def _stages(*, codec_device: str, speaker_device: str) -> list[StageConfig]:
         ),
         StageConfig(
             name="speaker_encode",
-            process="pipeline",
+            process=auxiliary_process,
             factory=f"{_PKG}.stages.create_speaker_encode_executor",
             factory_args={
-                "device": speaker_device,
                 "speaker_cache": True,
                 "speaker_cache_max_items": 256,
                 "spk_compile": False,
             },
-            gpu=0,
+            gpu=auxiliary_gpu,
             next="tts_engine",
         ),
         StageConfig(
@@ -63,10 +62,9 @@ def _stages(*, codec_device: str, speaker_device: str) -> list[StageConfig]:
         ),
         StageConfig(
             name="vocoder",
-            process="pipeline",
+            process=auxiliary_process,
             factory=f"{_PKG}.stages.create_vocoder_executor",
             factory_args={
-                "device": codec_device,
                 # note (Yue Yin): keep dac_batch OFF -- verified numerically unsafe.
                 # Batched DAC right-pads shorter items and the padding contaminates
                 # them GLOBALLY (only the longest, unpadded item matches single
@@ -76,7 +74,7 @@ def _stages(*, codec_device: str, speaker_device: str) -> list[StageConfig]:
                 "dac_batch": False,
                 "vocoder_warmup": False,
             },
-            gpu=0,
+            gpu=auxiliary_gpu,
             terminal=True,
             can_accept_stream_before_payload=True,
         ),
@@ -110,7 +108,7 @@ class Zonos2PipelineConfig(PipelineConfig):
 
     model_path: str
     stages: list[StageConfig] = Field(
-        default_factory=lambda: _stages(codec_device="cuda:0", speaker_device="cuda:0")
+        default_factory=lambda: _stages(auxiliary_gpu=0, auxiliary_process="pipeline")
     )
 
 
@@ -118,7 +116,7 @@ class Zonos2MultiGPUPipelineConfig(Zonos2PipelineConfig):
     """Offload codec + speaker encoder to cuda:1, leaving the AR engine alone on cuda:0."""
 
     stages: list[StageConfig] = Field(
-        default_factory=lambda: _stages(codec_device="cuda:1", speaker_device="cuda:1")
+        default_factory=lambda: _stages(auxiliary_gpu=1, auxiliary_process="auxiliary")
     )
 
 

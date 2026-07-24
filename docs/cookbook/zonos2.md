@@ -4,7 +4,7 @@
 text-to-speech model from Zyphra. A MoE autoregressive decoder predicts
 **9 DAC audio codebooks** scheduled in a **delay pattern**; the codes are then
 decoded back to **44.1 kHz** speech by a DAC vocoder. It clones a voice from a
-short reference clip and accepts an optional target-language hint. In
+short reference clip and supports optional language-specific text normalization. In
 SGLang-Omni it runs as a `preprocessing → speaker_encode → tts_engine →
 vocoder` pipeline and is served through the OpenAI-compatible
 `/v1/audio/speech` endpoint.
@@ -41,8 +41,9 @@ sgl-omni serve \
 ### Voice Cloning
 
 ZONOS2 clones a voice from a reference clip. The `references` field accepts `audio_path`
-(a local path, HTTP URL, or base64 data URI) and `text` (the transcript of that clip). Supplying
-the transcript materially improves cloning quality.
+(a local path, HTTP URL, or base64 data URI) and `text` (the transcript of that clip).
+The shared speech API accepts the transcript, but ZONOS2 currently conditions only on
+the reference audio.
 
 ```bash
 curl -X POST http://localhost:8000/v1/audio/speech \
@@ -58,7 +59,7 @@ curl -X POST http://localhost:8000/v1/audio/speech \
 ```
 
 `ref_audio` and `ref_text` are accepted as shorthand for `references[0].audio_path` and
-`references[0].text`.
+`references[0].text`. `ref_text` is currently unused by ZONOS2.
 
 #### Python
 
@@ -89,24 +90,34 @@ URL, or a base64 **data URI** (`data:audio/wav;base64,<...>`, transcoded via `ff
 
 ### Streaming
 
-Set `"stream": true` to receive Server-Sent Events (SSE). Audio events carry base64-encoded WAV
-bytes in `audio.data`; the final metadata event has `audio: null`, followed by `data: [DONE]`.
+Set `"stream": true` with `"response_format": "pcm"` to receive raw signed 16-bit
+little-endian PCM bytes. The response is not SSE or base64. ZONOS2 returns mono 44.1 kHz
+audio with `Content-Type: audio/pcm` and the `X-Sample-Rate`, `X-Channels`, and
+`X-Bit-Depth` headers.
 
 ```bash
-curl -N -X POST http://localhost:8000/v1/audio/speech \
+curl -sS -D output.headers -X POST http://localhost:8000/v1/audio/speech \
   -H "Content-Type: application/json" \
   -d '{
     "input": "Get the trust fund to the bank early.",
     "ref_audio": "https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini/resolve/main/en/prompt-wavs/common_voice_en_10119832.wav",
     "ref_text": "We asked over twenty different people, and they all said it was his.",
+    "response_format": "pcm",
     "stream": true
-  }'
+  }' \
+  --output output.pcm
+
+ffmpeg -f s16le -ar 44100 -ac 1 -i output.pcm output.wav
 ```
 
 ### Language
 
-An optional `language` hint biases the target language; omit it to let the model infer from the
-text.
+`language` selects the NeMo written-to-spoken normalizer before the prompt is
+tokenized. `English`, `Chinese`, `Japanese`, `Korean`, `German`, `French`,
+`Portuguese`, `Spanish`, and `Italian` are normalized. Omit it or use `Auto` to
+keep the input unchanged; accepted languages without a NeMo package, such as
+`Russian`, also pass through unchanged. The model infers the spoken language
+from the resulting text.
 
 ```json
 {
@@ -121,10 +132,11 @@ text.
 | Parameter | Default | Notes |
 |---|---|---|
 | `input` | (required) | Text to synthesize |
-| `references` | `null` | Reference clip for cloning; each item has `audio_path` and `text` |
-| `ref_audio` / `ref_text` | `null` | Shorthand for `references[0].audio_path` / `references[0].text` |
-| `stream` | `false` | Enable SSE streaming |
-| `language` | `null` | Optional target-language hint; omit to let the model infer |
+| `references` | `null` | Reference clip for cloning; `text` is accepted but currently unused |
+| `ref_audio` / `ref_text` | `null` | Shorthand fields; `ref_text` is currently unused |
+| `response_format` | `wav` | Use `pcm` when `stream=true` |
+| `stream` | `false` | Stream raw mono 44.1 kHz PCM16 bytes; requires `response_format=pcm` |
+| `language` | `null` | Optional NeMo text-normalization language; `Auto` preserves raw text |
 | `max_new_tokens` | (model default) | Maximum generated frames; an explicit value must be `> 0` |
 | `temperature` | (model default) | Sampling temperature |
 | `top_p` | (model default) | Top-p sampling |
@@ -185,8 +197,11 @@ pipeline (codec + speaker encoder on `cuda:1`) stacks on top for the best stream
 
 ## Known Limitations
 
-- **Voice cloning depends on the reference.** Provide the transcript (`text` / `ref_text`) for
-  the best speaker similarity when cloning.
-- **Language is a hint.** `language` biases the target language but is not a hard constraint.
+- **Reference transcripts are not used.** The shared API accepts `text` / `ref_text`, but
+  ZONOS2 currently conditions only on reference audio.
+- **Language controls text normalization only.** It does not add a separate model-side
+  language condition.
+- **Per-request seeds are unsupported.** Requests with `seed` are rejected until sampling
+  has an isolated request RNG.
 - **Rare runaway generation.** A small fraction of utterances can loop and generate up to
   `max_new_tokens`; lowering `max_new_tokens` bounds the output.

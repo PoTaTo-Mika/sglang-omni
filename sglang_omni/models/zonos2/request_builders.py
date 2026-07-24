@@ -38,7 +38,6 @@ _SAMPLING_FIELDS = (
     "top_p",
     "min_p",
     "repetition_penalty",
-    "seed",
 )
 
 
@@ -71,19 +70,25 @@ def build_zonos2_state(payload: StagePayload) -> Zonos2State:
         if isinstance(explicit, (list, tuple, set))
         else set()
     )
+    if "seed" in explicit or tts_params.get("seed") is not None:
+        raise ValueError(
+            "ZONOS2 does not support seed because sampling uses the shared device RNG"
+        )
 
     gen: dict[str, Any] = {}
     raw_max = params.get("max_new_tokens")
     if raw_max is not None and not isinstance(raw_max, bool):
         gen["max_tokens"] = int(raw_max)
-    for field in _SAMPLING_FIELDS:
+    for sampling_field in _SAMPLING_FIELDS:
         for source in (tts_params, params):
-            val = source.get(field)
+            val = source.get(sampling_field)
             if val is None:
                 continue
             # tts_params always wins; params only honored when explicitly whitelisted
-            if field in explicit or source is tts_params:
-                gen[field] = int(val) if field in ("top_k", "seed") else float(val)
+            if sampling_field in explicit or source is tts_params:
+                gen[sampling_field] = (
+                    int(val) if sampling_field == "top_k" else float(val)
+                )
             break
 
     return Zonos2State(
@@ -106,7 +111,6 @@ _AR_SAMPLING_FIELDS = {
     "repetition_window",
     "repetition_codebooks",
     "max_tokens",
-    "seed",
     "ignore_eos",
 }
 
@@ -117,7 +121,6 @@ class Zonos2SGLangRequestData(SGLangARRequestData):
     speaker_emb: torch.Tensor | None = None
     speaker_position: int = -1
     params: TTSSamplingParams = field(default_factory=TTSSamplingParams)
-    generator: Any = None
     output_codes: list = field(default_factory=list)
     rep_hist: list = field(default_factory=list)
     eos_frame: int | None = None
@@ -207,10 +210,6 @@ def build_sglang_zonos2_request(
     )
     req.tokenizer = None
 
-    gen = None
-    if params.seed is not None:
-        gen = torch.Generator(device=model.device).manual_seed(int(params.seed))
-
     data = Zonos2SGLangRequestData(
         input_ids=torch.tensor(row_keys, dtype=torch.long),
         max_new_tokens=max_new,
@@ -220,7 +219,6 @@ def build_sglang_zonos2_request(
         speaker_emb=speaker_emb,
         speaker_position=speaker_position,
         params=params,
-        generator=gen,
         engine_start_s=time.perf_counter(),
     )
     data.stage_payload = payload

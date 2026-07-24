@@ -66,51 +66,19 @@ STARTUP_TIMEOUT = 600
 # WER gate fixed by the task: corpus WER < 2% (wer_corpus is a fraction).
 VC_WER_MAX_CORPUS = 0.02
 
-# RTF / throughput speed baseline.
-#
-# TODO(calibrate on CI GPU): _VC_NON_STREAM_P95 MUST be populated from a real
-# ZONOS2 seed-tts-eval-50 EN c=16 run on the target CI GPU before the speed
-# gate can enforce a number. Procedure: launch the zonos2 server, run
-#   python -m benchmarks.eval.benchmark_tts_seedtts \
-#     --meta zhaochenyang20/seed-tts-eval-50-arrow \
-#     --model <ZONOS2_MODEL_NAME> --port <port> \
-#     --ref-format references --lang en \
-#     --max-concurrency 16 --max-samples 50 --output-dir results/zonos2_en
-# three times, then set the dict below from the P95/worst of
-# speed_results.json['summary'] {throughput_qps, output_tok_per_req_s,
-# latency_mean_s, rtf_mean} and let apply_slack derive the thresholds.
-# Do NOT copy Qwen3-Omni's 0.8149 / Higgs's 0.335 — different model, different
-# GPU. While this is None the speed test skips its threshold assertion (the WER
-# test and the structural sanity checks still run).
-#
-# Measured reference (NOT the gate) from a single dev H100 80GB run on this
-# branch (Track B rebased onto ZONOS2 = Track A + FP8-off + loop-guard), c=16,
-# seed-tts-eval-50 EN:
-#   rtf_mean=0.8212  throughput_qps=5.167  latency_mean_s=2.827
-# output_tok_per_req_s is unavailable via --use-existing-server (no per-request
-# engine_time_s); the in-harness managed-server path the test uses populates it,
-# so calibrate there. WER sanity check (whisper-large-v3, not the Qwen3-ASR
-# gate judge): corpus 0.89%, no >50% outliers.
-_VC_NON_STREAM_P95: dict[int, dict[str, float]] | None = None
-
-# Optional ZONOS2-specific RTF hard cap (analogue of
-# QWEN3_OMNI_SEEDTTS_RTF_MEAN_MAX). Leave None until a measured run justifies a
-# value; the apply_slack-derived rtf_mean_max alone is the gate otherwise.
-ZONOS2_SEEDTTS_RTF_MEAN_MAX: float | None = None
-
-if _VC_NON_STREAM_P95 is not None:
-    VC_NON_STREAM_THRESHOLDS: dict[int, dict[str, float]] | None = apply_slack(
-        _VC_NON_STREAM_P95
-    )
-    if ZONOS2_SEEDTTS_RTF_MEAN_MAX is not None and "rtf_mean_max" in (
-        VC_NON_STREAM_THRESHOLDS[CONCURRENCY]
-    ):
-        VC_NON_STREAM_THRESHOLDS[CONCURRENCY]["rtf_mean_max"] = min(
-            VC_NON_STREAM_THRESHOLDS[CONCURRENCY]["rtf_mean_max"],
-            ZONOS2_SEEDTTS_RTF_MEAN_MAX,
-        )
-else:
-    VC_NON_STREAM_THRESHOLDS = None
+# note (luojiaxuan): This conservative c=16 envelope uses the cold H100
+# full-set repeats reported on PR 779 plus the matching 50-sample CI run. The
+# 50-sample run is the worst observed point: 5.167 qps, 2.827 s latency, and
+# 0.8212 RTF. output_tok_per_req_s is omitted because those runs did not expose
+# a reliable per-request engine time.
+_VC_NON_STREAM_P95 = {
+    CONCURRENCY: {
+        "throughput_qps": 5.167,
+        "latency_mean_s": 2.827,
+        "rtf_mean": 0.8212,
+    }
+}
+VC_NON_STREAM_THRESHOLDS = apply_slack(_VC_NON_STREAM_P95)
 
 
 def _run_benchmark(
@@ -205,10 +173,14 @@ class _SpeedArtifacts:
 
 
 @pytest.fixture(scope="module")
-def zonos2_server(tmp_path_factory: pytest.TempPathFactory):
-    """Start a single colocated ZONOS2 server and yield its port."""
+def speed_artifacts(
+    dataset_repo: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> _SpeedArtifacts:
+    """Run generation, then stop TTS and free its GPU before ASR starts."""
     port = _find_available_port_range(1)
     log_file = server_log_file(tmp_path_factory, "zonos2_server_logs")
+    output_dir = str(tmp_path_factory.mktemp("vc_nonstream"))
     with managed_omni_server(
         model_path=ZONOS2_MODEL_PATH,
         port=port,
@@ -217,18 +189,8 @@ def zonos2_server(tmp_path_factory: pytest.TempPathFactory):
         timeout=STARTUP_TIMEOUT,
         wait_for_gpu_release=True,
     ):
-        yield port
-
-
-@pytest.fixture(scope="module")
-def speed_artifacts(
-    zonos2_server: int,
-    dataset_repo: str,
-    tmp_path_factory: pytest.TempPathFactory,
-) -> _SpeedArtifacts:
-    """Run the speed benchmark once and expose its artifacts."""
-    output_dir = str(tmp_path_factory.mktemp("vc_nonstream"))
-    results = _run_benchmark(zonos2_server, dataset_repo, output_dir)
+        results = _run_benchmark(port, dataset_repo, output_dir)
+    wait_for_gpu_memory_release()
     return _SpeedArtifacts(
         output_dir=output_dir,
         summary=results["summary"],
@@ -238,11 +200,7 @@ def speed_artifacts(
 
 @pytest.fixture(scope="module")
 def wer_audio_dir(speed_artifacts: _SpeedArtifacts) -> str:
-    """Reuse speed-benchmark audio for WER after freeing the TTS server GPU."""
-    # zonos2_server (depended on by speed_artifacts) is module-scoped; it tears
-    # down and frees the GPU after the last test that needs it. Force a cleanup
-    # here so the Qwen3-ASR WER router has the GPU before it starts.
-    wait_for_gpu_memory_release()
+    """Reuse audio generated before the TTS server was stopped."""
     generated_path = Path(speed_artifacts.output_dir) / "generated.json"
     assert generated_path.exists(), f"WER metadata missing: {generated_path}"
     return speed_artifacts.output_dir
@@ -262,19 +220,12 @@ def test_voice_cloning_non_streaming(
     checks = MetricCheckCollector("ZONOS2 voice-cloning speed")
     assert_summary_metrics(speed_artifacts.summary, collector=checks)
     assert_per_request_fields(speed_artifacts.per_request, collector=checks)
-    if VC_NON_STREAM_THRESHOLDS is not None:
-        assert_speed_thresholds(
-            speed_artifacts.summary,
-            VC_NON_STREAM_THRESHOLDS,
-            CONCURRENCY,
-            collector=checks,
-        )
-    else:
-        print(
-            "\n[ZONOS2 speed] RTF/throughput gate is a placeholder "
-            "(_VC_NON_STREAM_P95 is uncalibrated); enforcing structural "
-            "checks only. See TODO(calibrate on CI GPU) in this module."
-        )
+    assert_speed_thresholds(
+        speed_artifacts.summary,
+        VC_NON_STREAM_THRESHOLDS,
+        CONCURRENCY,
+        collector=checks,
+    )
     checks.check(
         Path(speed_artifacts.output_dir).is_dir(),
         f"Speed output directory missing: {speed_artifacts.output_dir}",
