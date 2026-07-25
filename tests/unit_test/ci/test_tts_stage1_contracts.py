@@ -217,6 +217,26 @@ def test_verdict_preserves_multi_gpu_not_applicable_contract() -> None:
     assert payload["reason_code"] == "mps_disabled_for_topology"
 
 
+@pytest.mark.parametrize(
+    ("status", "reason_code"),
+    [
+        ("dirty", None),
+        ("not_applicable", "caller_override"),
+    ],
+)
+def test_multi_gpu_mps_verdict_rejects_contract_overrides(
+    status: str,
+    reason_code: str | None,
+) -> None:
+    with pytest.raises(ValueError, match="cannot override"):
+        artifacts.verdict_envelope(
+            artifact_name="mps_teardown_verdict.json",
+            topology="multi_gpu",
+            status=status,
+            reason_code=reason_code,
+        )
+
+
 def test_initialize_contract_writes_manifest_and_multi_gpu_mps_envelopes(
     tmp_path: Path,
 ) -> None:

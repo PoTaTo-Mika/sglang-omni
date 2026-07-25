@@ -95,6 +95,11 @@ def verdict_envelope(
         topology=topology,
         mps_only=_is_mps_only(artifact_name),
     )
+    if payload["status"] == "not_applicable":
+        reason_conflicts = reason_code not in (None, MPS_DISABLED_REASON)
+        if status != "not_applicable" or reason_conflicts:
+            raise ValueError("callers cannot override a multi_gpu MPS-only N/A verdict")
+        return payload
     payload["status"] = status
     if clean is not None:
         payload["clean"] = clean
