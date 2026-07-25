@@ -33,6 +33,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Literal
 
@@ -59,7 +60,10 @@ from tests.test_model.omni_router_utils import (
     router_get_json,
 )
 from tests.test_model.tts_ci_config import select_tts_ci_preset
-from tests.test_model.tts_stage1_mps import launch_stage1_mps_router
+from tests.test_model.tts_stage1_mps import (
+    launch_stage1_mps_router,
+    write_bounded_canary_artifacts,
+)
 from tests.utils import (
     QWEN3_ASR_WER_CONCURRENCY,
     MetricCheckCollector,
@@ -157,6 +161,7 @@ def _run_benchmark(
     concurrency: int,
     max_samples: int | None = None,
     stream: bool = False,
+    warmup: int = 1,
 ) -> dict:
     benchmark_config = TtsSeedttsBenchmarkConfig(
         model=TTS_MODEL_PATH,
@@ -168,6 +173,7 @@ def _run_benchmark(
         stream=stream,
         ref_format=_PRESET.ref_format,
         token_count=_PRESET.token_count,
+        warmup=warmup,
     )
     speed_results = asyncio.run(run_tts_seedtts_benchmark(benchmark_config))
     _validate_speed_results_keys(speed_results)
@@ -777,6 +783,50 @@ def wer_input_dirs(
             generated_path = Path(output_dir) / "generated.json"
             assert generated_path.exists(), f"WER metadata missing: {generated_path}"
     return SPEED_OUTPUT_DIRS
+
+
+@pytest.mark.tts_stage(TTS_STAGE_NONSTREAM)
+@pytest.mark.benchmark
+def test_bounded_mps_overlap_canary(
+    router_server: ManagedRouterHandle,
+    dataset_repo: str,
+    tmp_path: Path,
+) -> None:
+    if os.environ.get("TTS_STAGE1_TOPOLOGY", "multi_gpu") != "mps_shared":
+        pytest.skip("bounded overlap canary applies only to mps_shared Stage 1")
+
+    concurrency = 4
+    max_samples = 8
+    output_dir = _resolve_stage_output_dir(tmp_path, "hc_canary_c4")
+    before_workers = router_get_json(router_server.port, "/workers")
+    started = time.perf_counter()
+    try:
+        results = _run_benchmark(
+            router_server.port,
+            dataset_repo,
+            output_dir,
+            concurrency=concurrency,
+            max_samples=max_samples,
+            warmup=0,
+        )
+        assert results["summary"]["total_requests"] == max_samples
+        assert results["summary"]["completed_requests"] == max_samples
+        assert results["summary"]["failed_requests"] == 0
+        _assert_stage_used_all_router_workers(
+            router_server=router_server,
+            before_workers=before_workers,
+            results=results,
+            label="TTS bounded MPS overlap canary",
+        )
+        write_bounded_canary_artifacts(
+            router=router_server,
+            results=results,
+            concurrency=concurrency,
+            wall_time_s=time.perf_counter() - started,
+        )
+    except Exception:
+        print_router_diagnostics(router_server)
+        raise
 
 
 @pytest.mark.tts_stage(TTS_STAGE_NONSTREAM)

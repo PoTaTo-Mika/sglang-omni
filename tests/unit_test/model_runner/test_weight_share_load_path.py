@@ -250,3 +250,29 @@ def test_weight_update_guard_blocks_all_three(tmp_path, monkeypatch):
         ok, message = method()
         assert ok is False
         assert "weight sharing" in message
+
+
+def test_verified_higgs_attachment_writes_structured_audit(tmp_path, monkeypatch):
+    audit_dir = tmp_path / "audit"
+    monkeypatch.setenv(ipc_weights.ENV_WEIGHT_SHARE, f"leader:{tmp_path / 'ipc'}")
+    monkeypatch.setenv(ipc_weights.ENV_WEIGHT_SHARE_RUN_ID, "run-higgs-audit")
+    monkeypatch.setenv(ipc_weights.ENV_WEIGHT_SHARE_AUDIT_DIR, str(audit_dir))
+    runner = _bare_runner()
+
+    with mock.patch.object(
+        ModelRunner, "load_model", _fake_upstream_load({"auto": 1.0})
+    ):
+        runner.load_model()
+    with mock.patch.object(ModelRunner, "init_device_graphs", lambda self: None):
+        runner.init_device_graphs()
+
+    audit_files = list(audit_dir.glob("weight_share_leader_*.json"))
+    assert len(audit_files) == 1
+    payload = __import__("json").loads(audit_files[0].read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 1
+    assert payload["status"] == "pass"
+    assert payload["role"] == "leader"
+    assert payload["run_id"] == "run-higgs-audit"
+    assert payload["model_class"] == "SmallModel"
+    assert payload["private_tensor_names"] == []
+    assert payload["verified_attachment"] is True

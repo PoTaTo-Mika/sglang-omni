@@ -18,6 +18,10 @@ TOPOLOGY = "mps_shared"
 REPLICA_COUNT = 2
 RUN_ID_PATTERN = re.compile(r"^run-[A-Za-z0-9_-]+$")
 KV_PATTERN = re.compile(r"#tokens:\s*([0-9]+)")
+EXPECTED_PRIVATE_TENSORS = {
+    "HiggsMultimodalQwen3ForConditionalGeneration": [],
+    "MossTTSLocalSGLangModel": ["_decode_input_embedding.weight"],
+}
 
 
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
@@ -180,6 +184,7 @@ class MpsLaunchSpec:
             "GPU_ID": str(self.gpu_id),
             "N": str(REPLICA_COUNT),
             "PYTHON_BIN": self.python_bin,
+            "REPLICA_ACTIVITY": "1",
             "RUN_ID": self.run_id,
             "SERVE_EXTRA_ARGS": self.serve_extra_args,
             "STATE_ROOT": str(self.state_root),
@@ -205,6 +210,7 @@ class LauncherState:
     replicas: tuple[ReplicaState, ...]
     attachment_text: str
     raw_control_text: str
+    weight_audits: tuple[dict[str, Any], ...]
 
     @property
     def equal_kv(self) -> bool:
@@ -235,6 +241,56 @@ def _read_kv_tokens(log_path: Path) -> int:
     if not matches:
         raise ValueError(f"resolved KV capacity is missing from {log_path}")
     return int(matches[-1])
+
+
+def _read_weight_audits(
+    state: Path, manifest: dict[str, str]
+) -> tuple[dict[str, Any], ...]:
+    paths = sorted((state / "weight_audit").glob("weight_share_*.json"))
+    if len(paths) != REPLICA_COUNT:
+        raise ValueError("expected exactly two verified weight-share audit files")
+    audits = tuple(json.loads(path.read_text(encoding="utf-8")) for path in paths)
+    roles = {audit.get("role") for audit in audits}
+    if roles != {"leader", "follower"}:
+        raise ValueError(f"weight-share audits have invalid roles: {sorted(roles)}")
+    for audit in audits:
+        if audit.get("schema_version") != SCHEMA_VERSION:
+            raise ValueError("weight-share audit schema version mismatch")
+        if (
+            audit.get("status") != "pass"
+            or audit.get("verified_attachment") is not True
+        ):
+            raise ValueError("weight-share audit was not emitted after verification")
+        if audit.get("run_id") != manifest["run_id"]:
+            raise ValueError("weight-share audit run_id does not match launcher state")
+        if audit.get("gpu_uuid") != manifest["gpu_uuid"]:
+            raise ValueError("weight-share audit GPU does not match launcher state")
+    equality_fields = (
+        "architecture",
+        "model_class",
+        "manifest_hash",
+        "shared_tensor_count",
+        "shared_tensor_names",
+        "private_tensor_names",
+    )
+    for field in equality_fields:
+        if len({json.dumps(audit.get(field), sort_keys=True) for audit in audits}) != 1:
+            raise ValueError(f"weight-share leader/follower disagree on {field}")
+    architecture = audits[0]["architecture"]
+    if architecture not in EXPECTED_PRIVATE_TENSORS:
+        raise ValueError(
+            f"unsupported TTS weight-share audit architecture: {architecture}"
+        )
+    if audits[0]["private_tensor_names"] != EXPECTED_PRIVATE_TENSORS[architecture]:
+        raise ValueError(
+            f"private tensor policy mismatch for {architecture}: "
+            f"{audits[0]['private_tensor_names']!r}"
+        )
+    shared = set(audits[0]["shared_tensor_names"])
+    private = set(audits[0]["private_tensor_names"])
+    if shared & private:
+        raise ValueError("private tensors leaked into the shared tensor audit")
+    return audits
 
 
 def read_launcher_state(state_dir: str | Path) -> LauncherState:
@@ -296,6 +352,7 @@ def read_launcher_state(state_dir: str | Path) -> LauncherState:
         replicas=tuple(replicas),
         attachment_text=(state / "mps_attach.txt").read_text(encoding="utf-8"),
         raw_control_text=(state / "mps_control_raw.txt").read_text(encoding="utf-8"),
+        weight_audits=_read_weight_audits(state, manifest),
     )
     if not snapshot.equal_kv:
         raise ValueError("replicas do not have the same resolved KV capacity")
@@ -366,6 +423,33 @@ def write_startup_artifacts(
             "source": str(snapshot.state_dir / "mps_attach.txt"),
         },
     )
+    representative_audit = snapshot.weight_audits[0]
+    _write_json_atomic(
+        output / "weight_share_audit.json",
+        {
+            **common,
+            "status": "pass",
+            "architecture": representative_audit["architecture"],
+            "model_class": representative_audit["model_class"],
+            "manifest_hash": representative_audit["manifest_hash"],
+            "shared_tensor_count": representative_audit["shared_tensor_count"],
+            "shared_tensor_names": representative_audit["shared_tensor_names"],
+            "replicas": list(snapshot.weight_audits),
+        },
+    )
+    _write_json_atomic(
+        output / "private_tensor_audit.json",
+        {
+            **common,
+            "status": "pass",
+            "architecture": representative_audit["architecture"],
+            "private_tensor_names": representative_audit["private_tensor_names"],
+            "replica_local_storage_required": bool(
+                representative_audit["private_tensor_names"]
+            ),
+            "shared_tensor_intersection": [],
+        },
+    )
     _write_json_atomic(
         output / "equal_kv.json",
         {
@@ -382,6 +466,61 @@ def write_startup_artifacts(
     (output / "raw_mps_control.txt").write_text(
         snapshot.raw_control_text, encoding="utf-8"
     )
+
+
+def read_replica_activity(snapshot: LauncherState) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for replica in snapshot.replicas:
+        path = snapshot.state_dir / f"replica_activity_{replica.index}.jsonl"
+        if not path.is_file():
+            raise ValueError(f"replica activity file is missing: {path}")
+        for line in path.read_text(encoding="utf-8").splitlines():
+            event = json.loads(line)
+            if event.get("schema_version") != SCHEMA_VERSION:
+                raise ValueError("replica activity schema version mismatch")
+            if event.get("clock") != "CLOCK_MONOTONIC":
+                raise ValueError("replica activity did not use CLOCK_MONOTONIC")
+            if event.get("run_id") != snapshot.manifest["run_id"]:
+                raise ValueError("replica activity run_id mismatch")
+            if event.get("replica_id") != replica.index:
+                raise ValueError("replica activity file contains the wrong replica_id")
+            if not event.get("host_boot_id") or event["host_boot_id"] == "unavailable":
+                raise ValueError("replica activity is missing the host boot ID")
+            events.append(event)
+    if len({event["host_boot_id"] for event in events}) != 1:
+        raise ValueError("replica activity spans more than one host boot")
+    return sorted(
+        events,
+        key=lambda event: (
+            int(event["monotonic_ns"]),
+            int(event["replica_id"]),
+            str(event["request_id"]),
+        ),
+    )
+
+
+def collect_replica_activity(
+    snapshot: LauncherState, *, output_dir: str | Path
+) -> list[dict[str, Any]]:
+    events = read_replica_activity(snapshot)
+    output = Path(output_dir) / "replica_activity.jsonl"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{output.name}.", suffix=".tmp", dir=output.parent
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            for event in events:
+                handle.write(json.dumps(event, sort_keys=True))
+                handle.write("\n")
+        os.replace(temporary, output)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+    return events
 
 
 def write_router_snapshot(

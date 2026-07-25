@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0
+# Exact Stage 1 profile for two same-GPU Higgs replicas on one 80 GB H100.
+# The N=3 profile remains a separate launcher example; CI must not infer DP2
+# capacity or timeout behavior from it.
+
+config_cls: HiggsTtsPipelineConfig
+name: higgs
+model_path: bosonai/higgs-tts-3-4b
+
+stage_overrides:
+  tts_engine:
+    runtime:
+      sglang_server_args:
+        mem_fraction_static: 0.85
+
+runtime_overrides:
+  tts_engine:
+    server_args_overrides:
+      max_total_tokens: 100000
+      max_running_requests: 64
+      cuda_graph_max_bs: 64

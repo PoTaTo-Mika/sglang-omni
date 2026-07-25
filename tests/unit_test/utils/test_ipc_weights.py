@@ -15,6 +15,7 @@ import os
 import pickle
 import threading
 import time
+from pathlib import Path
 
 import pytest
 import torch
@@ -735,3 +736,48 @@ def test_get_weight_share_config_parsing():
                 "SGLANG_OMNI_WEIGHT_SHARE_TIMEOUT_S": "-1",
             }
         )
+
+
+def test_verified_attachment_audit_is_structured_and_env_gated(tmp_path):
+    model = TinyModel(seed=1)
+    record = {
+        name: (tensor.data_ptr(), tuple(tensor.shape), tensor.dtype)
+        for name, tensor in ipc_weights._named_shared_tensors(model).items()
+    }
+    config = ipc_weights.WeightShareConfig(
+        role="leader",
+        dir_path=str(tmp_path / "ipc"),
+        attach_timeout_s=1.0,
+        run_id="run-audit",
+    )
+    policy = ipc_weights.WeightSharePolicy()
+
+    assert (
+        ipc_weights.write_verified_attachment_audit(
+            model,
+            record,
+            config=config,
+            policy=policy,
+            architecture="HiggsMultimodalQwen3ForConditionalGeneration",
+            environ={},
+        )
+        is None
+    )
+
+    audit_dir = tmp_path / "audit"
+    path = ipc_weights.write_verified_attachment_audit(
+        model,
+        record,
+        config=config,
+        policy=policy,
+        architecture="HiggsMultimodalQwen3ForConditionalGeneration",
+        environ={ipc_weights.ENV_WEIGHT_SHARE_AUDIT_DIR: str(audit_dir)},
+    )
+    assert path is not None
+    payload = __import__("json").loads(Path(path).read_text(encoding="utf-8"))
+    assert payload["status"] == "pass"
+    assert payload["verified_attachment"] is True
+    assert payload["role"] == "leader"
+    assert payload["run_id"] == "run-audit"
+    assert payload["private_tensor_names"] == []
+    assert payload["shared_tensor_count"] == len(record)

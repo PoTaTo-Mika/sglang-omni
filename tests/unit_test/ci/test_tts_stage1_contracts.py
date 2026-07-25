@@ -116,7 +116,7 @@ def test_default_topology_is_multi_gpu_and_resolves_validated_config() -> None:
     )
     resolved = REPO_ROOT / result.resolved_mps_config
     assert result.tts_stage1_topology == "multi_gpu"
-    assert result.resolved_mps_config == ("examples/mps_dp/configs/higgs_h100_dp3.yaml")
+    assert result.resolved_mps_config == ("examples/mps_dp/configs/higgs_h100_dp2.yaml")
     assert resolved.is_file()
     assert result.resolved_config_class == "HiggsTtsPipelineConfig"
 
@@ -262,3 +262,15 @@ def test_unknown_topology_is_rejected() -> None:
             topology="one_gpu",
             mps_only=False,
         )
+
+
+def test_higgs_stage1_config_is_an_explicit_h100_dp2_profile() -> None:
+    config_path = REPO_ROOT / "examples/mps_dp/configs/higgs_h100_dp2.yaml"
+    config = __import__("yaml").safe_load(config_path.read_text(encoding="utf-8"))
+
+    assert config["config_cls"] == "HiggsTtsPipelineConfig"
+    assert config["runtime_overrides"]["tts_engine"]["server_args_overrides"] == {
+        "max_total_tokens": 100000,
+        "max_running_requests": 64,
+        "cuda_graph_max_bs": 64,
+    }

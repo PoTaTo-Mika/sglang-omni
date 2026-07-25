@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import logging
 import os
 import pickle
@@ -58,6 +59,7 @@ logger = logging.getLogger(__name__)
 ENV_WEIGHT_SHARE = "SGLANG_OMNI_WEIGHT_SHARE"
 ENV_WEIGHT_SHARE_TIMEOUT_S = "SGLANG_OMNI_WEIGHT_SHARE_TIMEOUT_S"
 ENV_WEIGHT_SHARE_RUN_ID = "SGLANG_OMNI_WEIGHT_SHARE_RUN_ID"
+ENV_WEIGHT_SHARE_AUDIT_DIR = "SGLANG_OMNI_WEIGHT_SHARE_AUDIT_DIR"
 DEFAULT_ATTACH_TIMEOUT_S = 1800.0
 # Note (Jiaxin Deng): version 2 added per-tensor share/private classification;
 # version-1 handles predate it and must not be attached.
@@ -1098,6 +1100,48 @@ def verify_attachment(
             "weight-share attachment was broken after attach; offending "
             f"tensors (first 10): {drifted[:10]}"
         )
+
+
+def write_verified_attachment_audit(
+    model: torch.nn.Module,
+    record: dict[str, tuple[int, tuple[int, ...], torch.dtype]],
+    *,
+    config: WeightShareConfig,
+    policy: WeightSharePolicy,
+    architecture: str,
+    environ: Any | None = None,
+) -> str | None:
+    """Persist an env-gated audit only after verify_attachment succeeds."""
+
+    env = os.environ if environ is None else environ
+    audit_dir = (env.get(ENV_WEIGHT_SHARE_AUDIT_DIR) or "").strip()
+    if not audit_dir:
+        return None
+    _prepare_secure_dir(audit_dir)
+    tensors = _named_shared_tensors(model)
+    private = _resolve_private_names(tensors, policy.private_tensor_names, model)
+    shared_names = sorted(set(record) - private)
+    payload = {
+        "schema_version": 1,
+        "status": "pass",
+        "verified_attachment": True,
+        "role": config.role,
+        "run_id": config.run_id,
+        "pid": os.getpid(),
+        "gpu_uuid": _gpu_uuid(),
+        "architecture": architecture,
+        "model_class": type(model).__name__,
+        "manifest_hash": _manifest_hash(tensors, private),
+        "shared_tensor_count": len(shared_names),
+        "shared_tensor_names": shared_names,
+        "private_tensor_names": sorted(private),
+    }
+    path = os.path.join(audit_dir, f"weight_share_{config.role}_{os.getpid()}.json")
+    _atomic_write(
+        path,
+        (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+    )
+    return path
 
 
 def leader_export(

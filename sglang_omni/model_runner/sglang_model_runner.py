@@ -95,6 +95,8 @@ class SGLModelRunner(ModelRunner):
         ws = ipc_weights.get_weight_share_config()
         self._weight_share_config = ws
         self._weight_share_record = None
+        self._weight_share_policy = None
+        self._weight_share_architecture = None
         if ws is None:
             return super().load_model()
 
@@ -114,6 +116,8 @@ class SGLModelRunner(ModelRunner):
             else getattr(self.model_config.hf_config, "architectures", None)
         )
         policy = ipc_weights.validate_weight_share_architecture(architectures)
+        self._weight_share_policy = policy
+        self._weight_share_architecture = architectures[0].strip()
 
         # Note (Jiaxin Deng): a follower frees its dummy weights before KV
         # profiling, so it must pin an explicit cap or it over-budgets KV.
@@ -177,6 +181,13 @@ class SGLModelRunner(ModelRunner):
             from sglang_omni.utils import ipc_weights
 
             ipc_weights.verify_attachment(self.model, record)
+            ipc_weights.write_verified_attachment_audit(
+                self.model,
+                record,
+                config=self._weight_share_config,
+                policy=self._weight_share_policy,
+                architecture=self._weight_share_architecture,
+            )
         return super().init_device_graphs()
 
     def _weight_update_blocked_reason(self) -> str | None:

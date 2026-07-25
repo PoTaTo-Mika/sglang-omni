@@ -324,7 +324,9 @@ up() {
   local model_name=${MODEL_NAME:-}
   local gpu=${GPU_ID:-0} n=${N:-3} base_port=${BASE_PORT:-8801} mf=${MF:-}
   local weight_share=${WEIGHT_SHARE:-0}
+  local replica_activity=${REPLICA_ACTIVITY:-0}
   [[ "$weight_share" =~ ^[01]$ ]] || die "WEIGHT_SHARE must be 0 or 1, got '$weight_share'"
+  [[ "$replica_activity" =~ ^[01]$ ]] || die "REPLICA_ACTIVITY must be 0 or 1, got '$replica_activity'"
   [[ "$gpu" =~ ^[0-9]+$ ]] || die "GPU_ID must be a non-negative integer, got '$gpu'"
   [[ "$n" =~ ^[1-9][0-9]*$ ]] || die "N must be a positive integer, got '$n'"
   [[ "$base_port" =~ ^[1-9][0-9]*$ ]] \
@@ -444,9 +446,12 @@ up() {
     echo "mem_fraction_static_cli_override=${mf:-none}"
     echo "base_port=$base_port"; echo "core_blocks=$CORE_BLOCKS"
     echo "max_total_tokens=${expected_max_total_tokens:-auto/profiled}"
-    echo "weight_share=$weight_share"
+    echo "weight_share=$weight_share"; echo "replica_activity=$replica_activity"
   } > "$state/manifest"
-  if [ "$weight_share" = 1 ]; then mkdir -p "$state/ipc_weights"; chmod 700 "$state/ipc_weights"; fi
+  if [ "$weight_share" = 1 ]; then
+    mkdir -p "$state/ipc_weights" "$state/weight_audit"
+    chmod 700 "$state/ipc_weights" "$state/weight_audit"
+  fi
 
   export CUDA_MPS_PIPE_DIRECTORY=$state/mps/pipe CUDA_MPS_LOG_DIRECTORY=$state/mps/log
   local mps_launch_status=0
@@ -471,7 +476,7 @@ up() {
   pid_is_live "$control_pid" \
     || die "MPS control daemon PID $control_pid exited during startup"
 
-  local pid leader_start log resolved_tokens ws_env
+  local pid leader_start log resolved_tokens ws_env activity_path
   for ((i=0; i<n; i++)); do
     port=$((base_port+i))
     log=$state/logs/replica_$i.log
@@ -485,6 +490,10 @@ up() {
       if [ "$i" = 0 ]; then ws_env="leader:$state/ipc_weights"
       else ws_env="follower:$state/ipc_weights"; fi
     fi
+    activity_path=""
+    if [ "$replica_activity" = 1 ]; then
+      activity_path="$state/replica_activity_$i.jsonl"
+    fi
     # Note (Jiaxin Deng): concurrent colocated launches raced on CUDA-graph capture and
     # memory profiling in testing, so replicas start sequentially behind a health
     # gate; setsid gives each replica its own process group so teardown can signal
@@ -492,6 +501,10 @@ up() {
     CUDA_VISIBLE_DEVICES="$uuid" \
     SGLANG_OMNI_WEIGHT_SHARE="$ws_env" \
     SGLANG_OMNI_WEIGHT_SHARE_RUN_ID="$run" \
+    SGLANG_OMNI_WEIGHT_SHARE_AUDIT_DIR="$state/weight_audit" \
+    SGLANG_OMNI_REPLICA_ACTIVITY_PATH="$activity_path" \
+    SGLANG_OMNI_REPLICA_ACTIVITY_RUN_ID="$run" \
+    SGLANG_OMNI_REPLICA_ACTIVITY_REPLICA_ID="$i" \
     SGLANG_OMNI_STRICT_PORT=1 \
     setsid numactl --cpunodebind="$node" --membind="$node" -C "${blocks[$i]}" \
       "${serve_cmd[@]}" "${source_args[@]}" "${model_name_args[@]}" \

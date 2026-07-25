@@ -14,12 +14,16 @@ import pytest
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / ".github" / "scripts"))
 
+from tts_stage1_artifacts import write_json_atomic  # noqa: E402
 from tts_stage1_mps_runtime import (  # noqa: E402
     MpsLaunchSpec,
+    collect_replica_activity,
     launch_replicas,
+    read_replica_activity,
     teardown_replicas,
     write_router_snapshot,
 )
+from tts_stage1_overlap import build_overlap_verdict  # noqa: E402
 
 from tests.test_model.omni_router_utils import (  # noqa: E402
     ManagedRouterHandle,
@@ -76,12 +80,13 @@ def launch_stage1_mps_router(
     if os.environ.get(TOPOLOGY_ENV) != "mps_shared":
         raise ValueError("launch_stage1_mps_router requires mps_shared topology")
     spec = build_launch_spec(serve_extra_args=worker_extra_args)
-    launch_replicas(spec)
+    launcher_snapshot = launch_replicas(spec)
     cleaned = False
     router: ManagedRouterHandle | None = None
 
     def record_after_workers() -> None:
         assert router is not None
+        collect_replica_activity(launcher_snapshot, output_dir=spec.output_dir)
         write_router_snapshot(
             output_dir=spec.output_dir,
             artifact_name="router_workers_after.json",
@@ -105,6 +110,8 @@ def launch_stage1_mps_router(
             cleanup_callback=cleanup_replicas,
         ) as running_router:
             router = running_router
+            router.mps_state_dir = launcher_snapshot.state_dir
+            router.audit_root = spec.output_dir
             write_router_snapshot(
                 output_dir=spec.output_dir,
                 artifact_name="router_workers_before.json",
@@ -113,3 +120,55 @@ def launch_stage1_mps_router(
             yield router
     finally:
         cleanup_replicas()
+
+
+def write_bounded_canary_artifacts(
+    *,
+    router: ManagedRouterHandle,
+    results: dict,
+    concurrency: int,
+    wall_time_s: float,
+) -> dict:
+    if router.mps_state_dir is None or router.audit_root is None:
+        raise ValueError("bounded canary requires an mps_shared router handle")
+    successful = [item for item in results["per_request"] if item["is_success"]]
+    request_ids = {str(item["id"]) for item in successful}
+    if len(successful) != len(results["per_request"]):
+        raise AssertionError("bounded canary contains failed requests")
+    if any(
+        not item.get("wav_path")
+        or float(item.get("audio_duration_s") or 0) <= 0
+        or item.get("error")
+        for item in successful
+    ):
+        raise AssertionError("bounded canary audio integrity failed")
+
+    snapshot = read_launcher_state(router.mps_state_dir)
+    events = read_replica_activity(snapshot)
+    verdict = build_overlap_verdict(
+        events,
+        request_ids=request_ids,
+        min_successes_per_replica=2,
+        min_matched_overlap_count=2,
+        measurement_uncertainty_ns=1_000_000,
+    )
+    correctness = {
+        "schema_version": 1,
+        "topology": "mps_shared",
+        "status": "pass",
+        "request_ids": sorted(request_ids),
+        "total_requests": len(results["per_request"]),
+        "completed_requests": len(successful),
+        "failed_requests": 0,
+        "concurrency": concurrency,
+        "canary_wall_time_s": wall_time_s,
+        "canonical_stage3_input": False,
+        "audio_integrity": "pass",
+        "threshold_provenance": verdict["threshold_provenance"],
+        "promotion_eligible": False,
+    }
+    write_json_atomic(router.audit_root / "overlap_verdict.json", verdict)
+    write_json_atomic(
+        router.audit_root / "high_concurrency_correctness.json", correctness
+    )
+    return verdict

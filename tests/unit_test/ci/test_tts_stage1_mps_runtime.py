@@ -61,6 +61,7 @@ def test_launch_spec_uses_production_launcher_and_fixed_two_replica_contract(
         "GPU_ID": "0",
         "N": "2",
         "PYTHON_BIN": "/opt/omni/bin/python",
+        "REPLICA_ACTIVITY": "1",
         "RUN_ID": "run-123-1",
         "SERVE_EXTRA_ARGS": "--allowed-local-media-path /tmp",
         "STATE_ROOT": str(tmp_path / "state"),
@@ -129,6 +130,30 @@ def _write_state(tmp_path: Path) -> Path:
         "$ get_server_list\n99\n$ get_client_list 99\n201\n202\n",
         encoding="utf-8",
     )
+    audit_dir = state / "weight_audit"
+    audit_dir.mkdir()
+    for role, pid in (("leader", 101), ("follower", 102)):
+        (audit_dir / f"weight_share_{role}_{pid}.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "status": "pass",
+                    "verified_attachment": True,
+                    "role": role,
+                    "run_id": "run-123",
+                    "pid": pid,
+                    "gpu_uuid": "GPU-abc",
+                    "architecture": "HiggsMultimodalQwen3ForConditionalGeneration",
+                    "model_class": "HiggsModel",
+                    "manifest_hash": "manifest-1",
+                    "shared_tensor_count": 2,
+                    "shared_tensor_names": ["embed.weight", "head.weight"],
+                    "private_tensor_names": [],
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
     return state
 
 
@@ -158,6 +183,8 @@ def test_write_startup_artifacts_records_runtime_evidence(
     status = json.loads((output / "mps_status.json").read_text())
     attachment = json.loads((output / "mps_attachment.json").read_text())
     equal_kv = json.loads((output / "equal_kv.json").read_text())
+    weight_audit = json.loads((output / "weight_share_audit.json").read_text())
+    private_audit = json.loads((output / "private_tensor_audit.json").read_text())
 
     assert launch["topology"] == "mps_shared"
     assert launch["run_id"] == "run-123"
@@ -167,6 +194,13 @@ def test_write_startup_artifacts_records_runtime_evidence(
     assert attachment["status"] == "pass"
     assert equal_kv["status"] == "pass"
     assert equal_kv["expected_max_total_tokens"] == 30000
+    assert weight_audit["status"] == "pass"
+    assert {entry["role"] for entry in weight_audit["replicas"]} == {
+        "leader",
+        "follower",
+    }
+    assert private_audit["status"] == "pass"
+    assert private_audit["private_tensor_names"] == []
     assert (output / "raw_mps_control.txt").read_text() == (
         "$ get_server_list\n99\n$ get_client_list 99\n201\n202\n"
     )
@@ -208,3 +242,50 @@ def test_post_launch_validation_failure_attempts_run_specific_teardown(
         runtime.launch_replicas(spec)
 
     assert commands == [spec.command, spec.teardown_command]
+
+
+def test_collect_replica_activity_requires_same_run_monotonic_host_boot(
+    tmp_path: Path,
+) -> None:
+    snapshot = runtime.read_launcher_state(_write_state(tmp_path))
+    for replica_id in (0, 1):
+        events = [
+            {
+                "schema_version": 1,
+                "clock": "CLOCK_MONOTONIC",
+                "monotonic_ns": 100 + replica_id,
+                "run_id": "run-123",
+                "replica_id": replica_id,
+                "request_id": f"req-{replica_id}",
+                "pid": 101 + replica_id,
+                "host_boot_id": "boot-1",
+                "event": "model_path_start",
+            },
+            {
+                "schema_version": 1,
+                "clock": "CLOCK_MONOTONIC",
+                "monotonic_ns": 200 + replica_id,
+                "run_id": "run-123",
+                "replica_id": replica_id,
+                "request_id": f"req-{replica_id}",
+                "pid": 101 + replica_id,
+                "host_boot_id": "boot-1",
+                "event": "model_path_end",
+                "status": "success",
+            },
+        ]
+        (snapshot.state_dir / f"replica_activity_{replica_id}.jsonl").write_text(
+            "".join(json.dumps(event) + "\n" for event in events),
+            encoding="utf-8",
+        )
+
+    output = tmp_path / "audit"
+    collected = runtime.collect_replica_activity(snapshot, output_dir=output)
+
+    assert len(collected) == 4
+    persisted = [
+        json.loads(line)
+        for line in (output / "replica_activity.jsonl").read_text().splitlines()
+    ]
+    assert persisted == collected
+    assert {event["replica_id"] for event in collected} == {0, 1}

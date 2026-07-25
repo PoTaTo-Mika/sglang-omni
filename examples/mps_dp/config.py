@@ -32,7 +32,7 @@ WEIGHT_SHARE_VALIDATED_CONFIGS: dict[str, str] = {
 }
 
 TTS_STAGE1_VALIDATED_CONFIGS: dict[str, str] = {
-    "higgs": "configs/higgs_h100_dp3.yaml",
+    "higgs": "configs/higgs_h100_dp2.yaml",
     "moss": "configs/moss_local_h100_dp2.yaml",
 }
 

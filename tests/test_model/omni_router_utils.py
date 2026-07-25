@@ -47,15 +47,19 @@ class ManagedRouterHandle:
     router_ready_s: float | None = None
     before_stop_callback: Callable[[], None] | None = None
     cleanup_callback: Callable[[], None] | None = None
+    mps_state_dir: Path | None = None
+    audit_root: Path | None = None
     stopped: bool = False
 
     def stop(self) -> None:
         if self.stopped:
             return
         try:
-            if self.before_stop_callback is not None:
-                self.before_stop_callback()
-            stop_server(self.proc)
+            try:
+                if self.before_stop_callback is not None:
+                    self.before_stop_callback()
+            finally:
+                stop_server(self.proc)
         finally:
             try:
                 if self.cleanup_manifest is not None:
