@@ -176,3 +176,35 @@ def test_cpu_list_round_trip_for_numa_affinity() -> None:
     cores = runtime.parse_cpu_list("0-3,8,10-11")
     assert cores == [0, 1, 2, 3, 8, 10, 11]
     assert runtime.format_cpu_list(cores) == "0-3,8,10-11"
+
+
+def test_post_launch_validation_failure_attempts_run_specific_teardown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = runtime.MpsLaunchSpec(
+        repository_root=REPO_ROOT,
+        output_dir=tmp_path / "audit",
+        state_root=tmp_path / "state",
+        run_id="run-cleanup-test",
+        config_path=REPO_ROOT / "examples/mps_dp/configs/moss_local_h100_dp2.yaml",
+        gpu_id=0,
+        base_port=9100,
+        core_blocks=("0-3", "4-7"),
+        python_bin="python",
+    )
+    commands: list[tuple[str, ...]] = []
+
+    def record_run(command, **kwargs):
+        commands.append(tuple(command))
+
+    def fail_validation(state_dir):
+        raise ValueError("invalid attachment evidence")
+
+    monkeypatch.setattr(runtime.subprocess, "run", record_run)
+    monkeypatch.setattr(runtime, "read_launcher_state", fail_validation)
+
+    with pytest.raises(ValueError, match="invalid attachment evidence"):
+        runtime.launch_replicas(spec)
+
+    assert commands == [spec.command, spec.teardown_command]

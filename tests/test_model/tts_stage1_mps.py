@@ -48,12 +48,7 @@ def build_launch_spec(*, serve_extra_args: str) -> MpsLaunchSpec:
     output_dir = Path(_required_environment(OUTPUT_ENV)).resolve()
     raw_config = Path(_required_environment(CONFIG_ENV))
     config_path = raw_config if raw_config.is_absolute() else PROJECT_ROOT / raw_config
-    state_root_value = os.environ.get(STATE_ROOT_ENV, "").strip()
-    state_root = (
-        Path(state_root_value).resolve()
-        if state_root_value
-        else (output_dir / "launcher-state").resolve()
-    )
+    state_root = Path(_required_environment(STATE_ROOT_ENV)).resolve()
     return MpsLaunchSpec(
         repository_root=PROJECT_ROOT,
         output_dir=output_dir,

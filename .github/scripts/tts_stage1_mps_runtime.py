@@ -455,10 +455,21 @@ def launch_replicas(spec: MpsLaunchSpec) -> LauncherState:
         env=environment,
         check=True,
     )
-    snapshot = read_launcher_state(spec.state_dir)
-    write_startup_artifacts(snapshot, output_dir=spec.output_dir)
-    write_process_tree(snapshot, output_dir=spec.output_dir)
-    return snapshot
+    try:
+        snapshot = read_launcher_state(spec.state_dir)
+        write_startup_artifacts(snapshot, output_dir=spec.output_dir)
+        write_process_tree(snapshot, output_dir=spec.output_dir)
+        return snapshot
+    except BaseException as post_launch_error:
+        try:
+            teardown_replicas(spec)
+        except BaseException as cleanup_error:
+            raise RuntimeError(
+                "post-launch validation failed and run-specific teardown also failed; "
+                f"state retained at {spec.state_dir}; original error: "
+                f"{post_launch_error!r}"
+            ) from cleanup_error
+        raise
 
 
 def teardown_replicas(spec: MpsLaunchSpec) -> None:

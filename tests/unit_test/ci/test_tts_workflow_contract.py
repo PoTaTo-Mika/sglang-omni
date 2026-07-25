@@ -90,6 +90,8 @@ def test_stage1_alone_consumes_explicit_topology_and_validated_config() -> None:
     stage1_text = str(child["jobs"]["stage-1-non-streaming"])
     assert "TTS_STAGE1_TOPOLOGY" in stage1_text
     assert "TTS_STAGE1_MPS_CONFIG" in stage1_text
+    assert "TTS_STAGE1_MPS_STATE_ROOT" in stage1_text
+    assert "tts-stage1-mps-state" in stage1_text
     assert "examples/mps_dp/launch.sh" in stage1_text
     for job_name in (
         "stage-2-streaming",

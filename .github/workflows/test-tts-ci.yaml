@@ -96,6 +96,7 @@ jobs:
           TTS_STAGE1_TOPOLOGY: ${{ inputs.tts_stage1_topology }}
           TTS_STAGE1_MPS_CONFIG: ${{ inputs.tts_stage1_mps_config }}
           TTS_STAGE1_AUDIT_ROOT: ${{ env.OMNI_CI_HOME }}/tts-stage-results/nonstream/mps-audit
+          TTS_STAGE1_MPS_STATE_ROOT: ${{ env.OMNI_CI_HOME }}/tts-stage1-mps-state
           TTS_STAGE1_MPS_GPU_ID: "0"
           TORCHINDUCTOR_CACHE_DIR: ${{ env.OMNI_CI_HOME }}/.torchinductor
 
