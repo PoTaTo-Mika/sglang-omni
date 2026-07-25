@@ -129,12 +129,15 @@ jobs:
             --repository-root "${GITHUB_WORKSPACE}" \
             --output "${output_dir}/preflight.json" \
             --github-output "${GITHUB_OUTPUT}"
+          python .github/scripts/tts_stage1_artifacts.py initialize \
+            --output-dir "${output_dir}" \
+            --topology "${TTS_STAGE1_TOPOLOGY}"
 
       - name: Upload TTS preflight artifact
         uses: actions/upload-artifact@v4
         with:
           name: tts-stage1-preflight
-          path: ${{ runner.temp }}/tts-stage1-preflight/preflight.json
+          path: ${{ runner.temp }}/tts-stage1-preflight
           if-no-files-found: error
           retention-days: 14
           overwrite: true

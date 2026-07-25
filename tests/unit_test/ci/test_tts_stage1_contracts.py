@@ -135,6 +135,32 @@ def test_moss_resolves_the_merged_1124_validated_config() -> None:
     assert result.resolved_config_class == "MossTTSLocalPipelineConfig"
 
 
+def test_config_path_is_derived_from_the_merged_registry(tmp_path: Path) -> None:
+    config_dir = tmp_path / "examples" / "mps_dp" / "configs"
+    config_dir.mkdir(parents=True)
+    (tmp_path / "examples" / "mps_dp" / "config.py").write_text(
+        "WEIGHT_SHARE_VALIDATED_CONFIGS = {\n"
+        '    "HiggsTtsPipelineConfig": "HiggsArchitecture",\n'
+        "}\n"
+        "TTS_STAGE1_VALIDATED_CONFIGS = {\n"
+        '    "higgs": "configs/custom_higgs.yaml",\n'
+        "}\n",
+        encoding="utf-8",
+    )
+    (config_dir / "custom_higgs.yaml").write_text(
+        "config_cls: HiggsTtsPipelineConfig\n",
+        encoding="utf-8",
+    )
+
+    resolved, config_class = selection._resolve_config(
+        repository_root=tmp_path,
+        model="higgs",
+    )
+
+    assert resolved == "examples/mps_dp/configs/custom_higgs.yaml"
+    assert config_class == "HiggsTtsPipelineConfig"
+
+
 def test_preflight_json_contains_immutable_selection_and_provenance(
     tmp_path: Path,
 ) -> None:
@@ -179,6 +205,34 @@ def test_mps_artifact_is_required_for_mps_topology() -> None:
     )
     assert payload["status"] == "required"
     assert "reason_code" not in payload
+
+
+def test_verdict_preserves_multi_gpu_not_applicable_contract() -> None:
+    payload = artifacts.verdict_envelope(
+        artifact_name="mps_teardown_verdict.json",
+        topology="multi_gpu",
+        status="not_applicable",
+    )
+    assert payload["status"] == "not_applicable"
+    assert payload["reason_code"] == "mps_disabled_for_topology"
+
+
+def test_initialize_contract_writes_manifest_and_multi_gpu_mps_envelopes(
+    tmp_path: Path,
+) -> None:
+    artifacts.initialize_artifact_contracts(tmp_path, topology="multi_gpu")
+
+    manifest = json.loads(
+        (tmp_path / "artifact_manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["schema_version"] == 1
+    assert manifest["topology"] == "multi_gpu"
+    expected = {entry["artifact_name"]: entry for entry in manifest["artifacts"]}
+    for artifact_name in artifacts.MPS_ONLY_JSON_ARTIFACTS:
+        payload = json.loads((tmp_path / artifact_name).read_text(encoding="utf-8"))
+        assert payload["status"] == "not_applicable"
+        assert payload["reason_code"] == "mps_disabled_for_topology"
+        assert expected[artifact_name]["status"] == "not_applicable"
 
 
 def test_unknown_topology_is_rejected() -> None:

@@ -14,14 +14,7 @@ from tts_stage1_artifacts import SCHEMA_VERSION, write_json_atomic
 
 MODELS = ("higgs", "moss")
 MODEL_LABELS = {"higgs": "run-higgs", "moss": "run-moss"}
-MODEL_CONFIG_CLASSES = {
-    "higgs": "HiggsTtsPipelineConfig",
-    "moss": "MossTTSLocalPipelineConfig",
-}
-MODEL_CONFIG_PATHS = {
-    "higgs": "examples/mps_dp/configs/higgs_h100_dp3.yaml",
-    "moss": "examples/mps_dp/configs/moss_local_h100_dp2.yaml",
-}
+
 SUPPORTED_TOPOLOGIES = frozenset({"multi_gpu", "mps_shared"})
 
 
@@ -40,20 +33,19 @@ class SelectionResult(NamedTuple):
         return self._asdict()
 
 
-def _load_weight_share_registry(repository_root: Path) -> dict[str, str]:
+def _load_registry(repository_root: Path, name: str) -> dict[str, str]:
     registry_path = repository_root / "examples" / "mps_dp" / "config.py"
     tree = ast.parse(registry_path.read_text(encoding="utf-8"), registry_path)
     for node in tree.body:
-        if not isinstance(node, ast.AnnAssign):
-            continue
-        if not isinstance(node.target, ast.Name):
-            continue
-        if node.target.id == "WEIGHT_SHARE_VALIDATED_CONFIGS":
+        target = node.target if isinstance(node, ast.AnnAssign) else None
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+        if isinstance(target, ast.Name) and target.id == name:
             value = ast.literal_eval(node.value)
             if isinstance(value, dict):
                 return value
             break
-    raise ValueError(f"Cannot find WEIGHT_SHARE_VALIDATED_CONFIGS in {registry_path}")
+    raise ValueError(f"Cannot find {name} in {registry_path}")
 
 
 def _config_class(path: Path) -> str | None:
@@ -69,23 +61,22 @@ def _resolve_config(
     repository_root: Path,
     model: str,
 ) -> tuple[str, str]:
-    config_class = MODEL_CONFIG_CLASSES[model]
-    registry = _load_weight_share_registry(repository_root)
-    if config_class not in registry:
-        raise ValueError(
-            f"{config_class} is not in the merged #1124 "
-            "WEIGHT_SHARE_VALIDATED_CONFIGS registry"
-        )
-
-    relative_path = MODEL_CONFIG_PATHS[model]
+    weight_share_registry = _load_registry(
+        repository_root, "WEIGHT_SHARE_VALIDATED_CONFIGS"
+    )
+    tts_registry = _load_registry(repository_root, "TTS_STAGE1_VALIDATED_CONFIGS")
+    relative_to_mps = tts_registry.get(model)
+    if not relative_to_mps:
+        raise ValueError(f"No validated TTS Stage 1 config is registered for {model}")
+    relative_path = f"examples/mps_dp/{relative_to_mps}"
     path = repository_root / relative_path
     if not path.is_file():
         raise ValueError(f"Validated MPS config is missing: {relative_path}")
-    actual_config_class = _config_class(path)
-    if actual_config_class != config_class:
+    config_class = _config_class(path)
+    if config_class not in weight_share_registry:
         raise ValueError(
-            f"Validated MPS config {relative_path} declares "
-            f"{actual_config_class!r}, expected {config_class!r}"
+            f"{config_class} is not in the merged #1124 "
+            "WEIGHT_SHARE_VALIDATED_CONFIGS registry"
         )
     return relative_path, config_class
 

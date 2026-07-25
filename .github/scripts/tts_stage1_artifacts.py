@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import tempfile
@@ -12,11 +13,46 @@ from typing import Any
 SCHEMA_VERSION = 1
 SUPPORTED_TOPOLOGIES = frozenset({"multi_gpu", "mps_shared"})
 MPS_DISABLED_REASON = "mps_disabled_for_topology"
+MPS_ONLY_JSON_ARTIFACTS = (
+    "mps_status.json",
+    "mps_attachment.json",
+    "weight_share_audit.json",
+    "private_tensor_audit.json",
+    "equal_kv.json",
+    "mps_teardown_verdict.json",
+)
+MPS_ONLY_TEXT_ARTIFACTS = ("raw_mps_control.txt",)
+REQUIRED_JSON_ARTIFACTS = (
+    "runner_quarantine_feasibility.json",
+    "preflight.json",
+    "baseline_gpu.json",
+    "launch_manifest.json",
+    "replica_manifest.json",
+    *MPS_ONLY_JSON_ARTIFACTS,
+    "router_workers_before.json",
+    "router_workers_after.json",
+    "overlap_verdict.json",
+    "normal_correctness.json",
+    "high_concurrency_correctness.json",
+    "performance_observation.json",
+    "stage1_timing_breakdown.json",
+    "process_tree.json",
+    "ordinary_teardown_verdict.json",
+    "pre_evaluator_cleanup_verdict.json",
+    "post_state.json",
+    "lane_release_verdict.json",
+    "artifact_index.json",
+)
+REQUIRED_NON_JSON_ARTIFACTS = (*MPS_ONLY_TEXT_ARTIFACTS, "replica_activity.jsonl")
 
 
 def _validate_topology(topology: str) -> None:
     if topology not in SUPPORTED_TOPOLOGIES:
         raise ValueError(f"Unsupported TTS Stage 1 topology: {topology!r}")
+
+
+def _is_mps_only(artifact_name: str) -> bool:
+    return artifact_name in MPS_ONLY_JSON_ARTIFACTS + MPS_ONLY_TEXT_ARTIFACTS
 
 
 def artifact_envelope(
@@ -57,7 +93,7 @@ def verdict_envelope(
     payload = artifact_envelope(
         artifact_name=artifact_name,
         topology=topology,
-        mps_only=False,
+        mps_only=_is_mps_only(artifact_name),
     )
     payload["status"] = status
     if clean is not None:
@@ -67,6 +103,26 @@ def verdict_envelope(
     if details:
         payload["details"] = details
     return payload
+
+
+def artifact_manifest(topology: str) -> dict[str, Any]:
+    """Describe every required artifact without fabricating runtime evidence."""
+
+    _validate_topology(topology)
+    names = REQUIRED_JSON_ARTIFACTS + REQUIRED_NON_JSON_ARTIFACTS
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "topology": topology,
+        "status": "contract",
+        "artifacts": [
+            artifact_envelope(
+                artifact_name=name,
+                topology=topology,
+                mps_only=_is_mps_only(name),
+            )
+            for name in names
+        ],
+    }
 
 
 def write_json_atomic(path: str | Path, payload: dict[str, Any]) -> None:
@@ -90,3 +146,46 @@ def write_json_atomic(path: str | Path, payload: dict[str, Any]) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+def initialize_artifact_contracts(output_dir: str | Path, *, topology: str) -> None:
+    """Write the manifest and honest N/A files for the selected topology."""
+
+    root = Path(output_dir)
+    write_json_atomic(root / "artifact_manifest.json", artifact_manifest(topology))
+    if topology != "multi_gpu":
+        return
+    for artifact_name in MPS_ONLY_JSON_ARTIFACTS:
+        write_json_atomic(
+            root / artifact_name,
+            artifact_envelope(
+                artifact_name=artifact_name,
+                topology=topology,
+                mps_only=True,
+            ),
+        )
+    for artifact_name in MPS_ONLY_TEXT_ARTIFACTS:
+        payload = artifact_envelope(
+            artifact_name=artifact_name,
+            topology=topology,
+            mps_only=True,
+        )
+        (root / artifact_name).write_text(
+            "\n".join(f"{key}={value}" for key, value in payload.items()) + "\n",
+            encoding="utf-8",
+        )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    initialize = subparsers.add_parser("initialize")
+    initialize.add_argument("--output-dir", required=True)
+    initialize.add_argument("--topology", required=True)
+    args = parser.parse_args()
+    if args.command == "initialize":
+        initialize_artifact_contracts(args.output_dir, topology=args.topology)
+
+
+if __name__ == "__main__":
+    main()

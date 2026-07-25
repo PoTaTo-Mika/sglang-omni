@@ -27,6 +27,12 @@ def test_model_selection_is_a_cpu_preflight_output_before_h100_setup() -> None:
     assert "tts_stage1_topology" in preflight["outputs"]
     assert "pick-tts-model" not in jobs
     assert "preflight" in jobs["setup"]["needs"]
+    upload = next(
+        step
+        for step in preflight["steps"]
+        if step.get("name") == "Upload TTS preflight artifact"
+    )
+    assert upload["with"]["path"] == "${{ runner.temp }}/tts-stage1-preflight"
 
 
 def test_tts_job_passes_one_preflight_selection_to_stages_one_through_three() -> None:

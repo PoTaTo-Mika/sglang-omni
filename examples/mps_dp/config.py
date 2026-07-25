@@ -31,6 +31,11 @@ WEIGHT_SHARE_VALIDATED_CONFIGS: dict[str, str] = {
     "FunASRPipelineConfig": "FunAsrNanoForConditionalGeneration",
 }
 
+TTS_STAGE1_VALIDATED_CONFIGS: dict[str, str] = {
+    "higgs": "configs/higgs_h100_dp3.yaml",
+    "moss": "configs/moss_local_h100_dp2.yaml",
+}
+
 
 def resolve_max_total_tokens(
     config_path: str | Path,
