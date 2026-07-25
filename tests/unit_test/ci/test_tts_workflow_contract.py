@@ -62,3 +62,40 @@ def test_tts_job_passes_one_preflight_selection_to_stages_one_through_three() ->
         )
 
     assert "TTS_CI_MODEL" not in str(child_jobs["stage-4-serving"])
+
+
+def test_stage1_alone_consumes_explicit_topology_and_validated_config() -> None:
+    parent = _workflow(".github/workflows/omni-ci.yaml")
+    child = _workflow(".github/workflows/test-tts-ci.yaml")
+
+    parent_inputs = parent["on"]["workflow_dispatch"]["inputs"]
+    assert parent_inputs["tts_stage1_topology"]["default"] == "multi_gpu"
+    assert parent_inputs["tts_stage1_topology"]["options"] == [
+        "multi_gpu",
+        "mps_shared",
+    ]
+
+    parent_call = parent["jobs"]["tts-ci"]["with"]
+    assert parent_call["tts_stage1_topology"] == (
+        "${{ needs.preflight.outputs.tts_stage1_topology }}"
+    )
+    assert parent_call["tts_stage1_mps_config"] == (
+        "${{ needs.preflight.outputs.resolved_mps_config }}"
+    )
+
+    child_inputs = child["on"]["workflow_call"]["inputs"]
+    assert child_inputs["tts_stage1_topology"]["default"] == "multi_gpu"
+    assert child_inputs["tts_stage1_mps_config"]["required"] == "true"
+
+    stage1_text = str(child["jobs"]["stage-1-non-streaming"])
+    assert "TTS_STAGE1_TOPOLOGY" in stage1_text
+    assert "TTS_STAGE1_MPS_CONFIG" in stage1_text
+    assert "examples/mps_dp/launch.sh" in stage1_text
+    for job_name in (
+        "stage-2-streaming",
+        "stage-3-consistency",
+        "stage-4-serving",
+    ):
+        job_text = str(child["jobs"][job_name])
+        assert "TTS_STAGE1_TOPOLOGY" not in job_text
+        assert "TTS_STAGE1_MPS_CONFIG" not in job_text

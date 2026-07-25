@@ -181,13 +181,20 @@ run_is_active() {
 }
 
 mps_clients() {
-  local state=$1 servers s clients="" out
+  local state=$1 capture=${2:-} servers s clients="" out
+  [ -z "$capture" ] || : > "$capture"
   if ! out=$(mps_query "$state" get_server_list); then
     return 1
+  fi
+  if [ -n "$capture" ]; then
+    printf '$ get_server_list\n%s\n' "$out" >> "$capture"
   fi
   servers=$(echo "$out" | grep -E '^[0-9]+$' || true)
   for s in $servers; do
     out=$(mps_query "$state" "get_client_list $s") || return 1
+    if [ -n "$capture" ]; then
+      printf '$ get_client_list %s\n%s\n' "$s" "$out" >> "$capture"
+    fi
     clients+=" $s:$(echo "$out" | grep -E '^[0-9]+$' | tr '\n' ',' || true)"
   done
   echo "$clients"
@@ -198,7 +205,7 @@ verify_attach() {
   [ -n "$state" ] && [ -f "$state/replicas.tsv" ] || die "invalid or missing run state '$state'"
   local art="$state/mps_attach.txt" fail=0 raw entry srv cl all=" " idx pid pgid port log
   : > "$art"
-  if ! raw=$(mps_clients "$state"); then
+  if ! raw=$(mps_clients "$state" "$state/mps_control_raw.txt"); then
     echo "FAIL: MPS control query failed (see $state/mps_ctl.err)" | tee -a "$art" >&2
     return 1
   fi

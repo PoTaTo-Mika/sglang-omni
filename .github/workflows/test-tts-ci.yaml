@@ -11,6 +11,15 @@ on:
         type: string
         required: false
         default: ""
+      tts_stage1_topology:
+        description: Explicit Stage 1 topology selected by CPU preflight.
+        type: string
+        required: false
+        default: multi_gpu
+      tts_stage1_mps_config:
+        description: Validated production launch.sh config selected by CPU preflight.
+        type: string
+        required: true
 
 env:
   OMNI_CI_HOME: >-
@@ -45,6 +54,23 @@ jobs:
         with:
           venv-name: omni
 
+      - name: Prepare explicit MPS Stage 1 runtime
+        if: ${{ inputs.tts_stage1_topology == 'mps_shared' }}
+        shell: bash
+        env:
+          TTS_STAGE1_AUDIT_ROOT: ${{ env.OMNI_CI_HOME }}/tts-stage-results/nonstream/mps-audit
+        run: |
+          source omni/bin/activate
+          test -f examples/mps_dp/launch.sh
+          mkdir -p "${TTS_STAGE1_AUDIT_ROOT}"
+          python .github/scripts/tts_stage1_artifacts.py initialize \
+            --output-dir "${TTS_STAGE1_AUDIT_ROOT}" \
+            --topology mps_shared
+          core_blocks=$(python .github/scripts/tts_stage1_mps_runtime.py \
+            derive-core-blocks --gpu-id 0)
+          echo "TTS_STAGE1_MPS_CORE_BLOCKS=${core_blocks}" >> "${GITHUB_ENV}"
+          echo "TTS_STAGE1_MPS_RUN_ID=run-tts-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "${GITHUB_ENV}"
+
       - name: Prepare speaker similarity assets
         shell: bash
         run: |
@@ -67,7 +93,21 @@ jobs:
           SEEDTTS_SIM_CACHE_DIR: /github/home/seedtts-wavlm-sim
           TTS_CI_MODEL: ${{ inputs.tts_ci_model }}
           TTS_STAGE_OUTPUT_ROOT: ${{ env.OMNI_CI_HOME }}/tts-stage-results/nonstream
+          TTS_STAGE1_TOPOLOGY: ${{ inputs.tts_stage1_topology }}
+          TTS_STAGE1_MPS_CONFIG: ${{ inputs.tts_stage1_mps_config }}
+          TTS_STAGE1_AUDIT_ROOT: ${{ env.OMNI_CI_HOME }}/tts-stage-results/nonstream/mps-audit
+          TTS_STAGE1_MPS_GPU_ID: "0"
           TORCHINDUCTOR_CACHE_DIR: ${{ env.OMNI_CI_HOME }}/.torchinductor
+
+      - name: Upload MPS Stage 1 audit
+        if: ${{ always() && inputs.tts_stage1_topology == 'mps_shared' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: tts-stage1-mps-audit-${{ inputs.tts_ci_model }}
+          path: ${{ env.OMNI_CI_HOME }}/tts-stage-results/nonstream/mps-audit
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
 
       - name: Upload non-streaming speed artifact
         uses: actions/upload-artifact@v4

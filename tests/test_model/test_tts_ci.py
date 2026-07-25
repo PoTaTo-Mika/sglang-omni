@@ -59,6 +59,7 @@ from tests.test_model.omni_router_utils import (
     router_get_json,
 )
 from tests.test_model.tts_ci_config import select_tts_ci_preset
+from tests.test_model.tts_stage1_mps import launch_stage1_mps_router
 from tests.utils import (
     QWEN3_ASR_WER_CONCURRENCY,
     MetricCheckCollector,
@@ -708,8 +709,24 @@ def cleanup_generated_audio_fixture():
 
 
 @pytest.fixture(scope="module")
-def router_server(tmp_path_factory: pytest.TempPathFactory):
+def router_server(
+    tmp_path_factory: pytest.TempPathFactory,
+    selected_tts_ci_stage: str,
+):
     """Start two TTS workers behind the router and wait until healthy."""
+    if (
+        selected_tts_ci_stage == TTS_STAGE_NONSTREAM
+        and os.environ.get("TTS_STAGE1_TOPOLOGY", "multi_gpu") == "mps_shared"
+    ):
+        with launch_stage1_mps_router(
+            tmp_path_factory=tmp_path_factory,
+            model_name=TTS_MODEL_PATH,
+            worker_extra_args=f"{TTS_WORKER_EXTRA_ARGS} {_PRESET.worker_extra_args}".strip(),
+            wait_timeout=STARTUP_TIMEOUT,
+        ) as router:
+            yield router
+        return
+
     with launch_managed_router(
         tmp_path_factory=tmp_path_factory,
         model_path=TTS_MODEL_PATH,

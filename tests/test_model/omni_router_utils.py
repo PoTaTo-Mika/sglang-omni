@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,17 +45,27 @@ class ManagedRouterHandle:
     cleanup_manifest: Path | None = None
     is_router: bool = True
     router_ready_s: float | None = None
+    before_stop_callback: Callable[[], None] | None = None
+    cleanup_callback: Callable[[], None] | None = None
     stopped: bool = False
 
     def stop(self) -> None:
         if self.stopped:
             return
         try:
+            if self.before_stop_callback is not None:
+                self.before_stop_callback()
             stop_server(self.proc)
         finally:
-            if self.cleanup_manifest is not None:
-                cleanup_process_groups_from_manifest(self.cleanup_manifest)
-            self.stopped = True
+            try:
+                if self.cleanup_manifest is not None:
+                    cleanup_process_groups_from_manifest(self.cleanup_manifest)
+            finally:
+                try:
+                    if self.cleanup_callback is not None:
+                        self.cleanup_callback()
+                finally:
+                    self.stopped = True
 
 
 @dataclass
@@ -170,6 +180,88 @@ def launch_managed_router(
             launcher_config=launcher_config,
             cleanup_manifest=cleanup_manifest,
             router_ready_s=router_ready_s,
+        )
+        yield handle
+    finally:
+        if handle is not None:
+            handle.stop()
+        elif router_proc is not None:
+            stop_server(router_proc)
+        cleanup_process_groups_from_manifest(cleanup_manifest)
+
+
+@contextmanager
+def launch_router_for_workers(
+    *,
+    tmp_path_factory: pytest.TempPathFactory,
+    worker_urls: list[str],
+    model_name: str,
+    wait_timeout: int = 900,
+    startup_timeout: int | None = None,
+    log_prefix: str = "omni_external_router_logs",
+    before_stop_callback: Callable[[], None] | None = None,
+    cleanup_callback: Callable[[], None] | None = None,
+) -> Iterator[ManagedRouterHandle]:
+    """Launch the production router against externally managed workers."""
+
+    if not worker_urls:
+        raise ValueError("at least one external worker URL is required")
+    worker_ports = [int(url.rsplit(":", 1)[1]) for url in worker_urls]
+    router_port = _find_available_port_excluding(worker_ports)
+    cleanup_manifest = (
+        tmp_path_factory.mktemp("omni_external_router_cleanup") / "router_pgids.txt"
+    )
+    router_log = server_log_file(tmp_path_factory, log_prefix)
+    router_proc: subprocess.Popen | None = None
+    handle: ManagedRouterHandle | None = None
+
+    try:
+        startup_t0 = time.perf_counter()
+        router_cmd = [
+            sys.executable,
+            "-m",
+            "sglang_omni_router.serve",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            str(router_port),
+            "--worker-urls",
+            *worker_urls,
+            "--model",
+            model_name,
+            "--policy",
+            ROUTER_POLICY,
+            "--health-success-threshold",
+            "1",
+            "--health-failure-threshold",
+            "2",
+            "--health-check-interval-secs",
+            "2",
+            "--log-level",
+            "info",
+        ]
+        router_proc = start_server_from_cmd(
+            router_cmd,
+            router_log,
+            router_port,
+            timeout=startup_timeout or wait_timeout + 60,
+            env={ROUTER_CLEANUP_MANIFEST_ENV: str(cleanup_manifest)},
+        )
+        _record_process_group(cleanup_manifest, os.getpgid(router_proc.pid))
+        wait_for_all_router_workers(
+            router_port,
+            expected_workers=len(worker_urls),
+            timeout=wait_timeout,
+        )
+        handle = ManagedRouterHandle(
+            proc=router_proc,
+            port=router_port,
+            worker_ports=worker_ports,
+            log_file=router_log,
+            cleanup_manifest=cleanup_manifest,
+            router_ready_s=time.perf_counter() - startup_t0,
+            before_stop_callback=before_stop_callback,
+            cleanup_callback=cleanup_callback,
         )
         yield handle
     finally:
