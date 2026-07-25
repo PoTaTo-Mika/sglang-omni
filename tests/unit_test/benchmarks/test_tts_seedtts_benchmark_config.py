@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import asyncio
+from types import SimpleNamespace
+
+from benchmarks.benchmarker.data import RequestResult
 from benchmarks.eval.benchmark_tts_seedtts import (
     TtsSeedttsBenchmarkConfig,
     _build_arg_parser,
     _build_results_config,
     _config_from_args,
 )
+from benchmarks.metrics.performance import _request_result_to_dict
+from benchmarks.tasks.tts import make_tts_send_fn
 
 
 def _config_from_cli(*args: str) -> TtsSeedttsBenchmarkConfig:
@@ -44,3 +50,46 @@ def test_seedtts_benchmark_batch_args_are_independent() -> None:
     )
     assert results_config["max_running_requests"] == 32
     assert results_config["cuda_graph_max_bs"] == 128
+
+
+def test_speed_result_preserves_server_request_id() -> None:
+    result = RequestResult(
+        request_id="sample-1",
+        server_request_id="speech-runtime-1",
+        is_success=True,
+    )
+
+    assert _request_result_to_dict(result)["server_request_id"] == "speech-runtime-1"
+
+
+class _ResponseWithRequestId:
+    status = 500
+    headers = {"X-Request-Id": "speech-runtime-2"}
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
+
+    async def text(self) -> str:
+        return "expected test error"
+
+
+class _SessionWithRequestId:
+    def post(self, url, *, json):
+        return _ResponseWithRequestId()
+
+
+def test_tts_sender_captures_server_request_id() -> None:
+    send = make_tts_send_fn(
+        "model",
+        "http://localhost/v1/audio/speech",
+        no_ref_audio=True,
+    )
+    sample = SimpleNamespace(sample_id="sample-2", target_text="hello")
+
+    result = asyncio.run(send(_SessionWithRequestId(), sample))
+
+    assert result.request_id == "sample-2"
+    assert result.server_request_id == "speech-runtime-2"

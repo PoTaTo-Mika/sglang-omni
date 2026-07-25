@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 @dataclass
 class RequestResult:
     request_id: str = ""
+    server_request_id: str = ""
     text: str = ""
     is_success: bool = False
     latency_s: float = 0.0

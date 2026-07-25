@@ -452,6 +452,7 @@ def test_speech_endpoint_returns_binary_audio() -> None:
     )
 
     assert response.status_code == 200
+    assert response.headers["x-request-id"].startswith("speech-")
     assert response.content == b"RIFF"
     assert response.headers["content-type"] == "audio/wav"
     assert speech_client.speech_requests[0].model == "tts"
@@ -503,6 +504,7 @@ def test_speech_endpoint_accepts_sdk_shaped_binary_request() -> None:
     )
 
     assert response.status_code == 200
+    assert response.headers["x-request-id"].startswith("speech-")
     assert response.content == b"RIFF"
     assert response.headers["content-type"] == "audio/wav"
     assert (
@@ -716,6 +718,7 @@ def test_speech_stream_defaults_to_raw_pcm() -> None:
     expected = encode_pcm([0.0, 0.1, -0.1, 0.0], sample_rate=24000)
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("audio/pcm")
+    assert response.headers["x-request-id"].startswith("speech-")
     assert response.headers["x-sample-rate"] == "24000"
     assert response.headers["x-channels"] == "1"
     assert response.headers["x-bit-depth"] == "16"

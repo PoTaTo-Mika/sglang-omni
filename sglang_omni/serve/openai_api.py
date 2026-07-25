@@ -1247,6 +1247,7 @@ def _register_speech(app: FastAPI) -> None:
 
         headers = {
             "Content-Disposition": f'attachment; filename="speech.{result.format}"',
+            "X-Request-Id": request_id,
         }
         if result.usage is not None:
             if result.usage.prompt_tokens is not None:
@@ -1465,6 +1466,7 @@ async def _speech_audio_response(
             "X-Sample-Rate": str(stream_sample_rate),
             "X-Channels": "1",
             "X-Bit-Depth": "16",
+            "X-Request-Id": request_id,
         },
     )
 

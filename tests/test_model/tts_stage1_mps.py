@@ -132,9 +132,12 @@ def write_bounded_canary_artifacts(
     if router.mps_state_dir is None or router.audit_root is None:
         raise ValueError("bounded canary requires an mps_shared router handle")
     successful = [item for item in results["per_request"] if item["is_success"]]
-    request_ids = {str(item["id"]) for item in successful}
+    request_ids = {str(item.get("server_request_id") or "") for item in successful}
+    request_ids.discard("")
     if len(successful) != len(results["per_request"]):
         raise AssertionError("bounded canary contains failed requests")
+    if len(request_ids) != len(successful):
+        raise AssertionError("bounded canary is missing unique server request IDs")
     if any(
         not item.get("wav_path")
         or float(item.get("audio_duration_s") or 0) <= 0
