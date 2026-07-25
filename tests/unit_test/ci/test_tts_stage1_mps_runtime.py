@@ -149,6 +149,15 @@ def _write_state(tmp_path: Path) -> Path:
                     "shared_tensor_count": 2,
                     "shared_tensor_names": ["embed.weight", "head.weight"],
                     "private_tensor_names": [],
+                    "private_storage_preserved_after_attachment": True,
+                    "replica_local_state": {
+                        "status": "not_applicable",
+                        "reason_code": "no_architecture_specific_mutable_state",
+                        "scope": "none",
+                        "tensor_names": [],
+                        "history_tensor_names": [],
+                        "shared_record_intersection": [],
+                    },
                 }
             )
             + "\n",
@@ -289,3 +298,42 @@ def test_collect_replica_activity_requires_same_run_monotonic_host_boot(
     ]
     assert persisted == collected
     assert {event["replica_id"] for event in collected} == {0, 1}
+
+
+def test_moss_private_and_history_provenance_is_preserved(tmp_path: Path) -> None:
+    state = _write_state(tmp_path)
+    local_state = {
+        "status": "pass",
+        "scope": "process_local_unregistered_tensors",
+        "tensor_names": [
+            "audio_token_presence",
+            "feedback_embeds",
+            "generation_steps",
+            "sampling_steps",
+        ],
+        "history_tensor_names": ["audio_token_presence"],
+        "shared_record_intersection": [],
+    }
+    for path in (state / "weight_audit").glob("weight_share_*.json"):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["architecture"] = "MossTTSLocalSGLangModel"
+        payload["private_tensor_names"] = ["_decode_input_embedding.weight"]
+        payload["private_storage_preserved_after_attachment"] = True
+        payload["replica_local_state"] = local_state
+        path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+    output = tmp_path / "audit"
+    runtime.write_startup_artifacts(
+        runtime.read_launcher_state(state),
+        output_dir=output,
+    )
+
+    private = json.loads((output / "private_tensor_audit.json").read_text())
+    assert private["private_tensor_names"] == ["_decode_input_embedding.weight"]
+    assert private["follower_private_storage_preserved"] is True
+    assert private["replica_local_state"] == local_state
+    assert private["history_provenance"] == {
+        "scope": "replica_process",
+        "tensor_names": ["audio_token_presence"],
+        "exported_via_weight_share": False,
+    }

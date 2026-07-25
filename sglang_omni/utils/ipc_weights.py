@@ -1102,6 +1102,61 @@ def verify_attachment(
         )
 
 
+_MOSS_REPLICA_LOCAL_STATE_TENSORS = (
+    "audio_token_presence",
+    "feedback_embeds",
+    "generation_steps",
+    "sampling_steps",
+)
+_MOSS_HISTORY_STATE_TENSORS = ("audio_token_presence",)
+
+
+def _replica_local_state_audit(
+    model: torch.nn.Module,
+    *,
+    architecture: str,
+    shared_record: dict[str, tuple[int, tuple[int, ...], torch.dtype]],
+) -> dict[str, Any]:
+    if architecture != "MossTTSLocalSGLangModel":
+        return {
+            "status": "not_applicable",
+            "reason_code": "no_architecture_specific_mutable_state",
+            "scope": "none",
+            "tensor_names": [],
+            "history_tensor_names": [],
+            "shared_record_intersection": [],
+        }
+    pool = getattr(model, "_state_pool", None)
+    if pool is None:
+        raise WeightShareError("MOSS-TTS Local model is missing its decode-state pool")
+    shared_ptrs = {item[0] for item in shared_record.values()}
+    state_tensors: dict[str, torch.Tensor] = {}
+    for name in _MOSS_REPLICA_LOCAL_STATE_TENSORS:
+        tensor = getattr(pool, name, None)
+        if not isinstance(tensor, torch.Tensor):
+            raise WeightShareError(
+                f"MOSS-TTS Local replica-local state tensor {name!r} is missing"
+            )
+        state_tensors[name] = tensor
+    intersection = sorted(
+        name
+        for name, tensor in state_tensors.items()
+        if tensor.data_ptr() in shared_ptrs
+    )
+    if intersection:
+        raise WeightShareError(
+            "MOSS-TTS Local replica-local state aliases the weight-share record: "
+            f"{intersection}"
+        )
+    return {
+        "status": "pass",
+        "scope": "process_local_unregistered_tensors",
+        "tensor_names": sorted(state_tensors),
+        "history_tensor_names": list(_MOSS_HISTORY_STATE_TENSORS),
+        "shared_record_intersection": [],
+    }
+
+
 def write_verified_attachment_audit(
     model: torch.nn.Module,
     record: dict[str, tuple[int, tuple[int, ...], torch.dtype]],
@@ -1121,6 +1176,19 @@ def write_verified_attachment_audit(
     tensors = _named_shared_tensors(model)
     private = _resolve_private_names(tensors, policy.private_tensor_names, model)
     shared_names = sorted(set(record) - private)
+    private_storage_preserved = all(
+        name in record and record[name][0] == tensors[name].data_ptr()
+        for name in private
+    )
+    if not private_storage_preserved:
+        raise WeightShareError(
+            "replica-private tensor storage changed before the attachment audit"
+        )
+    replica_local_state = _replica_local_state_audit(
+        model,
+        architecture=architecture,
+        shared_record={name: record[name] for name in shared_names},
+    )
     payload = {
         "schema_version": 1,
         "status": "pass",
@@ -1135,6 +1203,8 @@ def write_verified_attachment_audit(
         "shared_tensor_count": len(shared_names),
         "shared_tensor_names": shared_names,
         "private_tensor_names": sorted(private),
+        "private_storage_preserved_after_attachment": private_storage_preserved,
+        "replica_local_state": replica_local_state,
     }
     path = os.path.join(audit_dir, f"weight_share_{config.role}_{os.getpid()}.json")
     _atomic_write(

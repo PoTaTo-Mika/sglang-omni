@@ -781,3 +781,62 @@ def test_verified_attachment_audit_is_structured_and_env_gated(tmp_path):
     assert payload["run_id"] == "run-audit"
     assert payload["private_tensor_names"] == []
     assert payload["shared_tensor_count"] == len(record)
+
+
+class _MossReplicaState:
+    def __init__(self) -> None:
+        self.feedback_embeds = torch.zeros(2, 4)
+        self.generation_steps = torch.zeros(2, dtype=torch.int64)
+        self.sampling_steps = torch.zeros(2, dtype=torch.int64)
+        self.audio_token_presence = torch.zeros(2, 2, 4, dtype=torch.bool)
+
+
+class _MossAuditModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.shared = torch.nn.Parameter(torch.ones(2, 2))
+        self._decode_input_embedding = torch.nn.Embedding(2, 4)
+        self._state_pool = _MossReplicaState()
+
+
+def test_moss_audit_proves_private_storage_and_history_exclusion(tmp_path):
+    model = _MossAuditModel()
+    tensors = ipc_weights._named_shared_tensors(model)
+    record = {
+        name: (tensor.data_ptr(), tuple(tensor.shape), tensor.dtype)
+        for name, tensor in tensors.items()
+    }
+    config = ipc_weights.WeightShareConfig(
+        role="follower",
+        dir_path=str(tmp_path / "ipc"),
+        attach_timeout_s=1.0,
+        run_id="run-moss-audit",
+    )
+    policy = ipc_weights.WeightSharePolicy(
+        private_tensor_names=frozenset({"_decode_input_embedding.weight"})
+    )
+
+    path = ipc_weights.write_verified_attachment_audit(
+        model,
+        record,
+        config=config,
+        policy=policy,
+        architecture="MossTTSLocalSGLangModel",
+        environ={ipc_weights.ENV_WEIGHT_SHARE_AUDIT_DIR: str(tmp_path / "audit")},
+    )
+
+    assert path is not None
+    payload = __import__("json").loads(Path(path).read_text(encoding="utf-8"))
+    assert payload["private_storage_preserved_after_attachment"] is True
+    assert payload["replica_local_state"] == {
+        "status": "pass",
+        "scope": "process_local_unregistered_tensors",
+        "tensor_names": [
+            "audio_token_presence",
+            "feedback_embeds",
+            "generation_steps",
+            "sampling_steps",
+        ],
+        "history_tensor_names": ["audio_token_presence"],
+        "shared_record_intersection": [],
+    }

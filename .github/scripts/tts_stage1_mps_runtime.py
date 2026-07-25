@@ -272,6 +272,8 @@ def _read_weight_audits(
         "shared_tensor_count",
         "shared_tensor_names",
         "private_tensor_names",
+        "private_storage_preserved_after_attachment",
+        "replica_local_state",
     )
     for field in equality_fields:
         if len({json.dumps(audit.get(field), sort_keys=True) for audit in audits}) != 1:
@@ -290,6 +292,17 @@ def _read_weight_audits(
     private = set(audits[0]["private_tensor_names"])
     if shared & private:
         raise ValueError("private tensors leaked into the shared tensor audit")
+    if audits[0].get("private_storage_preserved_after_attachment") is not True:
+        raise ValueError("replica-private storage preservation was not verified")
+    local_state = audits[0].get("replica_local_state") or {}
+    if architecture == "MossTTSLocalSGLangModel":
+        if (
+            local_state.get("status") != "pass"
+            or local_state.get("scope") != "process_local_unregistered_tensors"
+            or local_state.get("shared_record_intersection") != []
+            or "audio_token_presence" not in local_state.get("history_tensor_names", [])
+        ):
+            raise ValueError("MOSS replica-local history isolation audit failed")
     return audits
 
 
@@ -424,6 +437,15 @@ def write_startup_artifacts(
         },
     )
     representative_audit = snapshot.weight_audits[0]
+    follower_audit = next(
+        audit for audit in snapshot.weight_audits if audit["role"] == "follower"
+    )
+    local_state = representative_audit["replica_local_state"]
+    history_provenance = {
+        "scope": "replica_process" if local_state["status"] == "pass" else "none",
+        "tensor_names": local_state["history_tensor_names"],
+        "exported_via_weight_share": False,
+    }
     _write_json_atomic(
         output / "weight_share_audit.json",
         {
@@ -448,6 +470,11 @@ def write_startup_artifacts(
                 representative_audit["private_tensor_names"]
             ),
             "shared_tensor_intersection": [],
+            "follower_private_storage_preserved": follower_audit[
+                "private_storage_preserved_after_attachment"
+            ],
+            "replica_local_state": local_state,
+            "history_provenance": history_provenance,
         },
     )
     _write_json_atomic(
