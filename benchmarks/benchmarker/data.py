@@ -9,7 +9,6 @@ from dataclasses import dataclass, field
 @dataclass
 class RequestResult:
     request_id: str = ""
-    server_request_id: str = ""
     text: str = ""
     is_success: bool = False
     latency_s: float = 0.0
@@ -26,3 +25,4 @@ class RequestResult:
     text_ttft_s: float | None = None
     audio_chunk_count: int = 0
     first_audio_payload_bytes: int = 0
+    server_request_id: str = ""

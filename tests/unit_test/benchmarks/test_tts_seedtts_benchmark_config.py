@@ -93,3 +93,12 @@ def test_tts_sender_captures_server_request_id() -> None:
 
     assert result.request_id == "sample-2"
     assert result.server_request_id == "speech-runtime-2"
+
+
+def test_request_result_positional_constructor_remains_compatible() -> None:
+    result = RequestResult("sample-positional", "original text", True)
+
+    assert result.request_id == "sample-positional"
+    assert result.text == "original text"
+    assert result.is_success is True
+    assert result.server_request_id == ""
