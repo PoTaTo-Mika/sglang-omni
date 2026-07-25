@@ -60,6 +60,13 @@ jobs:
     timeout-minutes: 15
     outputs:
       labels: ${{ steps.pr.outputs.labels || '[]' }}
+      selected_model: ${{ steps.tts.outputs.selected_model }}
+      selection_digest: ${{ steps.tts.outputs.selection_digest }}
+      selection_reason: ${{ steps.tts.outputs.selection_reason }}
+      tts_stage1_topology: ${{ steps.tts.outputs.tts_stage1_topology }}
+      resolved_mps_config: ${{ steps.tts.outputs.resolved_mps_config }}
+      resolved_config_class: ${{ steps.tts.outputs.resolved_config_class }}
+      run_attempt: ${{ steps.tts.outputs.run_attempt }}
     steps:
       - name: Fetch latest PR gate state
         if: ${{ github.event_name == 'pull_request' }}
@@ -99,10 +106,38 @@ jobs:
           fi
 
       - name: Checkout workflow scripts
-        if: ${{ github.event_name == 'pull_request' }}
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+      - name: Select TTS model and topology once
+        id: tts
+        shell: bash
+        env:
+          PR_LABELS: ${{ steps.pr.outputs.labels || '[]' }}
+          TTS_CI_MODEL_OVERRIDE: ${{ github.event.inputs.tts_ci_model || '' }}
+          TTS_STAGE1_TOPOLOGY: multi_gpu
+        run: |
+          output_dir="${RUNNER_TEMP}/tts-stage1-preflight"
+          mkdir -p "${output_dir}"
+          python .github/scripts/tts_stage1_selection.py \
+            --run-id "${{ github.run_id }}" \
+            --run-attempt "${{ github.run_attempt }}" \
+            --labels-json "${PR_LABELS}" \
+            --override "${TTS_CI_MODEL_OVERRIDE}" \
+            --topology "${TTS_STAGE1_TOPOLOGY}" \
+            --repository-root "${GITHUB_WORKSPACE}" \
+            --output "${output_dir}/preflight.json" \
+            --github-output "${GITHUB_OUTPUT}"
+
+      - name: Upload TTS preflight artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tts-stage1-preflight
+          path: ${{ runner.temp }}/tts-stage1-preflight/preflight.json
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
 
       - name: Check PR lint and mergeability
         if: ${{ github.event_name == 'pull_request' }}
@@ -178,55 +213,6 @@ jobs:
         shell: bash
         run: bash .github/scripts/validate_omni_env_complete.sh omni
 
-  pick-tts-model:
-    name: pick TTS model
-    needs: [preflight, setup]
-    if: needs.preflight.result == 'success' && needs.setup.result == 'success'
-    runs-on: ubuntu-latest
-    outputs:
-      tts_ci_model: ${{ steps.pick.outputs.tts_ci_model }}
-    steps:
-      - id: pick
-        env:
-          PR_LABELS: ${{ needs.preflight.outputs.labels || '[]' }}
-          RUN_HIGGS_LABEL: ${{ contains(fromJson(needs.preflight.outputs.labels || '[]'), 'run-higgs') }}
-          RUN_MOSS_LABEL: ${{ contains(fromJson(needs.preflight.outputs.labels || '[]'), 'run-moss') }}
-          TTS_CI_MODEL_OVERRIDE: ${{ github.event.inputs.tts_ci_model }}
-        run: |
-          models=(higgs moss)
-          selected=""
-          override="${TTS_CI_MODEL_OVERRIDE,,}"
-          if [[ -n "${override}" ]]; then
-            for model in "${models[@]}"; do
-              if [[ "${override}" == "${model}" ]]; then
-                selected="${model}"
-                break
-              fi
-            done
-            if [[ -z "${selected}" ]]; then
-              echo "::error::Unsupported tts_ci_model='${TTS_CI_MODEL_OVERRIDE}'. Expected one of: ${models[*]}"
-              exit 1
-            fi
-          else
-            if [[ "${RUN_HIGGS_LABEL}" == "true" && "${RUN_MOSS_LABEL}" == "true" ]]; then
-              echo "::error::Multiple TTS model labels found in PR labels ${PR_LABELS}. Keep only one of: run-higgs run-moss"
-              exit 1
-            fi
-            if [[ "${RUN_HIGGS_LABEL}" == "true" ]]; then
-              selected="higgs"
-            elif [[ "${RUN_MOSS_LABEL}" == "true" ]]; then
-              selected="moss"
-            fi
-          fi
-          if [[ -z "${selected}" ]]; then
-            seed="$(date +%s%N)"
-            RANDOM=$((seed % 32768))
-            selected="${models[$((RANDOM % ${#models[@]}))]}"
-            echo "Random seed for TTS CI model: ${seed}"
-          fi
-          echo "Selected TTS CI model: ${selected}"
-          echo "tts_ci_model=${selected}" >> "$GITHUB_OUTPUT"
-
   asr-ci:
     name: ASR CI
     needs: [setup, pr-test]
@@ -243,14 +229,14 @@ jobs:
 
   tts-ci:
     name: TTS CI
-    needs: [setup, pr-test, asr-ci, pick-tts-model]
+    needs: [preflight, setup, pr-test, asr-ci]
     if: >-
       always() && !cancelled() &&
       needs.setup.result == 'success' &&
-      needs.pick-tts-model.result == 'success'
+      needs.preflight.result == 'success'
     uses: ./.github/workflows/test-tts-ci.yaml
     with:
-      tts_ci_model: ${{ needs.pick-tts-model.outputs.tts_ci_model }}
+      tts_ci_model: ${{ needs.preflight.outputs.selected_model }}
       omni_ci_home: >-
         ${{ github.event_name == 'pull_request'
             && format('/data/omni-ci/pr-{0}', github.event.pull_request.number)
