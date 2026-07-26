@@ -119,6 +119,12 @@ def test_stage1_all_topologies_finalize_lane_before_always_upload() -> None:
     assert "tts_stage1_lifecycle.py initialize" in prepare["run"]
     assert "${{ inputs.tts_stage1_topology }}" in prepare["run"]
     assert "tts_stage1_lifecycle.py initialize" not in mps_prepare["run"]
+    benchmark = steps[names.index("Run TTS non-streaming benchmark stage")]
+    assert "run_flaky_pytest.sh" in benchmark["run"]
+    assert "run_tts_stage1_attempt.sh" in benchmark["run"]
+    assert benchmark["run"].index("run_tts_stage1_attempt.sh") < benchmark["run"].index(
+        "pytest tests/test_model/test_tts_ci.py"
+    )
     assert "tts_stage1_lifecycle.py finalize" in finalize["run"]
     assert "${{ inputs.tts_stage1_topology }}" in finalize["run"]
     assert "always()" in finalize["if"]
