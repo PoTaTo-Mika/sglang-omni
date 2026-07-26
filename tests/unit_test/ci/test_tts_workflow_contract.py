@@ -103,19 +103,25 @@ def test_stage1_alone_consumes_explicit_topology_and_validated_config() -> None:
         assert "TTS_STAGE1_MPS_CONFIG" not in job_text
 
 
-def test_mps_stage1_finalizes_lane_before_always_upload() -> None:
+def test_stage1_all_topologies_finalize_lane_before_always_upload() -> None:
     child = _workflow(".github/workflows/test-tts-ci.yaml")
     steps = child["jobs"]["stage-1-non-streaming"]["steps"]
     names = [step.get("name") for step in steps]
 
-    prepare = steps[names.index("Prepare explicit MPS Stage 1 runtime")]
+    prepare = steps[names.index("Prepare Stage 1 lifecycle")]
+    mps_prepare = steps[names.index("Prepare explicit MPS Stage 1 runtime")]
     finalize = steps[names.index("Finalize Stage 1 lane verdict")]
-    upload = steps[names.index("Upload MPS Stage 1 audit")]
+    upload = steps[names.index("Upload Stage 1 lifecycle audit")]
 
     assert "tts_stage1_lifecycle.py initialize" in prepare["run"]
+    assert "${{ inputs.tts_stage1_topology }}" in prepare["run"]
+    assert "tts_stage1_lifecycle.py initialize" not in mps_prepare["run"]
     assert "tts_stage1_lifecycle.py finalize" in finalize["run"]
+    assert "${{ inputs.tts_stage1_topology }}" in finalize["run"]
     assert "always()" in finalize["if"]
+    assert "tts_stage1_topology" not in finalize["if"]
     assert "always()" in upload["if"]
+    assert "tts_stage1_topology" not in upload["if"]
     assert names.index("Finalize Stage 1 lane verdict") < names.index(
-        "Upload MPS Stage 1 audit"
+        "Upload Stage 1 lifecycle audit"
     )

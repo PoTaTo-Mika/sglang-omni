@@ -59,6 +59,48 @@ def test_default_feasibility_is_blocked_without_fabricated_consumer() -> None:
     assert "host_visible_verdict_consumer" in payload["missing_capabilities"]
 
 
+def test_clean_ordinary_teardown_allows_bound_evaluator_barrier(
+    tmp_path: Path,
+) -> None:
+    teardown = lifecycle.build_ordinary_teardown_verdict(
+        router_stopped=True,
+        requests_drained_or_cancelled=True,
+        process_query_succeeded=True,
+        tracked_process_groups_alive=[],
+        occupied_ports=[],
+        gpu_memory_released=True,
+        retained_state=None,
+    )
+    lifecycle.write_json_atomic(tmp_path / "ordinary_teardown_verdict.json", teardown)
+    barrier = lifecycle.write_pre_evaluator_cleanup(
+        tmp_path,
+        topology="multi_gpu",
+        environ={},
+    )
+
+    assert teardown["clean"] is True
+    assert barrier["source_artifact"] == "ordinary_teardown_verdict.json"
+    assert barrier["evaluator_start_allowed"] is True
+    lifecycle.require_pre_evaluator_clean(tmp_path)
+
+
+def test_dirty_ordinary_teardown_failure_injection_blocks_evaluator() -> None:
+    teardown = lifecycle.build_ordinary_teardown_verdict(
+        router_stopped=True,
+        requests_drained_or_cancelled=True,
+        process_query_succeeded=True,
+        tracked_process_groups_alive=[],
+        occupied_ports=[],
+        gpu_memory_released=True,
+        retained_state="/state/router_pgids.txt",
+        failure_injection="dirty_ordinary_teardown",
+    )
+
+    assert teardown["clean"] is False
+    assert teardown["quarantine_required"] is True
+    assert teardown["retained_state"] == "/state/router_pgids.txt"
+
+
 def test_pre_evaluator_barrier_binds_to_clean_source(tmp_path: Path) -> None:
     teardown = _clean_teardown()
     lifecycle.write_json_atomic(tmp_path / "mps_teardown_verdict.json", teardown)
@@ -172,6 +214,53 @@ def test_finalize_writes_auditable_blocked_verdict_without_lease(
     index = json.loads((tmp_path / "artifact_index.json").read_text())
     assert index["exact_sha"] == "abc123"
     assert index["workflow_url"] == "https://example.test/run/1"
+
+
+def test_finalize_multi_gpu_uses_ordinary_teardown_chain(tmp_path: Path) -> None:
+    lifecycle.initialize_lifecycle(
+        tmp_path,
+        topology="multi_gpu",
+        model="moss",
+        environ={},
+        command_runner=_command_runner,
+    )
+    teardown = lifecycle.build_ordinary_teardown_verdict(
+        router_stopped=True,
+        requests_drained_or_cancelled=True,
+        process_query_succeeded=True,
+        tracked_process_groups_alive=[],
+        occupied_ports=[],
+        gpu_memory_released=True,
+        retained_state=None,
+    )
+    lifecycle.write_json_atomic(tmp_path / "ordinary_teardown_verdict.json", teardown)
+    lifecycle.write_pre_evaluator_cleanup(
+        tmp_path,
+        topology="multi_gpu",
+        environ={},
+    )
+    lifecycle.write_evaluator_lifecycle(
+        tmp_path,
+        status="completed",
+        pid=None,
+        port=None,
+    )
+
+    verdict = lifecycle.finalize_lifecycle(
+        tmp_path,
+        topology="multi_gpu",
+        model="moss",
+        exact_sha="rollback-sha",
+        workflow_url="https://example.test/run/rollback",
+        environ={},
+        command_runner=_command_runner,
+    )
+
+    index = json.loads((tmp_path / "artifact_index.json").read_text())
+    assert index["cleanup"]["source"] == "ordinary_teardown_verdict.json"
+    assert index["cleanup"]["pre_evaluator_clean"] is True
+    assert verdict["checks"]["topology_teardown_clean"] is True
+    assert verdict["checks"]["runner_consumer_deployed"] is False
 
 
 def test_finalize_missing_evidence_still_writes_quarantine_verdict(

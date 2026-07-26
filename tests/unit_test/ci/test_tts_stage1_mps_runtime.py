@@ -388,3 +388,49 @@ def test_teardown_writes_clean_mps_and_pre_evaluator_verdicts(
     assert teardown["checks"]["mps_control_pid_observed"] is True
     assert barrier["clean"] is True
     assert barrier["evaluator_start_allowed"] is True
+
+
+def test_teardown_runs_production_down_when_launcher_evidence_is_corrupt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = runtime.MpsLaunchSpec(
+        repository_root=REPO_ROOT,
+        output_dir=tmp_path / "audit",
+        state_root=tmp_path / "state-root",
+        run_id="run-corrupt-evidence",
+        config_path=REPO_ROOT / "examples/mps_dp/configs/higgs_h100_dp2.yaml",
+        gpu_id=0,
+        base_port=9200,
+        core_blocks=("0-3", "4-7"),
+        python_bin="python",
+    )
+    spec.state_dir.mkdir(parents=True)
+    (spec.state_dir / "manifest").write_text("corrupt\n", encoding="utf-8")
+    commands = []
+
+    def record_down(command, **kwargs):
+        commands.append(tuple(command))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(runtime.subprocess, "run", record_down)
+    monkeypatch.setattr(runtime, "_gpu_client_pids", lambda: (set(), True))
+    monkeypatch.setattr(runtime, "_occupied_ports", lambda _: [])
+
+    with pytest.raises(RuntimeError, match="MPS teardown is dirty"):
+        runtime.teardown_replicas(
+            spec,
+            router_stopped=True,
+            requests_drained_or_cancelled=True,
+        )
+
+    assert spec.teardown_command in commands
+    teardown = json.loads((spec.output_dir / "mps_teardown_verdict.json").read_text())
+    barrier = json.loads(
+        (spec.output_dir / "pre_evaluator_cleanup_verdict.json").read_text()
+    )
+    assert teardown["clean"] is False
+    assert teardown["checks"]["launch_down_succeeded"] is True
+    assert teardown["checks"]["process_query_succeeded"] is False
+    assert teardown["evidence_errors"]
+    assert barrier["evaluator_start_allowed"] is False

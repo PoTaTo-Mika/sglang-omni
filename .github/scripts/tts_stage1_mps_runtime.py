@@ -712,7 +712,12 @@ def teardown_replicas(
     requests_drained_or_cancelled: bool = False,
     emit_lifecycle: bool = True,
 ) -> None:
-    """Stop this run and emit a fail-closed MPS-sub-lifecycle verdict."""
+    """Stop this run and emit a fail-closed MPS-sub-lifecycle verdict.
+
+    The production ``launch.sh down RUN_ID`` command is attempted even when
+    startup evidence is missing or corrupt. Evidence failures make the verdict
+    dirty; they never bypass run-scoped teardown.
+    """
 
     environment = os.environ.copy()
     environment.update(spec.environment)
@@ -724,42 +729,77 @@ def teardown_replicas(
             check=True,
         )
         return
-    snapshot = read_launcher_state(spec.state_dir)
-    tracked_before, process_query_succeeded = _tracked_pids(snapshot)
+
+    evidence_errors: list[str] = []
+    tracked_before: set[int] = set()
+    process_query_succeeded = False
+    ports = {spec.base_port + offset for offset in range(REPLICA_COUNT)}
+    try:
+        snapshot = read_launcher_state(spec.state_dir)
+    except BaseException as exc:
+        snapshot = None
+        evidence_errors.append(f"launcher_state: {exc!r}")
+    else:
+        ports = {replica.port for replica in snapshot.replicas}
+        try:
+            tracked_before, process_query_succeeded = _tracked_pids(snapshot)
+        except BaseException as exc:
+            tracked_before = {replica.pid for replica in snapshot.replicas}
+            evidence_errors.append(f"process_query: {exc!r}")
+
+    lifecycle_state_dir = snapshot.state_dir if snapshot is not None else spec.state_dir
     control_pid_path = (
-        snapshot.state_dir / "mps" / "pipe" / "nvidia-cuda-mps-control.pid"
+        lifecycle_state_dir / "mps" / "pipe" / "nvidia-cuda-mps-control.pid"
     )
-    control_pid = (
-        int(control_pid_path.read_text(encoding="utf-8").strip())
-        if control_pid_path.is_file()
-        else None
-    )
-    result = subprocess.run(
-        spec.teardown_command,
-        cwd=spec.repository_root,
-        env=environment,
-        check=False,
-    )
+    control_pid = None
+    if control_pid_path.is_file():
+        try:
+            control_pid = int(control_pid_path.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError) as exc:
+            evidence_errors.append(f"mps_control_pid: {exc!r}")
+
+    try:
+        result = subprocess.run(
+            spec.teardown_command,
+            cwd=spec.repository_root,
+            env=environment,
+            check=False,
+        )
+        down_exit_code = result.returncode
+    except BaseException as exc:
+        down_exit_code = -1
+        evidence_errors.append(f"launch_down: {exc!r}")
+
     alive = sorted(pid for pid in tracked_before if _pid_alive(pid))
-    gpu_client_pids, gpu_client_query_succeeded = _gpu_client_pids()
+    try:
+        gpu_client_pids, gpu_client_query_succeeded = _gpu_client_pids()
+    except BaseException as exc:
+        gpu_client_pids, gpu_client_query_succeeded = set(), False
+        evidence_errors.append(f"gpu_client_query: {exc!r}")
     tracked_gpu_clients = sorted(gpu_client_pids & tracked_before)
-    retained_state = str(snapshot.state_dir) if snapshot.state_dir.exists() else None
+    try:
+        occupied_ports = _occupied_ports(ports)
+    except BaseException as exc:
+        occupied_ports = sorted(ports)
+        evidence_errors.append(f"port_query: {exc!r}")
+    retained_state = str(lifecycle_state_dir) if lifecycle_state_dir.exists() else None
     verdict = build_mps_teardown_verdict(
         run_id=spec.run_id,
         router_stopped=router_stopped,
         requests_drained_or_cancelled=requests_drained_or_cancelled,
-        down_exit_code=result.returncode,
+        down_exit_code=down_exit_code,
         process_query_succeeded=process_query_succeeded,
         tracked_processes_alive=alive,
         mps_control_pid_observed=control_pid is not None,
         mps_control_alive=bool(control_pid and _pid_alive(control_pid)),
-        mps_namespace_active=(snapshot.state_dir / "mps" / "pipe").exists(),
-        occupied_ports=_occupied_ports({r.port for r in snapshot.replicas}),
+        mps_namespace_active=(lifecycle_state_dir / "mps" / "pipe").exists(),
+        occupied_ports=occupied_ports,
         gpu_client_query_succeeded=gpu_client_query_succeeded,
         tracked_gpu_clients_alive=tracked_gpu_clients,
         retained_state=retained_state,
         failure_injection=(os.environ.get(FAILURE_INJECTION_ENV) or "").strip() or None,
     )
+    verdict["evidence_errors"] = evidence_errors
     _write_json_atomic(spec.output_dir / "mps_teardown_verdict.json", verdict)
     write_pre_evaluator_cleanup(spec.output_dir, topology=TOPOLOGY)
     if verdict["clean"] is not True:

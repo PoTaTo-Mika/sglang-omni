@@ -39,6 +39,17 @@ from typing import Literal
 
 import pytest
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+SCRIPTS_ROOT = str(PROJECT_ROOT / ".github" / "scripts")
+if SCRIPTS_ROOT not in sys.path:
+    sys.path.insert(0, SCRIPTS_ROOT)
+
+from tts_stage1_ordinary_runtime import (  # noqa: E402
+    finalize_ordinary_teardown,
+    write_router_after as write_ordinary_router_after,
+    write_startup_artifacts as write_ordinary_startup_artifacts,
+)
+
 from benchmarks.dataset.prepare import DATASETS, download_dataset
 from benchmarks.eval.benchmark_tts_seedtts import (
     TtsSeedttsBenchmarkConfig,
@@ -742,6 +753,37 @@ def router_server(
         wait_timeout=STARTUP_TIMEOUT,
         log_prefix="tts_router_logs",
     ) as router:
+        audit_root_value = os.environ.get("TTS_STAGE1_AUDIT_ROOT", "").strip()
+        if selected_tts_ci_stage == TTS_STAGE_NONSTREAM and audit_root_value:
+            if router.cleanup_manifest is None:
+                raise RuntimeError("managed router did not expose its cleanup manifest")
+            audit_root = Path(audit_root_value)
+            write_ordinary_startup_artifacts(
+                audit_root,
+                model=_MODEL_NAME,
+                router_pid=router.proc.pid,
+                router_port=router.port,
+                worker_ports=router.worker_ports,
+                num_gpus_per_worker=_PRESET.num_gpus_per_worker,
+                router_ready_s=router.router_ready_s,
+                cleanup_manifest=router.cleanup_manifest,
+                before_workers=router_get_json(router.port, "/workers"),
+            )
+
+            def record_ordinary_after_workers() -> None:
+                try:
+                    snapshot = router_get_json(router.port, "/workers")
+                except BaseException as exc:
+                    write_ordinary_router_after(
+                        audit_root,
+                        snapshot=None,
+                        error=repr(exc),
+                    )
+                else:
+                    write_ordinary_router_after(audit_root, snapshot=snapshot)
+
+            router.before_stop_callback = record_ordinary_after_workers
+            router.audit_root = audit_root
         yield router
 
 
@@ -775,8 +817,31 @@ def wer_input_dirs(
     router_server: ManagedRouterHandle,
 ) -> dict[str, dict[int, str]]:
     """Reuse saved benchmark audio for WER after freeing the TTS server GPU."""
-    router_server.stop()
-    wait_for_gpu_memory_release()
+    topology = os.environ.get("TTS_STAGE1_TOPOLOGY", "multi_gpu")
+    stop_succeeded = False
+    gpu_memory_released = False
+    try:
+        router_server.stop()
+        stop_succeeded = True
+    finally:
+        try:
+            wait_for_gpu_memory_release()
+            gpu_memory_released = True
+        finally:
+            if topology == "multi_gpu" and router_server.audit_root is not None:
+                if router_server.cleanup_manifest is None:
+                    raise RuntimeError(
+                        "ordinary teardown requires the router cleanup manifest"
+                    )
+                finalize_ordinary_teardown(
+                    router_server.audit_root,
+                    cleanup_manifest=router_server.cleanup_manifest,
+                    router_port=router_server.port,
+                    worker_ports=router_server.worker_ports,
+                    router_stopped=router_server.stopped,
+                    requests_drained_or_cancelled=stop_succeeded,
+                    gpu_memory_released=gpu_memory_released,
+                )
 
     for output_dirs in SPEED_OUTPUT_DIRS.values():
         for output_dir in output_dirs.values():

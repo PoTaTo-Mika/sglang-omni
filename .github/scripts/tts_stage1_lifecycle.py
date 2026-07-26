@@ -237,6 +237,46 @@ def build_mps_teardown_verdict(
     }
 
 
+def build_ordinary_teardown_verdict(
+    *,
+    router_stopped: bool,
+    requests_drained_or_cancelled: bool,
+    process_query_succeeded: bool,
+    tracked_process_groups_alive: Sequence[int],
+    occupied_ports: Sequence[int],
+    gpu_memory_released: bool,
+    retained_state: str | None,
+    startup_evidence_clean: bool = True,
+    router_attribution_recorded: bool = True,
+    failure_injection: str | None = None,
+) -> dict[str, Any]:
+    """Describe ordinary managed cleanup without implying MPS evidence."""
+
+    checks = {
+        "router_stopped": router_stopped,
+        "requests_drained_or_cancelled": requests_drained_or_cancelled,
+        "process_query_succeeded": process_query_succeeded,
+        "tracked_process_groups_exited": not tracked_process_groups_alive,
+        "tts_ports_released": not occupied_ports,
+        "gpu_memory_released": gpu_memory_released,
+        "startup_evidence_clean": startup_evidence_clean,
+        "router_attribution_recorded": router_attribution_recorded,
+    }
+    clean = all(checks.values()) and failure_injection != "dirty_ordinary_teardown"
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "topology": "multi_gpu",
+        "status": "pass" if clean else "dirty",
+        "clean": clean,
+        "checks": checks,
+        "tracked_process_groups_alive": list(tracked_process_groups_alive),
+        "occupied_ports": list(occupied_ports),
+        "failure_injection": failure_injection,
+        "retained_state": retained_state,
+        "quarantine_required": not clean,
+    }
+
+
 def write_pre_evaluator_cleanup(
     output_dir: str | Path,
     *,
