@@ -731,6 +731,23 @@ the value globally or per AR stage:</p>
 <p><code class="docutils literal notranslate"><span class="pre">--mem-fraction-static</span></code> applies to both Qwen AR stages. Per-stage flags override
 the global value for that stage. Values must be greater than <code class="docutils literal notranslate"><span class="pre">0</span></code> and less than
 <code class="docutils literal notranslate"><span class="pre">1</span></code>.</p>
+<p>The thinker admits up to 64 running requests by default. Use the
+thinker-specific flag to lower or raise that limit in either text-only or
+speech mode:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>sgl-omni<span class="w"> </span>serve<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--model-path<span class="w"> </span>Qwen/Qwen3-Omni-30B-A3B-Instruct<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--thinker-max-running-requests<span class="w"> </span><span class="m">16</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">--max-running-requests</span></code> continues to target the generation stage, which is the
+talker in the Qwen3-Omni speech pipeline. To configure the thinker through a
+pipeline YAML file instead, use the stage runtime override:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">runtime_overrides</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">thinker</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">server_args_overrides</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">max_running_requests</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">16</span>
+</pre></div>
+</div>
 </section>
 </section>
 <section id="single-gpu-fp8-on-h100-h20">
