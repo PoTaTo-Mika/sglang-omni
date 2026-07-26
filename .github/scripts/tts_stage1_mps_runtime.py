@@ -7,11 +7,18 @@ import argparse
 import json
 import os
 import re
+import socket
 import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from tts_stage1_lifecycle import (
+    FAILURE_INJECTION_ENV,
+    build_mps_teardown_verdict,
+    write_pre_evaluator_cleanup,
+)
 
 SCHEMA_VERSION = 1
 TOPOLOGY = "mps_shared"
@@ -628,7 +635,7 @@ def launch_replicas(spec: MpsLaunchSpec) -> LauncherState:
         return snapshot
     except BaseException as post_launch_error:
         try:
-            teardown_replicas(spec)
+            teardown_replicas(spec, emit_lifecycle=False)
         except BaseException as cleanup_error:
             raise RuntimeError(
                 "post-launch validation failed and run-specific teardown also failed; "
@@ -638,17 +645,128 @@ def launch_replicas(spec: MpsLaunchSpec) -> LauncherState:
         raise
 
 
-def teardown_replicas(spec: MpsLaunchSpec) -> None:
-    """Ask launch.sh to stop only the run identified by this immutable spec."""
+def _tracked_pids(snapshot: LauncherState) -> tuple[set[int], bool]:
+    tracked = {replica.pid for replica in snapshot.replicas}
+    query_succeeded = True
+    for replica in snapshot.replicas:
+        result = subprocess.run(
+            ["ps", "-o", "pid=", "-g", str(replica.pgid)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        query_succeeded = query_succeeded and result.returncode == 0
+        for raw in result.stdout.split():
+            if raw.isdigit():
+                tracked.add(int(raw))
+    return tracked, query_succeeded
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _occupied_ports(ports: set[int]) -> list[int]:
+    occupied = []
+    for port in sorted(ports):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.settimeout(0.2)
+            if probe.connect_ex(("127.0.0.1", port)) == 0:
+                occupied.append(port)
+    return occupied
+
+
+def _gpu_client_pids() -> tuple[set[int], bool]:
+    result = subprocess.run(
+        [
+            "nvidia-smi",
+            "--query-compute-apps=pid",
+            "--format=csv,noheader,nounits",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return set(), False
+    return (
+        {
+            int(raw.strip())
+            for raw in result.stdout.splitlines()
+            if raw.strip().isdigit()
+        },
+        True,
+    )
+
+
+def teardown_replicas(
+    spec: MpsLaunchSpec,
+    *,
+    router_stopped: bool = False,
+    requests_drained_or_cancelled: bool = False,
+    emit_lifecycle: bool = True,
+) -> None:
+    """Stop this run and emit a fail-closed MPS-sub-lifecycle verdict."""
 
     environment = os.environ.copy()
     environment.update(spec.environment)
-    subprocess.run(
+    if not emit_lifecycle:
+        subprocess.run(
+            spec.teardown_command,
+            cwd=spec.repository_root,
+            env=environment,
+            check=True,
+        )
+        return
+    snapshot = read_launcher_state(spec.state_dir)
+    tracked_before, process_query_succeeded = _tracked_pids(snapshot)
+    control_pid_path = (
+        snapshot.state_dir / "mps" / "pipe" / "nvidia-cuda-mps-control.pid"
+    )
+    control_pid = (
+        int(control_pid_path.read_text(encoding="utf-8").strip())
+        if control_pid_path.is_file()
+        else None
+    )
+    result = subprocess.run(
         spec.teardown_command,
         cwd=spec.repository_root,
         env=environment,
-        check=True,
+        check=False,
     )
+    alive = sorted(pid for pid in tracked_before if _pid_alive(pid))
+    gpu_client_pids, gpu_client_query_succeeded = _gpu_client_pids()
+    tracked_gpu_clients = sorted(gpu_client_pids & tracked_before)
+    retained_state = str(snapshot.state_dir) if snapshot.state_dir.exists() else None
+    verdict = build_mps_teardown_verdict(
+        run_id=spec.run_id,
+        router_stopped=router_stopped,
+        requests_drained_or_cancelled=requests_drained_or_cancelled,
+        down_exit_code=result.returncode,
+        process_query_succeeded=process_query_succeeded,
+        tracked_processes_alive=alive,
+        mps_control_pid_observed=control_pid is not None,
+        mps_control_alive=bool(control_pid and _pid_alive(control_pid)),
+        mps_namespace_active=(snapshot.state_dir / "mps" / "pipe").exists(),
+        occupied_ports=_occupied_ports({r.port for r in snapshot.replicas}),
+        gpu_client_query_succeeded=gpu_client_query_succeeded,
+        tracked_gpu_clients_alive=tracked_gpu_clients,
+        retained_state=retained_state,
+        failure_injection=(os.environ.get(FAILURE_INJECTION_ENV) or "").strip() or None,
+    )
+    _write_json_atomic(spec.output_dir / "mps_teardown_verdict.json", verdict)
+    write_pre_evaluator_cleanup(spec.output_dir, topology=TOPOLOGY)
+    if verdict["clean"] is not True:
+        raise RuntimeError(
+            "MPS teardown is dirty; evaluator is blocked and state is retained at "
+            f"{retained_state or spec.output_dir}"
+        )
 
 
 def main() -> None:

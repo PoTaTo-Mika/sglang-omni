@@ -93,11 +93,15 @@ def launch_stage1_mps_router(
             snapshot=router_get_json(router.port, "/workers"),
         )
 
-    def cleanup_replicas() -> None:
+    def cleanup_replicas(*, router_was_stopped: bool) -> None:
         nonlocal cleaned
         if not cleaned:
-            teardown_replicas(spec)
             cleaned = True
+            teardown_replicas(
+                spec,
+                router_stopped=router_was_stopped,
+                requests_drained_or_cancelled=router_was_stopped,
+            )
 
     try:
         with launch_router_for_workers(
@@ -107,7 +111,7 @@ def launch_stage1_mps_router(
             wait_timeout=wait_timeout,
             log_prefix="tts_stage1_mps_router_logs",
             before_stop_callback=record_after_workers,
-            cleanup_callback=cleanup_replicas,
+            cleanup_callback=lambda: cleanup_replicas(router_was_stopped=True),
         ) as running_router:
             router = running_router
             router.mps_state_dir = launcher_snapshot.state_dir
@@ -119,7 +123,7 @@ def launch_stage1_mps_router(
             )
             yield router
     finally:
-        cleanup_replicas()
+        cleanup_replicas(router_was_stopped=False)
 
 
 def write_bounded_canary_artifacts(

@@ -101,3 +101,21 @@ def test_stage1_alone_consumes_explicit_topology_and_validated_config() -> None:
         job_text = str(child["jobs"][job_name])
         assert "TTS_STAGE1_TOPOLOGY" not in job_text
         assert "TTS_STAGE1_MPS_CONFIG" not in job_text
+
+
+def test_mps_stage1_finalizes_lane_before_always_upload() -> None:
+    child = _workflow(".github/workflows/test-tts-ci.yaml")
+    steps = child["jobs"]["stage-1-non-streaming"]["steps"]
+    names = [step.get("name") for step in steps]
+
+    prepare = steps[names.index("Prepare explicit MPS Stage 1 runtime")]
+    finalize = steps[names.index("Finalize Stage 1 lane verdict")]
+    upload = steps[names.index("Upload MPS Stage 1 audit")]
+
+    assert "tts_stage1_lifecycle.py initialize" in prepare["run"]
+    assert "tts_stage1_lifecycle.py finalize" in finalize["run"]
+    assert "always()" in finalize["if"]
+    assert "always()" in upload["if"]
+    assert names.index("Finalize Stage 1 lane verdict") < names.index(
+        "Upload MPS Stage 1 audit"
+    )

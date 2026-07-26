@@ -274,3 +274,29 @@ def test_higgs_stage1_config_is_an_explicit_h100_dp2_profile() -> None:
         "max_running_requests": 64,
         "cuda_graph_max_bs": 64,
     }
+
+
+def test_multi_gpu_activity_artifact_is_not_applicable(tmp_path: Path) -> None:
+    artifacts.initialize_artifact_contracts(tmp_path, topology="multi_gpu")
+
+    activity = (tmp_path / "replica_activity.jsonl").read_text(encoding="utf-8")
+    assert "status=not_applicable" in activity
+    assert "reason_code=mps_disabled_for_topology" in activity
+
+
+def test_mps_contract_writes_ordinary_teardown_not_applicable(
+    tmp_path: Path,
+) -> None:
+    artifacts.initialize_artifact_contracts(tmp_path, topology="mps_shared")
+
+    payload = json.loads(
+        (tmp_path / "ordinary_teardown_verdict.json").read_text(encoding="utf-8")
+    )
+    assert payload["status"] == "not_applicable"
+    assert payload["reason_code"] == "multi_gpu_disabled_for_topology"
+    verdict = artifacts.verdict_envelope(
+        artifact_name="ordinary_teardown_verdict.json",
+        topology="mps_shared",
+        status="not_applicable",
+    )
+    assert verdict == payload

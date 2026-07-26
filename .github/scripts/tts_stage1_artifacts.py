@@ -13,15 +13,19 @@ from typing import Any
 SCHEMA_VERSION = 1
 SUPPORTED_TOPOLOGIES = frozenset({"multi_gpu", "mps_shared"})
 MPS_DISABLED_REASON = "mps_disabled_for_topology"
+MULTI_GPU_DISABLED_REASON = "multi_gpu_disabled_for_topology"
 MPS_ONLY_JSON_ARTIFACTS = (
     "mps_status.json",
     "mps_attachment.json",
     "weight_share_audit.json",
     "private_tensor_audit.json",
     "equal_kv.json",
+    "overlap_verdict.json",
+    "high_concurrency_correctness.json",
     "mps_teardown_verdict.json",
 )
-MPS_ONLY_TEXT_ARTIFACTS = ("raw_mps_control.txt",)
+MPS_ONLY_TEXT_ARTIFACTS = ("raw_mps_control.txt", "replica_activity.jsonl")
+MULTI_GPU_ONLY_JSON_ARTIFACTS = ("ordinary_teardown_verdict.json",)
 REQUIRED_JSON_ARTIFACTS = (
     "runner_quarantine_feasibility.json",
     "preflight.json",
@@ -31,19 +35,17 @@ REQUIRED_JSON_ARTIFACTS = (
     *MPS_ONLY_JSON_ARTIFACTS,
     "router_workers_before.json",
     "router_workers_after.json",
-    "overlap_verdict.json",
     "normal_correctness.json",
-    "high_concurrency_correctness.json",
     "performance_observation.json",
     "stage1_timing_breakdown.json",
     "process_tree.json",
-    "ordinary_teardown_verdict.json",
+    *MULTI_GPU_ONLY_JSON_ARTIFACTS,
     "pre_evaluator_cleanup_verdict.json",
     "post_state.json",
     "lane_release_verdict.json",
     "artifact_index.json",
 )
-REQUIRED_NON_JSON_ARTIFACTS = (*MPS_ONLY_TEXT_ARTIFACTS, "replica_activity.jsonl")
+REQUIRED_NON_JSON_ARTIFACTS = MPS_ONLY_TEXT_ARTIFACTS
 
 
 def _validate_topology(topology: str) -> None:
@@ -60,6 +62,7 @@ def artifact_envelope(
     artifact_name: str,
     topology: str,
     mps_only: bool,
+    multi_gpu_only: bool = False,
 ) -> dict[str, Any]:
     """Return the initial contract for one Stage 1 artifact."""
 
@@ -73,6 +76,11 @@ def artifact_envelope(
         payload.update(
             status="not_applicable",
             reason_code=MPS_DISABLED_REASON,
+        )
+    elif multi_gpu_only and topology == "mps_shared":
+        payload.update(
+            status="not_applicable",
+            reason_code=MULTI_GPU_DISABLED_REASON,
         )
     else:
         payload["status"] = "required"
@@ -94,11 +102,13 @@ def verdict_envelope(
         artifact_name=artifact_name,
         topology=topology,
         mps_only=_is_mps_only(artifact_name),
+        multi_gpu_only=artifact_name in MULTI_GPU_ONLY_JSON_ARTIFACTS,
     )
     if payload["status"] == "not_applicable":
-        reason_conflicts = reason_code not in (None, MPS_DISABLED_REASON)
+        expected_reason = payload["reason_code"]
+        reason_conflicts = reason_code not in (None, expected_reason)
         if status != "not_applicable" or reason_conflicts:
-            raise ValueError("callers cannot override a multi_gpu MPS-only N/A verdict")
+            raise ValueError("callers cannot override a topology-derived N/A verdict")
         return payload
     payload["status"] = status
     if clean is not None:
@@ -124,6 +134,7 @@ def artifact_manifest(topology: str) -> dict[str, Any]:
                 artifact_name=name,
                 topology=topology,
                 mps_only=_is_mps_only(name),
+                multi_gpu_only=name in MULTI_GPU_ONLY_JSON_ARTIFACTS,
             )
             for name in names
         ],
@@ -158,17 +169,23 @@ def initialize_artifact_contracts(output_dir: str | Path, *, topology: str) -> N
 
     root = Path(output_dir)
     write_json_atomic(root / "artifact_manifest.json", artifact_manifest(topology))
-    if topology != "multi_gpu":
-        return
-    for artifact_name in MPS_ONLY_JSON_ARTIFACTS:
+    inapplicable_json = (
+        MPS_ONLY_JSON_ARTIFACTS
+        if topology == "multi_gpu"
+        else MULTI_GPU_ONLY_JSON_ARTIFACTS
+    )
+    for artifact_name in inapplicable_json:
         write_json_atomic(
             root / artifact_name,
             artifact_envelope(
                 artifact_name=artifact_name,
                 topology=topology,
-                mps_only=True,
+                mps_only=artifact_name in MPS_ONLY_JSON_ARTIFACTS,
+                multi_gpu_only=artifact_name in MULTI_GPU_ONLY_JSON_ARTIFACTS,
             ),
         )
+    if topology != "multi_gpu":
+        return
     for artifact_name in MPS_ONLY_TEXT_ARTIFACTS:
         payload = artifact_envelope(
             artifact_name=artifact_name,

@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import shutil
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(REPO_ROOT / ".github" / "scripts"))
 
 
 def _load(module_name: str, relative_path: str):
@@ -337,3 +340,51 @@ def test_moss_private_and_history_provenance_is_preserved(tmp_path: Path) -> Non
         "tensor_names": ["audio_token_presence"],
         "exported_via_weight_share": False,
     }
+
+
+def test_teardown_writes_clean_mps_and_pre_evaluator_verdicts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _write_state(tmp_path)
+    control = state / "mps" / "pipe" / "nvidia-cuda-mps-control.pid"
+    control.parent.mkdir(parents=True)
+    control.write_text("999\n", encoding="utf-8")
+    snapshot = runtime.read_launcher_state(state)
+    spec = runtime.MpsLaunchSpec(
+        repository_root=REPO_ROOT,
+        output_dir=tmp_path / "audit",
+        state_root=tmp_path / "state-root",
+        run_id="run-clean-teardown",
+        config_path=REPO_ROOT / "examples/mps_dp/configs/higgs_h100_dp2.yaml",
+        gpu_id=0,
+        base_port=9100,
+        core_blocks=("0-3", "4-7"),
+        python_bin="python",
+    )
+
+    monkeypatch.setattr(runtime, "read_launcher_state", lambda _: snapshot)
+    monkeypatch.setattr(runtime, "_tracked_pids", lambda _: ({101, 102}, True))
+    monkeypatch.setattr(runtime, "_pid_alive", lambda _: False)
+    monkeypatch.setattr(runtime, "_gpu_client_pids", lambda: (set(), True))
+    monkeypatch.setattr(runtime, "_occupied_ports", lambda _: [])
+
+    def clean_down(*args, **kwargs):
+        shutil.rmtree(state)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(runtime.subprocess, "run", clean_down)
+    runtime.teardown_replicas(
+        spec,
+        router_stopped=True,
+        requests_drained_or_cancelled=True,
+    )
+
+    teardown = json.loads((spec.output_dir / "mps_teardown_verdict.json").read_text())
+    barrier = json.loads(
+        (spec.output_dir / "pre_evaluator_cleanup_verdict.json").read_text()
+    )
+    assert teardown["clean"] is True
+    assert teardown["checks"]["mps_control_pid_observed"] is True
+    assert barrier["clean"] is True
+    assert barrier["evaluator_start_allowed"] is True

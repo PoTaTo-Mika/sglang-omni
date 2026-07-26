@@ -66,6 +66,10 @@ jobs:
           python .github/scripts/tts_stage1_artifacts.py initialize \
             --output-dir "${TTS_STAGE1_AUDIT_ROOT}" \
             --topology mps_shared
+          python .github/scripts/tts_stage1_lifecycle.py initialize \
+            --output-dir "${TTS_STAGE1_AUDIT_ROOT}" \
+            --topology mps_shared \
+            --model "${{ inputs.tts_ci_model }}"
           core_blocks=$(python .github/scripts/tts_stage1_mps_runtime.py \
             derive-core-blocks --gpu-id 0)
           echo "TTS_STAGE1_MPS_CORE_BLOCKS=${core_blocks}" >> "${GITHUB_ENV}"
@@ -100,6 +104,18 @@ jobs:
           TTS_STAGE1_MPS_GPU_ID: "0"
           TORCHINDUCTOR_CACHE_DIR: ${{ env.OMNI_CI_HOME }}/.torchinductor
 
+      - name: Finalize Stage 1 lane verdict
+        if: ${{ always() && inputs.tts_stage1_topology == 'mps_shared' }}
+        shell: bash
+        env:
+          TTS_STAGE1_AUDIT_ROOT: ${{ env.OMNI_CI_HOME }}/tts-stage-results/nonstream/mps-audit
+        run: |
+          source omni/bin/activate
+          python .github/scripts/tts_stage1_lifecycle.py finalize \
+            --output-dir "${TTS_STAGE1_AUDIT_ROOT}" \
+            --topology mps_shared \
+            --model "${{ inputs.tts_ci_model }}" \
+            --exact-sha "${GITHUB_SHA}"
       - name: Upload MPS Stage 1 audit
         if: ${{ always() && inputs.tts_stage1_topology == 'mps_shared' }}
         uses: actions/upload-artifact@v4

@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import sys
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -92,19 +94,56 @@ class MetricCheckCollector:
 def qwen3_asr_wer_router(
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Iterator["ManagedRouterHandle"]:
-    """Launch Qwen3-ASR router for WER after upstream servers release GPU."""
+    """Launch Qwen3-ASR only after a clean Stage 1 generation barrier."""
     from tests.test_model.omni_router_utils import launch_managed_router
 
+    audit_root = os.environ.get("TTS_STAGE1_AUDIT_ROOT")
+    lifecycle = None
+    if audit_root:
+        scripts = str(REPO_ROOT / ".github" / "scripts")
+        if scripts not in sys.path:
+            sys.path.insert(0, scripts)
+        import tts_stage1_lifecycle as lifecycle_module
+
+        lifecycle = lifecycle_module
+        lifecycle.require_pre_evaluator_clean(audit_root)
+
     wait_for_gpu_memory_release()
-    with launch_managed_router(
-        tmp_path_factory=tmp_path_factory,
-        model_path=QWEN3_ASR_WER_MODEL_PATH,
-        model_name=QWEN3_ASR_WER_MODEL_PATH,
-        worker_extra_args="",
-        wait_timeout=QWEN3_ASR_ROUTER_STARTUP_TIMEOUT,
-        log_prefix="asr_wer_router_logs",
-    ) as router:
-        yield router
+    try:
+        with launch_managed_router(
+            tmp_path_factory=tmp_path_factory,
+            model_path=QWEN3_ASR_WER_MODEL_PATH,
+            model_name=QWEN3_ASR_WER_MODEL_PATH,
+            worker_extra_args="",
+            wait_timeout=QWEN3_ASR_ROUTER_STARTUP_TIMEOUT,
+            log_prefix="asr_wer_router_logs",
+        ) as router:
+            if lifecycle is not None:
+                lifecycle.write_evaluator_lifecycle(
+                    audit_root,
+                    status="running",
+                    pid=router.proc.pid,
+                    port=router.port,
+                )
+            yield router
+    except BaseException as exc:
+        if lifecycle is not None:
+            lifecycle.write_evaluator_lifecycle(
+                audit_root,
+                status="error",
+                pid=None,
+                port=None,
+                error=repr(exc),
+            )
+        raise
+    else:
+        if lifecycle is not None:
+            lifecycle.write_evaluator_lifecycle(
+                audit_root,
+                status="completed",
+                pid=None,
+                port=None,
+            )
 
 
 def _metric_collector(
