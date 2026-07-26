@@ -210,6 +210,7 @@ def initialize_lifecycle(
     if topology not in SUPPORTED_TOPOLOGIES:
         raise ValueError(f"unsupported topology: {topology!r}")
     root = Path(output_dir)
+    finalization_started_at_ns = time.time_ns()
     baseline = capture_gpu_state(command_runner=command_runner)
     baseline.update(topology=topology, model=model, lane_context=lane_context(environ))
     write_json_atomic(
@@ -487,6 +488,7 @@ def finalize_lifecycle(
     command_runner: Any = subprocess.run,
 ) -> dict[str, Any]:
     root = Path(output_dir)
+    finalization_started_at_ns = time.time_ns()
     baseline = _read_or_missing(root / "baseline_gpu.json", topology=topology)
     feasibility = _read_or_missing(
         root / "runner_quarantine_feasibility.json", topology=topology
@@ -516,15 +518,53 @@ def finalize_lifecycle(
         post.update(clean=False, failure_injection=injection)
     write_json_atomic(root / "post_state.json", post)
     final_context = lane_context(env)
+    preflight = _read_or_missing(root / "preflight.json", topology=topology)
+    normal_correctness = _read_or_missing(
+        root / "normal_correctness.json", topology=topology
+    )
+    performance = _read_or_missing(
+        root / "performance_observation.json", topology=topology
+    )
+    timing = _read_or_missing(root / "stage1_timing_breakdown.json", topology=topology)
+    preflight_matches = (
+        preflight.get("selected_model") == model
+        and preflight.get("tts_stage1_topology") == topology
+        and preflight.get("run_id") == final_context.get("run_id")
+        and preflight.get("run_attempt") == final_context.get("run_attempt")
+    )
+    runtime_evidence_complete = (
+        all(
+            item.get("status") not in {"missing_or_invalid", "error"}
+            for item in (
+                baseline,
+                feasibility,
+                teardown,
+                pre,
+                evaluator,
+                post,
+                timing,
+            )
+        )
+        and preflight_matches
+        and normal_correctness.get("status") == "pass"
+        and performance.get("status") == "observed"
+    )
     write_json_atomic(
         root / "artifact_index.json",
         {
             "schema_version": SCHEMA_VERSION,
             "status": "indexed",
-            "evidence_complete": all(
-                item.get("status") not in {"missing_or_invalid", "error"}
-                for item in (baseline, feasibility, teardown, pre, evaluator, post)
+            "evidence_complete": runtime_evidence_complete,
+            "promotion_ready": (
+                runtime_evidence_complete
+                and (performance.get("threshold_calibration") or {}).get(
+                    "promotion_eligible"
+                )
+                is True
+                and (timing.get("outer_timeout") or {}).get("adequate") is True
             ),
+            "preflight_matches_current_run": preflight_matches,
+            "selection_digest": preflight.get("selection_digest"),
             "exact_sha": exact_sha,
             "workflow_url": workflow_url,
             "model": model,
@@ -536,7 +576,12 @@ def finalize_lifecycle(
                 "pre_evaluator_clean": pre.get("clean"),
             },
             "evaluator": evaluator,
-            "threshold_provenance": "pending_h100_calibration",
+            "threshold_provenance": performance.get("threshold_calibration"),
+            "timeout_validation": timing.get("outer_timeout"),
+            "normal_correctness": {
+                "status": normal_correctness.get("status"),
+                "clean": normal_correctness.get("clean"),
+            },
             "retained_state": teardown.get("retained_state"),
             "runner_quarantine_status": feasibility.get("status"),
         },
@@ -553,6 +598,22 @@ def finalize_lifecycle(
         failure_injection=injection,
     )
     write_json_atomic(root / "lane_release_verdict.json", verdict)
+    try:
+        from tts_stage1_observation import finalize_observation
+
+        finalize_observation(
+            root,
+            finalization_started_at_ns=finalization_started_at_ns,
+        )
+    except (
+        OSError,
+        RuntimeError,
+        ValueError,
+        KeyError,
+        TypeError,
+        json.JSONDecodeError,
+    ):
+        pass
     return verdict
 
 

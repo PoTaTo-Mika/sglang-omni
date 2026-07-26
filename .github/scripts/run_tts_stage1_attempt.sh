@@ -13,5 +13,10 @@ python .github/scripts/tts_stage1_lifecycle.py initialize \
   --output-dir "${TTS_STAGE1_AUDIT_ROOT}" \
   --topology "${TTS_STAGE1_TOPOLOGY}" \
   --model "${TTS_CI_MODEL}"
+python .github/scripts/tts_stage1_observation.py initialize \
+  --output-dir "${TTS_STAGE1_AUDIT_ROOT}" \
+  --topology "${TTS_STAGE1_TOPOLOGY}" \
+  --model "${TTS_CI_MODEL}" \
+  --configured-timeout-minutes "${TTS_STAGE1_CONFIGURED_TIMEOUT_MINUTES:-25}"
 
 exec "$@"

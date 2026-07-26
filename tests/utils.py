@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -100,13 +101,16 @@ def qwen3_asr_wer_router(
     audit_root = os.environ.get("TTS_STAGE1_AUDIT_ROOT")
     topology = os.environ.get("TTS_STAGE1_TOPOLOGY", "multi_gpu")
     lifecycle = None
+    observation = None
     if audit_root:
         scripts = str(REPO_ROOT / ".github" / "scripts")
         if scripts not in sys.path:
             sys.path.insert(0, scripts)
         import tts_stage1_lifecycle as lifecycle_module
+        import tts_stage1_observation as observation_module
 
         lifecycle = lifecycle_module
+        observation = observation_module
         lifecycle.require_pre_evaluator_clean(audit_root)
 
     wait_for_gpu_memory_release()
@@ -127,7 +131,14 @@ def qwen3_asr_wer_router(
                     pid=router.proc.pid,
                     port=router.port,
                 )
+                observation.record_phase(
+                    audit_root,
+                    phase="evaluator_startup",
+                    duration_s=float(router.router_ready_s or 0.0),
+                    details={"model": QWEN3_ASR_WER_MODEL_PATH},
+                )
             yield router
+            evaluator_cleanup_started = time.perf_counter()
     except BaseException as exc:
         if lifecycle is not None:
             lifecycle.write_evaluator_lifecycle(
@@ -141,6 +152,11 @@ def qwen3_asr_wer_router(
         raise
     else:
         if lifecycle is not None:
+            observation.record_phase(
+                audit_root,
+                phase="evaluator_cleanup",
+                duration_s=time.perf_counter() - evaluator_cleanup_started,
+            )
             lifecycle.write_evaluator_lifecycle(
                 audit_root,
                 topology=topology,

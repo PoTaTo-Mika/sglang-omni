@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -23,6 +24,7 @@ from tts_stage1_mps_runtime import (  # noqa: E402
     teardown_replicas,
     write_router_snapshot,
 )
+from tts_stage1_observation import record_phase  # noqa: E402
 from tts_stage1_overlap import build_overlap_verdict  # noqa: E402
 
 from tests.test_model.omni_router_utils import (  # noqa: E402
@@ -80,6 +82,7 @@ def launch_stage1_mps_router(
     if os.environ.get(TOPOLOGY_ENV) != "mps_shared":
         raise ValueError("launch_stage1_mps_router requires mps_shared topology")
     spec = build_launch_spec(serve_extra_args=worker_extra_args)
+    startup_started = time.perf_counter()
     launcher_snapshot = launch_replicas(spec)
     cleaned = False
     router: ManagedRouterHandle | None = None
@@ -120,6 +123,12 @@ def launch_stage1_mps_router(
                 output_dir=spec.output_dir,
                 artifact_name="router_workers_before.json",
                 snapshot=router_get_json(router.port, "/workers"),
+            )
+            record_phase(
+                spec.output_dir,
+                phase="startup_attachment",
+                duration_s=time.perf_counter() - startup_started,
+                details={"replicas": 2, "attachment": "pass"},
             )
             yield router
     finally:
@@ -177,5 +186,15 @@ def write_bounded_canary_artifacts(
     write_json_atomic(router.audit_root / "overlap_verdict.json", verdict)
     write_json_atomic(
         router.audit_root / "high_concurrency_correctness.json", correctness
+    )
+    record_phase(
+        router.audit_root,
+        phase="hc_canary",
+        duration_s=wall_time_s,
+        details={
+            "concurrency": concurrency,
+            "completed_requests": len(successful),
+            "matched_overlap_count": verdict["matched_overlap_count"],
+        },
     )
     return verdict

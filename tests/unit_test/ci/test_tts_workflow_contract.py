@@ -108,13 +108,19 @@ def test_stage1_all_topologies_finalize_lane_before_always_upload() -> None:
     steps = child["jobs"]["stage-1-non-streaming"]["steps"]
     names = [step.get("name") for step in steps]
 
+    download = steps[names.index("Download current TTS preflight evidence")]
     prepare = steps[names.index("Prepare Stage 1 lifecycle")]
     mps_prepare = steps[names.index("Prepare explicit MPS Stage 1 runtime")]
     finalize = steps[names.index("Finalize Stage 1 lane verdict")]
     upload = steps[names.index("Upload Stage 1 lifecycle audit")]
 
-    assert (
-        "attempt-${{ github.run_attempt }}" in prepare["env"]["TTS_STAGE1_AUDIT_ROOT"]
+    audit_root = prepare["env"]["TTS_STAGE1_AUDIT_ROOT"]
+    assert "run-${{ github.run_id }}" in audit_root
+    assert "attempt-${{ github.run_attempt }}" in audit_root
+    assert download["with"]["name"] == "tts-stage1-preflight"
+    assert download["with"]["path"] == audit_root
+    assert names.index("Download current TTS preflight evidence") < names.index(
+        "Prepare Stage 1 lifecycle"
     )
     assert "tts_stage1_lifecycle.py initialize" in prepare["run"]
     assert "${{ inputs.tts_stage1_topology }}" in prepare["run"]
@@ -134,3 +140,13 @@ def test_stage1_all_topologies_finalize_lane_before_always_upload() -> None:
     assert names.index("Finalize Stage 1 lane verdict") < names.index(
         "Upload Stage 1 lifecycle audit"
     )
+
+
+def test_mps_normal_speed_thresholds_remain_observation_only() -> None:
+    source = (REPO_ROOT / "tests/test_model/test_tts_ci.py").read_text(encoding="utf-8")
+
+    assert source.count("if _PRESET.gate_thresholds and _gate_speed_thresholds():") == 2
+    assert "TTS_STAGE1_TOPOLOGY" in source
+    assert "observation_only_pending_h100_calibration" in (
+        REPO_ROOT / ".github/scripts/tts_stage1_observation.py"
+    ).read_text(encoding="utf-8")

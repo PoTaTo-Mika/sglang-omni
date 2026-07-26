@@ -44,6 +44,11 @@ SCRIPTS_ROOT = str(PROJECT_ROOT / ".github" / "scripts")
 if SCRIPTS_ROOT not in sys.path:
     sys.path.insert(0, SCRIPTS_ROOT)
 
+from tts_stage1_observation import (  # noqa: E402
+    record_correctness_component,
+    record_performance_observation,
+    record_phase,
+)
 from tts_stage1_ordinary_runtime import (  # noqa: E402
     finalize_ordinary_teardown,
     write_router_after as write_ordinary_router_after,
@@ -468,6 +473,18 @@ def _assert_tts_audio_result_integrity(
         )
 
 
+def _stage1_audit_root() -> Path | None:
+    value = os.environ.get("TTS_STAGE1_AUDIT_ROOT", "").strip()
+    return Path(value) if value else None
+
+
+def _gate_speed_thresholds() -> bool:
+    return not (
+        os.environ.get("TTS_STAGE1_TOPOLOGY", "multi_gpu") == "mps_shared"
+        and _stage1_audit_root() is not None
+    )
+
+
 def _store_consistency_inputs(
     *,
     mode: Literal["non_stream", "stream"],
@@ -515,7 +532,7 @@ def _store_consistency_inputs(
                 f"TTS {mode} c{concurrency}: request {request_id} "
                 f"completion_tokens={completion_tokens}, expected > 0",
             )
-        if _PRESET.gate_thresholds:
+        if _PRESET.gate_thresholds and _gate_speed_thresholds():
             assert_speed_thresholds(
                 summary,
                 _THRESHOLDS.non_stream_speed,
@@ -524,7 +541,7 @@ def _store_consistency_inputs(
             )
         store_key = f"vc_nonstream_c{concurrency}"
     else:
-        if _PRESET.gate_thresholds:
+        if _PRESET.gate_thresholds and _gate_speed_thresholds():
             assert_speed_thresholds(
                 summary, _THRESHOLDS.stream_speed, concurrency, collector=checks
             )
@@ -769,6 +786,15 @@ def router_server(
                 cleanup_manifest=router.cleanup_manifest,
                 before_workers=router_get_json(router.port, "/workers"),
             )
+            record_phase(
+                audit_root,
+                phase="startup_attachment",
+                duration_s=float(router.router_ready_s or 0.0),
+                details={
+                    "replicas": len(router.worker_ports),
+                    "attachment": "not_applicable",
+                },
+            )
 
             def record_ordinary_after_workers() -> None:
                 try:
@@ -818,6 +844,7 @@ def wer_input_dirs(
 ) -> dict[str, dict[int, str]]:
     """Reuse saved benchmark audio for WER after freeing the TTS server GPU."""
     topology = os.environ.get("TTS_STAGE1_TOPOLOGY", "multi_gpu")
+    teardown_started = time.perf_counter()
     stop_succeeded = False
     gpu_memory_released = False
     try:
@@ -843,6 +870,15 @@ def wer_input_dirs(
                     gpu_memory_released=gpu_memory_released,
                 )
 
+    audit_root = _stage1_audit_root()
+    if audit_root is not None:
+        record_phase(
+            audit_root,
+            phase="generation_teardown",
+            duration_s=time.perf_counter() - teardown_started,
+            details={"topology": topology},
+        )
+
     for output_dirs in SPEED_OUTPUT_DIRS.values():
         for output_dir in output_dirs.values():
             generated_path = Path(output_dir) / "generated.json"
@@ -863,6 +899,7 @@ def test_voice_cloning_non_streaming(
         _print_stage("TTS speed", "non-streaming", concurrency, "generate WAVs for WER")
         output_dir = _resolve_stage_output_dir(tmp_path, f"vc_nonstream_c{concurrency}")
         before_workers = router_get_json(router_server.port, "/workers")
+        canonical_started = time.perf_counter()
         try:
             results = _run_benchmark(
                 router_server.port,
@@ -894,6 +931,31 @@ def test_voice_cloning_non_streaming(
             collector=checks,
         )
         checks.assert_all()
+        audit_root = _stage1_audit_root()
+        if audit_root is not None:
+            duration_s = time.perf_counter() - canonical_started
+            record_phase(
+                audit_root,
+                phase="canonical_generation",
+                duration_s=duration_s,
+                details={"concurrency": concurrency},
+            )
+            record_performance_observation(
+                audit_root,
+                concurrency=concurrency,
+                summary=results["summary"],
+            )
+            record_correctness_component(
+                audit_root,
+                component="canonical_generation",
+                details={
+                    "concurrency": concurrency,
+                    "completed_requests": results["summary"].get("completed_requests"),
+                    "failed_requests": results["summary"].get("failed_requests"),
+                    "audio_integrity": "pass",
+                    "router_attribution": "pass",
+                },
+            )
 
 
 @pytest.mark.tts_stage(TTS_STAGE_NONSTREAM)
@@ -1029,6 +1091,7 @@ def test_voice_cloning_wer(
     qwen3_asr_wer_router: ManagedRouterHandle,
 ) -> None:
     checks = MetricCheckCollector("TTS non-streaming WER")
+    phase_started = time.perf_counter()
     for concurrency in selected_tts_concurrencies:
         _print_stage(
             "WER",
@@ -1060,6 +1123,18 @@ def test_voice_cloning_wer(
                 collector=checks,
             )
     checks.assert_all()
+    audit_root = _stage1_audit_root()
+    if audit_root is not None:
+        record_phase(
+            audit_root,
+            phase="qwen3_asr_evaluation",
+            duration_s=time.perf_counter() - phase_started,
+        )
+        record_correctness_component(
+            audit_root,
+            component="wer",
+            details=dict(results["summary"]),
+        )
 
 
 @pytest.mark.tts_stage(TTS_STAGE_NONSTREAM)
@@ -1071,6 +1146,7 @@ def test_voice_cloning_similarity(
     selected_tts_concurrencies: tuple[int, ...],
 ) -> None:
     checks = MetricCheckCollector("TTS non-streaming speaker similarity")
+    phase_started = time.perf_counter()
     for concurrency in selected_tts_concurrencies:
         _print_stage(
             "SIM",
@@ -1089,6 +1165,18 @@ def test_voice_cloning_similarity(
                 results, _THRESHOLDS.similarity_mean_min, collector=checks
             )
     checks.assert_all()
+    audit_root = _stage1_audit_root()
+    if audit_root is not None:
+        record_phase(
+            audit_root,
+            phase="similarity",
+            duration_s=time.perf_counter() - phase_started,
+        )
+        record_correctness_component(
+            audit_root,
+            component="similarity",
+            details=dict(results["summary"]),
+        )
 
 
 @pytest.mark.tts_stage(TTS_STAGE_NONSTREAM)
@@ -1098,12 +1186,25 @@ def test_voice_cloning_utmos(
     selected_tts_concurrencies: tuple[int, ...],
 ) -> None:
     checks = MetricCheckCollector("TTS non-streaming UTMOS")
+    phase_started = time.perf_counter()
     for concurrency in selected_tts_concurrencies:
         _print_stage("UTMOS", "non-streaming", concurrency, "score speed-stage WAVs")
         results = _run_utmos(wer_input_dirs["non_stream"][concurrency])
         if _PRESET.gate_thresholds:
             _assert_utmos_results(results, _THRESHOLDS.utmos_mean_min, collector=checks)
     checks.assert_all()
+    audit_root = _stage1_audit_root()
+    if audit_root is not None:
+        record_phase(
+            audit_root,
+            phase="utmos",
+            duration_s=time.perf_counter() - phase_started,
+        )
+        record_correctness_component(
+            audit_root,
+            component="utmos",
+            details=dict(results["summary"]),
+        )
 
 
 @pytest.mark.tts_stage(TTS_STAGE_STREAM)

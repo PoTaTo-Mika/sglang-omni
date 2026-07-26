@@ -273,6 +273,47 @@ def test_finalize_multi_gpu_uses_ordinary_teardown_chain(tmp_path: Path) -> None
         pid=None,
         port=None,
     )
+    lifecycle.write_json_atomic(
+        tmp_path / "preflight.json",
+        {
+            "schema_version": 1,
+            "selected_model": "moss",
+            "tts_stage1_topology": "multi_gpu",
+            "run_id": None,
+            "run_attempt": None,
+            "selection_digest": "digest",
+        },
+    )
+    lifecycle.write_json_atomic(
+        tmp_path / "normal_correctness.json",
+        {"schema_version": 1, "status": "pass", "clean": True},
+    )
+    lifecycle.write_json_atomic(
+        tmp_path / "performance_observation.json",
+        {
+            "schema_version": 1,
+            "status": "observed",
+            "threshold_calibration": {
+                "status": "pending_h100_repeated_runs",
+                "promotion_eligible": False,
+            },
+        },
+    )
+    lifecycle.write_json_atomic(
+        tmp_path / "stage1_timing_breakdown.json",
+        {
+            "schema_version": 1,
+            "status": "collecting",
+            "started_at_epoch_ns": lifecycle.time.time_ns(),
+            "phases": {},
+            "outer_timeout": {
+                "configured_minutes": 25,
+                "status": "unvalidated",
+                "adequate": None,
+                "promotion_eligible": False,
+            },
+        },
+    )
 
     verdict = lifecycle.finalize_lifecycle(
         tmp_path,
@@ -287,6 +328,10 @@ def test_finalize_multi_gpu_uses_ordinary_teardown_chain(tmp_path: Path) -> None
     index = json.loads((tmp_path / "artifact_index.json").read_text())
     assert index["cleanup"]["source"] == "ordinary_teardown_verdict.json"
     assert index["cleanup"]["pre_evaluator_clean"] is True
+    assert index["evidence_complete"] is True
+    assert index["preflight_matches_current_run"] is True
+    assert index["promotion_ready"] is False
+    assert index["timeout_validation"]["status"] == "unvalidated"
     assert verdict["checks"]["topology_teardown_clean"] is True
     assert verdict["checks"]["runner_consumer_deployed"] is False
 
@@ -294,6 +339,31 @@ def test_finalize_multi_gpu_uses_ordinary_teardown_chain(tmp_path: Path) -> None
 def test_finalize_missing_evidence_still_writes_quarantine_verdict(
     tmp_path: Path,
 ) -> None:
+    lifecycle.write_json_atomic(
+        tmp_path / "performance_observation.json",
+        {
+            "schema_version": 1,
+            "status": "observed",
+            "threshold_calibration": {
+                "status": "calibrated",
+                "promotion_eligible": True,
+            },
+        },
+    )
+    lifecycle.write_json_atomic(
+        tmp_path / "stage1_timing_breakdown.json",
+        {
+            "schema_version": 1,
+            "status": "sample_complete",
+            "started_at_epoch_ns": lifecycle.time.time_ns(),
+            "phases": {},
+            "outer_timeout": {
+                "status": "validated",
+                "adequate": True,
+                "promotion_eligible": True,
+            },
+        },
+    )
     verdict = lifecycle.finalize_lifecycle(
         tmp_path,
         topology="mps_shared",
@@ -312,3 +382,4 @@ def test_finalize_missing_evidence_still_writes_quarantine_verdict(
     index = json.loads((tmp_path / "artifact_index.json").read_text())
     assert index["status"] == "indexed"
     assert index["evidence_complete"] is False
+    assert index["promotion_ready"] is False
