@@ -86,6 +86,18 @@ def _attach(model, path, **kw):
     return attach_weights(model, path, **kw)
 
 
+def test_gpu_uuid_matches_nvidia_smi_canonical_format(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _: type("Props", (), {"uuid": "abc-def"})(),
+    )
+
+    assert ipc_weights._gpu_uuid() == "GPU-abc-def"
+
+
 @pytest.fixture()
 def handle_path(tmp_path):
     return str(tmp_path / "TinyModel.weights-ipc")
@@ -797,6 +809,35 @@ class _MossAuditModel(torch.nn.Module):
         self.shared = torch.nn.Parameter(torch.ones(2, 2))
         self._decode_input_embedding = torch.nn.Embedding(2, 4)
         self._state_pool = _MossReplicaState()
+
+
+def test_leader_record_tracks_private_storage_for_attachment_audit(tmp_path):
+    model = _MossAuditModel()
+    private_name = "_decode_input_embedding.weight"
+    private_names = frozenset({private_name})
+    record = _export(
+        model,
+        str(tmp_path / "MossAuditModel.weights-ipc"),
+        private_names=private_names,
+    )
+
+    assert record[private_name][0] == model._decode_input_embedding.weight.data_ptr()
+
+    path = ipc_weights.write_verified_attachment_audit(
+        model,
+        record,
+        config=ipc_weights.WeightShareConfig(
+            role="leader",
+            dir_path=str(tmp_path / "ipc"),
+            attach_timeout_s=1.0,
+            run_id="run-moss-leader-audit",
+        ),
+        policy=ipc_weights.WeightSharePolicy(private_tensor_names=private_names),
+        architecture="MossTTSLocalSGLangModel",
+        environ={ipc_weights.ENV_WEIGHT_SHARE_AUDIT_DIR: str(tmp_path / "audit")},
+    )
+
+    assert path is not None
 
 
 def test_moss_audit_proves_private_storage_and_history_exclusion(tmp_path):

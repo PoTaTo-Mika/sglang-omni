@@ -142,6 +142,13 @@ def test_stage1_all_topologies_finalize_lane_before_always_upload() -> None:
     )
 
 
+def test_stage1_container_allows_numa_membind_for_mps_launcher() -> None:
+    child = _workflow(".github/workflows/test-tts-ci.yaml")
+    options = child["jobs"]["stage-1-non-streaming"]["container"]["options"]
+
+    assert "--cap-add SYS_NICE" in options
+
+
 def test_mps_normal_speed_thresholds_remain_observation_only() -> None:
     source = (REPO_ROOT / "tests/test_model/test_tts_ci.py").read_text(encoding="utf-8")
 

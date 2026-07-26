@@ -128,7 +128,10 @@ def _gpu_uuid() -> str | None:
         return None
     try:
         props = torch.cuda.get_device_properties(torch.cuda.current_device())
-        return str(getattr(props, "uuid", "") or "") or None
+        raw = str(getattr(props, "uuid", "") or "") or None
+        if raw is None or raw.startswith(("GPU-", "MIG-")):
+            return raw
+        return f"GPU-{raw}"
     except Exception:
         return None
 
@@ -558,9 +561,9 @@ def export_weights(
     the leader's bytes into their own storage and never alias it.
 
     Returns a record {name: (data_ptr, shape, dtype)} of the leader-side shared
-    tensors for verify_attachment: the leader's own storages must stay put since
-    followers alias them, so in-place mutation is fine but rebinding .data after
-    export is not.
+    tensors plus policy-private tensors for verify_attachment: the leader's own
+    storages must stay put since followers alias or copy from them, so in-place
+    mutation is fine but rebinding .data after export is not.
     """
     abs_path = os.path.abspath(file_path)
     if abs_path in _EXPORTED_FILES:
@@ -607,8 +610,11 @@ def export_weights(
     _atomic_write(abs_path, pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL))
     _EXPORTED_FILES.add(abs_path)
 
+    recorded_names = set(ipc_tensors) | set(private)
     record = {
-        name: (t.data_ptr(), tuple(t.shape), t.dtype) for name, t in ipc_tensors.items()
+        name: (t.data_ptr(), tuple(t.shape), t.dtype)
+        for name, t in tensors.items()
+        if name in recorded_names
     }
     shared_bytes = sum(t.numel() * t.element_size() for t in ipc_tensors.values())
     logger.info(
