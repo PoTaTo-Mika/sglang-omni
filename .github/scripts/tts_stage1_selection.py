@@ -10,7 +10,7 @@ import json
 from pathlib import Path
 from typing import Any, NamedTuple
 
-from tts_stage1_artifacts import SCHEMA_VERSION, write_json_atomic
+from tts_stage1_evidence import SCHEMA_VERSION, write_json_atomic
 
 MODELS = ("higgs", "moss")
 MODEL_LABELS = {"higgs": "run-higgs", "moss": "run-moss"}
@@ -28,6 +28,8 @@ class SelectionResult(NamedTuple):
     resolved_config_class: str
     run_id: str
     run_attempt: str
+    exact_sha: str
+    workflow_url: str
 
     def as_dict(self) -> dict[str, Any]:
         return self._asdict()
@@ -89,6 +91,8 @@ def select_tts_stage1(
     override: str,
     repository_root: str | Path,
     topology: str = "multi_gpu",
+    exact_sha: str = "",
+    workflow_url: str = "",
 ) -> SelectionResult:
     """Resolve the model once from override, label, or stable run-id digest."""
 
@@ -139,6 +143,8 @@ def select_tts_stage1(
         resolved_config_class=config_class,
         run_id=run_id,
         run_attempt=run_attempt,
+        exact_sha=exact_sha,
+        workflow_url=workflow_url,
     )
 
 
@@ -168,6 +174,8 @@ def main() -> None:
     parser.add_argument("--override", default="")
     parser.add_argument("--topology", default="multi_gpu")
     parser.add_argument("--repository-root", default=".")
+    parser.add_argument("--exact-sha", default="")
+    parser.add_argument("--workflow-url", default="")
     parser.add_argument("--output", required=True)
     parser.add_argument("--github-output")
     args = parser.parse_args()
@@ -185,6 +193,8 @@ def main() -> None:
             override=args.override,
             topology=args.topology,
             repository_root=args.repository_root,
+            exact_sha=args.exact_sha,
+            workflow_url=args.workflow_url,
         )
     except (OSError, ValueError) as exc:
         parser.error(str(exc))

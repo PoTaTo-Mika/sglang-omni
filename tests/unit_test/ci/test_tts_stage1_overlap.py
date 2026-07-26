@@ -35,7 +35,7 @@ def test_canary_writer_imports_launcher_state_reader() -> None:
     imported = {
         alias.name
         for node in tree.body
-        if isinstance(node, ast.ImportFrom) and node.module == "tts_stage1_mps_runtime"
+        if isinstance(node, ast.ImportFrom) and node.module == "tts_stage1_runtime"
         for alias in node.names
     }
 
@@ -130,9 +130,8 @@ def test_composite_oracle_requires_repeated_one_to_one_cross_replica_overlap() -
     assert len({pair["replica_0_request_id"] for pair in verdict["matches"]}) == 2
     assert len({pair["replica_1_request_id"] for pair in verdict["matches"]}) == 2
     assert verdict["threshold_provenance"] == (
-        "provisional_repository_default_pending_h100_calibration"
+        "exact_sha_h100_runs_30196509700_30199556014_30202304743"
     )
-    assert verdict["promotion_eligible"] is False
 
 
 def test_composite_oracle_rejects_a_single_accidental_interval() -> None:

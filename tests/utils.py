@@ -99,19 +99,15 @@ def qwen3_asr_wer_router(
     from tests.test_model.omni_router_utils import launch_managed_router
 
     audit_root = os.environ.get("TTS_STAGE1_AUDIT_ROOT")
-    topology = os.environ.get("TTS_STAGE1_TOPOLOGY", "multi_gpu")
-    lifecycle = None
-    observation = None
+    evidence = None
     if audit_root:
         scripts = str(REPO_ROOT / ".github" / "scripts")
         if scripts not in sys.path:
             sys.path.insert(0, scripts)
-        import tts_stage1_lifecycle as lifecycle_module
-        import tts_stage1_observation as observation_module
+        import tts_stage1_evidence as evidence_module
 
-        lifecycle = lifecycle_module
-        observation = observation_module
-        lifecycle.require_pre_evaluator_clean(audit_root)
+        evidence = evidence_module
+        evidence.require_evaluator_start_allowed(audit_root)
 
     wait_for_gpu_memory_release()
     try:
@@ -123,15 +119,14 @@ def qwen3_asr_wer_router(
             wait_timeout=QWEN3_ASR_ROUTER_STARTUP_TIMEOUT,
             log_prefix="asr_wer_router_logs",
         ) as router:
-            if lifecycle is not None:
-                lifecycle.write_evaluator_lifecycle(
+            if evidence is not None:
+                evidence.record_evaluator(
                     audit_root,
-                    topology=topology,
                     status="running",
                     pid=router.proc.pid,
                     port=router.port,
                 )
-                observation.record_phase(
+                evidence.record_phase(
                     audit_root,
                     phase="evaluator_startup",
                     duration_s=float(router.router_ready_s or 0.0),
@@ -140,10 +135,9 @@ def qwen3_asr_wer_router(
             yield router
             evaluator_cleanup_started = time.perf_counter()
     except BaseException as exc:
-        if lifecycle is not None:
-            lifecycle.write_evaluator_lifecycle(
+        if evidence is not None:
+            evidence.record_evaluator(
                 audit_root,
-                topology=topology,
                 status="error",
                 pid=None,
                 port=None,
@@ -151,15 +145,14 @@ def qwen3_asr_wer_router(
             )
         raise
     else:
-        if lifecycle is not None:
-            observation.record_phase(
+        if evidence is not None:
+            evidence.record_phase(
                 audit_root,
                 phase="evaluator_cleanup",
                 duration_s=time.perf_counter() - evaluator_cleanup_started,
             )
-            lifecycle.write_evaluator_lifecycle(
+            evidence.record_evaluator(
                 audit_root,
-                topology=topology,
                 status="completed",
                 pid=None,
                 port=None,

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -13,129 +12,75 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / ".github" / "scripts"))
 
-
-def _load(module_name: str, relative_path: str):
-    spec = importlib.util.spec_from_file_location(
-        module_name, REPO_ROOT / relative_path
-    )
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
+import tts_stage1_evidence as evidence  # noqa: E402
+import tts_stage1_selection as selection  # noqa: E402
 
 
-selection = _load("tts_stage1_selection", ".github/scripts/tts_stage1_selection.py")
-artifacts = _load("tts_stage1_artifacts", ".github/scripts/tts_stage1_artifacts.py")
+def _select(**overrides):
+    args = {
+        "run_id": "123456789",
+        "run_attempt": "1",
+        "labels": [],
+        "override": "",
+        "repository_root": REPO_ROOT,
+        "topology": "multi_gpu",
+    }
+    args.update(overrides)
+    return selection.select_tts_stage1(**args)
 
 
 def test_run_attempt_does_not_change_digest_or_selected_model() -> None:
-    run_id = "123456789"
-    expected_digest = hashlib.sha256(run_id.encode("utf-8")).hexdigest()
+    expected_digest = hashlib.sha256(b"123456789").hexdigest()
     expected_model = ("higgs", "moss")[int(expected_digest, 16) % 2]
-
-    first = selection.select_tts_stage1(
-        run_id=run_id,
-        run_attempt="1",
-        labels=[],
-        override="",
-        repository_root=REPO_ROOT,
-    )
-    rerun = selection.select_tts_stage1(
-        run_id=run_id,
-        run_attempt="9",
-        labels=[],
-        override="",
-        repository_root=REPO_ROOT,
-    )
-
+    first = _select(run_attempt="1")
+    rerun = _select(run_attempt="9")
     assert first.selection_digest == expected_digest
     assert first.selected_model == expected_model
     assert rerun.selection_digest == first.selection_digest
     assert rerun.selected_model == first.selected_model
-    assert first.run_attempt == "1"
     assert rerun.run_attempt == "9"
 
 
 def test_conflicting_model_labels_fail_before_selection() -> None:
     with pytest.raises(ValueError, match="run-higgs.*run-moss"):
-        selection.select_tts_stage1(
-            run_id="42",
-            run_attempt="1",
-            labels=["run-ci", "run-higgs", "run-moss"],
-            override="",
-            repository_root=REPO_ROOT,
-        )
+        _select(labels=["run-ci", "run-higgs", "run-moss"])
 
 
 @pytest.mark.parametrize(
-    ("override", "expected"),
-    [("higgs", "higgs"), ("MOSS", "moss")],
+    ("override", "expected"), [("higgs", "higgs"), ("MOSS", "moss")]
 )
 def test_manual_override_selects_supported_model(override: str, expected: str) -> None:
-    result = selection.select_tts_stage1(
-        run_id="42",
-        run_attempt="2",
-        labels=[],
-        override=override,
-        repository_root=REPO_ROOT,
-    )
+    result = _select(override=override)
     assert result.selected_model == expected
     assert result.selection_reason == "workflow_dispatch_override"
 
 
-def test_invalid_manual_override_is_rejected() -> None:
+def test_invalid_manual_override_and_topology_are_rejected() -> None:
     with pytest.raises(ValueError, match="Unsupported tts_ci_model"):
-        selection.select_tts_stage1(
-            run_id="42",
-            run_attempt="1",
-            labels=[],
-            override="qwen3",
-            repository_root=REPO_ROOT,
-        )
+        _select(override="qwen3")
+    with pytest.raises(ValueError, match="Unsupported TTS Stage 1 topology"):
+        _select(topology="one_gpu")
 
 
 def test_single_model_label_wins_without_override() -> None:
-    result = selection.select_tts_stage1(
-        run_id="42",
-        run_attempt="3",
-        labels=["run-ci", "run-moss"],
-        override="",
-        repository_root=REPO_ROOT,
-    )
+    result = _select(labels=["run-ci", "run-moss"])
     assert result.selected_model == "moss"
     assert result.selection_reason == "label:run-moss"
 
 
-def test_default_topology_is_multi_gpu_and_resolves_validated_config() -> None:
-    result = selection.select_tts_stage1(
-        run_id="42",
-        run_attempt="1",
-        labels=["run-higgs"],
-        override="",
-        repository_root=REPO_ROOT,
+def test_default_topology_and_merged_1124_registry_resolution() -> None:
+    higgs = _select(labels=["run-higgs"])
+    moss = _select(labels=["run-moss"])
+    assert higgs.tts_stage1_topology == "multi_gpu"
+    assert higgs.resolved_mps_config == "examples/mps_dp/configs/higgs_h100_dp2.yaml"
+    assert higgs.resolved_config_class == "HiggsTtsPipelineConfig"
+    assert (
+        moss.resolved_mps_config == "examples/mps_dp/configs/moss_local_h100_dp2.yaml"
     )
-    resolved = REPO_ROOT / result.resolved_mps_config
-    assert result.tts_stage1_topology == "multi_gpu"
-    assert result.resolved_mps_config == ("examples/mps_dp/configs/higgs_h100_dp2.yaml")
-    assert resolved.is_file()
-    assert result.resolved_config_class == "HiggsTtsPipelineConfig"
+    assert moss.resolved_config_class == "MossTTSLocalPipelineConfig"
 
 
-def test_moss_resolves_the_merged_1124_validated_config() -> None:
-    result = selection.select_tts_stage1(
-        run_id="42",
-        run_attempt="1",
-        labels=["run-moss"],
-        override="",
-        repository_root=REPO_ROOT,
-    )
-    assert result.resolved_mps_config == (
-        "examples/mps_dp/configs/moss_local_h100_dp2.yaml"
-    )
-    assert result.resolved_config_class == "MossTTSLocalPipelineConfig"
-
-
-def test_config_path_is_derived_from_the_merged_registry(tmp_path: Path) -> None:
+def test_config_path_is_derived_from_registry(tmp_path: Path) -> None:
     config_dir = tmp_path / "examples" / "mps_dp" / "configs"
     config_dir.mkdir(parents=True)
     (tmp_path / "examples" / "mps_dp" / "config.py").write_text(
@@ -148,150 +93,98 @@ def test_config_path_is_derived_from_the_merged_registry(tmp_path: Path) -> None
         encoding="utf-8",
     )
     (config_dir / "custom_higgs.yaml").write_text(
-        "config_cls: HiggsTtsPipelineConfig\n",
-        encoding="utf-8",
+        "config_cls: HiggsTtsPipelineConfig\n", encoding="utf-8"
     )
-
     resolved, config_class = selection._resolve_config(
-        repository_root=tmp_path,
-        model="higgs",
+        repository_root=tmp_path, model="higgs"
     )
-
     assert resolved == "examples/mps_dp/configs/custom_higgs.yaml"
     assert config_class == "HiggsTtsPipelineConfig"
 
 
-def test_preflight_json_contains_immutable_selection_and_provenance(
-    tmp_path: Path,
-) -> None:
-    result = selection.select_tts_stage1(
+def test_preflight_json_contains_one_immutable_selection(tmp_path: Path) -> None:
+    result = _select(
         run_id="84",
         run_attempt="7",
-        labels=[],
         override="higgs",
         topology="mps_shared",
-        repository_root=REPO_ROOT,
+        exact_sha="abc123",
+        workflow_url="https://example.test/runs/84",
     )
     output = tmp_path / "preflight.json"
     selection.write_preflight(output, result)
-
-    payload = json.loads(output.read_text(encoding="utf-8"))
+    payload = evidence.read_evidence(output, expected_kind="preflight")
     assert payload == result.as_dict()
-    assert payload["schema_version"] == 1
     assert payload["run_attempt"] == "7"
-    assert payload["tts_stage1_topology"] == "mps_shared"
+    assert payload["exact_sha"] == "abc123"
+    assert payload["workflow_url"].endswith("/84")
 
 
-def test_multi_gpu_mps_artifact_is_explicitly_not_applicable() -> None:
-    payload = artifacts.artifact_envelope(
-        artifact_name="mps_attachment.json",
-        topology="multi_gpu",
-        mps_only=True,
-    )
-    assert payload == {
-        "schema_version": 1,
-        "artifact_name": "mps_attachment.json",
-        "topology": "multi_gpu",
-        "status": "not_applicable",
-        "reason_code": "mps_disabled_for_topology",
-    }
-
-
-def test_mps_artifact_is_required_for_mps_topology() -> None:
-    payload = artifacts.artifact_envelope(
-        artifact_name="mps_attachment.json",
-        topology="mps_shared",
-        mps_only=True,
-    )
-    assert payload["status"] == "required"
-    assert "reason_code" not in payload
-
-
-def test_verdict_preserves_multi_gpu_not_applicable_contract() -> None:
-    payload = artifacts.verdict_envelope(
-        artifact_name="mps_teardown_verdict.json",
-        topology="multi_gpu",
-        status="not_applicable",
-    )
-    assert payload["status"] == "not_applicable"
-    assert payload["reason_code"] == "mps_disabled_for_topology"
-
-
-@pytest.mark.parametrize(
-    ("status", "reason_code"),
-    [
-        ("dirty", None),
-        ("not_applicable", "caller_override"),
-    ],
-)
-def test_multi_gpu_mps_verdict_rejects_contract_overrides(
-    status: str,
-    reason_code: str | None,
+@pytest.mark.parametrize("topology", ["mps_shared", "multi_gpu"])
+def test_initialize_writes_only_four_aggregate_json_files(
+    tmp_path: Path, topology: str
 ) -> None:
-    with pytest.raises(ValueError, match="cannot override"):
-        artifacts.verdict_envelope(
-            artifact_name="mps_teardown_verdict.json",
-            topology="multi_gpu",
-            status=status,
-            reason_code=reason_code,
-        )
-
-
-def test_initialize_contract_writes_manifest_and_multi_gpu_mps_envelopes(
-    tmp_path: Path,
-) -> None:
-    artifacts.initialize_artifact_contracts(tmp_path, topology="multi_gpu")
-
-    manifest = json.loads(
-        (tmp_path / "artifact_manifest.json").read_text(encoding="utf-8")
+    evidence.initialize_evidence(
+        tmp_path,
+        topology=topology,
+        model="higgs",
+        configured_timeout_minutes=25,
+        environ={"GITHUB_RUN_ID": "10", "GITHUB_RUN_ATTEMPT": "2"},
     )
-    assert manifest["schema_version"] == 1
-    assert manifest["topology"] == "multi_gpu"
-    expected = {entry["artifact_name"]: entry for entry in manifest["artifacts"]}
-    for artifact_name in artifacts.MPS_ONLY_JSON_ARTIFACTS:
-        payload = json.loads((tmp_path / artifact_name).read_text(encoding="utf-8"))
-        assert payload["status"] == "not_applicable"
-        assert payload["reason_code"] == "mps_disabled_for_topology"
-        assert expected[artifact_name]["status"] == "not_applicable"
-
-
-def test_reinitialize_removes_same_attempt_runtime_evidence(tmp_path: Path) -> None:
-    artifacts.initialize_artifact_contracts(tmp_path, topology="mps_shared")
-    stale = {
-        "schema_version": 1,
-        "topology": "mps_shared",
-        "status": "pass",
-        "clean": True,
+    assert {path.name for path in tmp_path.glob("*.json")} == {
+        "stage1_runtime.json",
+        "stage1_correctness.json",
+        "stage1_timing.json",
+        "stage1_cleanup.json",
     }
-    artifacts.write_json_atomic(tmp_path / "mps_teardown_verdict.json", stale)
-    artifacts.write_json_atomic(tmp_path / "pre_evaluator_cleanup_verdict.json", stale)
-    artifacts.write_json_atomic(
-        tmp_path / "evaluator_lifecycle.json",
-        {**stale, "status": "completed"},
+    runtime = evidence.read_evidence(
+        tmp_path / "stage1_runtime.json", expected_kind="runtime"
     )
+    if topology == "multi_gpu":
+        assert runtime["mps"] == {
+            "status": "not_applicable",
+            "reason": "mps_disabled_for_topology",
+        }
+    else:
+        assert runtime["mps"]["status"] == "pending"
 
-    artifacts.initialize_artifact_contracts(tmp_path, topology="mps_shared")
 
-    assert not (tmp_path / "mps_teardown_verdict.json").exists()
-    assert not (tmp_path / "pre_evaluator_cleanup_verdict.json").exists()
-    assert not (tmp_path / "evaluator_lifecycle.json").exists()
-    ordinary = json.loads((tmp_path / "ordinary_teardown_verdict.json").read_text())
-    assert ordinary["status"] == "not_applicable"
+def test_atomic_reinitialize_replaces_stale_attempt_state(tmp_path: Path) -> None:
+    evidence.initialize_evidence(
+        tmp_path, topology="mps_shared", model="higgs", configured_timeout_minutes=25
+    )
+    evidence.update_evidence(
+        tmp_path / "stage1_cleanup.json",
+        expected_kind="cleanup",
+        updates={"clean": True, "verdict": "clean"},
+    )
+    evidence.initialize_evidence(
+        tmp_path, topology="mps_shared", model="higgs", configured_timeout_minutes=25
+    )
+    cleanup = evidence.read_evidence(
+        tmp_path / "stage1_cleanup.json", expected_kind="cleanup"
+    )
+    assert cleanup["clean"] is False
+    assert cleanup["verdict"] == "pending"
+    assert not list(tmp_path.glob(".*.tmp"))
 
 
-def test_unknown_topology_is_rejected() -> None:
-    with pytest.raises(ValueError, match="Unsupported TTS Stage 1 topology"):
-        artifacts.artifact_envelope(
-            artifact_name="normal_correctness.json",
-            topology="one_gpu",
-            mps_only=False,
+def test_schema_validation_is_fail_closed(tmp_path: Path) -> None:
+    bad = tmp_path / "stage1_runtime.json"
+    bad.write_text('{"schema_version": 99, "artifact_kind": "runtime"}')
+    with pytest.raises(RuntimeError, match="schema_version"):
+        evidence.read_evidence(bad, expected_kind="runtime")
+    bad.write_text('{"schema_version": 1, "artifact_kind": "cleanup"}')
+    with pytest.raises(RuntimeError, match="artifact_kind"):
+        evidence.read_evidence(bad, expected_kind="runtime")
+
+
+def test_higgs_stage1_config_is_explicit_h100_dp2() -> None:
+    config = __import__("yaml").safe_load(
+        (REPO_ROOT / "examples/mps_dp/configs/higgs_h100_dp2.yaml").read_text(
+            encoding="utf-8"
         )
-
-
-def test_higgs_stage1_config_is_an_explicit_h100_dp2_profile() -> None:
-    config_path = REPO_ROOT / "examples/mps_dp/configs/higgs_h100_dp2.yaml"
-    config = __import__("yaml").safe_load(config_path.read_text(encoding="utf-8"))
-
+    )
     assert config["config_cls"] == "HiggsTtsPipelineConfig"
     assert config["runtime_overrides"]["tts_engine"]["server_args_overrides"] == {
         "max_total_tokens": 100000,
@@ -300,27 +193,84 @@ def test_higgs_stage1_config_is_an_explicit_h100_dp2_profile() -> None:
     }
 
 
-def test_multi_gpu_activity_artifact_is_not_applicable(tmp_path: Path) -> None:
-    artifacts.initialize_artifact_contracts(tmp_path, topology="multi_gpu")
-
-    activity = (tmp_path / "replica_activity.jsonl").read_text(encoding="utf-8")
-    assert "status=not_applicable" in activity
-    assert "reason_code=mps_disabled_for_topology" in activity
-
-
-def test_mps_contract_writes_ordinary_teardown_not_applicable(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    ("model", "summary"),
+    [
+        (
+            "higgs",
+            {
+                "throughput_qps": 13.624,
+                "latency_mean_s": 1.168,
+                "rtf_mean": 0.2764,
+                "audio_throughput_s_per_s": 58.987,
+                "output_throughput": 1570.1,
+                "output_tok_per_req_s": 111.1,
+                "completed_requests": 1088,
+                "failed_requests": 0,
+            },
+        ),
+        (
+            "moss",
+            {
+                "throughput_qps": 9.905,
+                "latency_mean_s": 1.609,
+                "rtf_mean": 0.3778,
+                "audio_throughput_s_per_s": 43.593,
+                "output_throughput": 544.9,
+                "output_tok_per_req_s": 58.8,
+                "completed_requests": 1088,
+                "failed_requests": 0,
+            },
+        ),
+    ],
+)
+def test_mps_normal_load_floor_accepts_raw_h100_samples(
+    tmp_path: Path, model: str, summary: dict
 ) -> None:
-    artifacts.initialize_artifact_contracts(tmp_path, topology="mps_shared")
+    evidence.initialize_evidence(
+        tmp_path, topology="mps_shared", model=model, configured_timeout_minutes=25
+    )
+    verdict = evidence.record_normal_performance(
+        tmp_path, concurrency=16, summary=summary
+    )
+    assert verdict["status"] == "pass"
+    assert verdict["provenance"]["temporary"] is True
+    assert verdict["provenance"]["accepted_run_ids"]
+    timing = json.loads((tmp_path / "stage1_timing.json").read_text())
+    assert timing["normal_load_performance"]["status"] == "pass"
 
-    payload = json.loads(
-        (tmp_path / "ordinary_teardown_verdict.json").read_text(encoding="utf-8")
+
+def test_mps_normal_load_floor_hard_fails_obvious_regression(tmp_path: Path) -> None:
+    evidence.initialize_evidence(
+        tmp_path, topology="mps_shared", model="higgs", configured_timeout_minutes=25
     )
-    assert payload["status"] == "not_applicable"
-    assert payload["reason_code"] == "multi_gpu_disabled_for_topology"
-    verdict = artifacts.verdict_envelope(
-        artifact_name="ordinary_teardown_verdict.json",
-        topology="mps_shared",
-        status="not_applicable",
+    summary = {
+        "throughput_qps": 1.0,
+        "latency_mean_s": 10.0,
+        "rtf_mean": 2.0,
+        "audio_throughput_s_per_s": 2.0,
+        "output_throughput": 100.0,
+        "output_tok_per_req_s": 5.0,
+        "completed_requests": 1088,
+        "failed_requests": 0,
+    }
+    with pytest.raises(AssertionError, match="MPS normal-load safety floor"):
+        evidence.record_normal_performance(tmp_path, concurrency=16, summary=summary)
+    timing = json.loads((tmp_path / "stage1_timing.json").read_text())
+    assert timing["normal_load_performance"]["status"] == "fail"
+    assert timing["normal_load_performance"]["failed_checks"]
+
+
+def test_multi_gpu_records_metrics_without_mps_specific_gate(tmp_path: Path) -> None:
+    evidence.initialize_evidence(
+        tmp_path, topology="multi_gpu", model="moss", configured_timeout_minutes=25
     )
-    assert verdict == payload
+    verdict = evidence.record_normal_performance(
+        tmp_path,
+        concurrency=16,
+        summary={"completed_requests": 1088, "failed_requests": 0},
+    )
+    assert verdict == {
+        "status": "recorded",
+        "gate": "existing_multi_gpu_rollback_contract",
+    }

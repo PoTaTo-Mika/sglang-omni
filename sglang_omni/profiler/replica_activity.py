@@ -45,7 +45,9 @@ class ReplicaActivityRecorder:
             raise ValueError(f"{ENV_PATH} requires {ENV_RUN_ID} and {ENV_REPLICA_ID}")
         self._clock = monotonic_ns
         self._pid = os.getpid() if pid is None else pid
-        self._boot_id = _host_boot_id() if boot_id is None else boot_id
+        self._boot_id = (
+            _host_boot_id() if self._path is not None and boot_id is None else boot_id
+        )
         self._lock = threading.Lock()
         self._started: set[str] = set()
         self._ended: set[str] = set()

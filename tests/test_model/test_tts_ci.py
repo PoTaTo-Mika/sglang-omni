@@ -44,17 +44,15 @@ SCRIPTS_ROOT = str(PROJECT_ROOT / ".github" / "scripts")
 if SCRIPTS_ROOT not in sys.path:
     sys.path.insert(0, SCRIPTS_ROOT)
 
-from tts_stage1_observation import (  # noqa: E402
+from tts_stage1_evidence import (  # noqa: E402
     record_correctness_component,
-    record_performance_observation,
+    record_normal_performance,
     record_phase,
 )
-from tts_stage1_ordinary_runtime import finalize_ordinary_teardown
-from tts_stage1_ordinary_runtime import (  # noqa: E402
-    write_router_after as write_ordinary_router_after,
-)
-from tts_stage1_ordinary_runtime import (
-    write_startup_artifacts as write_ordinary_startup_artifacts,
+from tts_stage1_runtime import (  # noqa: E402
+    teardown_multi_gpu,
+    write_multi_gpu_runtime,
+    write_router_snapshot,
 )
 
 from benchmarks.dataset.prepare import DATASETS, download_dataset
@@ -480,7 +478,7 @@ def _stage1_audit_root() -> Path | None:
     return Path(value) if value else None
 
 
-def _gate_speed_thresholds() -> bool:
+def _use_ordinary_speed_thresholds() -> bool:
     return not (
         os.environ.get("TTS_STAGE1_TOPOLOGY", "multi_gpu") == "mps_shared"
         and _stage1_audit_root() is not None
@@ -534,7 +532,7 @@ def _store_consistency_inputs(
                 f"TTS {mode} c{concurrency}: request {request_id} "
                 f"completion_tokens={completion_tokens}, expected > 0",
             )
-        if _PRESET.gate_thresholds and _gate_speed_thresholds():
+        if _PRESET.gate_thresholds and _use_ordinary_speed_thresholds():
             assert_speed_thresholds(
                 summary,
                 _THRESHOLDS.non_stream_speed,
@@ -543,7 +541,7 @@ def _store_consistency_inputs(
             )
         store_key = f"vc_nonstream_c{concurrency}"
     else:
-        if _PRESET.gate_thresholds and _gate_speed_thresholds():
+        if _PRESET.gate_thresholds and _use_ordinary_speed_thresholds():
             assert_speed_thresholds(
                 summary, _THRESHOLDS.stream_speed, concurrency, collector=checks
             )
@@ -777,7 +775,7 @@ def router_server(
             if router.cleanup_manifest is None:
                 raise RuntimeError("managed router did not expose its cleanup manifest")
             audit_root = Path(audit_root_value)
-            write_ordinary_startup_artifacts(
+            write_multi_gpu_runtime(
                 audit_root,
                 model=_MODEL_NAME,
                 router_pid=router.proc.pid,
@@ -802,13 +800,11 @@ def router_server(
                 try:
                     snapshot = router_get_json(router.port, "/workers")
                 except BaseException as exc:
-                    write_ordinary_router_after(
-                        audit_root,
-                        snapshot=None,
-                        error=repr(exc),
+                    write_router_snapshot(
+                        audit_root, when="after", snapshot=None, error=repr(exc)
                     )
                 else:
-                    write_ordinary_router_after(audit_root, snapshot=snapshot)
+                    write_router_snapshot(audit_root, when="after", snapshot=snapshot)
 
             router.before_stop_callback = record_ordinary_after_workers
             router.audit_root = audit_root
@@ -862,7 +858,7 @@ def wer_input_dirs(
                     raise RuntimeError(
                         "ordinary teardown requires the router cleanup manifest"
                     )
-                finalize_ordinary_teardown(
+                teardown_multi_gpu(
                     router_server.audit_root,
                     cleanup_manifest=router_server.cleanup_manifest,
                     router_port=router_server.port,
@@ -942,7 +938,7 @@ def test_voice_cloning_non_streaming(
                 duration_s=duration_s,
                 details={"concurrency": concurrency},
             )
-            record_performance_observation(
+            record_normal_performance(
                 audit_root,
                 concurrency=concurrency,
                 summary=results["summary"],

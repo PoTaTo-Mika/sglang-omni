@@ -33,6 +33,13 @@ def test_model_selection_is_a_cpu_preflight_output_before_h100_setup() -> None:
         if step.get("name") == "Upload TTS preflight artifact"
     )
     assert upload["with"]["path"] == "${{ runner.temp }}/tts-stage1-preflight"
+    selection_step = next(
+        step
+        for step in preflight["steps"]
+        if "tts_stage1_selection.py" in step.get("run", "")
+    )
+    assert "--exact-sha" in selection_step["run"]
+    assert "--workflow-url" in selection_step["run"]
 
 
 def test_tts_job_passes_one_preflight_selection_to_stages_one_through_three() -> None:
@@ -103,42 +110,31 @@ def test_stage1_alone_consumes_explicit_topology_and_validated_config() -> None:
         assert "TTS_STAGE1_MPS_CONFIG" not in job_text
 
 
-def test_stage1_all_topologies_finalize_lane_before_always_upload() -> None:
+def test_stage1_all_topologies_finalize_cleanup_before_always_upload() -> None:
     child = _workflow(".github/workflows/test-tts-ci.yaml")
     steps = child["jobs"]["stage-1-non-streaming"]["steps"]
     names = [step.get("name") for step in steps]
 
     download = steps[names.index("Download current TTS preflight evidence")]
-    prepare = steps[names.index("Prepare Stage 1 lifecycle")]
     mps_prepare = steps[names.index("Prepare explicit MPS Stage 1 runtime")]
-    finalize = steps[names.index("Finalize Stage 1 lane verdict")]
-    upload = steps[names.index("Upload Stage 1 lifecycle audit")]
+    benchmark = steps[names.index("Run TTS non-streaming benchmark stage")]
+    finalize = steps[names.index("Finalize Stage 1 evidence and cleanup")]
+    upload = steps[names.index("Upload Stage 1 evidence")]
 
-    audit_root = prepare["env"]["TTS_STAGE1_AUDIT_ROOT"]
+    audit_root = benchmark["env"]["TTS_STAGE1_AUDIT_ROOT"]
     assert "run-${{ github.run_id }}" in audit_root
     assert "attempt-${{ github.run_attempt }}" in audit_root
-    assert download["with"]["name"] == "tts-stage1-preflight"
-    assert download["with"]["path"] == audit_root
-    assert names.index("Download current TTS preflight evidence") < names.index(
-        "Prepare Stage 1 lifecycle"
-    )
-    assert "tts_stage1_lifecycle.py initialize" in prepare["run"]
-    assert "${{ inputs.tts_stage1_topology }}" in prepare["run"]
-    assert "tts_stage1_lifecycle.py initialize" not in mps_prepare["run"]
-    benchmark = steps[names.index("Run TTS non-streaming benchmark stage")]
-    assert "run_flaky_pytest.sh" in benchmark["run"]
+    assert download["with"] == {"name": "tts-stage1-preflight", "path": audit_root}
+    assert "tts_stage1_runtime.py" in mps_prepare["run"]
+    assert "derive-core-blocks --gpu-id 0" in mps_prepare["run"]
     assert "run_tts_stage1_attempt.sh" in benchmark["run"]
-    assert benchmark["run"].index("run_tts_stage1_attempt.sh") < benchmark["run"].index(
-        "pytest tests/test_model/test_tts_ci.py"
-    )
-    assert "tts_stage1_lifecycle.py finalize" in finalize["run"]
-    assert "${{ inputs.tts_stage1_topology }}" in finalize["run"]
+    wrapper = (REPO_ROOT / ".github/scripts/run_tts_stage1_attempt.sh").read_text()
+    assert wrapper.count("tts_stage1_runtime.py initialize") == 1
+    assert "tts_stage1_runtime.py finalize" in finalize["run"]
     assert "always()" in finalize["if"]
-    assert "tts_stage1_topology" not in finalize["if"]
     assert "always()" in upload["if"]
-    assert "tts_stage1_topology" not in upload["if"]
-    assert names.index("Finalize Stage 1 lane verdict") < names.index(
-        "Upload Stage 1 lifecycle audit"
+    assert names.index("Finalize Stage 1 evidence and cleanup") < names.index(
+        "Upload Stage 1 evidence"
     )
 
 
@@ -149,11 +145,14 @@ def test_stage1_container_allows_numa_membind_for_mps_launcher() -> None:
     assert "--cap-add SYS_NICE" in options
 
 
-def test_mps_normal_speed_thresholds_remain_observation_only() -> None:
+def test_mps_normal_speed_thresholds_use_model_specific_h100_floor() -> None:
     source = (REPO_ROOT / "tests/test_model/test_tts_ci.py").read_text(encoding="utf-8")
+    evidence = (REPO_ROOT / ".github/scripts/tts_stage1_evidence.py").read_text(
+        encoding="utf-8"
+    )
 
-    assert source.count("if _PRESET.gate_thresholds and _gate_speed_thresholds():") == 2
-    assert "TTS_STAGE1_TOPOLOGY" in source
-    assert "observation_only_pending_h100_calibration" in (
-        REPO_ROOT / ".github/scripts/tts_stage1_observation.py"
-    ).read_text(encoding="utf-8")
+    assert "record_normal_performance" in source
+    assert "MPS_NORMAL_LOAD_FLOORS" in evidence
+    assert "30196509700" in evidence
+    assert "30202304743" in evidence
+    assert "observation_only_pending_h100_calibration" not in evidence

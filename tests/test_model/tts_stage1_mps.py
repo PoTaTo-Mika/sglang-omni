@@ -15,18 +15,17 @@ import pytest
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / ".github" / "scripts"))
 
-from tts_stage1_artifacts import write_json_atomic  # noqa: E402
-from tts_stage1_mps_runtime import (  # noqa: E402
+from tts_stage1_evidence import record_overlap_summary, record_phase  # noqa: E402
+from tts_stage1_overlap import build_overlap_verdict  # noqa: E402
+from tts_stage1_runtime import (  # noqa: E402
     MpsLaunchSpec,
     collect_replica_activity,
     launch_replicas,
     read_launcher_state,
     read_replica_activity,
-    teardown_replicas,
+    teardown_mps,
     write_router_snapshot,
 )
-from tts_stage1_observation import record_phase  # noqa: E402
-from tts_stage1_overlap import build_overlap_verdict  # noqa: E402
 
 from tests.test_model.omni_router_utils import (  # noqa: E402
     ManagedRouterHandle,
@@ -92,8 +91,8 @@ def launch_stage1_mps_router(
         assert router is not None
         collect_replica_activity(launcher_snapshot, output_dir=spec.output_dir)
         write_router_snapshot(
-            output_dir=spec.output_dir,
-            artifact_name="router_workers_after.json",
+            spec.output_dir,
+            when="after",
             snapshot=router_get_json(router.port, "/workers"),
         )
 
@@ -101,7 +100,7 @@ def launch_stage1_mps_router(
         nonlocal cleaned
         if not cleaned:
             cleaned = True
-            teardown_replicas(
+            teardown_mps(
                 spec,
                 router_stopped=router_was_stopped,
                 requests_drained_or_cancelled=router_was_stopped,
@@ -121,8 +120,8 @@ def launch_stage1_mps_router(
             router.mps_state_dir = launcher_snapshot.state_dir
             router.audit_root = spec.output_dir
             write_router_snapshot(
-                output_dir=spec.output_dir,
-                artifact_name="router_workers_before.json",
+                spec.output_dir,
+                when="before",
                 snapshot=router_get_json(router.port, "/workers"),
             )
             record_phase(
@@ -169,25 +168,16 @@ def write_bounded_canary_artifacts(
         min_matched_overlap_count=2,
         measurement_uncertainty_ns=1_000_000,
     )
-    correctness = {
-        "schema_version": 1,
-        "topology": "mps_shared",
-        "status": "pass",
-        "request_ids": sorted(request_ids),
-        "total_requests": len(results["per_request"]),
-        "completed_requests": len(successful),
-        "failed_requests": 0,
-        "concurrency": concurrency,
-        "canary_wall_time_s": wall_time_s,
-        "canonical_stage3_input": False,
-        "audio_integrity": "pass",
-        "threshold_provenance": verdict["threshold_provenance"],
-        "promotion_eligible": False,
-    }
-    write_json_atomic(router.audit_root / "overlap_verdict.json", verdict)
-    write_json_atomic(
-        router.audit_root / "high_concurrency_correctness.json", correctness
+    verdict.update(
+        request_ids=sorted(request_ids),
+        total_requests=len(results["per_request"]),
+        completed_requests=len(successful),
+        failed_requests=0,
+        concurrency=concurrency,
+        canary_wall_time_s=wall_time_s,
+        audio_integrity="pass",
     )
+    record_overlap_summary(router.audit_root, verdict)
     record_phase(
         router.audit_root,
         phase="hc_canary",

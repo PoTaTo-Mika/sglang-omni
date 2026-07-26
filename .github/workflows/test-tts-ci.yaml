@@ -60,20 +60,6 @@ jobs:
         with:
           name: tts-stage1-preflight
           path: ${{ env.OMNI_CI_HOME }}/tts-stage-results/nonstream/stage1-audit/run-${{ github.run_id }}/attempt-${{ github.run_attempt }}
-      - name: Prepare Stage 1 lifecycle
-        shell: bash
-        env:
-          TTS_STAGE1_AUDIT_ROOT: ${{ env.OMNI_CI_HOME }}/tts-stage-results/nonstream/stage1-audit/run-${{ github.run_id }}/attempt-${{ github.run_attempt }}
-        run: |
-          source omni/bin/activate
-          mkdir -p "${TTS_STAGE1_AUDIT_ROOT}"
-          python .github/scripts/tts_stage1_artifacts.py initialize \
-            --output-dir "${TTS_STAGE1_AUDIT_ROOT}" \
-            --topology "${{ inputs.tts_stage1_topology }}"
-          python .github/scripts/tts_stage1_lifecycle.py initialize \
-            --output-dir "${TTS_STAGE1_AUDIT_ROOT}" \
-            --topology "${{ inputs.tts_stage1_topology }}" \
-            --model "${{ inputs.tts_ci_model }}"
       - name: Prepare explicit MPS Stage 1 runtime
         if: ${{ inputs.tts_stage1_topology == 'mps_shared' }}
         shell: bash
@@ -83,7 +69,7 @@ jobs:
           source omni/bin/activate
           test -f examples/mps_dp/launch.sh
 
-          core_blocks=$(python .github/scripts/tts_stage1_mps_runtime.py \
+          core_blocks=$(python .github/scripts/tts_stage1_runtime.py \
             derive-core-blocks --gpu-id 0)
           echo "TTS_STAGE1_MPS_CORE_BLOCKS=${core_blocks}" >> "${GITHUB_ENV}"
           echo "TTS_STAGE1_MPS_RUN_ID=run-tts-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "${GITHUB_ENV}"
@@ -119,20 +105,20 @@ jobs:
           TTS_STAGE1_CONFIGURED_TIMEOUT_MINUTES: "25"
           TORCHINDUCTOR_CACHE_DIR: ${{ env.OMNI_CI_HOME }}/.torchinductor
 
-      - name: Finalize Stage 1 lane verdict
+      - name: Finalize Stage 1 evidence and cleanup
         if: ${{ always() }}
         shell: bash
         env:
           TTS_STAGE1_AUDIT_ROOT: ${{ env.OMNI_CI_HOME }}/tts-stage-results/nonstream/stage1-audit/run-${{ github.run_id }}/attempt-${{ github.run_attempt }}
         run: |
           source omni/bin/activate
-          python .github/scripts/tts_stage1_lifecycle.py finalize \
+          python .github/scripts/tts_stage1_runtime.py finalize \
             --output-dir "${TTS_STAGE1_AUDIT_ROOT}" \
             --topology "${{ inputs.tts_stage1_topology }}" \
             --model "${{ inputs.tts_ci_model }}" \
             --exact-sha "${GITHUB_SHA}"
 
-      - name: Upload Stage 1 lifecycle audit
+      - name: Upload Stage 1 evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:

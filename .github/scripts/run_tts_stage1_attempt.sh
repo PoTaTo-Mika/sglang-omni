@@ -6,14 +6,7 @@ set -euo pipefail
 : "${TTS_STAGE1_TOPOLOGY:?TTS_STAGE1_TOPOLOGY is required}"
 : "${TTS_CI_MODEL:?TTS_CI_MODEL is required}"
 
-python .github/scripts/tts_stage1_artifacts.py initialize \
-  --output-dir "${TTS_STAGE1_AUDIT_ROOT}" \
-  --topology "${TTS_STAGE1_TOPOLOGY}"
-python .github/scripts/tts_stage1_lifecycle.py initialize \
-  --output-dir "${TTS_STAGE1_AUDIT_ROOT}" \
-  --topology "${TTS_STAGE1_TOPOLOGY}" \
-  --model "${TTS_CI_MODEL}"
-python .github/scripts/tts_stage1_observation.py initialize \
+python .github/scripts/tts_stage1_runtime.py initialize \
   --output-dir "${TTS_STAGE1_AUDIT_ROOT}" \
   --topology "${TTS_STAGE1_TOPOLOGY}" \
   --model "${TTS_CI_MODEL}" \

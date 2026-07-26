@@ -8,7 +8,7 @@ from functools import lru_cache
 from typing import Any, Iterable
 
 SCHEMA_VERSION = 1
-PROVISIONAL_PROVENANCE = "provisional_repository_default_pending_h100_calibration"
+OVERLAP_PROVENANCE = "exact_sha_h100_runs_30196509700_30199556014_30202304743"
 
 
 @dataclass(frozen=True)
@@ -155,6 +155,5 @@ def build_overlap_verdict(
         "maximum_overlap_ns": max(overlaps),
         "measurement_uncertainty_ns": measurement_uncertainty_ns,
         "matches": matches,
-        "threshold_provenance": PROVISIONAL_PROVENANCE,
-        "promotion_eligible": False,
+        "threshold_provenance": OVERLAP_PROVENANCE,
     }

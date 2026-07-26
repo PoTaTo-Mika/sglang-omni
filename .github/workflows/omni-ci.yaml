@@ -135,11 +135,10 @@ jobs:
             --override "${TTS_CI_MODEL_OVERRIDE}" \
             --topology "${TTS_STAGE1_TOPOLOGY}" \
             --repository-root "${GITHUB_WORKSPACE}" \
+            --exact-sha "${GITHUB_SHA}" \
+            --workflow-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
             --output "${output_dir}/preflight.json" \
             --github-output "${GITHUB_OUTPUT}"
-          python .github/scripts/tts_stage1_artifacts.py initialize \
-            --output-dir "${output_dir}" \
-            --topology "${TTS_STAGE1_TOPOLOGY}"
 
       - name: Upload TTS preflight artifact
         uses: actions/upload-artifact@v4
