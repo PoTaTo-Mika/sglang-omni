@@ -166,7 +166,7 @@ def test_dirty_mps_failure_injection_blocks_evaluator() -> None:
     assert verdict["retained_state"] == "/state/run-1"
 
 
-def test_lane_release_requires_real_consumer_and_matching_lease() -> None:
+def test_lane_release_records_external_follow_up_without_failing_cleanup() -> None:
     context = {
         "lane_lease_id": "lease-1",
         "lane_lease_verified": True,
@@ -193,13 +193,44 @@ def test_lane_release_requires_real_consumer_and_matching_lease() -> None:
         feasibility={"status": "deployed"},
     )
 
-    assert blocked["clean"] is False
-    assert blocked["quarantine_required"] is True
+    assert blocked["clean"] is True
+    assert blocked["repository_cleanup_clean"] is True
+    assert blocked["external_follow_up_required"] is True
+    assert blocked["release_eligible"] is False
+    assert blocked["quarantine_required"] is False
+    assert blocked["status"] == "repository_clean_external_follow_up"
     assert clean["clean"] is True
     assert clean["release_eligible"] is True
 
 
-def test_finalize_writes_auditable_blocked_verdict_without_lease(
+def test_lane_release_failure_injection_still_hard_fails() -> None:
+    context = {"lane_lease_id": "lease-1", "lane_lease_verified": True}
+    common = {
+        "topology": "mps_shared",
+        "teardown": {"clean": True, "lane_context": context},
+        "pre_evaluator": {"clean": True, "lane_context": context},
+        "evaluator": {
+            "status": "completed",
+            "topology": "mps_shared",
+            "lane_context": context,
+        },
+        "post_state": {"clean": True},
+        "feasibility": {"status": "deployed"},
+        "baseline_lane_context": context,
+        "final_lane_context": context,
+    }
+
+    verdict = lifecycle.build_lane_release_verdict(
+        **common,
+        failure_injection="lease_mismatch",
+    )
+
+    assert verdict["clean"] is False
+    assert verdict["quarantine_required"] is True
+    assert verdict["external_follow_up_required"] is False
+
+
+def test_finalize_writes_auditable_follow_up_without_lease(
     tmp_path: Path,
 ) -> None:
     lifecycle.initialize_lifecycle(
@@ -223,6 +254,7 @@ def test_finalize_writes_auditable_blocked_verdict_without_lease(
         status="completed",
         pid=10,
         port=8000,
+        environ={},
     )
 
     verdict = lifecycle.finalize_lifecycle(
@@ -235,7 +267,11 @@ def test_finalize_writes_auditable_blocked_verdict_without_lease(
         command_runner=_command_runner,
     )
 
-    assert verdict["clean"] is False
+    assert verdict["clean"] is True
+    assert verdict["repository_cleanup_clean"] is True
+    assert verdict["release_eligible"] is False
+    assert verdict["external_follow_up_required"] is True
+    assert verdict["quarantine_required"] is False
     assert verdict["checks"]["runner_consumer_deployed"] is False
     assert verdict["checks"]["lane_lease_verified_and_matching"] is False
     index = json.loads((tmp_path / "artifact_index.json").read_text())
@@ -272,6 +308,7 @@ def test_finalize_multi_gpu_uses_ordinary_teardown_chain(tmp_path: Path) -> None
         status="completed",
         pid=None,
         port=None,
+        environ={},
     )
     lifecycle.write_json_atomic(
         tmp_path / "preflight.json",
@@ -325,6 +362,11 @@ def test_finalize_multi_gpu_uses_ordinary_teardown_chain(tmp_path: Path) -> None
         command_runner=_command_runner,
     )
 
+    assert verdict["clean"] is True
+    assert verdict["repository_cleanup_clean"] is True
+    assert verdict["release_eligible"] is False
+    assert verdict["external_follow_up_required"] is True
+    assert verdict["quarantine_required"] is False
     index = json.loads((tmp_path / "artifact_index.json").read_text())
     assert index["cleanup"]["source"] == "ordinary_teardown_verdict.json"
     assert index["cleanup"]["pre_evaluator_clean"] is True

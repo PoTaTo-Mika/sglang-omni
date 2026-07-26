@@ -445,22 +445,51 @@ def build_lane_release_verdict(
         checks["lane_lease_verified_and_matching"] = False
     if failure_injection == "dirty_post_state":
         checks["final_post_state_clean"] = False
-    clean = all(checks.values())
+    repository_check_names = (
+        "topology_teardown_clean",
+        "pre_evaluator_cleanup_clean",
+        "evaluator_completed_and_clean",
+        "final_post_state_clean",
+        "baseline_run_lane_identity_matches",
+        "teardown_run_lane_identity_matches",
+        "pre_evaluator_run_lane_identity_matches",
+        "evaluator_run_lane_identity_matches",
+    )
+    repository_clean = all(checks[name] for name in repository_check_names)
+    if failure_injection == "lease_mismatch":
+        repository_clean = False
+    infrastructure_ready = (
+        checks["runner_consumer_deployed"]
+        and checks["lane_lease_verified_and_matching"]
+    )
+    release_eligible = repository_clean and infrastructure_ready
+    external_follow_up_required = repository_clean and not infrastructure_ready
+    if not repository_clean:
+        status = "dirty"
+        required_runner_action = (
+            "preserve dirty state, run scoped cleanup, and quarantine if supported"
+        )
+    elif release_eligible:
+        status = "pass"
+        required_runner_action = "release matching exclusive lane lease"
+    else:
+        status = "repository_clean_external_follow_up"
+        required_runner_action = (
+            "follow up with the runner owner to deploy the lease/quarantine consumer"
+        )
     return {
         "schema_version": SCHEMA_VERSION,
         "topology": topology,
-        "status": "pass" if clean else "blocked",
-        "clean": clean,
-        "release_eligible": clean,
+        "status": status,
+        "clean": repository_clean,
+        "repository_cleanup_clean": repository_clean,
+        "external_follow_up_required": external_follow_up_required,
+        "release_eligible": release_eligible,
         "checks": checks,
         "lane_lease_id": lease_id,
         "failure_injection": failure_injection,
-        "quarantine_required": not clean,
-        "required_runner_action": (
-            "release matching exclusive lane lease"
-            if clean
-            else "quarantine lane and perform independent recovery verification"
-        ),
+        "quarantine_required": not repository_clean,
+        "required_runner_action": required_runner_action,
     }
 
 
