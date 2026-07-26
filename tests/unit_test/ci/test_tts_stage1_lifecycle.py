@@ -81,7 +81,7 @@ def test_clean_ordinary_teardown_allows_bound_evaluator_barrier(
     assert teardown["clean"] is True
     assert barrier["source_artifact"] == "ordinary_teardown_verdict.json"
     assert barrier["evaluator_start_allowed"] is True
-    lifecycle.require_pre_evaluator_clean(tmp_path)
+    lifecycle.require_pre_evaluator_clean(tmp_path, environ={})
 
 
 def test_dirty_ordinary_teardown_failure_injection_blocks_evaluator() -> None:
@@ -111,12 +111,12 @@ def test_pre_evaluator_barrier_binds_to_clean_source(tmp_path: Path) -> None:
     )
 
     assert verdict["clean"] is True
-    lifecycle.require_pre_evaluator_clean(tmp_path)
+    lifecycle.require_pre_evaluator_clean(tmp_path, environ={})
 
     teardown["clean"] = False
     (tmp_path / "mps_teardown_verdict.json").write_text(json.dumps(teardown))
     with pytest.raises(RuntimeError, match="source verdict changed"):
-        lifecycle.require_pre_evaluator_clean(tmp_path)
+        lifecycle.require_pre_evaluator_clean(tmp_path, environ={})
 
 
 def test_pre_evaluator_barrier_rejects_a_different_run_attempt(
