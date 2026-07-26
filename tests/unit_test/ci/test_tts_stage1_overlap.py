@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 import sys
@@ -25,6 +26,20 @@ def _load(module_name: str, relative_path: str):
 
 overlap = _load("tts_stage1_overlap", ".github/scripts/tts_stage1_overlap.py")
 activity = _load("replica_activity", "sglang_omni/profiler/replica_activity.py")
+
+
+def test_canary_writer_imports_launcher_state_reader() -> None:
+    tree = ast.parse(
+        (REPO_ROOT / "tests/test_model/tts_stage1_mps.py").read_text(encoding="utf-8")
+    )
+    imported = {
+        alias.name
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom) and node.module == "tts_stage1_mps_runtime"
+        for alias in node.names
+    }
+
+    assert "read_launcher_state" in imported
 
 
 def test_replica_activity_uses_monotonic_clock_and_dedupes(tmp_path: Path) -> None:
