@@ -113,6 +113,9 @@ def test_stage1_all_topologies_finalize_lane_before_always_upload() -> None:
     finalize = steps[names.index("Finalize Stage 1 lane verdict")]
     upload = steps[names.index("Upload Stage 1 lifecycle audit")]
 
+    assert (
+        "attempt-${{ github.run_attempt }}" in prepare["env"]["TTS_STAGE1_AUDIT_ROOT"]
+    )
     assert "tts_stage1_lifecycle.py initialize" in prepare["run"]
     assert "${{ inputs.tts_stage1_topology }}" in prepare["run"]
     assert "tts_stage1_lifecycle.py initialize" not in mps_prepare["run"]

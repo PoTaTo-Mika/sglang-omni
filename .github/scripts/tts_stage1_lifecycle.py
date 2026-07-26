@@ -170,6 +170,35 @@ def lane_context(environ: Mapping[str, str] | None = None) -> dict[str, Any]:
     }
 
 
+IDENTITY_FIELDS = (
+    "runner_name",
+    "run_id",
+    "run_attempt",
+    "job",
+    "lane_lease_id",
+    "lane_lease_verified",
+)
+
+
+def lifecycle_identity(context: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize the run/lane fields used to reject stale evidence."""
+
+    identity = {
+        field: context.get(field)
+        for field in IDENTITY_FIELDS
+        if field != "lane_lease_verified" and context.get(field) is not None
+    }
+    if context.get("lane_lease_id") is not None:
+        identity["lane_lease_verified"] = context.get("lane_lease_verified") is True
+    return identity
+
+
+def lifecycle_identity_matches(
+    recorded: Mapping[str, Any], current: Mapping[str, Any]
+) -> bool:
+    return lifecycle_identity(recorded) == lifecycle_identity(current)
+
+
 def initialize_lifecycle(
     output_dir: str | Path,
     *,
@@ -290,10 +319,14 @@ def write_pre_evaluator_cleanup(
         else "ordinary_teardown_verdict.json"
     )
     source = _read_json(root / source_name)
+    current_context = lane_context(environ)
     clean = (
         source.get("topology") == topology
         and source.get("status") == "pass"
         and source.get("clean") is True
+        and lifecycle_identity_matches(
+            source.get("lane_context") or {}, current_context
+        )
     )
     payload = {
         "schema_version": SCHEMA_VERSION,
@@ -303,14 +336,18 @@ def write_pre_evaluator_cleanup(
         "source_artifact": source_name,
         "source_sha256": _json_digest(source),
         "evaluator_start_allowed": clean,
-        "lane_context": lane_context(environ),
+        "lane_context": current_context,
         "quarantine_required": not clean,
     }
     write_json_atomic(root / "pre_evaluator_cleanup_verdict.json", payload)
     return payload
 
 
-def require_pre_evaluator_clean(output_dir: str | Path) -> dict[str, Any]:
+def require_pre_evaluator_clean(
+    output_dir: str | Path,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
     root = Path(output_dir)
     payload = _read_json(root / "pre_evaluator_cleanup_verdict.json")
     if (
@@ -322,16 +359,27 @@ def require_pre_evaluator_clean(output_dir: str | Path) -> dict[str, Any]:
     source = _read_json(root / str(payload.get("source_artifact")))
     if _json_digest(source) != payload.get("source_sha256"):
         raise RuntimeError("pre-evaluator cleanup source verdict changed")
+    current_context = lane_context(environ)
+    if not lifecycle_identity_matches(
+        payload.get("lane_context") or {}, current_context
+    ) or not lifecycle_identity_matches(
+        source.get("lane_context") or {}, current_context
+    ):
+        raise RuntimeError(
+            "pre-evaluator cleanup run or lane identity does not match current job"
+        )
     return payload
 
 
 def write_evaluator_lifecycle(
     output_dir: str | Path,
     *,
+    topology: str,
     status: str,
     pid: int | None,
     port: int | None,
     error: str | None = None,
+    environ: Mapping[str, str] | None = None,
 ) -> None:
     if status not in {"running", "completed", "error"}:
         raise ValueError(f"unsupported evaluator status: {status}")
@@ -339,7 +387,9 @@ def write_evaluator_lifecycle(
         Path(output_dir) / "evaluator_lifecycle.json",
         {
             "schema_version": SCHEMA_VERSION,
+            "topology": topology,
             "status": status,
+            "lane_context": lane_context(environ),
             "pid": pid,
             "port": port,
             "error": error,
@@ -374,6 +424,21 @@ def build_lane_release_verdict(
         "final_post_state_clean": post_state.get("clean") is True,
         "runner_consumer_deployed": feasibility.get("status") == "deployed",
         "lane_lease_verified_and_matching": lease_match,
+        "baseline_run_lane_identity_matches": lifecycle_identity_matches(
+            baseline_lane_context, final_lane_context
+        ),
+        "teardown_run_lane_identity_matches": lifecycle_identity_matches(
+            teardown.get("lane_context") or {}, final_lane_context
+        ),
+        "pre_evaluator_run_lane_identity_matches": lifecycle_identity_matches(
+            pre_evaluator.get("lane_context") or {}, final_lane_context
+        ),
+        "evaluator_run_lane_identity_matches": (
+            evaluator.get("topology") == topology
+            and lifecycle_identity_matches(
+                evaluator.get("lane_context") or {}, final_lane_context
+            )
+        ),
     }
     if failure_injection == "lease_mismatch":
         checks["lane_lease_verified_and_matching"] = False

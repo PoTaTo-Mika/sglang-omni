@@ -41,6 +41,7 @@ REQUIRED_JSON_ARTIFACTS = (
     "process_tree.json",
     *MULTI_GPU_ONLY_JSON_ARTIFACTS,
     "pre_evaluator_cleanup_verdict.json",
+    "evaluator_lifecycle.json",
     "post_state.json",
     "lane_release_verdict.json",
     "artifact_index.json",
@@ -168,6 +169,16 @@ def initialize_artifact_contracts(output_dir: str | Path, *, topology: str) -> N
     """Write the manifest and honest N/A files for the selected topology."""
 
     root = Path(output_dir)
+    reset_names = set(
+        REQUIRED_JSON_ARTIFACTS
+        + REQUIRED_NON_JSON_ARTIFACTS
+        + ("artifact_manifest.json",)
+    )
+    # CPU preflight is immutable for one github.run_id and may be staged here
+    # before a flaky pytest retry. Runtime evidence must never survive a retry.
+    reset_names.discard("preflight.json")
+    for artifact_name in reset_names:
+        (root / artifact_name).unlink(missing_ok=True)
     write_json_atomic(root / "artifact_manifest.json", artifact_manifest(topology))
     inapplicable_json = (
         MPS_ONLY_JSON_ARTIFACTS

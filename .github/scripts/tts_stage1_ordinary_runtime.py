@@ -13,6 +13,7 @@ from tts_stage1_artifacts import SCHEMA_VERSION, write_json_atomic
 from tts_stage1_lifecycle import (
     FAILURE_INJECTION_ENV,
     build_ordinary_teardown_verdict,
+    lane_context,
     write_pre_evaluator_cleanup,
 )
 
@@ -241,6 +242,7 @@ def finalize_ordinary_teardown(
         router_attribution_recorded=router_attribution_recorded,
         failure_injection=injection,
     )
+    verdict["lane_context"] = lane_context(env)
     write_json_atomic(root / "ordinary_teardown_verdict.json", verdict)
     write_pre_evaluator_cleanup(root, topology=TOPOLOGY, environ=env)
     if verdict["clean"] is not True:

@@ -17,6 +17,7 @@ from typing import Any
 from tts_stage1_lifecycle import (
     FAILURE_INJECTION_ENV,
     build_mps_teardown_verdict,
+    lane_context,
     write_pre_evaluator_cleanup,
 )
 
@@ -800,6 +801,7 @@ def teardown_replicas(
         failure_injection=(os.environ.get(FAILURE_INJECTION_ENV) or "").strip() or None,
     )
     verdict["evidence_errors"] = evidence_errors
+    verdict["lane_context"] = lane_context(os.environ)
     _write_json_atomic(spec.output_dir / "mps_teardown_verdict.json", verdict)
     write_pre_evaluator_cleanup(spec.output_dir, topology=TOPOLOGY)
     if verdict["clean"] is not True:

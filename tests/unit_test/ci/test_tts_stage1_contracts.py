@@ -255,6 +255,30 @@ def test_initialize_contract_writes_manifest_and_multi_gpu_mps_envelopes(
         assert expected[artifact_name]["status"] == "not_applicable"
 
 
+def test_reinitialize_removes_same_attempt_runtime_evidence(tmp_path: Path) -> None:
+    artifacts.initialize_artifact_contracts(tmp_path, topology="mps_shared")
+    stale = {
+        "schema_version": 1,
+        "topology": "mps_shared",
+        "status": "pass",
+        "clean": True,
+    }
+    artifacts.write_json_atomic(tmp_path / "mps_teardown_verdict.json", stale)
+    artifacts.write_json_atomic(tmp_path / "pre_evaluator_cleanup_verdict.json", stale)
+    artifacts.write_json_atomic(
+        tmp_path / "evaluator_lifecycle.json",
+        {**stale, "status": "completed"},
+    )
+
+    artifacts.initialize_artifact_contracts(tmp_path, topology="mps_shared")
+
+    assert not (tmp_path / "mps_teardown_verdict.json").exists()
+    assert not (tmp_path / "pre_evaluator_cleanup_verdict.json").exists()
+    assert not (tmp_path / "evaluator_lifecycle.json").exists()
+    ordinary = json.loads((tmp_path / "ordinary_teardown_verdict.json").read_text())
+    assert ordinary["status"] == "not_applicable"
+
+
 def test_unknown_topology_is_rejected() -> None:
     with pytest.raises(ValueError, match="Unsupported TTS Stage 1 topology"):
         artifacts.artifact_envelope(

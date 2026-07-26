@@ -44,6 +44,8 @@ SCRIPTS_ROOT = str(PROJECT_ROOT / ".github" / "scripts")
 if SCRIPTS_ROOT not in sys.path:
     sys.path.insert(0, SCRIPTS_ROOT)
 
+from tts_stage1_artifacts import initialize_artifact_contracts  # noqa: E402
+from tts_stage1_lifecycle import initialize_lifecycle  # noqa: E402
 from tts_stage1_ordinary_runtime import (  # noqa: E402
     finalize_ordinary_teardown,
     write_router_after as write_ordinary_router_after,
@@ -713,6 +715,25 @@ def similarity_checkpoint() -> str | None:
     if not raw:
         return None
     return str(Path(raw).expanduser())
+
+
+@pytest.fixture(scope="module", autouse=True)
+def reset_stage1_runtime_evidence(selected_tts_ci_stage: str) -> None:
+    """Start every flaky pytest attempt with fresh run-bound evidence."""
+
+    if selected_tts_ci_stage != TTS_STAGE_NONSTREAM:
+        return
+    audit_root_value = os.environ.get("TTS_STAGE1_AUDIT_ROOT", "").strip()
+    if not audit_root_value:
+        return
+    audit_root = Path(audit_root_value)
+    topology = os.environ.get("TTS_STAGE1_TOPOLOGY", "multi_gpu")
+    initialize_artifact_contracts(audit_root, topology=topology)
+    initialize_lifecycle(
+        audit_root,
+        topology=topology,
+        model=_MODEL_NAME,
+    )
 
 
 @pytest.fixture(scope="module", autouse=True)

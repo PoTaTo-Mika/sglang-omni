@@ -98,6 +98,7 @@ def qwen3_asr_wer_router(
     from tests.test_model.omni_router_utils import launch_managed_router
 
     audit_root = os.environ.get("TTS_STAGE1_AUDIT_ROOT")
+    topology = os.environ.get("TTS_STAGE1_TOPOLOGY", "multi_gpu")
     lifecycle = None
     if audit_root:
         scripts = str(REPO_ROOT / ".github" / "scripts")
@@ -121,6 +122,7 @@ def qwen3_asr_wer_router(
             if lifecycle is not None:
                 lifecycle.write_evaluator_lifecycle(
                     audit_root,
+                    topology=topology,
                     status="running",
                     pid=router.proc.pid,
                     port=router.port,
@@ -130,6 +132,7 @@ def qwen3_asr_wer_router(
         if lifecycle is not None:
             lifecycle.write_evaluator_lifecycle(
                 audit_root,
+                topology=topology,
                 status="error",
                 pid=None,
                 port=None,
@@ -140,6 +143,7 @@ def qwen3_asr_wer_router(
         if lifecycle is not None:
             lifecycle.write_evaluator_lifecycle(
                 audit_root,
+                topology=topology,
                 status="completed",
                 pid=None,
                 port=None,

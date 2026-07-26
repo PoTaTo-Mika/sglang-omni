@@ -119,6 +119,30 @@ def test_pre_evaluator_barrier_binds_to_clean_source(tmp_path: Path) -> None:
         lifecycle.require_pre_evaluator_clean(tmp_path)
 
 
+def test_pre_evaluator_barrier_rejects_a_different_run_attempt(
+    tmp_path: Path,
+) -> None:
+    first_attempt = {
+        "GITHUB_RUN_ID": "100",
+        "GITHUB_RUN_ATTEMPT": "1",
+        "GITHUB_JOB": "stage-1",
+        "TTS_STAGE1_LANE_LEASE_ID": "lease-100",
+        "TTS_STAGE1_LANE_LEASE_VERIFIED": "true",
+    }
+    second_attempt = {**first_attempt, "GITHUB_RUN_ATTEMPT": "2"}
+    teardown = _clean_teardown()
+    teardown["lane_context"] = lifecycle.lane_context(first_attempt)
+    lifecycle.write_json_atomic(tmp_path / "mps_teardown_verdict.json", teardown)
+    lifecycle.write_pre_evaluator_cleanup(
+        tmp_path,
+        topology="mps_shared",
+        environ=first_attempt,
+    )
+
+    with pytest.raises(RuntimeError, match="run or lane identity"):
+        lifecycle.require_pre_evaluator_clean(tmp_path, environ=second_attempt)
+
+
 def test_dirty_mps_failure_injection_blocks_evaluator() -> None:
     verdict = lifecycle.build_mps_teardown_verdict(
         run_id="run-1",
@@ -143,20 +167,22 @@ def test_dirty_mps_failure_injection_blocks_evaluator() -> None:
 
 
 def test_lane_release_requires_real_consumer_and_matching_lease() -> None:
+    context = {
+        "lane_lease_id": "lease-1",
+        "lane_lease_verified": True,
+    }
     common = {
         "topology": "mps_shared",
-        "teardown": {"clean": True},
-        "pre_evaluator": {"clean": True},
-        "evaluator": {"status": "completed"},
+        "teardown": {"clean": True, "lane_context": context},
+        "pre_evaluator": {"clean": True, "lane_context": context},
+        "evaluator": {
+            "status": "completed",
+            "topology": "mps_shared",
+            "lane_context": context,
+        },
         "post_state": {"clean": True},
-        "baseline_lane_context": {
-            "lane_lease_id": "lease-1",
-            "lane_lease_verified": True,
-        },
-        "final_lane_context": {
-            "lane_lease_id": "lease-1",
-            "lane_lease_verified": True,
-        },
+        "baseline_lane_context": context,
+        "final_lane_context": context,
     }
     blocked = lifecycle.build_lane_release_verdict(
         **common,
@@ -193,6 +219,7 @@ def test_finalize_writes_auditable_blocked_verdict_without_lease(
     )
     lifecycle.write_evaluator_lifecycle(
         tmp_path,
+        topology="mps_shared",
         status="completed",
         pid=10,
         port=8000,
@@ -241,6 +268,7 @@ def test_finalize_multi_gpu_uses_ordinary_teardown_chain(tmp_path: Path) -> None
     )
     lifecycle.write_evaluator_lifecycle(
         tmp_path,
+        topology="multi_gpu",
         status="completed",
         pid=None,
         port=None,

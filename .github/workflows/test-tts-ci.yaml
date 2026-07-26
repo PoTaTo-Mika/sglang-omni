@@ -57,7 +57,7 @@ jobs:
       - name: Prepare Stage 1 lifecycle
         shell: bash
         env:
-          TTS_STAGE1_AUDIT_ROOT: ${{ env.OMNI_CI_HOME }}/tts-stage-results/nonstream/stage1-audit
+          TTS_STAGE1_AUDIT_ROOT: ${{ env.OMNI_CI_HOME }}/tts-stage-results/nonstream/stage1-audit/attempt-${{ github.run_attempt }}
         run: |
           source omni/bin/activate
           mkdir -p "${TTS_STAGE1_AUDIT_ROOT}"
@@ -72,7 +72,7 @@ jobs:
         if: ${{ inputs.tts_stage1_topology == 'mps_shared' }}
         shell: bash
         env:
-          TTS_STAGE1_AUDIT_ROOT: ${{ env.OMNI_CI_HOME }}/tts-stage-results/nonstream/stage1-audit
+          TTS_STAGE1_AUDIT_ROOT: ${{ env.OMNI_CI_HOME }}/tts-stage-results/nonstream/stage1-audit/attempt-${{ github.run_attempt }}
         run: |
           source omni/bin/activate
           test -f examples/mps_dp/launch.sh
@@ -106,7 +106,7 @@ jobs:
           TTS_STAGE_OUTPUT_ROOT: ${{ env.OMNI_CI_HOME }}/tts-stage-results/nonstream
           TTS_STAGE1_TOPOLOGY: ${{ inputs.tts_stage1_topology }}
           TTS_STAGE1_MPS_CONFIG: ${{ inputs.tts_stage1_mps_config }}
-          TTS_STAGE1_AUDIT_ROOT: ${{ env.OMNI_CI_HOME }}/tts-stage-results/nonstream/stage1-audit
+          TTS_STAGE1_AUDIT_ROOT: ${{ env.OMNI_CI_HOME }}/tts-stage-results/nonstream/stage1-audit/attempt-${{ github.run_attempt }}
           TTS_STAGE1_MPS_STATE_ROOT: ${{ env.OMNI_CI_HOME }}/tts-stage1-mps-state
           TTS_STAGE1_MPS_GPU_ID: "0"
           TORCHINDUCTOR_CACHE_DIR: ${{ env.OMNI_CI_HOME }}/.torchinductor
@@ -115,7 +115,7 @@ jobs:
         if: ${{ always() }}
         shell: bash
         env:
-          TTS_STAGE1_AUDIT_ROOT: ${{ env.OMNI_CI_HOME }}/tts-stage-results/nonstream/stage1-audit
+          TTS_STAGE1_AUDIT_ROOT: ${{ env.OMNI_CI_HOME }}/tts-stage-results/nonstream/stage1-audit/attempt-${{ github.run_attempt }}
         run: |
           source omni/bin/activate
           python .github/scripts/tts_stage1_lifecycle.py finalize \
@@ -128,8 +128,8 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
-          name: tts-stage1-audit-${{ inputs.tts_ci_model }}-${{ inputs.tts_stage1_topology }}
-          path: ${{ env.OMNI_CI_HOME }}/tts-stage-results/nonstream/stage1-audit
+          name: tts-stage1-audit-${{ inputs.tts_ci_model }}-${{ inputs.tts_stage1_topology }}-attempt-${{ github.run_attempt }}
+          path: ${{ env.OMNI_CI_HOME }}/tts-stage-results/nonstream/stage1-audit/attempt-${{ github.run_attempt }}
           if-no-files-found: error
           retention-days: 14
           overwrite: true
