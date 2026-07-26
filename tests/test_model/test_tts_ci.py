@@ -49,9 +49,11 @@ from tts_stage1_observation import (  # noqa: E402
     record_performance_observation,
     record_phase,
 )
+from tts_stage1_ordinary_runtime import finalize_ordinary_teardown
 from tts_stage1_ordinary_runtime import (  # noqa: E402
-    finalize_ordinary_teardown,
     write_router_after as write_ordinary_router_after,
+)
+from tts_stage1_ordinary_runtime import (
     write_startup_artifacts as write_ordinary_startup_artifacts,
 )
 
