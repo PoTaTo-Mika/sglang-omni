@@ -669,8 +669,23 @@ def _pid_alive(pid: int) -> bool:
     except ProcessLookupError:
         return False
     except PermissionError:
+        pass
+
+    try:
+        status = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(pid)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
         return True
-    return True
+    process_state = status.stdout.strip()
+    if status.returncode != 0 or not process_state:
+        return False
+    # Match production launch.sh: zombies hold no GPU/port resources and cannot
+    # be reaped by this verifier when its parent is an init-less container.
+    return not process_state.startswith("Z")
 
 
 def _occupied_ports(ports: set[int]) -> list[int]:

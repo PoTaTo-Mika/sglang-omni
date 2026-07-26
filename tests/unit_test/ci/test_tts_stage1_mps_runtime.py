@@ -224,6 +224,19 @@ def test_cpu_list_round_trip_for_numa_affinity() -> None:
     assert runtime.format_cpu_list(cores) == "0-3,8,10-11"
 
 
+def test_pid_alive_treats_zombie_as_exited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(runtime.os, "kill", lambda *_: None)
+    monkeypatch.setattr(
+        runtime.subprocess,
+        "run",
+        lambda *_, **__: SimpleNamespace(returncode=0, stdout="Z\n"),
+    )
+
+    assert runtime._pid_alive(123) is False
+
+
 def test_post_launch_validation_failure_attempts_run_specific_teardown(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
