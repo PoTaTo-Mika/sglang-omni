@@ -58,6 +58,19 @@ def test_startup_artifacts_record_router_ports_gpu_mapping_and_process_tree(
     assert [item["tracked_pgid"] for item in tree["groups"]] == [100, 101]
 
 
+def test_process_group_alive_treats_zombie_only_group_as_exited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(runtime.os, "killpg", lambda *_: None, raising=False)
+    monkeypatch.setattr(
+        runtime.subprocess,
+        "run",
+        lambda *_, **__: SimpleNamespace(returncode=0, stdout="Z\nZ+\n"),
+    )
+
+    assert runtime._process_group_alive(123) is False
+
+
 def test_clean_ordinary_teardown_writes_evaluator_barrier(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

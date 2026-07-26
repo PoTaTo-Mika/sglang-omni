@@ -184,8 +184,25 @@ def _process_group_alive(process_group_id: int) -> bool:
     except ProcessLookupError:
         return False
     except PermissionError:
+        pass
+
+    try:
+        status = subprocess.run(
+            ["ps", "-o", "stat=", "-g", str(process_group_id)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
         return True
-    return True
+    if status.returncode != 0:
+        return True
+    # A group containing only zombies owns no GPU/port resources. Match the
+    # production launcher while keeping process-status query failures dirty.
+    return any(
+        state.strip() and not state.lstrip().startswith("Z")
+        for state in status.stdout.splitlines()
+    )
 
 
 def _occupied_ports(ports: Sequence[int]) -> list[int]:
