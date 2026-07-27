@@ -6,7 +6,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from benchmarks.audar_tts.prepare_fleurs_dataset import _is_arabic_text, _select_targets
 from benchmarks.audar_tts.run_quality_benchmark import (
     DATASET_REPO,
     DATASET_REVISION,
@@ -28,36 +27,6 @@ def _generation_result(samples: list[dict]) -> dict:
         "truncated_samples": 0,
         "samples": samples,
     }
-
-
-def test_select_targets_keeps_fixed_arabic_subset() -> None:
-    selected = _select_targets(
-        [
-            {"id": 1, "transcription": "short"},
-            {
-                "id": 2,
-                "transcription": "مرحبا بكم في هذا الاختبار العربي الواضح",
-            },
-            {
-                "id": 3,
-                "transcription": "هذا النص العربي يحتوي على الرقم 123 هنا",
-            },
-            {
-                "id": 4,
-                "transcription": "هذا مثال عربي ثان لاختبار جودة الكلام",
-            },
-        ],
-        samples=2,
-        min_words=6,
-        max_words=20,
-    )
-
-    assert [sample["source_id"] for sample in selected] == ["2", "4"]
-    assert [sample["sample_id"] for sample in selected] == [
-        "fleurs-ar-eg-0001",
-        "fleurs-ar-eg-0003",
-    ]
-    assert _is_arabic_text(selected[0]["target_text"])
 
 
 def test_quality_runner_loads_pinned_hf_dataset(monkeypatch) -> None:

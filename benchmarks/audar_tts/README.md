@@ -89,10 +89,7 @@ comparison or quality threshold.
 - Dataset revision: `65835c3a1047037f9e0cd4947652722c0a58c304`
 - Dataset manifest:
   [`manifest.json`](https://huggingface.co/datasets/zhaochenyang20/sglang-omni-arabic-tts-smoke/blob/65835c3a1047037f9e0cd4947652722c0a58c304/manifest.json)
-- Materialization command:
 
-```bash
-python -m benchmarks.audar_tts.prepare_fleurs_dataset \
-  --output-dir /tmp/sglang-omni-arabic-tts-smoke \
-  --samples 50
-```
+The dataset is the canonical benchmark artifact, so this repository does not
+carry its one-time materialization script. The pinned manifest records the
+FLEURS source revision, selection rules, artifact path, and Parquet SHA-256.
