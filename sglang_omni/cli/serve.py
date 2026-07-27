@@ -901,11 +901,6 @@ def apply_prefill_coalesce_cli_overrides(
         updates["prefill_coalesce_wait_ms"] = wait_ms
     if not updates:
         return pipeline_config
-    if prefill_coalesce_requests is None:
-        logger.warning(
-            "--prefill-coalesce-wait-ms alone does not enable coalescing; the "
-            "gate engages only when --prefill-coalesce-requests is >= 2"
-        )
     matching_stages = [
         stage
         for stage in pipeline_config.stages
@@ -916,6 +911,17 @@ def apply_prefill_coalesce_cli_overrides(
             "--prefill-coalesce-requests/--prefill-coalesce-wait-ms currently "
             f"support only {_PREFILL_COALESCE_SUPPORTED_MODELS}; no stage in "
             "this pipeline uses a supported factory"
+        )
+    if prefill_coalesce_requests is None and not any(
+        # The YAML may already enable the gate; only warn when tuning the wait
+        # would genuinely have no effect on any targeted stage.
+        int((stage.factory_args or {}).get("prefill_coalesce_requests", 0)) >= 2
+        for stage in matching_stages
+    ):
+        logger.warning(
+            "--prefill-coalesce-wait-ms alone does not enable coalescing; the "
+            "gate engages only when prefill_coalesce_requests is >= 2 (via "
+            "--prefill-coalesce-requests or the stage's factory_args)"
         )
     _apply_factory_args_updates(pipeline_config, matching_stages, updates)
     return pipeline_config

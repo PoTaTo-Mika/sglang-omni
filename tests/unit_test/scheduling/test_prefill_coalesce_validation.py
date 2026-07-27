@@ -17,11 +17,24 @@ def test_validate_prefill_coalesce_args_normalizes_values():
         (0, 0.0),
         (0, float("nan")),
         (0, float("inf")),
+        # bools and non-integral counts must fail before int()/float()
+        # truncation can silently change their meaning
+        (True, 60.0),
+        (False, 60.0),
+        (0, True),
+        (-0.5, 60.0),
+        (2.9, 60.0),
     ],
 )
 def test_validate_prefill_coalesce_args_rejects_invalid_values(requests, wait_ms):
     with pytest.raises(ValueError):
         validate_prefill_coalesce_args(requests, wait_ms)
+
+
+def test_validate_prefill_coalesce_args_accepts_integral_floats():
+    # YAML often parses `32` as an int, but `32.0` should also work since it
+    # loses nothing under int().
+    assert validate_prefill_coalesce_args(32.0, 300) == (32, 300.0)
 
 
 def test_validate_prefill_coalesce_args_warns_on_one(caplog):
