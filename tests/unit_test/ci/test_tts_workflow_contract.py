@@ -104,7 +104,18 @@ def test_stage1_alone_consumes_explicit_topology_and_validated_config() -> None:
     assert "TTS_STAGE1_TOPOLOGY" in stage1_text
     assert "TTS_STAGE1_MPS_CONFIG" in stage1_text
     assert "TTS_STAGE1_MPS_STATE_ROOT" in stage1_text
-    assert "tts-stage1-mps-state/run-${{ github.run_id }}" in stage1_text
+    state_root = next(
+        step["env"]["TTS_STAGE1_MPS_STATE_ROOT"]
+        for step in child["jobs"]["stage-1-non-streaming"]["steps"]
+        if "TTS_STAGE1_MPS_STATE_ROOT" in step.get("env", {})
+    )
+    rendered_root = state_root.replace(
+        "${{ env.OMNI_CI_HOME }}", "/data/omni-ci/run-30255610170"
+    )
+    control_socket = (
+        f"{rendered_root}/gpu-0/run-tts-30255610170-1/mps/pipe/control"
+    )
+    assert len(control_socket.encode()) <= 107
     assert "examples/mps_dp/launch.sh" in stage1_text
     for job_name in (
         "stage-2-streaming",
