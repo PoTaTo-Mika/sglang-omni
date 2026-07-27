@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Pipeline configuration for OpenBMB VoxCPM1.5."""
+"""Pipeline configuration for OpenBMB VoxCPM 1.x."""
 
 from __future__ import annotations
 
@@ -36,7 +36,9 @@ class VoxCPMPipelineConfig(PipelineConfig):
     architecture: ClassVar[str] = "voxcpm"
     architecture_aliases: ClassVar[tuple[str, ...]] = (
         "VoxCPM",
+        "VoxCPM1",
         "VoxCPMForConditionalGeneration",
+        "VoxCPM1ForConditionalGeneration",
     )
     requires_model_capabilities: ClassVar[bool] = True
 

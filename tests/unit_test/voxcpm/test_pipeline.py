@@ -12,6 +12,7 @@ from sglang_omni.models.voxcpm_common.request_builders import (
     build_voxcpm_state,
 )
 from sglang_omni.models.voxcpm_common.engine_builder import VoxCPMEngineBuilder
+from sglang_omni.models.voxcpm_common.hf_config import VoxCPMConfig
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.serve.protocol import CreateSpeechRequest
 from sglang_omni.utils.hf import try_resolve_arch_from_raw_config
@@ -44,6 +45,8 @@ def _payload(
     ("architecture", "expected"),
     [
         ("voxcpm", VoxCPMPipelineConfig),
+        ("VoxCPM1", VoxCPMPipelineConfig),
+        ("VoxCPM1ForConditionalGeneration", VoxCPMPipelineConfig),
         ("VoxCPMForConditionalGeneration", VoxCPMPipelineConfig),
         ("voxcpm2", VoxCPM2PipelineConfig),
         ("VoxCPM2TalkerForConditionalGeneration", VoxCPM2PipelineConfig),
@@ -96,6 +99,31 @@ def test_engine_builder_injects_missing_voxcpm_model_type(tmp_path):
     assert builder.config.model_type == "voxcpm"
     assert builder.config.architectures == ["VoxCPMSGLangModel"]
     assert builder.context_length == 128
+
+
+def test_voxcpm1_official_config_uses_shared_v1_adapter():
+    config = VoxCPMConfig.from_dict(
+        {
+            "architecture": "voxcpm",
+            "lm_config": {
+                "hidden_size": 16,
+                "intermediate_size": 32,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "num_hidden_layers": 2,
+                "max_position_embeddings": 128,
+                "vocab_size": 32,
+            },
+            "patch_size": 2,
+            "feat_dim": 64,
+            "residual_lm_num_layers": 6,
+        }
+    )
+    assert config.model_type == "voxcpm"
+    assert config.architecture == "voxcpm"
+    assert config.architectures == ["VoxCPMSGLangModel"]
+    assert config.patch_size == 2
+    assert getattr(config, "audio_vae_config", None) is None
 
 
 def test_voxcpm1_reference_allows_optional_transcript():

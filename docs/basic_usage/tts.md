@@ -29,7 +29,7 @@ uv pip install --no-deps qwen-tts==0.1.1
 | [Qwen3-TTS VoiceDesign](../cookbook/qwen3_tts.md) | `examples/configs/qwen3_tts_1_7b_voicedesign.yaml` | Requires `task_type="VoiceDesign"` and non-empty `instructions`. No reference audio is required |
 | [Ming-Omni-TTS](../cookbook/ming_tts.md) | `examples/configs/ming_omni_tts.yaml` | Text-only synthesis or one local reference clip with its transcript; TP1 is supported and the provided config uses TP2 |
 | [MOSS-TTS](../cookbook/moss_tts.md) | `examples/configs/moss_tts.yaml` | Voice cloning via `ref_audio` or `references[0].audio_path` (+ `text`). Duration via `${token:N}` or `token_count`. Benchmark at `--max-concurrency 8` |
-| VoxCPM1.5 | `examples/configs/voxcpm.yaml` | Text-only synthesis or continuation cloning; `ref_text` is optional when `ref_audio` is supplied |
+| VoxCPM 1.0 / 1.5 | `examples/configs/voxcpm1.yaml`, `examples/configs/voxcpm.yaml` | Text-only synthesis or continuation cloning; `ref_text` is optional when `ref_audio` is supplied |
 | VoxCPM2 | `examples/configs/voxcpm2.yaml` | Text-only synthesis, isolated cloning with `ref_audio`, or continuation with `ref_audio` + `ref_text`; outputs 48 kHz audio |
 
 ## Launch the Server
