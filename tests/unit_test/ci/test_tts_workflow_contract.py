@@ -76,7 +76,7 @@ def test_stage1_alone_consumes_explicit_topology_and_validated_config() -> None:
     child = _workflow(".github/workflows/test-tts-ci.yaml")
 
     parent_inputs = parent["on"]["workflow_dispatch"]["inputs"]
-    assert parent_inputs["tts_stage1_topology"]["default"] == "multi_gpu"
+    assert parent_inputs["tts_stage1_topology"]["default"] == "mps_shared"
     assert parent_inputs["tts_stage1_topology"]["options"] == [
         "multi_gpu",
         "mps_shared",
@@ -91,7 +91,7 @@ def test_stage1_alone_consumes_explicit_topology_and_validated_config() -> None:
     )
 
     child_inputs = child["on"]["workflow_call"]["inputs"]
-    assert child_inputs["tts_stage1_topology"]["default"] == "multi_gpu"
+    assert child_inputs["tts_stage1_topology"]["default"] == "mps_shared"
     assert child_inputs["tts_stage1_mps_config"]["required"] == "true"
 
     stage1_text = str(child["jobs"]["stage-1-non-streaming"])

@@ -15,7 +15,7 @@ on:
         description: Explicit Stage 1 topology selected by CPU preflight.
         type: string
         required: false
-        default: multi_gpu
+        default: mps_shared
       tts_stage1_mps_config:
         description: Validated production launch.sh config selected by CPU preflight.
         type: string

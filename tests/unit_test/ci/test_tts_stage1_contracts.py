@@ -23,7 +23,6 @@ def _select(**overrides):
         "labels": [],
         "override": "",
         "repository_root": REPO_ROOT,
-        "topology": "multi_gpu",
     }
     args.update(overrides)
     return selection.select_tts_stage1(**args)
@@ -71,7 +70,7 @@ def test_single_model_label_wins_without_override() -> None:
 def test_default_topology_and_merged_1124_registry_resolution() -> None:
     higgs = _select(labels=["run-higgs"])
     moss = _select(labels=["run-moss"])
-    assert higgs.tts_stage1_topology == "multi_gpu"
+    assert higgs.tts_stage1_topology == "mps_shared"
     assert higgs.resolved_mps_config == "examples/mps_dp/configs/higgs_h100_dp2.yaml"
     assert higgs.resolved_config_class == "HiggsTtsPipelineConfig"
     assert (

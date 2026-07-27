@@ -90,7 +90,7 @@ def select_tts_stage1(
     labels: list[str],
     override: str,
     repository_root: str | Path,
-    topology: str = "multi_gpu",
+    topology: str = "mps_shared",
     exact_sha: str = "",
     workflow_url: str = "",
 ) -> SelectionResult:
@@ -172,7 +172,7 @@ def main() -> None:
     parser.add_argument("--run-attempt", required=True)
     parser.add_argument("--labels-json", default="[]")
     parser.add_argument("--override", default="")
-    parser.add_argument("--topology", default="multi_gpu")
+    parser.add_argument("--topology", default="mps_shared")
     parser.add_argument("--repository-root", default=".")
     parser.add_argument("--exact-sha", default="")
     parser.add_argument("--workflow-url", default="")

@@ -32,13 +32,13 @@ on:
         type: string
         default: ""
       tts_stage1_topology:
-        description: "TTS Stage 1 topology; multi_gpu remains the promotion-safe default."
+        description: "TTS Stage 1 topology; multi_gpu remains available for rollback."
         required: false
         type: choice
         options:
           - multi_gpu
           - mps_shared
-        default: multi_gpu
+        default: mps_shared
 
 concurrency:
   group: omni-ci-${{ github.event.pull_request.number || github.ref }}
@@ -124,7 +124,7 @@ jobs:
         env:
           PR_LABELS: ${{ steps.pr.outputs.labels || '[]' }}
           TTS_CI_MODEL_OVERRIDE: ${{ github.event.inputs.tts_ci_model || '' }}
-          TTS_STAGE1_TOPOLOGY: ${{ github.event.inputs.tts_stage1_topology || 'multi_gpu' }}
+          TTS_STAGE1_TOPOLOGY: ${{ github.event.inputs.tts_stage1_topology || 'mps_shared' }}
         run: |
           output_dir="${RUNNER_TEMP}/tts-stage1-preflight"
           mkdir -p "${output_dir}"
