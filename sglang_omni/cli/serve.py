@@ -40,6 +40,17 @@ _ASYNC_DECODE_SUPPORTED_MODELS = (
     "Higgs TTS, MOSS-TTS-Local, MOSS-Transcribe-Diarize, Fun-ASR, "
     "Qwen3-ASR, and the Qwen3-Omni thinker"
 )
+_PREFILL_COALESCE_FACTORIES = frozenset(
+    {
+        "sglang_omni.models.higgs_tts.stages.create_sglang_tts_engine_executor",
+        "sglang_omni.models.moss_tts_local.stages.create_sglang_tts_engine_executor",
+        "sglang_omni.models.qwen3_omni.stages."
+        "create_sglang_thinker_executor_from_config",
+        "sglang_omni.models.moss_transcribe_diarize.stages."
+        "create_sglang_moss_transcribe_diarize_executor",
+        "sglang_omni.models.fun_asr.stages.create_sglang_fun_asr_executor",
+    }
+)
 _QWEN_PARTIAL_START_TALKER_FACTORY = (
     "sglang_omni.models.qwen3_omni.stages.create_talker_ar_executor_from_config"
 )
@@ -883,12 +894,12 @@ def apply_prefill_coalesce_cli_overrides(
         )
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
-    # Note (maydomine): Model configs opt in with a scheduling block so CLI
-    # validation does not import optional model dependencies.
+    # Note (maydomine): Factory identity keeps CLI discovery stable for full
+    # stage YAML files created before runtime.scheduling existed.
     matching_stages = [
         stage
         for stage in pipeline_config.stages
-        if stage.runtime.scheduling is not None
+        if stage.factory in _PREFILL_COALESCE_FACTORIES
     ]
     if not matching_stages:
         raise typer.BadParameter(
@@ -932,9 +943,12 @@ def apply_prefill_coalesce_cli_overrides(
         )
     cli_updates = cli_values.model_dump(exclude_none=True)
     for stage in matching_stages:
-        scheduling = stage.runtime.scheduling
-        if scheduling is None:
-            continue
+        # Note (maydomine): Explicit CLI values override their legacy sources
+        # instead of creating a typed-versus-legacy conflict at launch.
+        for knob in cli_updates:
+            stage.factory_args.pop(knob, None)
+            pipeline_config.runtime_overrides.get(stage.name, {}).pop(knob, None)
+        scheduling = stage.runtime.scheduling or SchedulingConfig()
         stage.runtime.scheduling = scheduling.model_copy(update=cli_updates)
     return pipeline_config
 

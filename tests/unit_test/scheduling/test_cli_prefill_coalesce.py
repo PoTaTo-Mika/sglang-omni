@@ -11,10 +11,11 @@ import pytest
 import typer
 
 from sglang_omni.cli.serve import apply_prefill_coalesce_cli_overrides
-from sglang_omni.config import (
-    PipelineConfig,
-    SchedulingConfig,
-    resolve_stage_factory_args,
+from sglang_omni.config import PipelineConfig, SchedulingConfig
+from sglang_omni.config.runtime import (
+    resolve_factory_signature_args,
+    resolve_stage_factory_arg_defaults,
+    resolve_stage_static_factory_args,
 )
 from sglang_omni.models.fun_asr.config import FunASRPipelineConfig
 from sglang_omni.models.higgs_tts.config import HiggsTtsPipelineConfig
@@ -23,11 +24,16 @@ from sglang_omni.models.moss_transcribe_diarize.config import (
 )
 from sglang_omni.models.moss_tts_local.config import MossTTSLocalPipelineConfig
 from sglang_omni.models.qwen3_omni.config import Qwen3OmniPipelineConfig
+from sglang_omni.utils.imports import import_string
 
 
 def _ar_stage_args(config: PipelineConfig, stage_name: str) -> dict[str, object]:
     stage = next(s for s in config.stages if s.name == stage_name)
-    return resolve_stage_factory_args(stage, config)
+    return resolve_factory_signature_args(
+        import_string(stage.factory),
+        resolve_stage_static_factory_args(stage, config),
+        defaults=resolve_stage_factory_arg_defaults(stage, config),
+    )
 
 
 @pytest.mark.parametrize(
@@ -89,6 +95,24 @@ def test_rejects_pipeline_without_supporting_factory():
         )
 
 
+def test_cli_discovers_legacy_full_stage_yaml():
+    dumped = HiggsTtsPipelineConfig(model_path="dummy").model_dump()
+    tts_stage = next(
+        stage for stage in dumped["stages"] if stage["name"] == "tts_engine"
+    )
+    tts_stage["runtime"].pop("scheduling")
+    config = HiggsTtsPipelineConfig(**dumped)
+
+    stage = next(stage for stage in config.stages if stage.name == "tts_engine")
+    assert stage.runtime.scheduling is None
+    apply_prefill_coalesce_cli_overrides(
+        config,
+        prefill_coalesce_requests=32,
+        prefill_coalesce_wait_ms=None,
+    )
+    assert stage.runtime.scheduling.prefill_coalesce_requests == 32
+
+
 def test_rejects_invalid_values():
     config = HiggsTtsPipelineConfig(model_path="dummy")
     with pytest.raises(typer.BadParameter):
@@ -135,6 +159,24 @@ def test_wait_only_cli_respects_legacy_request_count(caplog):
     assert not any(
         "alone does not enable" in record.message for record in caplog.records
     )
+
+
+@pytest.mark.parametrize("legacy_source", ["factory_args", "runtime_overrides"])
+def test_cli_value_overrides_legacy_source(legacy_source):
+    config = HiggsTtsPipelineConfig(model_path="dummy")
+    stage = next(s for s in config.stages if s.name == "tts_engine")
+    if legacy_source == "factory_args":
+        stage.factory_args["prefill_coalesce_requests"] = 32
+    else:
+        config.runtime_overrides[stage.name] = {"prefill_coalesce_requests": 32}
+
+    apply_prefill_coalesce_cli_overrides(
+        config,
+        prefill_coalesce_requests=64,
+        prefill_coalesce_wait_ms=None,
+    )
+
+    assert _ar_stage_args(config, "tts_engine")["prefill_coalesce_requests"] == 64
 
 
 def test_typed_and_legacy_values_conflict():

@@ -34,15 +34,6 @@ def resolve_stage_factory_args(
 
     args = resolve_stage_static_factory_args(stage_cfg, global_cfg)
     factory = import_string(stage_cfg.factory)
-    scheduling = stage_cfg.runtime.scheduling
-    if scheduling is not None and scheduling.model_dump(exclude_none=True):
-        signature = inspect.signature(factory)
-        missing = set(_PREFILL_COALESCE_KNOBS) - signature.parameters.keys()
-        if missing:
-            raise ValueError(
-                f"Stage {stage_cfg.name!r} configures runtime.scheduling, but "
-                f"factory {stage_cfg.factory!r} does not support {sorted(missing)}"
-            )
     return resolve_factory_signature_args(
         factory,
         args,
@@ -106,6 +97,14 @@ def resolve_factory_signature_args(
 
     args = dict(args)
     sig = inspect.signature(factory)
+    unsupported = set(_PREFILL_COALESCE_KNOBS) & defaults.keys() - sig.parameters.keys()
+    if unsupported:
+        # Note (maydomine): Fail in the child-side resolver used at launch so
+        # unsupported typed settings cannot be silently dropped.
+        raise ValueError(
+            f"Factory {factory.__module__}.{factory.__name__} does not support "
+            f"configured runtime.scheduling fields {sorted(unsupported)}"
+        )
 
     for name, value in defaults.items():
         if name in sig.parameters and name not in args:
