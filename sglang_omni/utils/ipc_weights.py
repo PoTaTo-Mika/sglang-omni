@@ -1108,7 +1108,7 @@ def verify_attachment(
         )
 
 
-_MOSS_REPLICA_LOCAL_STATE_TENSORS = (
+_MOSS_REQUIRED_REPLICA_LOCAL_STATE_TENSORS = (
     "audio_token_presence",
     "feedback_embeds",
     "generation_steps",
@@ -1136,14 +1136,18 @@ def _replica_local_state_audit(
     if pool is None:
         raise WeightShareError("MOSS-TTS Local model is missing its decode-state pool")
     shared_ptrs = {item[0] for item in shared_record.values()}
-    state_tensors: dict[str, torch.Tensor] = {}
-    for name in _MOSS_REPLICA_LOCAL_STATE_TENSORS:
-        tensor = getattr(pool, name, None)
-        if not isinstance(tensor, torch.Tensor):
-            raise WeightShareError(
-                f"MOSS-TTS Local replica-local state tensor {name!r} is missing"
-            )
-        state_tensors[name] = tensor
+    state_tensors = {
+        name: value
+        for name, value in vars(pool).items()
+        if isinstance(value, torch.Tensor)
+    }
+    missing = sorted(
+        set(_MOSS_REQUIRED_REPLICA_LOCAL_STATE_TENSORS) - set(state_tensors)
+    )
+    if missing:
+        raise WeightShareError(
+            f"MOSS-TTS Local replica-local state tensors are missing: {missing}"
+        )
     intersection = sorted(
         name
         for name, tensor in state_tensors.items()
@@ -1186,6 +1190,15 @@ def write_verified_attachment_audit(
         name in record and record[name][0] == tensors[name].data_ptr()
         for name in private
     )
+    shared_ptrs = {record[name][0] for name in shared_names}
+    private_shared_storage_intersection = sorted(
+        name for name in private if tensors[name].data_ptr() in shared_ptrs
+    )
+    if private_shared_storage_intersection:
+        raise WeightShareError(
+            "replica-private tensors alias shared storage: "
+            f"{private_shared_storage_intersection}"
+        )
     if not private_storage_preserved:
         raise WeightShareError(
             "replica-private tensor storage changed before the attachment audit"
@@ -1209,6 +1222,7 @@ def write_verified_attachment_audit(
         "shared_tensor_count": len(shared_names),
         "shared_tensor_names": shared_names,
         "private_tensor_names": sorted(private),
+        "private_shared_storage_intersection": private_shared_storage_intersection,
         "private_storage_preserved_after_attachment": private_storage_preserved,
         "replica_local_state": replica_local_state,
     }

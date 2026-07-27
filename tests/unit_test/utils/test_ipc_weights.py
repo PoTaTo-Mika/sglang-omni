@@ -798,8 +798,16 @@ def test_verified_attachment_audit_is_structured_and_env_gated(tmp_path):
 class _MossReplicaState:
     def __init__(self) -> None:
         self.feedback_embeds = torch.zeros(2, 4)
+        self.text_temp = torch.zeros(2)
+        self.text_top_p = torch.zeros(2)
+        self.audio_temp = torch.zeros(2)
+        self.audio_top_p = torch.zeros(2)
+        self.text_top_k = torch.zeros(2, dtype=torch.int64)
+        self.audio_top_k = torch.zeros(2, dtype=torch.int64)
+        self.seeds = torch.zeros(2, dtype=torch.int64)
         self.generation_steps = torch.zeros(2, dtype=torch.int64)
         self.sampling_steps = torch.zeros(2, dtype=torch.int64)
+        self.audio_repetition_penalty = torch.zeros(2)
         self.audio_token_presence = torch.zeros(2, 2, 4, dtype=torch.bool)
 
 
@@ -869,14 +877,23 @@ def test_moss_audit_proves_private_storage_and_history_exclusion(tmp_path):
     assert path is not None
     payload = __import__("json").loads(Path(path).read_text(encoding="utf-8"))
     assert payload["private_storage_preserved_after_attachment"] is True
+    assert payload["private_shared_storage_intersection"] == []
     assert payload["replica_local_state"] == {
         "status": "pass",
         "scope": "process_local_unregistered_tensors",
         "tensor_names": [
+            "audio_repetition_penalty",
+            "audio_temp",
             "audio_token_presence",
+            "audio_top_k",
+            "audio_top_p",
             "feedback_embeds",
             "generation_steps",
             "sampling_steps",
+            "seeds",
+            "text_temp",
+            "text_top_k",
+            "text_top_p",
         ],
         "history_tensor_names": ["audio_token_presence"],
         "shared_record_intersection": [],

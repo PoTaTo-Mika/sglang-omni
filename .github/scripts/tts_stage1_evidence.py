@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import tempfile
@@ -15,18 +14,11 @@ from typing import Any
 SCHEMA_VERSION = 1
 SUPPORTED_TOPOLOGIES = frozenset({"multi_gpu", "mps_shared"})
 REQUIRED_CORRECTNESS = ("canonical_generation", "wer", "similarity", "utmos")
-AGGREGATE_FILES = (
-    "stage1_runtime.json",
-    "stage1_correctness.json",
-    "stage1_timing.json",
-    "stage1_cleanup.json",
-)
-
-# Temporary, deliberately wide H100 safety floors. These are independent of the
-# ordinary multi_gpu and #1138 HC thresholds and only reject obvious regressions.
-# Raw accepted samples are retained here so reviewers can reproduce every floor.
+# Note (Jiaxin Deng): wide model-specific floors retain enough slack to catch only
+# obvious MPS regressions while the exact H100 samples remain auditable here.
 MPS_NORMAL_LOAD_FLOORS: dict[str, dict[str, Any]] = {
     "higgs": {
+        "concurrency": 16,
         "minimum": {
             "throughput_qps": 10.0,
             "audio_throughput_s_per_s": 43.0,
@@ -62,6 +54,7 @@ MPS_NORMAL_LOAD_FLOORS: dict[str, dict[str, Any]] = {
         },
     },
     "moss": {
+        "concurrency": 16,
         "minimum": {
             "throughput_qps": 7.0,
             "audio_throughput_s_per_s": 30.0,
@@ -130,15 +123,6 @@ def read_evidence(path: str | Path, *, expected_kind: str) -> dict[str, Any]:
         _validate_topology(str(payload.get("tts_stage1_topology")))
     elif payload.get("artifact_kind") != expected_kind:
         raise RuntimeError(f"Stage 1 evidence artifact_kind mismatch: {target}")
-    return payload
-
-
-def update_evidence(
-    path: str | Path, *, expected_kind: str, updates: Mapping[str, Any]
-) -> dict[str, Any]:
-    payload = read_evidence(path, expected_kind=expected_kind)
-    payload.update(dict(updates))
-    write_json_atomic(path, payload)
     return payload
 
 
@@ -373,6 +357,10 @@ def record_normal_performance(
         write_json_atomic(path, payload)
         return verdict
     floor = MPS_NORMAL_LOAD_FLOORS[payload["model"]]
+    if concurrency != floor["concurrency"]:
+        raise ValueError(
+            f"MPS normal-load floor is calibrated only for concurrency {floor['concurrency']}, got {concurrency}"
+        )
     failed: list[str] = []
     checks: dict[str, Any] = {}
     for metric, threshold in floor["minimum"].items():
@@ -397,7 +385,13 @@ def record_normal_performance(
         }
         if not passed:
             failed.append(metric)
-    if summary.get("failed_requests") != 0 or summary.get("completed_requests") != 1088:
+    total_requests = summary.get("total_requests")
+    if (
+        summary.get("failed_requests") != 0
+        or not isinstance(total_requests, int)
+        or total_requests <= 0
+        or summary.get("completed_requests") != total_requests
+    ):
         failed.append("canonical_request_completion")
     verdict = {
         "status": "pass" if not failed else "fail",
@@ -505,24 +499,3 @@ def finalize_timing(
         payload["status"] = "complete"
 
     return _mutate(path, expected_kind="timing", mutate=mutate)
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    commands = parser.add_subparsers(dest="command", required=True)
-    initialize = commands.add_parser("initialize")
-    initialize.add_argument("--output-dir", required=True)
-    initialize.add_argument("--topology", required=True)
-    initialize.add_argument("--model", required=True)
-    initialize.add_argument("--configured-timeout-minutes", required=True, type=int)
-    args = parser.parse_args()
-    initialize_evidence(
-        args.output_dir,
-        topology=args.topology,
-        model=args.model,
-        configured_timeout_minutes=args.configured_timeout_minutes,
-    )
-
-
-if __name__ == "__main__":
-    main()

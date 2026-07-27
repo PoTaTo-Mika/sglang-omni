@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-# Exact Stage 1 profile for two same-GPU Higgs replicas on one 80 GB H100.
-# The N=3 profile remains a separate launcher example; CI must not infer DP2
-# capacity or timeout behavior from it.
+# Note (Jiaxin Deng): a separate DP2 profile prevents CI from inferring its
+# capacity or timeout from the N=3 launcher example.
 
 config_cls: HiggsTtsPipelineConfig
 name: higgs

@@ -23,6 +23,7 @@ from tts_stage1_runtime import (  # noqa: E402
     launch_replicas,
     read_launcher_state,
     read_replica_activity,
+    record_router_process,
     teardown_mps,
     write_router_snapshot,
 )
@@ -117,6 +118,14 @@ def launch_stage1_mps_router(
             cleanup_callback=lambda: cleanup_replicas(router_was_stopped=True),
         ) as running_router:
             router = running_router
+            if router.cleanup_manifest is None:
+                raise RuntimeError("MPS Router cleanup manifest is missing")
+            record_router_process(
+                spec.output_dir,
+                pid=router.proc.pid,
+                port=router.port,
+                cleanup_manifest=router.cleanup_manifest,
+            )
             router.mps_state_dir = launcher_snapshot.state_dir
             router.audit_root = spec.output_dir
             write_router_snapshot(

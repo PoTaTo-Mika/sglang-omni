@@ -33,6 +33,12 @@ def test_model_selection_is_a_cpu_preflight_output_before_h100_setup() -> None:
         if step.get("name") == "Upload TTS preflight artifact"
     )
     assert upload["with"]["path"] == "${{ runner.temp }}/tts-stage1-preflight"
+    checkout = next(
+        step
+        for step in preflight["steps"]
+        if step.get("name") == "Checkout workflow scripts"
+    )
+    assert "with" not in checkout
     selection_step = next(
         step
         for step in preflight["steps"]
@@ -98,7 +104,7 @@ def test_stage1_alone_consumes_explicit_topology_and_validated_config() -> None:
     assert "TTS_STAGE1_TOPOLOGY" in stage1_text
     assert "TTS_STAGE1_MPS_CONFIG" in stage1_text
     assert "TTS_STAGE1_MPS_STATE_ROOT" in stage1_text
-    assert "tts-stage1-mps-state" in stage1_text
+    assert "tts-stage1-mps-state/run-${{ github.run_id }}" in stage1_text
     assert "examples/mps_dp/launch.sh" in stage1_text
     for job_name in (
         "stage-2-streaming",
@@ -120,6 +126,7 @@ def test_stage1_all_topologies_finalize_cleanup_before_always_upload() -> None:
     benchmark = steps[names.index("Run TTS non-streaming benchmark stage")]
     finalize = steps[names.index("Finalize Stage 1 evidence and cleanup")]
     upload = steps[names.index("Upload Stage 1 evidence")]
+    speed_upload = steps[names.index("Upload non-streaming speed artifact")]
 
     audit_root = benchmark["env"]["TTS_STAGE1_AUDIT_ROOT"]
     assert "run-${{ github.run_id }}" in audit_root
@@ -129,10 +136,15 @@ def test_stage1_all_topologies_finalize_cleanup_before_always_upload() -> None:
     assert "derive-core-blocks --gpu-id 0" in mps_prepare["run"]
     assert "run_tts_stage1_attempt.sh" in benchmark["run"]
     wrapper = (REPO_ROOT / ".github/scripts/run_tts_stage1_attempt.sh").read_text()
+    assert "launch.sh down" in wrapper
+    assert wrapper.index("launch.sh down") < wrapper.index(
+        "tts_stage1_runtime.py initialize"
+    )
     assert wrapper.count("tts_stage1_runtime.py initialize") == 1
     assert "tts_stage1_runtime.py finalize" in finalize["run"]
     assert "always()" in finalize["if"]
     assert "always()" in upload["if"]
+    assert "always()" in speed_upload["if"]
     assert names.index("Finalize Stage 1 evidence and cleanup") < names.index(
         "Upload Stage 1 evidence"
     )

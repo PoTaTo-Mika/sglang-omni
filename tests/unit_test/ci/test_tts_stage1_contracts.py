@@ -152,11 +152,10 @@ def test_atomic_reinitialize_replaces_stale_attempt_state(tmp_path: Path) -> Non
     evidence.initialize_evidence(
         tmp_path, topology="mps_shared", model="higgs", configured_timeout_minutes=25
     )
-    evidence.update_evidence(
-        tmp_path / "stage1_cleanup.json",
-        expected_kind="cleanup",
-        updates={"clean": True, "verdict": "clean"},
-    )
+    cleanup_path = tmp_path / "stage1_cleanup.json"
+    stale = evidence.read_evidence(cleanup_path, expected_kind="cleanup")
+    stale.update(clean=True, verdict="clean")
+    evidence.write_json_atomic(cleanup_path, stale)
     evidence.initialize_evidence(
         tmp_path, topology="mps_shared", model="higgs", configured_timeout_minutes=25
     )
@@ -204,6 +203,7 @@ def test_higgs_stage1_config_is_explicit_h100_dp2() -> None:
                 "audio_throughput_s_per_s": 58.987,
                 "output_throughput": 1570.1,
                 "output_tok_per_req_s": 111.1,
+                "total_requests": 1088,
                 "completed_requests": 1088,
                 "failed_requests": 0,
             },
@@ -217,6 +217,7 @@ def test_higgs_stage1_config_is_explicit_h100_dp2() -> None:
                 "audio_throughput_s_per_s": 43.593,
                 "output_throughput": 544.9,
                 "output_tok_per_req_s": 58.8,
+                "total_requests": 1088,
                 "completed_requests": 1088,
                 "failed_requests": 0,
             },
@@ -239,6 +240,22 @@ def test_mps_normal_load_floor_accepts_raw_h100_samples(
     assert timing["normal_load_performance"]["status"] == "pass"
 
 
+def test_mps_normal_load_floor_rejects_uncalibrated_concurrency(tmp_path: Path) -> None:
+    evidence.initialize_evidence(
+        tmp_path, topology="mps_shared", model="higgs", configured_timeout_minutes=25
+    )
+    with pytest.raises(ValueError, match="calibrated only for concurrency 16"):
+        evidence.record_normal_performance(
+            tmp_path,
+            concurrency=4,
+            summary={
+                "total_requests": 8,
+                "completed_requests": 8,
+                "failed_requests": 0,
+            },
+        )
+
+
 def test_mps_normal_load_floor_hard_fails_obvious_regression(tmp_path: Path) -> None:
     evidence.initialize_evidence(
         tmp_path, topology="mps_shared", model="higgs", configured_timeout_minutes=25
@@ -250,6 +267,7 @@ def test_mps_normal_load_floor_hard_fails_obvious_regression(tmp_path: Path) -> 
         "audio_throughput_s_per_s": 2.0,
         "output_throughput": 100.0,
         "output_tok_per_req_s": 5.0,
+        "total_requests": 1088,
         "completed_requests": 1088,
         "failed_requests": 0,
     }

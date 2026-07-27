@@ -30,7 +30,7 @@ from tts_stage1_evidence import (
 REPLICA_COUNT = 2
 RUN_ID_PATTERN = re.compile(r"^run-[A-Za-z0-9_-]+$")
 KV_PATTERN = re.compile(r"#tokens:\s*([0-9]+)")
-FAILURE_INJECTION_ENV = "TTS_STAGE1_FAILURE_INJECTION"
+
 EXPECTED_PRIVATE_TENSORS = {
     "HiggsMultimodalQwen3ForConditionalGeneration": [],
     "MossTTSLocalSGLangModel": ["_decode_input_embedding.weight"],
@@ -169,6 +169,7 @@ class MpsLaunchSpec:
             "SERVE_EXTRA_ARGS": self.serve_extra_args,
             "STATE_ROOT": str(self.state_root),
             "WEIGHT_SHARE": "1",
+            "WEIGHT_SHARE_AUDIT": "1",
         }
 
 
@@ -189,7 +190,6 @@ class LauncherState:
     manifest: dict[str, str]
     replicas: tuple[ReplicaState, ...]
     attachment_text: str
-    raw_control_text: str
     weight_audits: tuple[dict[str, Any], ...]
 
     @property
@@ -244,6 +244,8 @@ def _read_weight_audits(
             or audit.get("verified_attachment") is not True
         ):
             raise ValueError("weight-share audit was not emitted after verification")
+        if audit.get("private_shared_storage_intersection") != []:
+            raise ValueError("private tensors alias shared storage")
         if (
             audit.get("run_id") != manifest["run_id"]
             or audit.get("gpu_uuid") != manifest["gpu_uuid"]
@@ -332,7 +334,6 @@ def read_launcher_state(state_dir: str | Path) -> LauncherState:
         manifest,
         tuple(replicas),
         (state / "mps_attach.txt").read_text(encoding="utf-8"),
-        (state / "mps_control_raw.txt").read_text(encoding="utf-8"),
         _read_weight_audits(state, manifest),
     )
     if not snapshot.attachment_passed:
@@ -557,15 +558,42 @@ def write_router_snapshot(
     write_json_atomic(path, payload)
 
 
+def record_router_process(
+    output_dir: str | Path,
+    *,
+    pid: int,
+    port: int,
+    cleanup_manifest: str | Path,
+) -> None:
+    groups, parsed = read_process_groups(cleanup_manifest)
+    if not parsed or pid <= 0 or not 1 <= port < 65536:
+        raise ValueError("router cleanup identity is missing or invalid")
+    if os.getpgid(pid) not in groups:
+        raise ValueError("router process group is missing from its cleanup manifest")
+    path = Path(output_dir) / "stage1_runtime.json"
+    payload = read_evidence(path, expected_kind="runtime")
+    payload["router"]["process"] = {
+        "pid": pid,
+        "port": port,
+        "process_groups": groups,
+        "cleanup_manifest": str(cleanup_manifest),
+    }
+    write_json_atomic(path, payload)
+
+
 def launch_replicas(spec: MpsLaunchSpec) -> LauncherState:
     environment = os.environ.copy()
     environment.update(spec.environment)
-    subprocess.run(spec.command, cwd=spec.repository_root, env=environment, check=True)
     try:
+        subprocess.run(
+            spec.command, cwd=spec.repository_root, env=environment, check=True
+        )
         snapshot = read_launcher_state(spec.state_dir)
         write_mps_runtime(snapshot, output_dir=spec.output_dir)
         return snapshot
     except BaseException as original:
+        if not spec.state_dir.exists():
+            raise
         try:
             subprocess.run(
                 spec.teardown_command,
@@ -575,7 +603,7 @@ def launch_replicas(spec: MpsLaunchSpec) -> LauncherState:
             )
         except BaseException as cleanup:
             raise RuntimeError(
-                f"post-launch validation and run-scoped teardown failed; state retained at {spec.state_dir}; original={original!r}"
+                f"MPS launch/validation and run-scoped teardown failed; state retained at {spec.state_dir}; original={original!r}"
             ) from cleanup
         raise
 
@@ -649,20 +677,6 @@ def _occupied_ports(ports: Sequence[int]) -> list[int]:
     return occupied
 
 
-def _gpu_client_pids(command_runner: Any = subprocess.run) -> tuple[set[int], bool]:
-    result = command_runner(
-        ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader,nounits"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        return set(), False
-    return {
-        int(raw.strip()) for raw in result.stdout.splitlines() if raw.strip().isdigit()
-    }, True
-
-
 def teardown_mps(
     spec: MpsLaunchSpec,
     *,
@@ -704,9 +718,22 @@ def teardown_mps(
         errors.append(f"launch_down: {exc!r}")
     alive = sorted(pid for pid in tracked if _pid_alive(pid))
     try:
-        gpu_clients, gpu_query = _gpu_client_pids()
+        runtime = read_evidence(
+            Path(spec.output_dir) / "stage1_runtime.json", expected_kind="runtime"
+        )
+        baseline = runtime.get("baseline_gpu") or {
+            "status": "error",
+            "compute_clients": [],
+        }
+        post_gpu = capture_gpu_state()
+        new_clients = _new_clients(baseline, post_gpu)
+        gpu_query = (
+            baseline.get("status") == "pass" and post_gpu.get("status") == "pass"
+        )
     except BaseException as exc:
-        gpu_clients, gpu_query = set(), False
+        post_gpu = {"status": "error", "compute_clients": []}
+        new_clients = []
+        gpu_query = False
         errors.append(f"gpu_client_query: {exc!r}")
     try:
         occupied = _occupied_ports(ports)
@@ -724,17 +751,16 @@ def teardown_mps(
         "mps_namespace_inactive": not (state / "mps/pipe").exists(),
         "ports_released": not occupied,
         "gpu_client_query_succeeded": gpu_query,
-        "tracked_gpu_clients_exited": not (gpu_clients & tracked),
+        "no_new_gpu_clients": not new_clients,
         "launcher_evidence_valid": snapshot is not None and not errors,
     }
-    if (os.environ.get(FAILURE_INJECTION_ENV) or "").strip() == "dirty_mps_teardown":
-        checks["failure_injection_clear"] = False
     details = {
         "run_id": spec.run_id,
         "down_exit_code": down_exit_code,
         "tracked_processes_alive": alive,
         "occupied_ports": occupied,
-        "tracked_gpu_clients_alive": sorted(gpu_clients & tracked),
+        "new_compute_clients": new_clients,
+        "post_teardown_gpu_state": post_gpu,
         "evidence_errors": errors,
     }
     return record_generation_cleanup(
@@ -840,10 +866,6 @@ def teardown_multi_gpu(
         )
         == "pass",
     }
-    if (
-        os.environ.get(FAILURE_INJECTION_ENV) or ""
-    ).strip() == "dirty_multi_gpu_teardown":
-        checks["failure_injection_clear"] = False
     details = {
         "tracked_process_groups_alive": alive,
         "occupied_ports": occupied,
@@ -967,26 +989,30 @@ def finalize_stage1(
     replicas = runtime.get("replicas") or []
     ports = [item["port"] for item in replicas if isinstance(item.get("port"), int)]
     router_launch = runtime.get("launch", {}).get("router") or {}
+    router_process = runtime.get("router", {}).get("process") or {}
     if isinstance(router_launch.get("port"), int):
         ports.append(router_launch["port"])
+    if isinstance(router_process.get("port"), int):
+        ports.append(router_process["port"])
     evaluator_pid = cleanup.get("evaluator", {}).get("observed_pid")
     evaluator_port = cleanup.get("evaluator", {}).get("observed_port")
     if isinstance(evaluator_port, int):
         ports.append(evaluator_port)
     process_errors: list[str] = []
-    live_processes: list[int] = []
+    live_processes: set[int] = set()
     try:
-        if topology == "mps_shared":
-            for item in replicas:
-                if isinstance(item.get("pid"), int) and _pid_alive(item["pid"]):
-                    live_processes.append(item["pid"])
-        else:
-            for group in (runtime.get("processes") or {}).get("groups", []):
-                pgid = group.get("tracked_pgid")
-                if isinstance(pgid, int) and _process_group_alive(pgid):
-                    live_processes.append(pgid)
+        for group in (runtime.get("processes") or {}).get("groups", []):
+            pgid = group.get("tracked_pgid")
+            if isinstance(pgid, int) and _process_group_alive(pgid):
+                live_processes.add(pgid)
+        router_pid = router_process.get("pid")
+        if isinstance(router_pid, int) and _pid_alive(router_pid):
+            live_processes.add(router_pid)
+        for pgid in router_process.get("process_groups", []):
+            if isinstance(pgid, int) and _process_group_alive(pgid):
+                live_processes.add(pgid)
         if isinstance(evaluator_pid, int) and _pid_alive(evaluator_pid):
-            live_processes.append(evaluator_pid)
+            live_processes.add(evaluator_pid)
     except BaseException as exc:
         process_errors.append(repr(exc))
     try:
@@ -1002,8 +1028,6 @@ def finalize_stage1(
         "tracked_ports_released": not occupied,
         "post_state_query_succeeded": not process_errors,
     }
-    if (os.environ.get(FAILURE_INJECTION_ENV) or "").strip() == "dirty_post_state":
-        post_checks["failure_injection_clear"] = False
     post_clean = all(post_checks.values())
     final_post = {
         "status": "clean" if post_clean else "dirty",
@@ -1011,7 +1035,7 @@ def finalize_stage1(
         "checks": post_checks,
         "gpu_state": post,
         "new_compute_clients": new_clients,
-        "live_tracked_processes": live_processes,
+        "live_tracked_processes": sorted(live_processes),
         "occupied_ports": occupied,
         "errors": process_errors,
     }
@@ -1028,8 +1052,17 @@ def finalize_stage1(
         resolved = str(preflight.get("resolved_mps_config") or "").replace("\\", "/")
         launched = str(runtime.get("launch", {}).get("config") or "").replace("\\", "/")
         config_matches = bool(resolved and launched.endswith(resolved))
+    router_process_recorded = (
+        isinstance(router_process.get("pid"), int)
+        and isinstance(router_process.get("port"), int)
+        and bool(router_process.get("process_groups"))
+        if topology == "mps_shared"
+        else isinstance(router_launch.get("pid"), int)
+        and isinstance(router_launch.get("port"), int)
+    )
     evidence_checks = {
         "preflight_selection_matches": preflight_matches,
+        "router_process_recorded": router_process_recorded,
         "validated_config_matches": config_matches,
         "runtime_identity_matches": runtime.get("topology") == topology
         and runtime.get("model") == model,

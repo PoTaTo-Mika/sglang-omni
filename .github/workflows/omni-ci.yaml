@@ -70,11 +70,8 @@ jobs:
       labels: ${{ steps.pr.outputs.labels || '[]' }}
       selected_model: ${{ steps.tts.outputs.selected_model }}
       selection_digest: ${{ steps.tts.outputs.selection_digest }}
-      selection_reason: ${{ steps.tts.outputs.selection_reason }}
       tts_stage1_topology: ${{ steps.tts.outputs.tts_stage1_topology }}
       resolved_mps_config: ${{ steps.tts.outputs.resolved_mps_config }}
-      resolved_config_class: ${{ steps.tts.outputs.resolved_config_class }}
-      run_attempt: ${{ steps.tts.outputs.run_attempt }}
     steps:
       - name: Fetch latest PR gate state
         if: ${{ github.event_name == 'pull_request' }}
@@ -115,8 +112,6 @@ jobs:
 
       - name: Checkout workflow scripts
         uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
 
       - name: Select TTS model and topology once
         id: tts

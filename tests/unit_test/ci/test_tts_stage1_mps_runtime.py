@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -122,6 +123,7 @@ def _write_state(tmp_path: Path, *, moss: bool = False) -> Path:
             "shared_tensor_count": 2,
             "shared_tensor_names": ["embed.weight", "head.weight"],
             "private_tensor_names": private,
+            "private_shared_storage_intersection": [],
             "private_storage_preserved_after_attachment": True,
             "replica_local_state": local,
         }
@@ -137,6 +139,7 @@ def test_launch_spec_uses_production_launcher_and_fixed_dp2(tmp_path: Path) -> N
     assert spec.worker_urls == ("http://127.0.0.1:9100", "http://127.0.0.1:9101")
     assert spec.environment["N"] == "2"
     assert spec.environment["WEIGHT_SHARE"] == "1"
+    assert spec.environment["WEIGHT_SHARE_AUDIT"] == "1"
     assert spec.environment["REPLICA_ACTIVITY"] == "1"
     with pytest.raises(ValueError, match="run-"):
         _spec(tmp_path, run_id="unsafe/path")
@@ -172,6 +175,39 @@ def test_launcher_manifest_aggregates_attachment_kv_and_moss_private_state(
     assert not (root / "mps_attachment.json").exists()
 
 
+def test_launcher_rejects_private_tensor_alias_to_shared_storage(
+    tmp_path: Path,
+) -> None:
+    state = _write_state(tmp_path, moss=True)
+    audit = next((state / "weight_audit").glob("weight_share_follower_*.json"))
+    payload = json.loads(audit.read_text(encoding="utf-8"))
+    payload["private_shared_storage_intersection"] = ["_decode_input_embedding.weight"]
+    audit.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="private tensors alias shared storage"):
+        runtime.read_launcher_state(state)
+
+
+def test_failed_launcher_start_runs_production_down(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spec = _spec(tmp_path)
+    spec.state_dir.mkdir(parents=True)
+    calls: list[tuple[str, ...]] = []
+
+    def run(command, **kwargs):
+        calls.append(tuple(command))
+        if tuple(command) == spec.command:
+            raise subprocess.CalledProcessError(1, command)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(runtime.subprocess, "run", run)
+    with pytest.raises(subprocess.CalledProcessError):
+        runtime.launch_replicas(spec)
+
+    assert calls == [spec.command, spec.teardown_command]
+
+
 def test_cpu_list_round_trip_and_zombie_is_exited(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -190,6 +226,7 @@ def test_post_launch_validation_failure_still_runs_production_down(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     spec = _spec(tmp_path, run_id="run-cleanup")
+    spec.state_dir.mkdir(parents=True)
     commands = []
     monkeypatch.setattr(
         runtime.subprocess,
@@ -260,7 +297,11 @@ def test_clean_mps_teardown_permits_evaluator(
     monkeypatch.setattr(runtime, "read_launcher_state", lambda _: snapshot)
     monkeypatch.setattr(runtime, "_tracked_pids", lambda _: ({101, 102}, True))
     monkeypatch.setattr(runtime, "_pid_alive", lambda _: False)
-    monkeypatch.setattr(runtime, "_gpu_client_pids", lambda: (set(), True))
+    monkeypatch.setattr(
+        runtime,
+        "capture_gpu_state",
+        lambda: {"status": "pass", "gpus": [], "compute_clients": [], "errors": []},
+    )
     monkeypatch.setattr(runtime, "_occupied_ports", lambda _: [])
 
     def clean_down(*args, **kwargs):
@@ -293,7 +334,11 @@ def test_corrupt_mps_evidence_runs_down_and_blocks_evaluator(
         lambda command, **kwargs: commands.append(tuple(command))
         or SimpleNamespace(returncode=0),
     )
-    monkeypatch.setattr(runtime, "_gpu_client_pids", lambda: (set(), True))
+    monkeypatch.setattr(
+        runtime,
+        "capture_gpu_state",
+        lambda: {"status": "pass", "gpus": [], "compute_clients": [], "errors": []},
+    )
     monkeypatch.setattr(runtime, "_occupied_ports", lambda _: [])
     with pytest.raises(RuntimeError, match="evaluator is blocked"):
         runtime.teardown_mps(
@@ -368,6 +413,135 @@ def test_dirty_multi_gpu_cleanup_blocks_evaluator(
     )
     assert cleanup["verdict"] == "dirty"
     assert cleanup["retained_diagnostics"] == str(manifest)
+
+
+def test_record_router_process_requires_cleanup_manifest_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "audit"
+    _init(root)
+    manifest = tmp_path / "router_pgids.txt"
+    manifest.write_text("300\n", encoding="utf-8")
+    monkeypatch.setattr(runtime.os, "getpgid", lambda pid: pid, raising=False)
+
+    runtime.record_router_process(root, pid=300, port=3000, cleanup_manifest=manifest)
+
+    payload = evidence.read_evidence(
+        root / "stage1_runtime.json", expected_kind="runtime"
+    )
+    assert payload["router"]["process"] == {
+        "pid": 300,
+        "port": 3000,
+        "process_groups": [300],
+        "cleanup_manifest": str(manifest),
+    }
+
+
+def test_final_cleanup_detects_mps_router_leftover(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "audit"
+    _init(root, topology="mps_shared")
+    snapshot = runtime.read_launcher_state(_write_state(tmp_path))
+    runtime.write_mps_runtime(
+        snapshot,
+        output_dir=root,
+        command_runner=lambda *a, **k: SimpleNamespace(
+            returncode=0, stdout="", stderr=""
+        ),
+    )
+    runtime.write_router_snapshot(root, when="before", snapshot={"workers": ["a", "b"]})
+    runtime.write_router_snapshot(root, when="after", snapshot={"workers": ["a", "b"]})
+    runtime_payload = evidence.read_evidence(
+        root / "stage1_runtime.json", expected_kind="runtime"
+    )
+    runtime_payload["router"]["process"] = {
+        "pid": 300,
+        "port": 3000,
+        "process_groups": [300],
+    }
+    evidence.write_json_atomic(root / "stage1_runtime.json", runtime_payload)
+    for component in evidence.REQUIRED_CORRECTNESS:
+        evidence.record_correctness_component(
+            root, component=component, details={"ok": True}
+        )
+    evidence.record_overlap_summary(root, {"status": "pass"})
+    evidence.record_model_audits(root, {"status": "pass"})
+    evidence.record_normal_performance(
+        root,
+        concurrency=16,
+        summary={
+            "total_requests": 1088,
+            "completed_requests": 1088,
+            "failed_requests": 0,
+            "throughput_qps": 14.0,
+            "latency_mean_s": 1.1,
+            "rtf_mean": 0.27,
+            "audio_throughput_s_per_s": 59.0,
+            "output_throughput": 1500.0,
+            "output_tok_per_req_s": 110.0,
+        },
+    )
+    evidence.record_generation_cleanup(root, checks={"clean": True})
+    evidence.record_evaluator(root, status="running", pid=400, port=4000)
+    evidence.record_evaluator(root, status="completed", pid=None, port=None)
+    evidence.write_json_atomic(
+        root / "preflight.json",
+        {
+            "schema_version": 1,
+            "selected_model": "higgs",
+            "selection_digest": "digest",
+            "selection_reason": "test",
+            "tts_stage1_topology": "mps_shared",
+            "resolved_mps_config": "config.yaml",
+            "resolved_config_class": "HiggsTtsPipelineConfig",
+            "run_id": "",
+            "run_attempt": "",
+            "exact_sha": "abc123",
+            "workflow_url": "https://github.test/run/1",
+        },
+    )
+
+    monkeypatch.setattr(runtime, "_pid_alive", lambda pid: pid == 300)
+    monkeypatch.setattr(runtime, "_process_group_alive", lambda pgid: pgid == 300)
+    monkeypatch.setattr(
+        runtime, "_occupied_ports", lambda ports: [3000] if 3000 in ports else []
+    )
+    with pytest.raises(RuntimeError, match="final cleanup/evidence is dirty"):
+        runtime.finalize_stage1(
+            root,
+            topology="mps_shared",
+            model="higgs",
+            exact_sha="abc123",
+            command_runner=_gpu_runner,
+        )
+
+    cleanup = evidence.read_evidence(
+        root / "stage1_cleanup.json", expected_kind="cleanup"
+    )
+    assert cleanup["final_post_state"]["live_tracked_processes"] == [300]
+    assert cleanup["final_post_state"]["occupied_ports"] == [3000]
+
+    runtime_payload = evidence.read_evidence(
+        root / "stage1_runtime.json", expected_kind="runtime"
+    )
+    runtime_payload["router"].pop("process")
+    evidence.write_json_atomic(root / "stage1_runtime.json", runtime_payload)
+    monkeypatch.setattr(runtime, "_pid_alive", lambda _: False)
+    monkeypatch.setattr(runtime, "_process_group_alive", lambda _: False)
+    monkeypatch.setattr(runtime, "_occupied_ports", lambda _: [])
+    with pytest.raises(RuntimeError, match="final cleanup/evidence is dirty"):
+        runtime.finalize_stage1(
+            root,
+            topology="mps_shared",
+            model="higgs",
+            exact_sha="abc123",
+            command_runner=_gpu_runner,
+        )
+    cleanup = evidence.read_evidence(
+        root / "stage1_cleanup.json", expected_kind="cleanup"
+    )
+    assert cleanup["final_checks"]["router_process_recorded"] is False
 
 
 def test_final_cleanup_detects_evaluator_port_and_process_leftovers(
