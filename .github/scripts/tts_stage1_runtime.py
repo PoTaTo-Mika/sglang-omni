@@ -382,6 +382,34 @@ def _copy_raw_mps(snapshot: LauncherState, output_dir: Path) -> Path:
     return raw
 
 
+def _copy_failed_launch_diagnostics(state_dir: Path, output_dir: Path) -> Path:
+    raw = output_dir / "raw" / "mps" / "failed_launch"
+    raw.mkdir(parents=True, exist_ok=True)
+    for name in (
+        "manifest",
+        "replicas.tsv",
+        "mps_ctl.err",
+        "mps_attach.txt",
+        "mps_control_raw.txt",
+    ):
+        source = state_dir / name
+        if not source.is_symlink() and source.is_file():
+            shutil.copy2(source, raw / name)
+    for source in state_dir.glob("replica_activity_*.jsonl"):
+        if not source.is_symlink() and source.is_file():
+            shutil.copy2(source, raw / source.name)
+    for relative in (Path("logs"), Path("mps/log"), Path("weight_audit")):
+        source_dir = state_dir / relative
+        if source_dir.is_symlink() or not source_dir.is_dir():
+            continue
+        target_dir = raw / relative
+        target_dir.mkdir(parents=True, exist_ok=True)
+        for source in source_dir.iterdir():
+            if not source.is_symlink() and source.is_file():
+                shutil.copy2(source, target_dir / source.name)
+    return raw
+
+
 def write_mps_runtime(
     snapshot: LauncherState,
     *,
@@ -594,6 +622,11 @@ def launch_replicas(spec: MpsLaunchSpec) -> LauncherState:
     except BaseException as original:
         if not spec.state_dir.exists():
             raise
+        retention_error: OSError | None = None
+        try:
+            _copy_failed_launch_diagnostics(spec.state_dir, spec.output_dir)
+        except OSError as error:
+            retention_error = error
         try:
             subprocess.run(
                 spec.teardown_command,
@@ -605,6 +638,10 @@ def launch_replicas(spec: MpsLaunchSpec) -> LauncherState:
             raise RuntimeError(
                 f"MPS launch/validation and run-scoped teardown failed; state retained at {spec.state_dir}; original={original!r}"
             ) from cleanup
+        if retention_error is not None:
+            raise RuntimeError(
+                f"MPS launch failed and diagnostics could not be retained before run-scoped teardown; original={original!r}"
+            ) from retention_error
         raise
 
 

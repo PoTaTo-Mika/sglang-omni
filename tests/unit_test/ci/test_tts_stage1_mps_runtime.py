@@ -188,17 +188,24 @@ def test_launcher_rejects_private_tensor_alias_to_shared_storage(
         runtime.read_launcher_state(state)
 
 
-def test_failed_launcher_start_runs_production_down(
+def test_failed_launcher_start_preserves_diagnostics_before_production_down(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     spec = _spec(tmp_path)
     spec.state_dir.mkdir(parents=True)
+    (spec.state_dir / "mps_ctl.err").write_text(
+        "MPS daemon startup error\n", encoding="utf-8"
+    )
+    (spec.state_dir / "manifest").write_text("run_id=run-test\n", encoding="utf-8")
     calls: list[tuple[str, ...]] = []
 
     def run(command, **kwargs):
         calls.append(tuple(command))
         if tuple(command) == spec.command:
             raise subprocess.CalledProcessError(1, command)
+        (spec.state_dir / "mps_ctl.err").unlink()
+        (spec.state_dir / "manifest").unlink()
+        spec.state_dir.rmdir()
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(runtime.subprocess, "run", run)
@@ -206,6 +213,11 @@ def test_failed_launcher_start_runs_production_down(
         runtime.launch_replicas(spec)
 
     assert calls == [spec.command, spec.teardown_command]
+    raw = spec.output_dir / "raw/mps/failed_launch"
+    assert (raw / "mps_ctl.err").read_text(encoding="utf-8") == (
+        "MPS daemon startup error\n"
+    )
+    assert (raw / "manifest").read_text(encoding="utf-8") == "run_id=run-test\n"
 
 
 def test_cpu_list_round_trip_and_zombie_is_exited(
