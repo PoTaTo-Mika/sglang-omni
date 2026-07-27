@@ -39,6 +39,7 @@ from sglang.srt.managers.scheduler import validate_input_length
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.utils import broadcast_pyobj
 
+from sglang_omni.config.schema import SchedulingConfig
 from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.profiler.event_recorder import (
     emit_model_path_end as _emit_model_path_end,
@@ -58,7 +59,6 @@ from sglang_omni.proto.admin import (
     ADMIN_UPDATE_WEIGHTS_FROM_TENSOR,
     ADMIN_WEIGHTS_CHECKER,
 )
-from sglang_omni.config.schema import SchedulingConfig
 from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
 from sglang_omni.vendor.sglang.server_args import override_server_args
 
@@ -280,11 +280,8 @@ class OmniScheduler:
                 "requests"
             )
 
-        # Note: (maydomine) coalescing gate: hold prefill until K requests wait
-        # or the oldest has waited T ms; the gate engages at K >= 2 (0 and 1
-        # both leave it off — SchedulingConfig warns on 1). Config-file and
-        # CLI paths were already validated by SchedulingConfig; re-validating
-        # here covers direct construction (tests, embedding).
+        # Note (maydomine): Revalidate here because direct construction can
+        # bypass the typed YAML and CLI entrypoints.
         validated = SchedulingConfig(
             prefill_coalesce_requests=prefill_coalesce_requests,
             prefill_coalesce_wait_ms=prefill_coalesce_wait_ms,
@@ -292,9 +289,8 @@ class OmniScheduler:
         requests = validated.prefill_coalesce_requests
         wait_ms = validated.prefill_coalesce_wait_ms
         if requests is None or wait_ms is None:
-            # The scheduler defaults are concrete; None can only come from an
-            # explicit null at direct construction — fail loudly rather than
-            # guess.
+            # Note (maydomine): Reject explicit nulls rather than guessing
+            # whether they mean the concrete defaults or disabled coalescing.
             raise ValueError(
                 "prefill_coalesce_requests and prefill_coalesce_wait_ms must "
                 "be concrete values at the scheduler (got "

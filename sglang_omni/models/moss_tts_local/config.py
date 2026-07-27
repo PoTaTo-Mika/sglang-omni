@@ -9,6 +9,7 @@ from pydantic import Field
 
 from sglang_omni.config import (
     PipelineConfig,
+    SchedulingConfig,
     SGLangServerArgsConfig,
     StageConfig,
     StageResourceConfig,
@@ -48,6 +49,7 @@ def _stages(*, codec_device: str, colocated: bool) -> list[StageConfig]:
         sglang_server_args=SGLangServerArgsConfig(
             mem_fraction_static=None if colocated else _AR_MEM_FRACTION_STATIC
         ),
+        scheduling=SchedulingConfig(),
     )
     tts_engine_args: dict[str, Any] = {"dtype": "bfloat16"}
     if colocated:

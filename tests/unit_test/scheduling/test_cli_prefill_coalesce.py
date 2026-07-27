@@ -2,9 +2,7 @@
 """CLI override tests for prefill admission coalescing.
 
 ``--prefill-coalesce-requests/--prefill-coalesce-wait-ms`` write the typed
-``runtime.scheduling`` block of the pipeline's generation SGLang AR stage
-(declared via ``generation_sglang_role_to_stage``); pipelines without one are
-rejected. Type/range validation lives in ``SchedulingConfig`` itself.
+``runtime.scheduling`` block of stages whose factories declare support.
 """
 
 from __future__ import annotations
@@ -13,7 +11,11 @@ import pytest
 import typer
 
 from sglang_omni.cli.serve import apply_prefill_coalesce_cli_overrides
-from sglang_omni.config import PipelineConfig, resolve_stage_factory_args
+from sglang_omni.config import (
+    PipelineConfig,
+    SchedulingConfig,
+    resolve_stage_factory_args,
+)
 from sglang_omni.models.fun_asr.config import FunASRPipelineConfig
 from sglang_omni.models.higgs_tts.config import HiggsTtsPipelineConfig
 from sglang_omni.models.moss_transcribe_diarize.config import (
@@ -51,7 +53,7 @@ def test_cli_sets_coalesce_args(config_cls, stage_name):
     assert args["prefill_coalesce_wait_ms"] == 300.0
 
 
-def test_typed_yaml_field_reaches_factory_args():
+def test_typed_scheduling_field_reaches_factory_args():
     config = HiggsTtsPipelineConfig(model_path="dummy")
     stage = next(s for s in config.stages if s.name == "tts_engine")
     stage.runtime.scheduling = type(stage.runtime.scheduling)(
@@ -59,10 +61,11 @@ def test_typed_yaml_field_reaches_factory_args():
     )
     args = _ar_stage_args(config, "tts_engine")
     assert args["prefill_coalesce_requests"] == 16
-    # wait_ms unset -> factory keeps its own default (not injected)
-    assert "prefill_coalesce_wait_ms" not in args or args[
-        "prefill_coalesce_wait_ms"
-    ] == 60.0
+    # Note (maydomine): An omitted typed value must preserve the factory default.
+    assert (
+        "prefill_coalesce_wait_ms" not in args
+        or args["prefill_coalesce_wait_ms"] == 60.0
+    )
 
 
 def test_omitting_both_flags_is_a_noop():
@@ -75,8 +78,8 @@ def test_omitting_both_flags_is_a_noop():
 
 
 def test_rejects_pipeline_without_supporting_factory():
-    # Qwen3-TTS's engine factory does not declare prefill_coalesce_* kwargs,
-    # so the CLI flags must be rejected for it.
+    # Note (maydomine): Reject unsupported factories instead of silently
+    # accepting ineffective CLI flags.
     from sglang_omni.models.qwen3_tts.config import Qwen3TTSPipelineConfig
 
     config = Qwen3TTSPipelineConfig(model_path="dummy")
@@ -101,14 +104,56 @@ def test_rejects_invalid_values():
             )
 
 
-def test_direct_factory_args_are_rejected():
-    # runtime.scheduling owns these knobs; raw factory_args bypass its
-    # validation and must fail at resolve time.
+def test_legacy_factory_args_are_validated(caplog):
+    # Note (maydomine): Preserve #1071 configs while directing users to the
+    # typed replacement.
+    config = HiggsTtsPipelineConfig(model_path="dummy")
+    stage = next(s for s in config.stages if s.name == "tts_engine")
+    stage.factory_args = {
+        **(stage.factory_args or {}),
+        "prefill_coalesce_requests": 32.0,
+    }
+    with caplog.at_level("WARNING", logger="sglang_omni.config.runtime"):
+        args = _ar_stage_args(config, "tts_engine")
+    assert args["prefill_coalesce_requests"] == 32
+    assert any("deprecated" in record.message for record in caplog.records)
+
+
+def test_wait_only_cli_respects_legacy_request_count(caplog):
     config = HiggsTtsPipelineConfig(model_path="dummy")
     stage = next(s for s in config.stages if s.name == "tts_engine")
     stage.factory_args = {
         **(stage.factory_args or {}),
         "prefill_coalesce_requests": 32,
     }
-    with pytest.raises(ValueError, match="runtime.scheduling"):
+    with caplog.at_level("WARNING", logger="sglang_omni.cli.serve"):
+        apply_prefill_coalesce_cli_overrides(
+            config,
+            prefill_coalesce_requests=None,
+            prefill_coalesce_wait_ms=300,
+        )
+    assert not any(
+        "alone does not enable" in record.message for record in caplog.records
+    )
+
+
+def test_typed_and_legacy_values_conflict():
+    config = HiggsTtsPipelineConfig(model_path="dummy")
+    stage = next(s for s in config.stages if s.name == "tts_engine")
+    stage.runtime.scheduling = SchedulingConfig(prefill_coalesce_requests=16)
+    stage.factory_args = {
+        **(stage.factory_args or {}),
+        "prefill_coalesce_requests": 32,
+    }
+    with pytest.raises(ValueError, match="through both"):
+        _ar_stage_args(config, "tts_engine")
+
+
+def test_typed_scheduling_rejects_unsupported_factory():
+    from sglang_omni.models.qwen3_tts.config import Qwen3TTSPipelineConfig
+
+    config = Qwen3TTSPipelineConfig(model_path="dummy")
+    stage = next(s for s in config.stages if s.name == "tts_engine")
+    stage.runtime.scheduling = SchedulingConfig(prefill_coalesce_requests=16)
+    with pytest.raises(ValueError, match="does not support"):
         _ar_stage_args(config, "tts_engine")

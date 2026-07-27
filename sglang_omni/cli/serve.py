@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect
 import logging
 from typing import Annotated, Literal, NoReturn
 
@@ -873,32 +872,57 @@ def apply_prefill_coalesce_cli_overrides(
 ) -> PipelineConfig:
     if prefill_coalesce_requests is None and prefill_coalesce_wait_ms is None:
         return pipeline_config
-    # A stage supports coalescing iff its factory signature declares the
-    # knobs (the same declaring-is-opt-in rule the resolver uses to inject
-    # runtime.scheduling values). A pipeline may run several OmniScheduler AR
-    # stages (e.g. Qwen3-Omni Speech: thinker + talker_ar) of which only some
-    # opt in; the CLI applies one value to every supporting stage — configure
-    # runtime.scheduling per stage in the YAML to differentiate.
-    from sglang_omni.utils.imports import import_string
+    # Note (maydomine): Validate before factory imports so malformed CLI values
+    # fail without loading model dependencies.
+    from sglang_omni.config.schema import SchedulingConfig
 
-    matching_stages = []
-    for stage in pipeline_config.stages:
-        # Importing the factory is what the resolver does anyway at build
-        # time; an unimportable factory would fail the launch regardless,
-        # so surfacing the error here is strictly earlier, not stricter.
-        signature = inspect.signature(import_string(stage.factory))
-        if "prefill_coalesce_requests" in signature.parameters:
-            matching_stages.append(stage)
+    try:
+        cli_values = SchedulingConfig(
+            prefill_coalesce_requests=prefill_coalesce_requests,
+            prefill_coalesce_wait_ms=prefill_coalesce_wait_ms,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    # Note (maydomine): Model configs opt in with a scheduling block so CLI
+    # validation does not import optional model dependencies.
+    matching_stages = [
+        stage
+        for stage in pipeline_config.stages
+        if stage.runtime.scheduling is not None
+    ]
     if not matching_stages:
         raise typer.BadParameter(
             "--prefill-coalesce-requests/--prefill-coalesce-wait-ms require a "
             "stage whose factory declares prefill coalescing; no stage in "
             f"{type(pipeline_config).__name__} does"
         )
-    if prefill_coalesce_requests is None and not any(
-        # The YAML may already enable the gate; only warn when tuning the wait
-        # would genuinely have no effect on any targeted stage.
-        (stage.runtime.scheduling.prefill_coalesce_requests or 0) >= 2
+    if len(matching_stages) > 1:
+        stage_names = ", ".join(stage.name for stage in matching_stages)
+        logger.warning(
+            "Prefill coalescing CLI values apply to all supporting stages "
+            f"({stage_names}); use per-stage runtime.scheduling values to "
+            "configure them independently"
+        )
+
+    def configured_requests(stage: StageConfig) -> int:
+        scheduling = stage.runtime.scheduling
+        if scheduling is not None and scheduling.prefill_coalesce_requests is not None:
+            return scheduling.prefill_coalesce_requests
+        overrides = pipeline_config.runtime_overrides.get(stage.name, {})
+        if "prefill_coalesce_requests" in overrides:
+            raw_value = overrides["prefill_coalesce_requests"]
+        else:
+            raw_value = stage.factory_args.get("prefill_coalesce_requests")
+        try:
+            validated = SchedulingConfig(prefill_coalesce_requests=raw_value)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        return validated.prefill_coalesce_requests or 0
+
+    if cli_values.prefill_coalesce_requests is None and not any(
+        # Note (maydomine): YAML may already enable the gate, in which case a
+        # CLI wait override is effective and should not trigger a warning.
+        configured_requests(stage) >= 2
         for stage in matching_stages
     ):
         logger.warning(
@@ -906,17 +930,12 @@ def apply_prefill_coalesce_cli_overrides(
             "gate engages only when prefill_coalesce_requests is >= 2 (via "
             "--prefill-coalesce-requests or runtime.scheduling in the config)"
         )
+    cli_updates = cli_values.model_dump(exclude_none=True)
     for stage in matching_stages:
         scheduling = stage.runtime.scheduling
-        try:
-            updates = scheduling.model_dump(exclude_none=True)
-            if prefill_coalesce_requests is not None:
-                updates["prefill_coalesce_requests"] = prefill_coalesce_requests
-            if prefill_coalesce_wait_ms is not None:
-                updates["prefill_coalesce_wait_ms"] = prefill_coalesce_wait_ms
-            stage.runtime.scheduling = type(scheduling)(**updates)
-        except ValueError as exc:
-            raise typer.BadParameter(str(exc)) from exc
+        if scheduling is None:
+            continue
+        stage.runtime.scheduling = scheduling.model_copy(update=cli_updates)
     return pipeline_config
 
 
@@ -1278,7 +1297,7 @@ def serve(
                 "amortizing the per-step host cost. The gate engages at >= 2; "
                 "0 disables (default), and 1 is likewise a no-op (logs a "
                 "warning). "
-                "Applies to the pipeline's generation SGLang AR stage."
+                "Applies to every stage whose factory supports coalescing."
             ),
         ),
     ] = None,

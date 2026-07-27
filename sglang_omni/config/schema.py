@@ -106,12 +106,13 @@ class SchedulingConfig(BaseModel):
     def _validate_requests(cls, value: Any) -> Any:
         if value is None:
             return None
-        # Validate before int() truncation can silently change meaning:
-        # YAML `-0.5` would land as 0 (gate silently off), `2.9` as 2,
-        # `true` as 1.
-        if isinstance(value, bool):
-            raise ValueError("prefill_coalesce_requests must be an integer, not a bool")
-        if isinstance(value, float) and value != int(value):
+        # Note (maydomine): Reject lossy coercions before int() can silently
+        # turn invalid YAML values into valid but unintended settings.
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("prefill_coalesce_requests must be an integer")
+        if isinstance(value, float) and (
+            not math.isfinite(value) or not value.is_integer()
+        ):
             raise ValueError(
                 f"prefill_coalesce_requests must be an integer, got {value!r}"
             )
@@ -119,9 +120,8 @@ class SchedulingConfig(BaseModel):
         if value < 0:
             raise ValueError("prefill_coalesce_requests must be >= 0")
         if value == 1:
-            # 0 and 1 both leave the admission gate disabled (it only engages
-            # at >= 2 — a batch of one has nothing to coalesce with); 1 is
-            # accepted but almost always a misconfiguration.
+            # Note (maydomine): Keep 1 compatible as an off value, but surface
+            # its likely accidental use because the gate starts at 2.
             logging.getLogger(__name__).warning(
                 "prefill_coalesce_requests=1 disables coalescing: the "
                 "admission gate only engages at >= 2. Use 0 to disable "
@@ -134,9 +134,14 @@ class SchedulingConfig(BaseModel):
     def _validate_wait_ms(cls, value: Any) -> Any:
         if value is None:
             return None
-        if isinstance(value, bool):
-            raise ValueError("prefill_coalesce_wait_ms must be a number, not a bool")
-        value = float(value)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("prefill_coalesce_wait_ms must be a number")
+        try:
+            value = float(value)
+        except OverflowError as exc:
+            raise ValueError(
+                "prefill_coalesce_wait_ms must be a finite value > 0"
+            ) from exc
         if not (math.isfinite(value) and value > 0):
             raise ValueError("prefill_coalesce_wait_ms must be a finite value > 0")
         return value
@@ -158,7 +163,7 @@ class StageRuntimeConfig(BaseModel):
     sglang_server_args: SGLangServerArgsConfig = Field(
         default_factory=SGLangServerArgsConfig
     )
-    scheduling: SchedulingConfig = Field(default_factory=SchedulingConfig)
+    scheduling: SchedulingConfig | None = None
 
     def model_post_init(self, __context: Any = None) -> None:
         if self.max_seq_len is not None and self.max_seq_len <= 0:

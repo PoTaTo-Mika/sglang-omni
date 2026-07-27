@@ -4,11 +4,19 @@
 from __future__ import annotations
 
 import inspect
+import logging
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from sglang_omni.config.schema import PipelineConfig, StageConfig
+from sglang_omni.config.schema import PipelineConfig, SchedulingConfig, StageConfig
 from sglang_omni.utils.imports import import_string
+
+logger = logging.getLogger(__name__)
+
+_PREFILL_COALESCE_KNOBS = (
+    "prefill_coalesce_requests",
+    "prefill_coalesce_wait_ms",
+)
 
 
 def resolve_stage_factory_args(
@@ -26,6 +34,15 @@ def resolve_stage_factory_args(
 
     args = resolve_stage_static_factory_args(stage_cfg, global_cfg)
     factory = import_string(stage_cfg.factory)
+    scheduling = stage_cfg.runtime.scheduling
+    if scheduling is not None and scheduling.model_dump(exclude_none=True):
+        signature = inspect.signature(factory)
+        missing = set(_PREFILL_COALESCE_KNOBS) - signature.parameters.keys()
+        if missing:
+            raise ValueError(
+                f"Stage {stage_cfg.name!r} configures runtime.scheduling, but "
+                f"factory {stage_cfg.factory!r} does not support {sorted(missing)}"
+            )
     return resolve_factory_signature_args(
         factory,
         args,
@@ -47,6 +64,7 @@ def resolve_stage_static_factory_args(
     runtime_overrides = global_cfg.runtime_overrides.get(stage_cfg.name, {})
     _validate_runtime_sources(stage_cfg, args, runtime_overrides)
     _merge_factory_arg_overrides(args, runtime_overrides)
+    _normalize_legacy_scheduling_args(stage_cfg.name, args)
     _apply_typed_runtime_args(args, stage_cfg)
     return args
 
@@ -66,10 +84,11 @@ def resolve_stage_factory_arg_defaults(
     total_gpu_memory_fraction = stage_cfg.runtime.resources.total_gpu_memory_fraction
     if total_gpu_memory_fraction is not None:
         defaults["total_gpu_memory_fraction"] = total_gpu_memory_fraction
-    # Typed scheduling knobs reach the AR factory only when its signature
-    # declares them, so declaring the parameter IS the capability opt-in —
-    # no separate supported-factory list to maintain.
+    # Note (maydomine): Factory declarations remain the final capability guard,
+    # preventing typed values from reaching unsupported call sites.
     scheduling = stage_cfg.runtime.scheduling
+    if scheduling is None:
+        return defaults
     if scheduling.prefill_coalesce_requests is not None:
         defaults["prefill_coalesce_requests"] = scheduling.prefill_coalesce_requests
     if scheduling.prefill_coalesce_wait_ms is not None:
@@ -177,15 +196,16 @@ def _validate_runtime_sources(
         runtime_overrides,
     )
 
-    # Coalescing knobs are owned by typed runtime.scheduling: raw
-    # factory_args/runtime_overrides bypass its validation (bool/truncation/
-    # range), so direct writes are rejected rather than silently merged.
-    for knob in ("prefill_coalesce_requests", "prefill_coalesce_wait_ms"):
-        if knob in factory_args or knob in runtime_overrides:
+    scheduling = stage_cfg.runtime.scheduling
+    if scheduling is not None:
+        for knob in _PREFILL_COALESCE_KNOBS:
+            if getattr(scheduling, knob) is None:
+                continue
+            if knob not in factory_args and knob not in runtime_overrides:
+                continue
             raise ValueError(
-                f"Stage {stage_cfg.name!r} sets {knob} through "
-                "factory_args/runtime_overrides; set "
-                f"runtime.scheduling.{knob} instead"
+                f"Stage {stage_cfg.name!r} sets {knob} through both "
+                "factory_args/runtime_overrides and runtime.scheduling"
             )
 
     for field_name, value in _mapped_stage_runtime_values(stage_cfg).items():
@@ -228,6 +248,27 @@ def _merge_factory_arg_overrides(
             args[key] = merged
             continue
         args[key] = value
+
+
+def _normalize_legacy_scheduling_args(
+    stage_name: str,
+    args: dict[str, Any],
+) -> None:
+    legacy_values = {
+        knob: args[knob] for knob in _PREFILL_COALESCE_KNOBS if knob in args
+    }
+    if not legacy_values:
+        return
+    # Note (maydomine): Keep #1071 configs working while routing their values
+    # through the same validation used by typed runtime.scheduling.
+    validated = SchedulingConfig(**legacy_values)
+    for knob in legacy_values:
+        args[knob] = getattr(validated, knob)
+    logger.warning(
+        "Stage %r sets prefill coalescing through deprecated "
+        "factory_args/runtime_overrides; migrate to runtime.scheduling",
+        stage_name,
+    )
 
 
 def _apply_typed_runtime_args(args: dict[str, Any], stage_cfg: StageConfig) -> None:
