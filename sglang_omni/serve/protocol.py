@@ -363,6 +363,10 @@ class CreateSpeechRequest(BaseModel):
     top_k: int | None = None
     repetition_penalty: float | None = None
     seed: int | None = None
+    cfg_value: float | None = Field(default=None, gt=0.0)
+    inference_timesteps: int | None = Field(default=None, ge=1)
+    min_len: int | None = Field(default=None, ge=0)
+    streaming_prefix_len: int | None = Field(default=None, ge=1)
 
     # Per-stage overrides (sglang-omni specific)
     stage_params: dict[str, dict[str, Any]] | None = None
@@ -398,6 +402,10 @@ class SpeechBatchItem(BaseModel):
     top_k: Any = None
     repetition_penalty: Any = None
     seed: Any = None
+    cfg_value: Any = None
+    inference_timesteps: Any = None
+    min_len: Any = None
+    streaming_prefix_len: Any = None
     stage_params: Any = None
 
 
@@ -431,6 +439,10 @@ class CreateSpeechBatchRequest(BaseModel):
     top_k: int | None = None
     repetition_penalty: float | None = None
     seed: int | None = None
+    cfg_value: float | None = Field(default=None, gt=0.0)
+    inference_timesteps: int | None = Field(default=None, ge=1)
+    min_len: int | None = Field(default=None, ge=0)
+    streaming_prefix_len: int | None = Field(default=None, ge=1)
     stage_params: dict[str, dict[str, Any]] | None = None
 
 
@@ -485,6 +497,10 @@ class SpeechStreamSessionConfig(BaseModel):
     top_k: int | None = None
     repetition_penalty: float | None = None
     seed: int | None = None
+    cfg_value: float | None = Field(default=None, gt=0.0)
+    inference_timesteps: int | None = Field(default=None, ge=1)
+    min_len: int | None = Field(default=None, ge=0)
+    streaming_prefix_len: int | None = Field(default=None, ge=1)
     stage_params: dict[str, dict[str, Any]] | None = None
 
 

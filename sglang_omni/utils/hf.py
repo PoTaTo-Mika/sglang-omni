@@ -29,6 +29,8 @@ _CONFIG_MODEL_TYPE_TO_ARCH = {
     "moss_tts_delay_with_codec": "MossTTSDelayWithCodec",
     "moss_tts_local": "MossTTSLocalModel",
     "qwen3_tts": "Qwen3TTSForConditionalGeneration",
+    "voxcpm": "voxcpm",
+    "voxcpm2": "voxcpm2",
     "voxtral_tts": "VoxtralTTSForConditionalGeneration",
 }
 

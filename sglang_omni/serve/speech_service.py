@@ -240,6 +240,13 @@ class SpeechRequestValidator:
             updates["language"] = self._normalize_language(request.language)
 
         _validate_positive_int(request.max_new_tokens, param="max_new_tokens")
+        _validate_positive_int(
+            request.inference_timesteps, param="inference_timesteps"
+        )
+        _validate_non_negative_int(request.min_len, param="min_len")
+        _validate_positive_int(
+            request.streaming_prefix_len, param="streaming_prefix_len"
+        )
         _validate_positive_int(request.token_count, param="token_count")
         _validate_positive_int(request.duration_tokens, param="duration_tokens")
         _validate_non_negative_int(
@@ -550,6 +557,13 @@ class SpeechRequestValidator:
         if batch.language is not None:
             self._normalize_language(batch.language)
         _validate_positive_int(batch.max_new_tokens, param="max_new_tokens")
+        _validate_positive_int(
+            batch.inference_timesteps, param="inference_timesteps"
+        )
+        _validate_non_negative_int(batch.min_len, param="min_len")
+        _validate_positive_int(
+            batch.streaming_prefix_len, param="streaming_prefix_len"
+        )
         _validate_positive_int(batch.token_count, param="token_count")
         _validate_positive_int(batch.duration_tokens, param="duration_tokens")
         _validate_non_negative_int(
@@ -634,6 +648,9 @@ class SpeechRequestValidator:
             "token_count",
             "duration_tokens",
             "seed",
+            "inference_timesteps",
+            "min_len",
+            "streaming_prefix_len",
         ):
             if field_name in payload and payload[field_name] is not None:
                 value = payload[field_name]
@@ -645,7 +662,13 @@ class SpeechRequestValidator:
             value = payload["top_k"]
             if isinstance(value, bool) or not isinstance(value, int):
                 raise bad_request("top_k must be an integer", param="top_k")
-        for field_name in ("speed", "temperature", "top_p", "repetition_penalty"):
+        for field_name in (
+            "speed",
+            "temperature",
+            "top_p",
+            "repetition_penalty",
+            "cfg_value",
+        ):
             if field_name in payload and payload[field_name] is not None:
                 value = payload[field_name]
                 if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -729,6 +752,10 @@ def _explicit_generation_params(request: CreateSpeechRequest) -> list[str]:
             "top_k",
             "repetition_penalty",
             "seed",
+            "cfg_value",
+            "inference_timesteps",
+            "min_len",
+            "streaming_prefix_len",
         )
         if field in request.model_fields_set
     )
@@ -776,6 +803,15 @@ def _build_tts_params(
         tts_params["duration_tokens"] = request.duration_tokens
     if request.seed is not None:
         tts_params["seed"] = request.seed
+    for field_name in (
+        "cfg_value",
+        "inference_timesteps",
+        "min_len",
+        "streaming_prefix_len",
+    ):
+        value = getattr(request, field_name)
+        if value is not None:
+            tts_params[field_name] = value
     return tts_params
 
 

@@ -1,0 +1,2 @@
+config_cls: VoxCPMPipelineConfig
+model_path: OpenBMB/VoxCPM1.5

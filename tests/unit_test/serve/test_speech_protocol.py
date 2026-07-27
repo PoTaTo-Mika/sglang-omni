@@ -51,6 +51,26 @@ def test_speech_generation_uses_served_model_and_default_voice() -> None:
     assert generate_request.metadata["tts_params"]["voice"] == "default"
 
 
+def test_speech_generation_lowers_voxcpm_parameters() -> None:
+    service = SpeechRequestValidator(default_model="voxcpm2")
+    prepared = service.parse_generation_request(
+        {
+            "input": "hello",
+            "cfg_value": 2.5,
+            "inference_timesteps": 12,
+            "min_len": 3,
+            "streaming_prefix_len": 4,
+        }
+    )
+    generate_request = service.build_generate_request(prepared.request, validate=False)
+
+    tts_params = generate_request.metadata["tts_params"]
+    assert tts_params["cfg_value"] == 2.5
+    assert tts_params["inference_timesteps"] == 12
+    assert tts_params["min_len"] == 3
+    assert tts_params["streaming_prefix_len"] == 4
+
+
 @pytest.mark.parametrize("stream", [False, True])
 def test_speech_generation_accepts_seedtts_reference_payload_without_voice(
     stream: bool,

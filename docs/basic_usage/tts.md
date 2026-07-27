@@ -29,6 +29,8 @@ uv pip install --no-deps qwen-tts==0.1.1
 | [Qwen3-TTS VoiceDesign](../cookbook/qwen3_tts.md) | `examples/configs/qwen3_tts_1_7b_voicedesign.yaml` | Requires `task_type="VoiceDesign"` and non-empty `instructions`. No reference audio is required |
 | [Ming-Omni-TTS](../cookbook/ming_tts.md) | `examples/configs/ming_omni_tts.yaml` | Text-only synthesis or one local reference clip with its transcript; TP1 is supported and the provided config uses TP2 |
 | [MOSS-TTS](../cookbook/moss_tts.md) | `examples/configs/moss_tts.yaml` | Voice cloning via `ref_audio` or `references[0].audio_path` (+ `text`). Duration via `${token:N}` or `token_count`. Benchmark at `--max-concurrency 8` |
+| VoxCPM1.5 | `examples/configs/voxcpm.yaml` | Text-only synthesis or continuation cloning; `ref_text` is optional when `ref_audio` is supplied |
+| VoxCPM2 | `examples/configs/voxcpm2.yaml` | Text-only synthesis, isolated cloning with `ref_audio`, or continuation with `ref_audio` + `ref_text`; outputs 48 kHz audio |
 
 ## Launch the Server
 
@@ -501,7 +503,11 @@ The table below lists all parameters accepted by the `/v1/audio/speech` endpoint
 | `top_p` | float | `null` | Top-p sampling |
 | `top_k` | int | `null` | Top-k sampling |
 | `repetition_penalty` | float | `null` | Repetition penalty |
-| `seed` | int | `null` | Model-specific. Qwen3-TTS Base accepts request-scoped seed, Voxtral TTS currently rejects seed |
+| `seed` | int | `null` | Model-specific. Qwen3-TTS Base and VoxCPM accept request-scoped seeds; Voxtral TTS currently rejects seed |
+| `cfg_value` | float | `null` | VoxCPM classifier-free guidance strength |
+| `inference_timesteps` | int | `null` | VoxCPM diffusion solver steps per generated latent patch |
+| `min_len` | int | `null` | Minimum VoxCPM latent patches before accepting the stop prediction |
+| `streaming_prefix_len` | int | `null` | Number of initial VoxCPM latent chunks buffered before streaming emission |
 
 Invalid speech requests return an OpenAI-style error envelope:
 

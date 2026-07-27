@@ -39,6 +39,8 @@ _ARCH_CONFIG_MAP: dict[str, tuple[str, str | None]] = {
     "MossTTSDelaySGLangModel": ("language_config", None),
     "MossTTSLocalSGLangModel": ("language_config", None),
     "MossTranscribeDiarizeForConditionalGeneration": ("text_config", None),
+    "VoxCPMSGLangModel": ("lm_config", None),
+    "VoxCPM2SGLangModel": ("lm_config", None),
 }
 
 
@@ -86,6 +88,15 @@ class ModelWorker:
             )
 
             register_ming_tts_hf_config()
+        if self.model_arch_override in {
+            "VoxCPMSGLangModel",
+            "VoxCPM2SGLangModel",
+        }:
+            from sglang_omni.models.voxcpm_common.hf_config import (
+                register_voxcpm_configs,
+            )
+
+            register_voxcpm_configs()
 
         from sglang.srt.configs.model_config import ModelConfig
 
@@ -124,12 +135,44 @@ class ModelWorker:
         if sub_cfg is None:
             return
         text_cfg = getattr(sub_cfg, text_config_attr) if text_config_attr else sub_cfg
-        model_config.hf_text_config = text_cfg
-        model_config.num_attention_heads = text_cfg.num_attention_heads
-        model_config.num_key_value_heads = text_cfg.num_key_value_heads
-        model_config.hidden_size = text_cfg.hidden_size
-        model_config.num_hidden_layers = text_cfg.num_hidden_layers
-        if arch == "MingTTSSGLangModel":
+        value = (
+            (lambda name: text_cfg[name])
+            if isinstance(text_cfg, dict)
+            else (lambda name: getattr(text_cfg, name))
+        )
+        if isinstance(text_cfg, dict):
+            from types import SimpleNamespace
+
+            model_config.hf_text_config = SimpleNamespace(**text_cfg)
+        else:
+            model_config.hf_text_config = text_cfg
+        model_config.num_attention_heads = value("num_attention_heads")
+        model_config.num_key_value_heads = value("num_key_value_heads")
+        model_config.hidden_size = value("hidden_size")
+        model_config.num_hidden_layers = value("num_hidden_layers")
+        if arch in {
+            "VoxCPMSGLangModel",
+            "VoxCPM2SGLangModel",
+        }:
+            kv_channels = (
+                text_cfg.get("kv_channels")
+                if isinstance(text_cfg, dict)
+                else getattr(text_cfg, "kv_channels", None)
+            )
+            model_config.head_dim = int(
+                kv_channels
+                or int(value("hidden_size")) // int(value("num_attention_heads"))
+            )
+            model_config.v_head_dim = model_config.head_dim
+            model_config.vocab_size = int(value("vocab_size"))
+            model_config.context_len = int(value("max_position_embeddings"))
+            residual_layers = int(
+                getattr(model_config.hf_config, "residual_lm_num_layers", 0)
+            )
+            model_config.num_attention_layers = (
+                int(value("num_hidden_layers")) + residual_layers
+            )
+        elif arch == "MingTTSSGLangModel":
             model_config.head_dim = int(text_cfg.head_dim)
             model_config.v_head_dim = model_config.head_dim
             model_config.vocab_size = int(text_cfg.vocab_size)
