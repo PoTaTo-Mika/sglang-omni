@@ -112,9 +112,7 @@ def test_stage1_alone_consumes_explicit_topology_and_validated_config() -> None:
     rendered_root = state_root.replace(
         "${{ env.OMNI_CI_HOME }}", "/data/omni-ci/run-30255610170"
     )
-    control_socket = (
-        f"{rendered_root}/gpu-0/run-tts-30255610170-1/mps/pipe/control"
-    )
+    control_socket = f"{rendered_root}/gpu-0/run-tts-30255610170-1/mps/pipe/control"
     assert len(control_socket.encode()) <= 107
     assert "examples/mps_dp/launch.sh" in stage1_text
     for job_name in (
