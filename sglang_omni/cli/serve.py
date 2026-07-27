@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import logging
 from typing import Annotated, Literal, NoReturn
 
@@ -15,7 +16,6 @@ from sglang_omni.config.manager import ConfigManager
 from sglang_omni.preprocessing.resource_connector import (
     resolve_allowed_local_media_path,
 )
-from sglang_omni.scheduling.prefill_coalesce import validate_prefill_coalesce_args
 from sglang_omni.serve.protocol import DEFAULT_TTS_BATCH_MAX_ITEMS
 from sglang_omni.utils.gpu_compat import should_disable_custom_all_reduce_for_gpus
 
@@ -40,21 +40,6 @@ _ASYNC_DECODE_FACTORIES = frozenset(
 _ASYNC_DECODE_SUPPORTED_MODELS = (
     "Higgs TTS, MOSS-TTS-Local, MOSS-Transcribe-Diarize, Fun-ASR, "
     "Qwen3-ASR, and the Qwen3-Omni thinker"
-)
-_PREFILL_COALESCE_FACTORIES = frozenset(
-    {
-        "sglang_omni.models.higgs_tts.stages.create_sglang_tts_engine_executor",
-        "sglang_omni.models.moss_tts_local.stages.create_sglang_tts_engine_executor",
-        "sglang_omni.models.qwen3_omni.stages."
-        "create_sglang_thinker_executor_from_config",
-        "sglang_omni.models.moss_transcribe_diarize.stages."
-        "create_sglang_moss_transcribe_diarize_executor",
-        "sglang_omni.models.fun_asr.stages.create_sglang_fun_asr_executor",
-    }
-)
-_PREFILL_COALESCE_SUPPORTED_MODELS = (
-    "Higgs TTS, MOSS-TTS-Local, MOSS-Transcribe-Diarize, Fun-ASR, "
-    "and the Qwen3-Omni thinker"
 )
 _QWEN_PARTIAL_START_TALKER_FACTORY = (
     "sglang_omni.models.qwen3_omni.stages.create_talker_ar_executor_from_config"
@@ -886,44 +871,52 @@ def apply_prefill_coalesce_cli_overrides(
     prefill_coalesce_requests: int | None,
     prefill_coalesce_wait_ms: float | None,
 ) -> PipelineConfig:
-    try:
-        requests, wait_ms = validate_prefill_coalesce_args(
-            prefill_coalesce_requests,
-            prefill_coalesce_wait_ms,
-        )
-    except ValueError as exc:
-        raise typer.BadParameter(str(exc)) from exc
-
-    updates: dict[str, object] = {}
-    if requests is not None:
-        updates["prefill_coalesce_requests"] = requests
-    if wait_ms is not None:
-        updates["prefill_coalesce_wait_ms"] = wait_ms
-    if not updates:
+    if prefill_coalesce_requests is None and prefill_coalesce_wait_ms is None:
         return pipeline_config
-    matching_stages = [
-        stage
-        for stage in pipeline_config.stages
-        if stage.factory in _PREFILL_COALESCE_FACTORIES
-    ]
+    # A stage supports coalescing iff its factory signature declares the
+    # knobs (the same declaring-is-opt-in rule the resolver uses to inject
+    # runtime.scheduling values). A pipeline may run several OmniScheduler AR
+    # stages (e.g. Qwen3-Omni Speech: thinker + talker_ar) of which only some
+    # opt in; the CLI applies one value to every supporting stage — configure
+    # runtime.scheduling per stage in the YAML to differentiate.
+    from sglang_omni.utils.imports import import_string
+
+    matching_stages = []
+    for stage in pipeline_config.stages:
+        # Importing the factory is what the resolver does anyway at build
+        # time; an unimportable factory would fail the launch regardless,
+        # so surfacing the error here is strictly earlier, not stricter.
+        signature = inspect.signature(import_string(stage.factory))
+        if "prefill_coalesce_requests" in signature.parameters:
+            matching_stages.append(stage)
     if not matching_stages:
         raise typer.BadParameter(
-            "--prefill-coalesce-requests/--prefill-coalesce-wait-ms currently "
-            f"support only {_PREFILL_COALESCE_SUPPORTED_MODELS}; no stage in "
-            "this pipeline uses a supported factory"
+            "--prefill-coalesce-requests/--prefill-coalesce-wait-ms require a "
+            "stage whose factory declares prefill coalescing; no stage in "
+            f"{type(pipeline_config).__name__} does"
         )
     if prefill_coalesce_requests is None and not any(
         # The YAML may already enable the gate; only warn when tuning the wait
         # would genuinely have no effect on any targeted stage.
-        int((stage.factory_args or {}).get("prefill_coalesce_requests", 0)) >= 2
+        (stage.runtime.scheduling.prefill_coalesce_requests or 0) >= 2
         for stage in matching_stages
     ):
         logger.warning(
             "--prefill-coalesce-wait-ms alone does not enable coalescing; the "
             "gate engages only when prefill_coalesce_requests is >= 2 (via "
-            "--prefill-coalesce-requests or the stage's factory_args)"
+            "--prefill-coalesce-requests or runtime.scheduling in the config)"
         )
-    _apply_factory_args_updates(pipeline_config, matching_stages, updates)
+    for stage in matching_stages:
+        scheduling = stage.runtime.scheduling
+        try:
+            updates = scheduling.model_dump(exclude_none=True)
+            if prefill_coalesce_requests is not None:
+                updates["prefill_coalesce_requests"] = prefill_coalesce_requests
+            if prefill_coalesce_wait_ms is not None:
+                updates["prefill_coalesce_wait_ms"] = prefill_coalesce_wait_ms
+            stage.runtime.scheduling = type(scheduling)(**updates)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
     return pipeline_config
 
 
@@ -1285,7 +1278,7 @@ def serve(
                 "amortizing the per-step host cost. The gate engages at >= 2; "
                 "0 disables (default), and 1 is likewise a no-op (logs a "
                 "warning). "
-                f"Available for {_PREFILL_COALESCE_SUPPORTED_MODELS}."
+                "Applies to the pipeline's generation SGLang AR stage."
             ),
         ),
     ] = None,

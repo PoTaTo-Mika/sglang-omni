@@ -66,6 +66,14 @@ def resolve_stage_factory_arg_defaults(
     total_gpu_memory_fraction = stage_cfg.runtime.resources.total_gpu_memory_fraction
     if total_gpu_memory_fraction is not None:
         defaults["total_gpu_memory_fraction"] = total_gpu_memory_fraction
+    # Typed scheduling knobs reach the AR factory only when its signature
+    # declares them, so declaring the parameter IS the capability opt-in —
+    # no separate supported-factory list to maintain.
+    scheduling = stage_cfg.runtime.scheduling
+    if scheduling.prefill_coalesce_requests is not None:
+        defaults["prefill_coalesce_requests"] = scheduling.prefill_coalesce_requests
+    if scheduling.prefill_coalesce_wait_ms is not None:
+        defaults["prefill_coalesce_wait_ms"] = scheduling.prefill_coalesce_wait_ms
     return defaults
 
 
@@ -168,6 +176,17 @@ def _validate_runtime_sources(
         factory_args,
         runtime_overrides,
     )
+
+    # Coalescing knobs are owned by typed runtime.scheduling: raw
+    # factory_args/runtime_overrides bypass its validation (bool/truncation/
+    # range), so direct writes are rejected rather than silently merged.
+    for knob in ("prefill_coalesce_requests", "prefill_coalesce_wait_ms"):
+        if knob in factory_args or knob in runtime_overrides:
+            raise ValueError(
+                f"Stage {stage_cfg.name!r} sets {knob} through "
+                "factory_args/runtime_overrides; set "
+                f"runtime.scheduling.{knob} instead"
+            )
 
     for field_name, value in _mapped_stage_runtime_values(stage_cfg).items():
         if value is None:
