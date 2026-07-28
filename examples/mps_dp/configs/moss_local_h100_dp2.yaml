@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-# Validated on one 80 GB H100: two same-GPU MOSS TTS local replicas with
-# shared weights. Per-replica budget: AR 0.30 plus 0.15 codec reserve.
+# Note (Jiaxin Deng): independent weights keep this CI topology free of the
+# CUDA-IPC lifecycle while fixed per-replica budgets bound memory demand.
 
 config_cls: MossTTSLocalPipelineConfig
 name: mossl

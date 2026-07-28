@@ -40,7 +40,6 @@ from __future__ import annotations
 
 import hashlib
 import io
-import json
 import logging
 import os
 import pickle
@@ -59,7 +58,6 @@ logger = logging.getLogger(__name__)
 ENV_WEIGHT_SHARE = "SGLANG_OMNI_WEIGHT_SHARE"
 ENV_WEIGHT_SHARE_TIMEOUT_S = "SGLANG_OMNI_WEIGHT_SHARE_TIMEOUT_S"
 ENV_WEIGHT_SHARE_RUN_ID = "SGLANG_OMNI_WEIGHT_SHARE_RUN_ID"
-ENV_WEIGHT_SHARE_AUDIT_DIR = "SGLANG_OMNI_WEIGHT_SHARE_AUDIT_DIR"
 DEFAULT_ATTACH_TIMEOUT_S = 1800.0
 # Note (Jiaxin Deng): version 2 added per-tensor share/private classification;
 # version-1 handles predate it and must not be attached.
@@ -128,10 +126,7 @@ def _gpu_uuid() -> str | None:
         return None
     try:
         props = torch.cuda.get_device_properties(torch.cuda.current_device())
-        raw = str(getattr(props, "uuid", "") or "") or None
-        if raw is None or raw.startswith(("GPU-", "MIG-")):
-            return raw
-        return f"GPU-{raw}"
+        return str(getattr(props, "uuid", "") or "") or None
     except Exception:
         return None
 
@@ -561,9 +556,9 @@ def export_weights(
     the leader's bytes into their own storage and never alias it.
 
     Returns a record {name: (data_ptr, shape, dtype)} of the leader-side shared
-    tensors plus policy-private tensors for verify_attachment: the leader's own
-    storages must stay put since followers alias or copy from them, so in-place
-    mutation is fine but rebinding .data after export is not.
+    tensors for verify_attachment: the leader's own storages must stay put since
+    followers alias them, so in-place mutation is fine but rebinding .data after
+    export is not.
     """
     abs_path = os.path.abspath(file_path)
     if abs_path in _EXPORTED_FILES:
@@ -610,11 +605,8 @@ def export_weights(
     _atomic_write(abs_path, pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL))
     _EXPORTED_FILES.add(abs_path)
 
-    recorded_names = set(ipc_tensors) | set(private)
     record = {
-        name: (t.data_ptr(), tuple(t.shape), t.dtype)
-        for name, t in tensors.items()
-        if name in recorded_names
+        name: (t.data_ptr(), tuple(t.shape), t.dtype) for name, t in ipc_tensors.items()
     }
     shared_bytes = sum(t.numel() * t.element_size() for t in ipc_tensors.values())
     logger.info(
@@ -1106,132 +1098,6 @@ def verify_attachment(
             "weight-share attachment was broken after attach; offending "
             f"tensors (first 10): {drifted[:10]}"
         )
-
-
-_MOSS_REQUIRED_REPLICA_LOCAL_STATE_TENSORS = (
-    "audio_token_presence",
-    "feedback_embeds",
-    "generation_steps",
-    "sampling_steps",
-)
-_MOSS_HISTORY_STATE_TENSORS = ("audio_token_presence",)
-
-
-def _replica_local_state_audit(
-    model: torch.nn.Module,
-    *,
-    architecture: str,
-    shared_record: dict[str, tuple[int, tuple[int, ...], torch.dtype]],
-) -> dict[str, Any]:
-    if architecture != "MossTTSLocalSGLangModel":
-        return {
-            "status": "not_applicable",
-            "reason_code": "no_architecture_specific_mutable_state",
-            "scope": "none",
-            "tensor_names": [],
-            "history_tensor_names": [],
-            "shared_record_intersection": [],
-        }
-    pool = getattr(model, "_state_pool", None)
-    if pool is None:
-        raise WeightShareError("MOSS-TTS Local model is missing its decode-state pool")
-    shared_ptrs = {item[0] for item in shared_record.values()}
-    state_tensors = {
-        name: value
-        for name, value in vars(pool).items()
-        if isinstance(value, torch.Tensor)
-    }
-    missing = sorted(
-        set(_MOSS_REQUIRED_REPLICA_LOCAL_STATE_TENSORS) - set(state_tensors)
-    )
-    if missing:
-        raise WeightShareError(
-            f"MOSS-TTS Local replica-local state tensors are missing: {missing}"
-        )
-    intersection = sorted(
-        name
-        for name, tensor in state_tensors.items()
-        if tensor.data_ptr() in shared_ptrs
-    )
-    if intersection:
-        raise WeightShareError(
-            "MOSS-TTS Local replica-local state aliases the weight-share record: "
-            f"{intersection}"
-        )
-    return {
-        "status": "pass",
-        "scope": "process_local_unregistered_tensors",
-        "tensor_names": sorted(state_tensors),
-        "history_tensor_names": list(_MOSS_HISTORY_STATE_TENSORS),
-        "shared_record_intersection": [],
-    }
-
-
-def write_verified_attachment_audit(
-    model: torch.nn.Module,
-    record: dict[str, tuple[int, tuple[int, ...], torch.dtype]],
-    *,
-    config: WeightShareConfig,
-    policy: WeightSharePolicy,
-    architecture: str,
-    environ: Any | None = None,
-) -> str | None:
-    """Persist an env-gated audit only after verify_attachment succeeds."""
-
-    env = os.environ if environ is None else environ
-    audit_dir = (env.get(ENV_WEIGHT_SHARE_AUDIT_DIR) or "").strip()
-    if not audit_dir:
-        return None
-    _prepare_secure_dir(audit_dir)
-    tensors = _named_shared_tensors(model)
-    private = _resolve_private_names(tensors, policy.private_tensor_names, model)
-    shared_names = sorted(set(record) - private)
-    private_storage_preserved = all(
-        name in record and record[name][0] == tensors[name].data_ptr()
-        for name in private
-    )
-    shared_ptrs = {record[name][0] for name in shared_names}
-    private_shared_storage_intersection = sorted(
-        name for name in private if tensors[name].data_ptr() in shared_ptrs
-    )
-    if private_shared_storage_intersection:
-        raise WeightShareError(
-            "replica-private tensors alias shared storage: "
-            f"{private_shared_storage_intersection}"
-        )
-    if not private_storage_preserved:
-        raise WeightShareError(
-            "replica-private tensor storage changed before the attachment audit"
-        )
-    replica_local_state = _replica_local_state_audit(
-        model,
-        architecture=architecture,
-        shared_record={name: record[name] for name in shared_names},
-    )
-    payload = {
-        "schema_version": 1,
-        "status": "pass",
-        "verified_attachment": True,
-        "role": config.role,
-        "run_id": config.run_id,
-        "pid": os.getpid(),
-        "gpu_uuid": _gpu_uuid(),
-        "architecture": architecture,
-        "model_class": type(model).__name__,
-        "manifest_hash": _manifest_hash(tensors, private),
-        "shared_tensor_count": len(shared_names),
-        "shared_tensor_names": shared_names,
-        "private_tensor_names": sorted(private),
-        "private_shared_storage_intersection": private_shared_storage_intersection,
-        "private_storage_preserved_after_attachment": private_storage_preserved,
-        "replica_local_state": replica_local_state,
-    }
-    path = os.path.join(audit_dir, f"weight_share_{config.role}_{os.getpid()}.json")
-    _atomic_write(
-        path,
-        (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8"),
-    )
-    return path
 
 
 def leader_export(

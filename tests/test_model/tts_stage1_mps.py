@@ -78,7 +78,7 @@ def launch_stage1_mps_router(
     worker_extra_args: str,
     wait_timeout: int,
 ) -> Iterator[ManagedRouterHandle]:
-    """Launch exactly two shared-weight replicas and the production router."""
+    """Launch exactly two same-GPU MPS replicas and the production router."""
 
     if os.environ.get(TOPOLOGY_ENV) != "mps_shared":
         raise ValueError("launch_stage1_mps_router requires mps_shared topology")

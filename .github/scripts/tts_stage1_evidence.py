@@ -189,9 +189,6 @@ def initialize_evidence(
             "router": {"before": None, "after": None},
             "processes": {"status": "pending"},
             "mps": mps,
-            "model_audits": {
-                "status": "pending" if topology == "mps_shared" else "not_applicable"
-            },
             "raw_state_directory": None,
             "evidence_index": {"status": "pending"},
         },
@@ -210,9 +207,6 @@ def initialize_evidence(
                 if topology == "mps_shared"
                 else {"status": "not_applicable", "reason": "mps_disabled_for_topology"}
             ),
-            "model_audits": {
-                "status": "pending" if topology == "mps_shared" else "not_applicable"
-            },
         },
     )
     write_json_atomic(
@@ -300,7 +294,6 @@ def _refresh_correctness(payload: dict[str, Any]) -> None:
     )
     if payload["topology"] == "mps_shared":
         complete = complete and payload["overlap_canary"].get("status") == "pass"
-        complete = complete and payload["model_audits"].get("status") == "pass"
     payload["status"] = "pass" if complete else "incomplete"
 
 
@@ -327,16 +320,6 @@ def record_overlap_summary(output_dir: str | Path, verdict: Mapping[str, Any]) -
         if payload["topology"] != "mps_shared":
             raise ValueError("overlap evidence applies only to mps_shared")
         payload["overlap_canary"] = summary
-        _refresh_correctness(payload)
-
-    _mutate(path, expected_kind="correctness", mutate=mutate)
-
-
-def record_model_audits(output_dir: str | Path, summary: Mapping[str, Any]) -> None:
-    path = Path(output_dir) / "stage1_correctness.json"
-
-    def mutate(payload: dict[str, Any]) -> None:
-        payload["model_audits"] = dict(summary)
         _refresh_correctness(payload)
 
     _mutate(path, expected_kind="correctness", mutate=mutate)

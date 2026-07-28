@@ -67,7 +67,7 @@ def test_single_model_label_wins_without_override() -> None:
     assert result.selection_reason == "label:run-moss"
 
 
-def test_default_topology_and_merged_1124_registry_resolution() -> None:
+def test_default_topology_and_stage1_registry_resolution() -> None:
     higgs = _select(labels=["run-higgs"])
     moss = _select(labels=["run-moss"])
     assert higgs.tts_stage1_topology == "mps_shared"
@@ -83,9 +83,6 @@ def test_config_path_is_derived_from_registry(tmp_path: Path) -> None:
     config_dir = tmp_path / "examples" / "mps_dp" / "configs"
     config_dir.mkdir(parents=True)
     (tmp_path / "examples" / "mps_dp" / "config.py").write_text(
-        "WEIGHT_SHARE_VALIDATED_CONFIGS = {\n"
-        '    "HiggsTtsPipelineConfig": "HiggsArchitecture",\n'
-        "}\n"
         "TTS_STAGE1_VALIDATED_CONFIGS = {\n"
         '    "higgs": "configs/custom_higgs.yaml",\n'
         "}\n",
@@ -146,6 +143,11 @@ def test_initialize_writes_only_four_aggregate_json_files(
         }
     else:
         assert runtime["mps"]["status"] == "pending"
+        assert "model_audits" not in runtime
+        correctness = evidence.read_evidence(
+            tmp_path / "stage1_correctness.json", expected_kind="correctness"
+        )
+        assert "model_audits" not in correctness
 
 
 def test_atomic_reinitialize_replaces_stale_attempt_state(tmp_path: Path) -> None:

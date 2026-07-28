@@ -63,9 +63,6 @@ def _resolve_config(
     repository_root: Path,
     model: str,
 ) -> tuple[str, str]:
-    weight_share_registry = _load_registry(
-        repository_root, "WEIGHT_SHARE_VALIDATED_CONFIGS"
-    )
     tts_registry = _load_registry(repository_root, "TTS_STAGE1_VALIDATED_CONFIGS")
     relative_to_mps = tts_registry.get(model)
     if not relative_to_mps:
@@ -75,11 +72,8 @@ def _resolve_config(
     if not path.is_file():
         raise ValueError(f"Validated MPS config is missing: {relative_path}")
     config_class = _config_class(path)
-    if config_class not in weight_share_registry:
-        raise ValueError(
-            f"{config_class} is not in the merged #1124 "
-            "WEIGHT_SHARE_VALIDATED_CONFIGS registry"
-        )
+    if not config_class:
+        raise ValueError(f"Validated MPS config has no config_cls: {relative_path}")
     return relative_path, config_class
 
 

@@ -50,14 +50,14 @@ def _spec(tmp_path: Path, *, run_id: str = "run-123") -> runtime.MpsLaunchSpec:
     )
 
 
-def _write_state(tmp_path: Path, *, moss: bool = False) -> Path:
+def _write_state(tmp_path: Path) -> Path:
     state = tmp_path / "state"
     logs = state / "logs"
     logs.mkdir(parents=True)
     (state / "manifest").write_text(
         "run_id=run-123\ngpu_id=0\ngpu_uuid=GPU-abc\nnuma_node=0\n"
         "config=/repo/config.yaml\nn=2\nbase_port=9100\n"
-        "core_blocks=0-3 4-7\nmax_total_tokens=30000\nweight_share=1\n",
+        "core_blocks=0-3 4-7\nmax_total_tokens=30000\nweight_share=0\n",
         encoding="utf-8",
     )
     (state / "replicas.tsv").write_text(
@@ -77,59 +77,6 @@ def _write_state(tmp_path: Path, *, moss: bool = False) -> Path:
     (state / "mps_control_raw.txt").write_text(
         "$ get_server_list\n99\n", encoding="utf-8"
     )
-    audit_dir = state / "weight_audit"
-    audit_dir.mkdir()
-    architecture = (
-        "MossTTSLocalSGLangModel"
-        if moss
-        else "HiggsMultimodalQwen3ForConditionalGeneration"
-    )
-    private = ["_decode_input_embedding.weight"] if moss else []
-    local = (
-        {
-            "status": "pass",
-            "scope": "process_local_unregistered_tensors",
-            "tensor_names": [
-                "audio_token_presence",
-                "feedback_embeds",
-                "generation_steps",
-                "sampling_steps",
-            ],
-            "history_tensor_names": ["audio_token_presence"],
-            "shared_record_intersection": [],
-        }
-        if moss
-        else {
-            "status": "not_applicable",
-            "reason_code": "no_architecture_specific_mutable_state",
-            "scope": "none",
-            "tensor_names": [],
-            "history_tensor_names": [],
-            "shared_record_intersection": [],
-        }
-    )
-    for role, pid in (("leader", 101), ("follower", 102)):
-        payload = {
-            "schema_version": 1,
-            "status": "pass",
-            "verified_attachment": True,
-            "role": role,
-            "run_id": "run-123",
-            "pid": pid,
-            "gpu_uuid": "GPU-abc",
-            "architecture": architecture,
-            "model_class": "TtsModel",
-            "manifest_hash": "manifest-1",
-            "shared_tensor_count": 2,
-            "shared_tensor_names": ["embed.weight", "head.weight"],
-            "private_tensor_names": private,
-            "private_shared_storage_intersection": [],
-            "private_storage_preserved_after_attachment": True,
-            "replica_local_state": local,
-        }
-        (audit_dir / f"weight_share_{role}_{pid}.json").write_text(
-            json.dumps(payload) + "\n", encoding="utf-8"
-        )
     return state
 
 
@@ -138,19 +85,19 @@ def test_launch_spec_uses_production_launcher_and_fixed_dp2(tmp_path: Path) -> N
     assert spec.command == ("bash", str(REPO_ROOT / "examples/mps_dp/launch.sh"), "up")
     assert spec.worker_urls == ("http://127.0.0.1:9100", "http://127.0.0.1:9101")
     assert spec.environment["N"] == "2"
-    assert spec.environment["WEIGHT_SHARE"] == "1"
-    assert spec.environment["WEIGHT_SHARE_AUDIT"] == "1"
+    assert spec.environment["WEIGHT_SHARE"] == "0"
+    assert "WEIGHT_SHARE_AUDIT" not in spec.environment
     assert spec.environment["REPLICA_ACTIVITY"] == "1"
     with pytest.raises(ValueError, match="run-"):
         _spec(tmp_path, run_id="unsafe/path")
 
 
-def test_launcher_manifest_aggregates_attachment_kv_and_moss_private_state(
+def test_launcher_manifest_aggregates_attachment_and_equal_kv_without_weight_sharing(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "audit"
     _init(root, model="moss")
-    snapshot = runtime.read_launcher_state(_write_state(tmp_path, moss=True))
+    snapshot = runtime.read_launcher_state(_write_state(tmp_path))
     runtime.write_mps_runtime(
         snapshot,
         output_dir=root,
@@ -166,26 +113,10 @@ def test_launcher_manifest_aggregates_attachment_kv_and_moss_private_state(
     assert [item["max_total_tokens"] for item in payload["replicas"]] == [30000, 30000]
     assert payload["mps"]["attachment"]["replicas"] == [0, 1]
     assert payload["mps"]["equal_kv"] == {"status": "pass", "max_total_tokens": 30000}
-    private = payload["model_audits"]["private_state"]
-    assert private["private_tensor_names"] == ["_decode_input_embedding.weight"]
-    assert private["follower_private_storage_preserved"] is True
-    assert private["replica_local_state"]["shared_record_intersection"] == []
-    assert private["history_provenance"]["tensor_names"] == ["audio_token_presence"]
+    assert payload["launch"]["weight_share"] is False
+    assert "model_audits" not in payload
     assert (root / "raw/mps/mps_control_raw.txt").is_file()
     assert not (root / "mps_attachment.json").exists()
-
-
-def test_launcher_rejects_private_tensor_alias_to_shared_storage(
-    tmp_path: Path,
-) -> None:
-    state = _write_state(tmp_path, moss=True)
-    audit = next((state / "weight_audit").glob("weight_share_follower_*.json"))
-    payload = json.loads(audit.read_text(encoding="utf-8"))
-    payload["private_shared_storage_intersection"] = ["_decode_input_embedding.weight"]
-    audit.write_text(json.dumps(payload) + "\n", encoding="utf-8")
-
-    with pytest.raises(ValueError, match="private tensors alias shared storage"):
-        runtime.read_launcher_state(state)
 
 
 def test_failed_launcher_start_preserves_diagnostics_before_production_down(
@@ -478,7 +409,6 @@ def test_final_cleanup_detects_mps_router_leftover(
             root, component=component, details={"ok": True}
         )
     evidence.record_overlap_summary(root, {"status": "pass"})
-    evidence.record_model_audits(root, {"status": "pass"})
     evidence.record_normal_performance(
         root,
         concurrency=16,

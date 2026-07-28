@@ -324,10 +324,8 @@ up() {
   local model_name=${MODEL_NAME:-}
   local gpu=${GPU_ID:-0} n=${N:-3} base_port=${BASE_PORT:-8801} mf=${MF:-}
   local weight_share=${WEIGHT_SHARE:-0}
-  local weight_share_audit=${WEIGHT_SHARE_AUDIT:-0}
   local replica_activity=${REPLICA_ACTIVITY:-0}
   [[ "$weight_share" =~ ^[01]$ ]] || die "WEIGHT_SHARE must be 0 or 1, got '$weight_share'"
-  [[ "$weight_share_audit" =~ ^[01]$ ]] || die "WEIGHT_SHARE_AUDIT must be 0 or 1, got '$weight_share_audit'"
   [[ "$replica_activity" =~ ^[01]$ ]] || die "REPLICA_ACTIVITY must be 0 or 1, got '$replica_activity'"
   [[ "$gpu" =~ ^[0-9]+$ ]] || die "GPU_ID must be a non-negative integer, got '$gpu'"
   [[ "$n" =~ ^[1-9][0-9]*$ ]] || die "N must be a positive integer, got '$n'"
@@ -451,8 +449,8 @@ up() {
     echo "weight_share=$weight_share"; echo "replica_activity=$replica_activity"
   } > "$state/manifest"
   if [ "$weight_share" = 1 ]; then
-    mkdir -p "$state/ipc_weights" "$state/weight_audit"
-    chmod 700 "$state/ipc_weights" "$state/weight_audit"
+    mkdir -p "$state/ipc_weights"
+    chmod 700 "$state/ipc_weights"
   fi
 
   export CUDA_MPS_PIPE_DIRECTORY=$state/mps/pipe CUDA_MPS_LOG_DIRECTORY=$state/mps/log
@@ -496,10 +494,6 @@ up() {
     if [ "$replica_activity" = 1 ]; then
       activity_path="$state/replica_activity_$i.jsonl"
     fi
-    audit_path=""
-    if [ "$weight_share" = 1 ] && [ "$weight_share_audit" = 1 ]; then
-      audit_path="$state/weight_audit"
-    fi
     # Note (Jiaxin Deng): concurrent colocated launches raced on CUDA-graph capture and
     # memory profiling in testing, so replicas start sequentially behind a health
     # gate; setsid gives each replica its own process group so teardown can signal
@@ -507,7 +501,6 @@ up() {
     CUDA_VISIBLE_DEVICES="$uuid" \
     SGLANG_OMNI_WEIGHT_SHARE="$ws_env" \
     SGLANG_OMNI_WEIGHT_SHARE_RUN_ID="$run" \
-    SGLANG_OMNI_WEIGHT_SHARE_AUDIT_DIR="$audit_path" \
     SGLANG_OMNI_REPLICA_ACTIVITY_PATH="$activity_path" \
     SGLANG_OMNI_REPLICA_ACTIVITY_RUN_ID="$run" \
     SGLANG_OMNI_REPLICA_ACTIVITY_REPLICA_ID="$i" \

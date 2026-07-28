@@ -22,7 +22,6 @@ from tts_stage1_evidence import (
     initialize_evidence,
     read_evidence,
     record_generation_cleanup,
-    record_model_audits,
     record_runtime_section,
     write_json_atomic,
 )
@@ -30,11 +29,6 @@ from tts_stage1_evidence import (
 REPLICA_COUNT = 2
 RUN_ID_PATTERN = re.compile(r"^run-[A-Za-z0-9_-]+$")
 KV_PATTERN = re.compile(r"#tokens:\s*([0-9]+)")
-
-EXPECTED_PRIVATE_TENSORS = {
-    "HiggsMultimodalQwen3ForConditionalGeneration": [],
-    "MossTTSLocalSGLangModel": ["_decode_input_embedding.weight"],
-}
 
 
 def parse_cpu_list(value: str) -> list[int]:
@@ -168,8 +162,7 @@ class MpsLaunchSpec:
             "RUN_ID": self.run_id,
             "SERVE_EXTRA_ARGS": self.serve_extra_args,
             "STATE_ROOT": str(self.state_root),
-            "WEIGHT_SHARE": "1",
-            "WEIGHT_SHARE_AUDIT": "1",
+            "WEIGHT_SHARE": "0",
         }
 
 
@@ -190,7 +183,6 @@ class LauncherState:
     manifest: dict[str, str]
     replicas: tuple[ReplicaState, ...]
     attachment_text: str
-    weight_audits: tuple[dict[str, Any], ...]
 
     @property
     def attachment_passed(self) -> bool:
@@ -218,63 +210,6 @@ def _read_kv_tokens(path: Path) -> int:
     return int(matches[-1])
 
 
-def _read_weight_audits(
-    state: Path, manifest: Mapping[str, str]
-) -> tuple[dict[str, Any], ...]:
-    paths = sorted((state / "weight_audit").glob("weight_share_*.json"))
-    if len(paths) != 2:
-        raise ValueError("expected exactly two verified weight-share audit files")
-    audits = tuple(json.loads(path.read_text(encoding="utf-8")) for path in paths)
-    if {item.get("role") for item in audits} != {"leader", "follower"}:
-        raise ValueError("weight-share audits require leader and follower roles")
-    equality_fields = (
-        "architecture",
-        "model_class",
-        "manifest_hash",
-        "shared_tensor_count",
-        "shared_tensor_names",
-        "private_tensor_names",
-        "private_storage_preserved_after_attachment",
-        "replica_local_state",
-    )
-    for audit in audits:
-        if (
-            audit.get("schema_version") != 1
-            or audit.get("status") != "pass"
-            or audit.get("verified_attachment") is not True
-        ):
-            raise ValueError("weight-share audit was not emitted after verification")
-        if audit.get("private_shared_storage_intersection") != []:
-            raise ValueError("private tensors alias shared storage")
-        if (
-            audit.get("run_id") != manifest["run_id"]
-            or audit.get("gpu_uuid") != manifest["gpu_uuid"]
-        ):
-            raise ValueError(
-                "weight-share audit identity does not match launcher state"
-            )
-    for field in equality_fields:
-        if len({json.dumps(item.get(field), sort_keys=True) for item in audits}) != 1:
-            raise ValueError(f"weight-share leader/follower disagree on {field}")
-    first = audits[0]
-    architecture = first["architecture"]
-    if first["private_tensor_names"] != EXPECTED_PRIVATE_TENSORS.get(architecture):
-        raise ValueError(f"private tensor policy mismatch for {architecture}")
-    if set(first["shared_tensor_names"]) & set(first["private_tensor_names"]):
-        raise ValueError("private tensors leaked into shared payload")
-    if first.get("private_storage_preserved_after_attachment") is not True:
-        raise ValueError("replica-private storage preservation was not verified")
-    local = first.get("replica_local_state") or {}
-    if architecture == "MossTTSLocalSGLangModel" and (
-        local.get("status") != "pass"
-        or local.get("scope") != "process_local_unregistered_tensors"
-        or local.get("shared_record_intersection") != []
-        or "audio_token_presence" not in local.get("history_tensor_names", [])
-    ):
-        raise ValueError("MOSS replica-local history isolation audit failed")
-    return audits
-
-
 def read_launcher_state(state_dir: str | Path) -> LauncherState:
     state = Path(state_dir)
     manifest = _read_key_values(state / "manifest")
@@ -295,10 +230,12 @@ def read_launcher_state(state_dir: str | Path) -> LauncherState:
         raise ValueError(f"launcher manifest is missing fields: {missing}")
     if (
         manifest["n"] != "2"
-        or manifest["weight_share"] != "1"
+        or manifest["weight_share"] != "0"
         or not manifest["max_total_tokens"].isdigit()
     ):
-        raise ValueError("launcher did not establish DP2 weight sharing and fixed KV")
+        raise ValueError(
+            "launcher did not establish independent-weight DP2 and fixed KV"
+        )
     replicas: list[ReplicaState] = []
     for line in (state / "replicas.tsv").read_text(encoding="utf-8").splitlines():
         fields = line.split("\t")
@@ -334,7 +271,6 @@ def read_launcher_state(state_dir: str | Path) -> LauncherState:
         manifest,
         tuple(replicas),
         (state / "mps_attach.txt").read_text(encoding="utf-8"),
-        _read_weight_audits(state, manifest),
     )
     if not snapshot.attachment_passed:
         raise ValueError("both replicas are not proven attached to private MPS")
@@ -375,10 +311,7 @@ def _copy_raw_mps(snapshot: LauncherState, output_dir: Path) -> Path:
     raw.mkdir(parents=True, exist_ok=True)
     for name in ("manifest", "replicas.tsv", "mps_attach.txt", "mps_control_raw.txt"):
         shutil.copy2(snapshot.state_dir / name, raw / name)
-    for directory in ("logs", "weight_audit"):
-        shutil.copytree(
-            snapshot.state_dir / directory, raw / directory, dirs_exist_ok=True
-        )
+    shutil.copytree(snapshot.state_dir / "logs", raw / "logs", dirs_exist_ok=True)
     return raw
 
 
@@ -398,7 +331,7 @@ def _copy_failed_launch_diagnostics(state_dir: Path, output_dir: Path) -> Path:
     for source in state_dir.glob("replica_activity_*.jsonl"):
         if not source.is_symlink() and source.is_file():
             shutil.copy2(source, raw / source.name)
-    for relative in (Path("logs"), Path("mps/log"), Path("weight_audit")):
+    for relative in (Path("logs"), Path("mps/log")):
         source_dir = state_dir / relative
         if source_dir.is_symlink() or not source_dir.is_dir():
             continue
@@ -418,38 +351,10 @@ def write_mps_runtime(
 ) -> None:
     root = Path(output_dir)
     raw = _copy_raw_mps(snapshot, root)
-    audits = snapshot.weight_audits
-    first = audits[0]
-    follower = next(item for item in audits if item["role"] == "follower")
-    local = first["replica_local_state"]
-    model_audits = {
-        "status": "pass",
-        "architecture": first["architecture"],
-        "weight_share": {
-            "status": "pass",
-            "manifest_hash": first["manifest_hash"],
-            "shared_tensor_count": first["shared_tensor_count"],
-            "roles": sorted(item["role"] for item in audits),
-        },
-        "private_state": {
-            "status": "pass",
-            "private_tensor_names": first["private_tensor_names"],
-            "shared_tensor_intersection": [],
-            "follower_private_storage_preserved": follower[
-                "private_storage_preserved_after_attachment"
-            ],
-            "replica_local_state": local,
-            "history_provenance": {
-                "scope": "replica_process" if local["status"] == "pass" else "none",
-                "tensor_names": local["history_tensor_names"],
-                "exported_via_weight_share": False,
-            },
-        },
-    }
     replicas = [
         {
             "replica_id": item.index,
-            "role": "leader" if item.index == 0 else "follower",
+            "role": "replica",
             "pid": item.pid,
             "pgid": item.pgid,
             "port": item.port,
@@ -472,7 +377,7 @@ def write_mps_runtime(
             "replica_count": 2,
             "base_port": int(snapshot.manifest["base_port"]),
             "core_blocks": snapshot.manifest["core_blocks"].split(),
-            "weight_share": True,
+            "weight_share": False,
         },
     )
     record_runtime_section(root, section="replicas", value=replicas)
@@ -491,7 +396,6 @@ def write_mps_runtime(
             "raw_control_path": str(raw / "mps_control_raw.txt"),
         },
     )
-    record_runtime_section(root, section="model_audits", value=model_audits)
     record_runtime_section(
         root,
         section="processes",
@@ -500,7 +404,6 @@ def write_mps_runtime(
         ),
     )
     record_runtime_section(root, section="raw_state_directory", value=str(raw))
-    record_model_audits(root, model_audits)
 
 
 def read_replica_activity(snapshot: LauncherState) -> list[dict[str, Any]]:
