@@ -189,8 +189,7 @@ def test_asr_matches_seedtts_reference_text_en(
 
     checks.check(
         total_samples == SEEDTTS_ASR_EN_SAMPLES,
-        f"Expected {SEEDTTS_ASR_EN_SAMPLES} scored samples, "
-        f"got {total_samples}",
+        f"Expected {SEEDTTS_ASR_EN_SAMPLES} scored samples, " f"got {total_samples}",
     )
     checks.check(
         evaluated == total_samples,
@@ -304,8 +303,7 @@ def test_asr_matches_seedtts_reference_text_zh(
 
     checks.check(
         total_samples == SEEDTTS_ASR_ZH_SAMPLES,
-        f"Expected {SEEDTTS_ASR_ZH_SAMPLES} scored samples, "
-        f"got {total_samples}",
+        f"Expected {SEEDTTS_ASR_ZH_SAMPLES} scored samples, " f"got {total_samples}",
     )
     checks.check(
         evaluated == total_samples,
