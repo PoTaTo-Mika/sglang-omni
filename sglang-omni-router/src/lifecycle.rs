@@ -57,6 +57,12 @@ impl Lifecycle {
     pub(crate) fn is_live(&self) -> bool {
         self.state
             .lock()
+            .is_ok_and(|state| matches!(*state, State::Serving | State::Draining))
+    }
+
+    pub(crate) fn is_serving(&self) -> bool {
+        self.state
+            .lock()
             .is_ok_and(|state| *state == State::Serving)
     }
 

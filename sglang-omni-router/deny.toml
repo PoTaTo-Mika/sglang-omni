@@ -12,6 +12,8 @@ allow = [
   "Apache-2.0",
   "Apache-2.0 WITH LLVM-exception",
   "BSD-3-Clause",
+  "CDLA-Permissive-2.0",
+  "ISC",
   "MIT",
   "Unicode-3.0",
 ]
@@ -27,18 +29,20 @@ multiple-versions = "deny"
 wildcards = "deny"
 highlight = "simplest-path"
 deny = [
-  { name = "git2", reason = "Git dependencies and libgit2 are outside the PR1 trust boundary" },
-  { name = "libgit2-sys", reason = "Native libgit2 is outside the PR1 trust boundary" },
-  { name = "native-tls", reason = "Use rustls if TLS enters a later reviewed branch" },
-  { name = "openssl", reason = "Use rustls if TLS enters a later reviewed branch" },
-  { name = "openssl-sys", reason = "Native OpenSSL is outside the PR1 trust boundary" },
+  { name = "git2", reason = "Git dependencies and libgit2 are outside the router trust boundary" },
+  { name = "libgit2-sys", reason = "Native libgit2 is outside the router trust boundary" },
+  { name = "native-tls", reason = "Isolated HTTPS health uses the reviewed rustls stack" },
+  { name = "openssl", reason = "Isolated HTTPS health uses the reviewed rustls stack" },
+  { name = "openssl-sys", reason = "Native OpenSSL is outside the router trust boundary" },
 ]
-skip = []
+skip = [
+  { name = "windows-sys", version = "=0.52.0", reason = "ring 0.17.14 pins this target-only line; Tokio and Criterion use 0.61.2" },
+]
 skip-tree = []
 
 [[bans.features]]
 name = "tokio"
-deny = ["fs", "full", "io-std", "io-util", "io-uring", "parking_lot", "process", "taskdump"]
+deny = ["fs", "full", "io-std", "io-uring", "parking_lot", "process", "taskdump"]
 
 [[bans.features]]
 name = "axum"
@@ -73,15 +77,140 @@ include-archives = true
 allow-build-scripts = [
   { name = "httparse", version = "=1.10.1" },
   { name = "libc", version = "=0.2.186" },
+  { name = "crunchy", version = "=0.2.4" },
+  { name = "icu_normalizer_data", version = "=2.2.0" },
+  { name = "icu_properties_data", version = "=2.2.0" },
+  { name = "num-traits", version = "=0.2.19" },
   { name = "proc-macro2", version = "=1.0.106" },
   { name = "quote", version = "=1.0.46" },
+  { name = "ring", version = "=0.17.14" },
+  { name = "rustls", version = "=0.23.42" },
+  { name = "rustversion", version = "=1.0.23" },
   { name = "serde", version = "=1.0.228" },
   { name = "serde_core", version = "=1.0.228" },
   { name = "serde_json", version = "=1.0.150" },
   { name = "thiserror", version = "=2.0.18" },
   { name = "valuable", version = "=0.1.1" },
+  { name = "wasm-bindgen", version = "=0.2.126" },
+  { name = "wasm-bindgen-shared", version = "=0.2.126" },
+  { name = "windows_aarch64_gnullvm", version = "=0.52.6" },
+  { name = "windows_aarch64_msvc", version = "=0.52.6" },
+  { name = "windows_i686_gnu", version = "=0.52.6" },
+  { name = "windows_i686_gnullvm", version = "=0.52.6" },
+  { name = "windows_i686_msvc", version = "=0.52.6" },
+  { name = "windows_x86_64_gnu", version = "=0.52.6" },
+  { name = "windows_x86_64_gnullvm", version = "=0.52.6" },
+  { name = "windows_x86_64_msvc", version = "=0.52.6" },
+  { name = "zerocopy", version = "=0.8.54" },
   { name = "zmij", version = "=1.0.23" },
 ]
+
+[[bans.build.bypass]]
+name = "untrusted"
+version = "=0.9.0"
+allow-globs = [
+  "mk/cargo.sh",
+  "mk/install-build-tools.sh",
+  "mk/runner",
+]
+
+[[bans.build.bypass]]
+name = "ring"
+version = "=0.17.14"
+allow-globs = [
+  "crypto/chacha/asm/chacha-armv4.pl",
+  "crypto/chacha/asm/chacha-armv8.pl",
+  "crypto/chacha/asm/chacha-x86.pl",
+  "crypto/chacha/asm/chacha-x86_64.pl",
+  "crypto/cipher/asm/chacha20_poly1305_armv8.pl",
+  "crypto/cipher/asm/chacha20_poly1305_x86_64.pl",
+  "crypto/fipsmodule/aes/asm/aes-gcm-avx2-x86_64.pl",
+  "crypto/fipsmodule/aes/asm/aesni-gcm-x86_64.pl",
+  "crypto/fipsmodule/aes/asm/aesni-x86.pl",
+  "crypto/fipsmodule/aes/asm/aesni-x86_64.pl",
+  "crypto/fipsmodule/aes/asm/aesv8-armx.pl",
+  "crypto/fipsmodule/aes/asm/aesv8-gcm-armv8.pl",
+  "crypto/fipsmodule/aes/asm/bsaes-armv7.pl",
+  "crypto/fipsmodule/aes/asm/ghash-armv4.pl",
+  "crypto/fipsmodule/aes/asm/ghash-neon-armv8.pl",
+  "crypto/fipsmodule/aes/asm/ghash-x86.pl",
+  "crypto/fipsmodule/aes/asm/ghash-x86_64.pl",
+  "crypto/fipsmodule/aes/asm/ghashv8-armx.pl",
+  "crypto/fipsmodule/aes/asm/vpaes-armv7.pl",
+  "crypto/fipsmodule/aes/asm/vpaes-armv8.pl",
+  "crypto/fipsmodule/aes/asm/vpaes-x86.pl",
+  "crypto/fipsmodule/aes/asm/vpaes-x86_64.pl",
+  "crypto/fipsmodule/bn/asm/armv4-mont.pl",
+  "crypto/fipsmodule/bn/asm/armv8-mont.pl",
+  "crypto/fipsmodule/bn/asm/x86-mont.pl",
+  "crypto/fipsmodule/bn/asm/x86_64-mont.pl",
+  "crypto/fipsmodule/bn/asm/x86_64-mont5.pl",
+  "crypto/fipsmodule/ec/asm/p256-armv8-asm.pl",
+  "crypto/fipsmodule/ec/asm/p256-x86_64-asm.pl",
+  "crypto/fipsmodule/sha/asm/sha256-armv4.pl",
+  "crypto/fipsmodule/sha/asm/sha512-armv4.pl",
+  "crypto/fipsmodule/sha/asm/sha512-armv8.pl",
+  "crypto/fipsmodule/sha/asm/sha512-x86_64.pl",
+  "crypto/perlasm/arm-xlate.pl",
+  "crypto/perlasm/x86_64-xlate.pl",
+  "crypto/perlasm/x86asm.pl",
+  "crypto/perlasm/x86gas.pl",
+  "crypto/perlasm/x86nasm.pl",
+]
+
+[[bans.build.bypass]]
+name = "zerocopy"
+version = "=0.8.54"
+allow-globs = [
+  "cargo.sh",
+  "ci/check_all_toolchains_tested.sh",
+  "ci/check_fmt.sh",
+  "ci/check_msrv_is_minimal.sh",
+  "ci/check_readme.sh",
+  "ci/check_stale_stderr.sh",
+  "ci/check_versions.sh",
+  "ci/release_crate_version.sh",
+]
+
+[[bans.build.bypass]]
+name = "windows_aarch64_gnullvm"
+version = "=0.52.6"
+allow-globs = ["lib/libwindows.0.52.0.a"]
+
+[[bans.build.bypass]]
+name = "windows_aarch64_msvc"
+version = "=0.52.6"
+allow-globs = ["lib/windows.0.52.0.lib"]
+
+[[bans.build.bypass]]
+name = "windows_i686_gnu"
+version = "=0.52.6"
+allow-globs = ["lib/libwindows.0.52.0.a"]
+
+[[bans.build.bypass]]
+name = "windows_i686_gnullvm"
+version = "=0.52.6"
+allow-globs = ["lib/libwindows.0.52.0.a"]
+
+[[bans.build.bypass]]
+name = "windows_i686_msvc"
+version = "=0.52.6"
+allow-globs = ["lib/windows.0.52.0.lib"]
+
+[[bans.build.bypass]]
+name = "windows_x86_64_gnu"
+version = "=0.52.6"
+allow-globs = ["lib/libwindows.0.52.0.a"]
+
+[[bans.build.bypass]]
+name = "windows_x86_64_gnullvm"
+version = "=0.52.6"
+allow-globs = ["lib/libwindows.0.52.0.a"]
+
+[[bans.build.bypass]]
+name = "windows_x86_64_msvc"
+version = "=0.52.6"
+allow-globs = ["lib/windows.0.52.0.lib"]
 
 [sources]
 unknown-registry = "deny"

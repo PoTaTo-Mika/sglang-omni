@@ -13,15 +13,16 @@
 
 //! Process foundation for the standalone SGLang-Omni Rust router.
 //!
-//! This crate owns strict startup configuration, the two router-local health
-//! routes, and joined process shutdown. It intentionally contains no worker or
-//! inference behavior.
+//! This crate owns strict startup configuration, a static correlated worker
+//! pool, isolated health, router-local liveness/readiness, and joined process
+//! shutdown. It intentionally contains no inference transport route.
 
 mod config;
 mod error;
 mod lifecycle;
 mod server;
 mod shutdown;
+mod worker_pool;
 
 use std::path::Path;
 

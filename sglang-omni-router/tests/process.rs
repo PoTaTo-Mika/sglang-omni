@@ -8,7 +8,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -34,9 +34,25 @@ impl TestDir {
     fn config(&self, address: SocketAddr, max_connections: u32, drain_timeout_ms: u64) -> PathBuf {
         let path = self.0.join("router.toml");
         let contents = format!(
-            "schema_version = 1\n\n[server]\nlisten = \"{address}\"\nmax_connections = {max_connections}\n\n[shutdown]\ndrain_timeout_ms = {drain_timeout_ms}\n\n[logging]\nformat = \"json\"\nfilter = \"info\"\n"
+            "schema_version = 1\n\n[server]\nlisten = \"{address}\"\nmax_connections = {max_connections}\n\n[shutdown]\ndrain_timeout_ms = {drain_timeout_ms}\n\n[logging]\nformat = \"json\"\nfilter = \"info\"\n\n[router]\nrequired_services = [\"generation_http\"]\n\n[admission]\nglobal = 8\ngeneration_http = 4\nspeech_http = 1\ntranscription_http = 1\nspeech_batch = 1\nspeech_websocket = 1\nrealtime_websocket = 1\ncontrol = 1\n\n[health]\ninterval_ms = 100\ntimeout_ms = 50\nsuccess_threshold = 2\nfailure_threshold = 3\nmax_concurrent_probes = 2\n\n[[workers]]\nworker_id = \"worker-1\"\nbase_url = \"http://127.0.0.1:9\"\ntrust_domain = \"local\"\ndefault_model_id = \"omni\"\n\n[workers.capacity]\ngeneration_http = 4\n\n[[workers.service_profiles]]\nservice = \"generation_http\"\nmodel_ids = [\"omni\"]\nmessage_content_forms = [\"string\"]\nmedia_placements = []\ninput_modalities = [\"text\"]\noutput_modalities = [\"text\"]\nchat_audio_formats = []\nstream_modes = [\"non_streaming\", \"streaming\"]\n"
         );
         fs::write(&path, contents).expect("write isolated process config");
+        path
+    }
+
+    fn config_with_worker(
+        &self,
+        address: SocketAddr,
+        drain_timeout_ms: u64,
+        worker: SocketAddr,
+    ) -> PathBuf {
+        let path = self.config(address, 1024, drain_timeout_ms);
+        let contents = fs::read_to_string(&path)
+            .expect("read generated config")
+            .replace("http://127.0.0.1:9", &format!("http://{worker}"))
+            .replace("success_threshold = 2", "success_threshold = 1")
+            .replace("failure_threshold = 3", "failure_threshold = 1");
+        fs::write(&path, contents).expect("write worker health config");
         path
     }
 }
@@ -283,6 +299,19 @@ fn wait_until_live(address: SocketAddr, child: &mut ChildGuard) {
     }
 }
 
+fn wait_for_status(address: SocketAddr, path: &str, status: &str, child: &mut ChildGuard) {
+    let end = Instant::now() + PROCESS_DEADLINE;
+    loop {
+        let response = request(address, "GET", path);
+        if response.starts_with(&format!("HTTP/1.1 {status}")) {
+            return;
+        }
+        child.assert_running();
+        assert!(Instant::now() < end, "{path} did not reach status {status}");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[test]
 fn help_version_and_check_config_have_exact_process_outcomes() {
     let _process_guard = process_lock();
@@ -514,4 +543,76 @@ fn drain_timeout_terminates_with_capped_connection() {
     drop(queued);
     let reused = TcpListener::bind(address).expect("listener is reusable after drain timeout");
     drop(reused);
+}
+
+#[test]
+fn readiness_tracks_required_health_while_liveness_remains_worker_independent() {
+    let _process_guard = process_lock();
+    let worker_listener = TcpListener::bind("127.0.0.1:0").expect("bind health worker fixture");
+    worker_listener
+        .set_nonblocking(true)
+        .expect("set health fixture nonblocking");
+    let worker_address = worker_listener
+        .local_addr()
+        .expect("read health fixture address");
+    let healthy = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let server_healthy = Arc::clone(&healthy);
+    let server_stop = Arc::clone(&stop);
+    let worker_thread = thread::spawn(move || {
+        while !server_stop.load(Ordering::Acquire) {
+            match worker_listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(1)))
+                        .expect("bound health fixture request");
+                    let mut request = [0_u8; 1024];
+                    match stream.read(&mut request) {
+                        Ok(0) => continue,
+                        Ok(_) => {}
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) =>
+                        {
+                            continue;
+                        }
+                        Err(error) => panic!("health fixture read failed: {error}"),
+                    }
+                    let status = if server_healthy.load(Ordering::Acquire) {
+                        "200 OK"
+                    } else {
+                        "503 Service Unavailable"
+                    };
+                    write!(
+                        stream,
+                        "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .expect("write health fixture response");
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => panic!("health fixture accept failed: {error}"),
+            }
+        }
+    });
+
+    let directory = TestDir::new();
+    let address = unused_address();
+    let config = directory.config_with_worker(address, 2_000, worker_address);
+    let mut child = ChildGuard::spawn(&config);
+    wait_until_live(address, &mut child);
+    wait_for_status(address, "/ready", "503", &mut child);
+    healthy.store(true, Ordering::Release);
+    wait_for_status(address, "/ready", "200", &mut child);
+    healthy.store(false, Ordering::Release);
+    wait_for_status(address, "/ready", "503", &mut child);
+    assert!(request(address, "GET", "/live").starts_with("HTTP/1.1 200"));
+
+    signal(child.id(), "-TERM");
+    assert_eq!(child.wait(PROCESS_DEADLINE).code(), Some(0));
+    stop.store(true, Ordering::Release);
+    worker_thread.join().expect("join health fixture worker");
 }

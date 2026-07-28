@@ -22,9 +22,9 @@ env:
 
 jobs:
   rust-router:
-    name: foundation
+    name: worker-pool
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 40
 
     defaults:
       run:
@@ -91,10 +91,13 @@ jobs:
           cargo +1.90.0 check --workspace --all-targets --all-features --locked
           cargo check --workspace --all-targets --all-features --locked
           cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-          cargo build --workspace --all-features --locked
-          cargo test --workspace --all-features --locked
+          cargo build --workspace --all-targets --all-features --locked
+          cargo test --workspace --all-targets --all-features --locked
           RUSTDOCFLAGS="-D warnings" \
             cargo doc --workspace --all-features --no-deps --locked
+          cargo bench --locked --no-run
+          cargo tree --locked -d
+          cargo tree --locked --target all -d
 
       - name: CLI smoke tests
         timeout-minutes: 3
@@ -119,6 +122,45 @@ jobs:
           [logging]
           format = "json"
           filter = "info"
+
+          [router]
+          required_services = ["generation_http"]
+
+          [admission]
+          global = 8
+          generation_http = 4
+          speech_http = 1
+          transcription_http = 1
+          speech_batch = 1
+          speech_websocket = 1
+          realtime_websocket = 1
+          control = 1
+
+          [health]
+          interval_ms = 100
+          timeout_ms = 50
+          success_threshold = 2
+          failure_threshold = 3
+          max_concurrent_probes = 2
+
+          [[workers]]
+          worker_id = "worker-1"
+          base_url = "http://127.0.0.1:9"
+          trust_domain = "local"
+          default_model_id = "omni"
+
+          [workers.capacity]
+          generation_http = 4
+
+          [[workers.service_profiles]]
+          service = "generation_http"
+          model_ids = ["omni"]
+          message_content_forms = ["string"]
+          media_placements = []
+          input_modalities = ["text"]
+          output_modalities = ["text"]
+          chat_audio_formats = []
+          stream_modes = ["non_streaming", "streaming"]
           EOF
 
           "$binary" --config "$config" --check-config

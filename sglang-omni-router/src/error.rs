@@ -80,6 +80,15 @@ pub enum RouterError {
     /// Signal observation could not be installed or completed.
     #[error("failed to observe process termination signals")]
     Signal(#[source] io::Error),
+    /// The isolated HTTPS health client failed to build.
+    #[error("failed to initialize the isolated health client")]
+    HealthClient(#[source] reqwest::Error),
+    /// Validated worker-pool data could not be reconstructed internally.
+    #[error("the validated worker-pool invariant failed")]
+    WorkerPoolInvariant,
+    /// A health worker exited before cancellation or failed during shutdown.
+    #[error("an owned health task failed")]
+    HealthTask,
 }
 
 impl RouterError {
@@ -97,7 +106,16 @@ impl RouterError {
             | Self::ForcedShutdown
             | Self::Lifecycle
             | Self::ShutdownNotify
-            | Self::Signal(_) => 1,
+            | Self::Signal(_)
+            | Self::HealthClient(_)
+            | Self::WorkerPoolInvariant
+            | Self::HealthTask => 1,
         }
+    }
+}
+
+impl ConfigError {
+    pub(crate) const fn invalid(field: &'static str, reason: &'static str) -> Self {
+        Self::InvalidField { field, reason }
     }
 }
