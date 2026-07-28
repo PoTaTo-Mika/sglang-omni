@@ -471,6 +471,36 @@ def test_admin_routes_broadcast_to_live_workers_and_preserve_query() -> None:
     assert [item[2] for item in seen] == [b"", b""]
 
 
+def test_abort_request_broadcasts_to_live_workers() -> None:
+    seen: list[tuple[str, bytes]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "worker"}, request=request)
+        if request.url.path == "/abort_request":
+            seen.append((_request_netloc(request), request.content))
+            return httpx.Response(
+                200,
+                json={"success": True, "num_aborted_requests": 2},
+                request=request,
+            )
+        raise AssertionError(f"unexpected request path: {request.url.path}")
+
+    async_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    app = create_app(_router_config(), client=async_client)
+
+    with TestClient(app) as client:
+        response = client.post("/abort_request", json={"abort_all": True})
+
+    assert response.status_code == 200
+    assert response.json()["success"] is True
+    assert {item[0] for item in seen} == {"worker-a:8101", "worker-b:8102"}
+    assert [json.loads(item[1]) for item in seen] == [
+        {"abort_all": True},
+        {"abort_all": True},
+    ]
+
+
 def test_model_info_broadcast_exposes_sglang_compatible_weight_version() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/health":
@@ -2567,6 +2597,7 @@ def test_payload_without_content_length_is_rejected_while_streaming_body() -> No
 # ---------------------------------------------------------------------------
 
 _ROUTER_ADMIN_PATHS = [
+    ("POST", "/abort_request"),
     ("GET", "/model_info"),
     ("POST", "/model_info"),
     ("POST", "/pause_generation"),

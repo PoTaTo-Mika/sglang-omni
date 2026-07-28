@@ -476,6 +476,24 @@ class Coordinator:
         logger.info("Coordinator aborted req=%s", request_id)
         return True
 
+    async def abort_requests(self, rid: str = "", abort_all: bool = False) -> int:
+        """Abort active requests using SGLang's prefix-matching semantics."""
+        if abort_all:
+            request_ids = list(self._requests)
+        elif rid:
+            request_ids = [
+                request_id
+                for request_id in self._requests
+                if request_id.startswith(rid)
+            ]
+        else:
+            return 0
+
+        results = await asyncio.gather(
+            *(self.abort(request_id) for request_id in request_ids)
+        )
+        return sum(results)
+
     async def run_completion_loop(self) -> None:
         """Run the completion receiving loop.
 

@@ -49,6 +49,38 @@ def test_coordinator_multi_terminal_completion_and_abort_contracts() -> None:
     asyncio.run(_run())
 
 
+def test_coordinator_aborts_request_prefix_and_all_active_requests() -> None:
+    async def _run() -> None:
+        coordinator = Coordinator(
+            "inproc://complete",
+            "inproc://abort",
+            entry_stage="preprocess",
+            terminal_stages=["decode"],
+        )
+        control_plane = RecordingCoordinatorControlPlane()
+        coordinator.control_plane = control_plane
+        coordinator.register_stage("preprocess", "inproc://preprocess")
+
+        for request_id in ("group-a-1", "group-a-2", "group-b-1"):
+            await coordinator._submit_request(request_id, "hello")
+        futures = list(coordinator._completion_futures.values())
+
+        assert await coordinator.abort_requests(rid="group-a") == 2
+        assert set(coordinator._requests) == {"group-b-1"}
+        assert await coordinator.abort_requests() == 0
+        assert await coordinator.abort_requests(abort_all=True) == 1
+        assert coordinator._requests == {}
+        assert [message.request_id for message in control_plane.aborts] == [
+            "group-a-1",
+            "group-a-2",
+            "group-b-1",
+        ]
+
+        await asyncio.gather(*futures, return_exceptions=True)
+
+    asyncio.run(_run())
+
+
 def test_coordinator_resolves_active_terminal_subset_per_request() -> None:
     async def _run() -> None:
         def terminal_stages(request: OmniRequest) -> list[str]:

@@ -3,6 +3,7 @@
 
 Provides the following endpoints:
 - POST /v1/chat/completions  — Text (+ audio) chat completions
+- POST /abort_request       — Abort one or all in-flight requests
 - POST /v1/audio/speech      — Text-to-speech synthesis
 - POST /v1/audio/speech/batch — Batch text-to-speech synthesis
 - WS   /v1/audio/speech/stream — Stateful TTS WebSocket streaming
@@ -69,6 +70,7 @@ from sglang_omni.http.favicon import register_favicon
 from sglang_omni.proto import EXPLICIT_GENERATION_PARAMS_KEY
 from sglang_omni.serve.protocol import (
     DEFAULT_TTS_BATCH_MAX_ITEMS,
+    AbortRequest,
     AdminRequestBase,
     ChatCompletionAudio,
     ChatCompletionChoice,
@@ -416,6 +418,21 @@ def _register_models(app: FastAPI) -> None:
 
 def _register_admin(app: FastAPI, admin_api_key: str | None = None) -> None:
     _auth = make_admin_auth_dependency(admin_api_key)
+
+    @app.post("/abort_request", dependencies=[Depends(_auth)])
+    async def abort_request(req: AbortRequest) -> JSONResponse:
+        client: Client = app.state.client
+        num_aborted = await client.abort_requests(
+            rid=req.rid,
+            abort_all=req.abort_all,
+        )
+        return JSONResponse(
+            {
+                "success": True,
+                "message": "ok",
+                "num_aborted_requests": num_aborted,
+            }
+        )
 
     @app.get("/model_info", dependencies=[Depends(_auth)])
     async def model_info_get() -> JSONResponse:
