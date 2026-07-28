@@ -19,7 +19,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
-from benchmarks.tasks.asr import FUN_ASR_MODEL_PATH
+from benchmarks.tasks.asr import FUN_ASR_MODEL_PATH, QWEN3_ASR_MODEL_PATH
 from tests.utils import apply_wer_slack
 
 
@@ -98,6 +98,48 @@ FUN_ASR_RTF_MEAN_THRESHOLD = round(FUN_ASR_RTF_MEAN_MAX * THRESHOLD_SLACK_LOWER,
 FUN_ASR_RTF_P95_THRESHOLD = round(FUN_ASR_RTF_P95_MAX * THRESHOLD_SLACK_LOWER, 4)
 
 
+# note (Jeffro): Qwen3-ASR runs report-only (gate_thresholds=False) until a
+# fresh tune-ci-thresholds worst-of-5 calibration on the current 2x H100
+# DP=2 topology lands (#1214). The EN references below are the last
+# calibrated values from the pre-#1093 stage-2 gate and are kept for log
+# context only; ZH has never been calibrated, so its bounds are inert
+# placeholders. None of these values gate CI while the flag is False.
+# ref: https://github.com/sgl-project/sglang-omni/pull/1093/changes#diff-806bffc1dc635f8f13348c3cc6ce6f1d5626e3cf32484339ebcc3058da71d189
+QWEN3_ASR_EN_CORPUS_WER_MAX = 0.0122
+QWEN3_ASR_EN_SAMPLE_WER_MAX = 0.1819
+QWEN3_ASR_ZH_CORPUS_WER_MAX = 1.0 # placeholder
+QWEN3_ASR_ZH_SAMPLE_WER_MAX = 1.0 # placeholder
+QWEN3_ASR_THROUGHPUT_MIN = 89.15367011738545
+QWEN3_ASR_LATENCY_MEAN_MAX_S = 0.357
+QWEN3_ASR_LATENCY_P95_MAX_S = 0.493352619552752
+QWEN3_ASR_RTF_MEAN_MAX = 0.07720349691994066
+QWEN3_ASR_RTF_P95_MAX = 0.1084
+
+QWEN3_ASR_EN_CORPUS_WER_THRESHOLD = apply_wer_slack(
+    QWEN3_ASR_EN_CORPUS_WER_MAX, THRESHOLD_SLACK_LOWER
+)
+QWEN3_ASR_EN_SAMPLE_WER_THRESHOLD = apply_wer_slack(
+    QWEN3_ASR_EN_SAMPLE_WER_MAX, THRESHOLD_SLACK_LOWER
+)
+QWEN3_ASR_ZH_CORPUS_WER_THRESHOLD = apply_wer_slack(
+    QWEN3_ASR_ZH_CORPUS_WER_MAX, THRESHOLD_SLACK_LOWER
+)
+QWEN3_ASR_ZH_SAMPLE_WER_THRESHOLD = apply_wer_slack(
+    QWEN3_ASR_ZH_SAMPLE_WER_MAX, THRESHOLD_SLACK_LOWER
+)
+QWEN3_ASR_THROUGHPUT_THRESHOLD = round(
+    QWEN3_ASR_THROUGHPUT_MIN * THRESHOLD_SLACK_HIGHER, 3
+)
+QWEN3_ASR_LATENCY_MEAN_THRESHOLD_S = round(
+    QWEN3_ASR_LATENCY_MEAN_MAX_S * THRESHOLD_SLACK_LOWER, 3
+)
+QWEN3_ASR_LATENCY_P95_THRESHOLD_S = round(
+    QWEN3_ASR_LATENCY_P95_MAX_S * THRESHOLD_SLACK_LOWER, 3
+)
+QWEN3_ASR_RTF_MEAN_THRESHOLD = round(QWEN3_ASR_RTF_MEAN_MAX * THRESHOLD_SLACK_LOWER, 4)
+QWEN3_ASR_RTF_P95_THRESHOLD = round(QWEN3_ASR_RTF_P95_MAX * THRESHOLD_SLACK_LOWER, 4)
+
+
 ASR_CI_PRESETS: dict[str, AsrCiPreset] = {
     "fun": AsrCiPreset(
         model_path=FUN_ASR_MODEL_PATH,
@@ -113,6 +155,22 @@ ASR_CI_PRESETS: dict[str, AsrCiPreset] = {
             rtf_mean_max=FUN_ASR_RTF_MEAN_THRESHOLD,
             rtf_p95_max=FUN_ASR_RTF_P95_THRESHOLD,
         ),
+    ),
+    "qwen3": AsrCiPreset(
+        model_path=QWEN3_ASR_MODEL_PATH,
+        display_name="Qwen3-ASR",
+        thresholds=AsrCiThresholdPreset(
+            en_corpus_wer_max=QWEN3_ASR_EN_CORPUS_WER_THRESHOLD,
+            en_sample_wer_max=QWEN3_ASR_EN_SAMPLE_WER_THRESHOLD,
+            zh_corpus_wer_max=QWEN3_ASR_ZH_CORPUS_WER_THRESHOLD,
+            zh_sample_wer_max=QWEN3_ASR_ZH_SAMPLE_WER_THRESHOLD,
+            throughput_min=QWEN3_ASR_THROUGHPUT_THRESHOLD,
+            latency_mean_max_s=QWEN3_ASR_LATENCY_MEAN_THRESHOLD_S,
+            latency_p95_max_s=QWEN3_ASR_LATENCY_P95_THRESHOLD_S,
+            rtf_mean_max=QWEN3_ASR_RTF_MEAN_THRESHOLD,
+            rtf_p95_max=QWEN3_ASR_RTF_P95_THRESHOLD,
+        ),
+        gate_thresholds=False,
     ),
 }
 
