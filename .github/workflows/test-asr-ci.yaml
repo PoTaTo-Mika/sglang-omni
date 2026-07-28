@@ -3,6 +3,11 @@ name: ASR CI
 on:
   workflow_call:
     inputs:
+      asr_ci_model:
+        description: ASR CI model preset selected by the parent pick-asr-model job.
+        type: string
+        required: false
+        default: fun
       omni_ci_home:
         description: PR-scoped CI home from the parent omni-ci workflow.
         type: string
@@ -110,6 +115,7 @@ jobs:
           bash .github/scripts/run_flaky_pytest.sh \
             pytest tests/test_model/test_asr_ci_seedtts.py -v -s -x
         env:
+          ASR_CI_MODEL: ${{ inputs.asr_ci_model }}
           HF_ENDPOINT: https://huggingface.co
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           TORCHINDUCTOR_CACHE_DIR: ${{ env.OMNI_CI_HOME }}/.torchinductor
