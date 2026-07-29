@@ -12,9 +12,11 @@ use super::{ResolvedTarget, WorkerRecord};
 ///
 /// Admission and dispatch take shared ownership only while checking `open` and
 /// acquiring bounded semaphore permits. Drain takes exclusive ownership before
-/// closing every semaphore and publishing draining disposition. Lock order is
-/// gate, then atomics/semaphore `try_acquire`; no other synchronous lock may be
-/// acquired while a gate guard is held, and no guard crosses an await point.
+/// closing every semaphore and publishing draining disposition. Least-request
+/// dispatch takes its per-class policy mutex before this gate. Admission and
+/// all other dispatch paths start here. From the gate, the only acquisitions
+/// are atomics and semaphore `try_acquire` operations; no guard crosses an
+/// await point.
 pub(super) struct Gate {
     pub(super) open: bool,
 }
@@ -53,19 +55,24 @@ pub(crate) enum DispatchError {
     Internal,
 }
 
-/// Global and transport-class ingress ownership acquired before worker matching.
+/// Global ingress and, except for speech batches, transport-class ownership.
 ///
-/// Both permits remain owned until this lease is dropped directly or as part
-/// of a [`RequestLease`]. Drop is nonblocking and performs no lookup.
+/// Speech batches defer their complete item-credit class permit until their
+/// bounded JSON body has been classified. Owned permits remain held until this
+/// lease is dropped directly or as part of a [`RequestLease`].
 pub(crate) struct AdmissionLease {
     class: CapacityClass,
-    _class: OwnedSemaphorePermit,
+    class_permit: Option<OwnedSemaphorePermit>,
     _global: OwnedSemaphorePermit,
 }
 
 impl AdmissionLease {
     pub(super) fn class(&self) -> CapacityClass {
         self.class
+    }
+
+    pub(super) fn has_class_permit(&self) -> bool {
+        self.class_permit.is_some()
     }
 }
 
@@ -178,15 +185,39 @@ impl AdmissionController {
         let global = Arc::clone(&self.global)
             .try_acquire_owned()
             .map_err(|_| AdmissionError::Overloaded)?;
-        let class_permit = Arc::clone(&self.classes[class_index(class)])
-            .try_acquire_owned()
-            .map_err(|_| AdmissionError::Overloaded)?;
+        let class_permit = if class == CapacityClass::SpeechBatch {
+            None
+        } else {
+            Some(
+                Arc::clone(&self.classes[class_index(class)])
+                    .try_acquire_owned()
+                    .map_err(|_| AdmissionError::Overloaded)?,
+            )
+        };
         drop(gate);
         Ok(AdmissionLease {
             class,
-            _class: class_permit,
+            class_permit,
             _global: global,
         })
+    }
+
+    pub(super) fn reserve_deferred_class(
+        &self,
+        admission: &mut AdmissionLease,
+        units: u32,
+    ) -> Result<(), DispatchError> {
+        if admission.class != CapacityClass::SpeechBatch
+            || admission.class_permit.is_some()
+            || units == 0
+        {
+            return Err(DispatchError::Internal);
+        }
+        let permit = Arc::clone(&self.classes[class_index(admission.class)])
+            .try_acquire_many_owned(units)
+            .map_err(|_| DispatchError::Overloaded)?;
+        admission.class_permit = Some(permit);
+        Ok(())
     }
 
     pub(super) fn close_semaphores(&self) {

@@ -83,11 +83,13 @@ For each request or session, the data flow is:
 
 1. Validate the public route, framing, bounded routing fields, and canonical
    `x-request-id`.
-2. Acquire one global and one service-class admission permit.
+2. Acquire one global admission permit. Non-batch routes also acquire one
+   service-class permit here.
 3. Build the exact compatibility requirement from the request, then filter by
    profile, trust domain, voice ownership, health, and serving disposition.
-4. Apply `round_robin` or `least_requests` only to that eligible set and acquire
-   one exact worker/service permit.
+4. Apply `round_robin` or `least_requests` only to that eligible set. Acquire
+   one exact worker/service permit for non-batch work, or `batch_size` class
+   and exact item credits on one worker for speech batch.
 5. Start one upstream request attempt to the selected worker and relay with
    backpressure. The exact worker lease remains attached to the downstream
    HTTP body or WebSocket session until completion, disconnect, cancellation,
@@ -148,8 +150,9 @@ change routing, resource ownership, or failure behavior.
 | `router.max_concurrent_classifications` | Process-wide buffered-classification concurrency, `1..=64`; default `4`. Contention waits asynchronously instead of blocking a Tokio worker thread. |
 | `router.required_services` | Required, nonempty set drawn from `generation_http`, `speech_http`, `transcription_http`, `speech_batch`, `speech_websocket`, `realtime_websocket`, and `voice_control`. It must include every enabled route family. |
 | `router.voice_owner_worker_id` | Optional exact worker ID that enables voice-control routes and managed-voice pinning. |
-| `admission.global` | Process-wide in-flight request/session limit, `1..=1000000`. |
-| `admission.*` | Required class limits for all seven classes, each `1..=65535` and no greater than `global`. Unused classes still need a value. |
+| `admission.global` | Process-wide in-flight request-envelope/session limit, `1..=1000000`. |
+| `admission.speech_batch` | Required item-credit limit, `1..=65535`; it must fit every advertised `max_batch_size` but is independent of the global envelope count. |
+| Other `admission.*` | Required request/session limits, each `1..=65535` and no greater than `global`. Unused classes still need a value. |
 | `health.interval_ms` | Probe interval, `100..=300000`; default `5000`. |
 | `health.timeout_ms` | Complete probe timeout, `10..=interval_ms`; default `1000`. |
 | `health.success_threshold` / `failure_threshold` | Consecutive observations required to become healthy/unhealthy, each `1..=32`; defaults `2` and `3`. |
@@ -198,9 +201,11 @@ The manifest deliberately separates three kinds of number:
 | Explicit capacity choice | Every `admission.*`, every `workers.capacity.*`, and `shutdown.drain_timeout_ms` | Required in the manifest. There is no built-in capacity or drain default. |
 
 `server.max_connections` bounds accepted client sockets, not worker requests.
-Admission first takes one process-wide permit and one service-class permit;
-dispatch then takes one exact permit from the selected worker/service pair.
-Set all three layers from expected simultaneous sockets, request/session mix,
+Admission first takes one process-wide envelope permit. Non-batch traffic also
+takes one service-class permit immediately, then one exact permit from the
+selected worker/service pair. A speech batch is classified first and atomically
+takes one class and exact item credit per batch item, all on one worker. Set
+all three layers from expected simultaneous sockets, request/session mix,
 worker queueing behavior, host memory, and measured latency under overload.
 
 Body budgets, upstream timeouts, connection-pool sizes, health cadence,
@@ -212,12 +217,13 @@ failure budget; vary one resource layer at a time without changing validation
 ceilings merely to improve a benchmark.
 
 JSON and multipart bodies at or below the buffered limit are fully classified
-and relayed as their original payload bytes. A larger request takes the direct
-upload path only when it has one valid `Content-Length`, no transfer framing,
-route hint, or content encoding, and every worker in the exact service/trust
-scope has the same default model and the same correlated rows. Otherwise it is
-rejected with `413`. Unknown-length requests are buffered and reserve the full
-per-request limit from the aggregate byte budget.
+and relayed as their original payload bytes. A larger non-batch request takes
+the direct upload path only when it has one valid `Content-Length`, no transfer
+framing, route hint, or content encoding, and every worker in the exact
+service/trust scope has the same default model and the same correlated rows.
+Otherwise it is rejected with `413`. Speech batches are always buffered because
+their item count owns capacity. Unknown-length requests are buffered and
+reserve the full per-request limit from the aggregate byte budget.
 
 Buffered HTTP requests wait asynchronously for a shared classification slot.
 That wait and the classification itself remain inside the route's existing
@@ -353,9 +359,12 @@ Speech-WebSocket:
 ```toml
 [workers.capacity]
 speech_http = 32
-speech_batch = 8
+speech_batch = 16
 speech_websocket = 16
 ```
+
+`speech_batch` is measured in item credits, so it must be at least the largest
+`max_batch_size` advertised by that worker.
 
 Use separate encoded and streaming PCM rows so their format/mode correlation
 is truthful:
@@ -641,8 +650,9 @@ Only then does policy order candidates:
   classes and rotates eligible workers in startup manifest order. Missing or
   unhealthy workers are skipped; control traffic is exact-owner and does not
   use a data-plane cursor.
-- `least_requests` snapshots each eligible worker's in-flight exact permits for
-  that service class once, orders by the smallest count, and uses that class's
+- `least_requests` serializes selection per data-plane class, snapshots each
+  eligible worker's in-flight exact permits once, orders by the smallest count,
+  and reserves before releasing that class guard. It uses the class's
   round-robin rank to break ties.
 
 Policy ordering is advisory: the router scans the ordered candidates and
@@ -651,11 +661,13 @@ exist but all exact permits are full, the request fails fast with `429`; it is
 not queued. No matching profile yields `422`, while matching profiles with no
 healthy serving worker yield `503`.
 
-Every admitted request/session owns exactly one global permit, one service
-class permit, and one selected worker's exact service permit. HTTP permits live
-through upstream response EOF/error or downstream body drop. WebSocket permits
-live through the complete pinned session. All are returned together by direct
-ownership; there is no background lookup or delayed accounting.
+Every admitted request/session owns exactly one global permit. Non-batch work
+also owns one service-class permit and one selected worker's exact permit.
+Speech batches own `batch_size` class and exact item credits on one worker.
+HTTP permits live through upstream response EOF/error or downstream body drop.
+WebSocket permits live through the complete pinned session. All are returned
+together by direct ownership; there is no background lookup or delayed
+accounting.
 
 The router makes one upstream attempt. Reqwest retries, redirects, proxies, and
 automatic decompression are disabled, and WebSockets do not reconnect. Once an
@@ -705,8 +717,10 @@ Tokio runtime gauges. Its only
 manifest-derived label is the immutable worker ID; it never uses model, URL,
 request, header, query, or error-text labels. `/diagnostics` returns bounded
 state as JSON and includes only worker IDs, startup registration ordinals,
-health/disposition, and configured/in-flight capacity—never URLs, IPs, model
-payloads, or request data. Operations endpoints are health-independent,
+health/disposition, and configured/in-flight capacity with explicit units.
+Global values are request envelopes; speech-batch class and exact values are
+item credits. It never exposes URLs, IPs, model payloads, or request data.
+Operations endpoints are health-independent,
 bodyless HTTP/1.1 GETs with no query, and are not registered on non-loopback
 listeners.
 

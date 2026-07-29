@@ -16,7 +16,7 @@ use crate::error::{HttpFault, RouterError};
 use crate::http_generation::headers::{REQUEST_ID_HEADER, validate_bodyless_request};
 use crate::lifecycle::State as LifecycleState;
 use crate::telemetry::Telemetry;
-use crate::worker_pool::{CapacityClass, OperationsSnapshot};
+use crate::worker_pool::{AdmissionClass, CapacityClass, OperationsSnapshot};
 
 const JSON_CONTENT_TYPE: &str = "application/json";
 const METRICS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
@@ -233,7 +233,7 @@ fn render_admission_metrics(output: &mut String, snapshot: &OperationsSnapshot) 
         );
     }
     output.push_str(
-        "# HELP sglang_omni_router_admission_in_flight Current admitted requests and sessions.\n",
+        "# HELP sglang_omni_router_admission_in_flight Current admitted request envelopes, requests, sessions, or speech-batch item credits by class.\n",
     );
     output.push_str("# TYPE sglang_omni_router_admission_in_flight gauge\n");
     for entry in &snapshot.admission {
@@ -269,7 +269,7 @@ fn render_worker_capacity_metrics(output: &mut String, snapshot: &OperationsSnap
         );
     }
     output.push_str(
-        "# HELP sglang_omni_router_worker_capacity_in_flight Aggregate current worker capacity use.\n",
+        "# HELP sglang_omni_router_worker_capacity_in_flight Aggregate current worker request, session, or speech-batch item-credit use.\n",
     );
     output.push_str("# TYPE sglang_omni_router_worker_capacity_in_flight gauge\n");
     for (index, class) in CapacityClass::ALL.into_iter().enumerate() {
@@ -305,6 +305,7 @@ struct Diagnostics<'a> {
 #[derive(Serialize)]
 struct DiagnosticCapacity {
     class: &'static str,
+    unit: &'static str,
     limit: usize,
     in_flight: usize,
 }
@@ -332,6 +333,7 @@ impl<'a> Diagnostics<'a> {
                 .iter()
                 .map(|entry| DiagnosticCapacity {
                     class: entry.class.label(),
+                    unit: admission_unit(entry.class),
                     limit: entry.limit,
                     in_flight: entry.in_flight,
                 })
@@ -349,6 +351,7 @@ impl<'a> Diagnostics<'a> {
                         .iter()
                         .map(|entry| DiagnosticCapacity {
                             class: entry.class.label(),
+                            unit: capacity_unit(entry.class),
                             limit: entry.limit,
                             in_flight: entry.in_flight,
                         })
@@ -356,6 +359,24 @@ impl<'a> Diagnostics<'a> {
                 })
                 .collect(),
         }
+    }
+}
+
+const fn admission_unit(class: AdmissionClass) -> &'static str {
+    match class {
+        AdmissionClass::Global => "request_envelopes",
+        AdmissionClass::Capacity(class) => capacity_unit(class),
+    }
+}
+
+const fn capacity_unit(class: CapacityClass) -> &'static str {
+    match class {
+        CapacityClass::GenerationHttp
+        | CapacityClass::SpeechHttp
+        | CapacityClass::TranscriptionHttp
+        | CapacityClass::Control => "requests",
+        CapacityClass::SpeechBatch => "item_credits",
+        CapacityClass::SpeechWebsocket | CapacityClass::RealtimeWebsocket => "sessions",
     }
 }
 
@@ -599,7 +620,7 @@ mod tests {
                 "sglang_omni_router_admission_limit{class=\"speech_websocket\"} 105\n",
                 "sglang_omni_router_admission_limit{class=\"realtime_websocket\"} 106\n",
                 "sglang_omni_router_admission_limit{class=\"control\"} 107\n",
-                "# HELP sglang_omni_router_admission_in_flight Current admitted requests and sessions.\n",
+                "# HELP sglang_omni_router_admission_in_flight Current admitted request envelopes, requests, sessions, or speech-batch item credits by class.\n",
                 "# TYPE sglang_omni_router_admission_in_flight gauge\n",
                 "sglang_omni_router_admission_in_flight{class=\"global\"} 0\n",
                 "sglang_omni_router_admission_in_flight{class=\"generation_http\"} 1\n",
@@ -618,7 +639,7 @@ mod tests {
                 "sglang_omni_router_worker_capacity_limit{class=\"speech_websocket\"} 50\n",
                 "sglang_omni_router_worker_capacity_limit{class=\"realtime_websocket\"} 60\n",
                 "sglang_omni_router_worker_capacity_limit{class=\"control\"} 73\n",
-                "# HELP sglang_omni_router_worker_capacity_in_flight Aggregate current worker capacity use.\n",
+                "# HELP sglang_omni_router_worker_capacity_in_flight Aggregate current worker request, session, or speech-batch item-credit use.\n",
                 "# TYPE sglang_omni_router_worker_capacity_in_flight gauge\n",
                 "sglang_omni_router_worker_capacity_in_flight{class=\"generation_http\"} 3\n",
                 "sglang_omni_router_worker_capacity_in_flight{class=\"speech_http\"} 2\n",
@@ -712,8 +733,13 @@ mod tests {
                 .keys()
                 .map(String::as_str)
                 .collect();
-            assert_eq!(keys, BTreeSet::from(["class", "in_flight", "limit"]));
+            assert_eq!(
+                keys,
+                BTreeSet::from(["class", "in_flight", "limit", "unit"])
+            );
         }
+        assert_eq!(admission[0]["unit"], "request_envelopes");
+        assert_eq!(admission[4]["unit"], "item_credits");
 
         let workers = value["workers"].as_array().expect("workers array");
         assert_eq!(workers.len(), 256);
@@ -761,8 +787,12 @@ mod tests {
                     .keys()
                     .map(String::as_str)
                     .collect();
-                assert_eq!(keys, BTreeSet::from(["class", "in_flight", "limit"]));
+                assert_eq!(
+                    keys,
+                    BTreeSet::from(["class", "in_flight", "limit", "unit"])
+                );
             }
+            assert_eq!(capacity[3]["unit"], "item_credits");
         }
     }
 

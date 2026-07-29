@@ -469,7 +469,7 @@ global = 8
 generation_http = 1
 speech_http = 4
 transcription_http = 4
-speech_batch = 4
+speech_batch = 16
 speech_websocket = 1
 realtime_websocket = 1
 control = 1
@@ -486,7 +486,7 @@ trust_domain = "local"
 default_model_id = "tts"
 [workers.capacity]
 speech_http = 4
-speech_batch = 4
+speech_batch = 16
 transcription_http = 4
 [[workers.service_profiles]]
 service = "speech_http"

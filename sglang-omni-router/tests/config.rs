@@ -114,7 +114,8 @@ fn speech_config(
 }
 
 fn speech_batch_config(stream_modes: Option<&str>) -> String {
-    let prefix = worker_config_prefix("speech_batch");
+    let prefix =
+        worker_config_prefix("speech_batch").replace("speech_batch = 1", "speech_batch = 4");
     let stream_modes =
         stream_modes.map_or_else(String::new, |modes| format!("stream_modes = {modes}\n"));
     format!(
@@ -209,6 +210,9 @@ fn media_http_config(
         ),
         &format!("required_services = [{required}]"),
     );
+    if worker_routes.contains(&MediaHttpRouteFixture::SpeechBatch) {
+        output = output.replace("speech_batch = 1", "speech_batch = 4");
+    }
     output.push_str(&format!(
         "[http_media]\nroutes = [{enabled}]\ntrust_domain = \"{media_trust}\"\n\n[[workers]]\nworker_id = \"worker-1\"\nbase_url = \"http://127.0.0.1:9\"\ntrust_domain = \"{worker_trust}\"\ndefault_model_id = \"media\"\n\n[workers.capacity]\n"
     ));
@@ -613,6 +617,32 @@ fn rejects_admission_health_and_required_service_boundaries() {
 }
 
 #[test]
+fn speech_batch_item_capacity_is_independent_of_global_envelopes_and_bounds_profiles() {
+    let envelopes = valid_config("127.0.0.1:30000", 30_000, "info")
+        .replace("speech_batch = 1", "speech_batch = 65535");
+    load_bytes(envelopes.as_bytes())
+        .expect("speech-batch item credits may exceed global request envelopes");
+
+    let valid = speech_batch_config(None);
+    load_bytes(valid.as_bytes()).expect("matching speech-batch capacities validate");
+    let worker_too_small = valid.replace(
+        "[workers.capacity]\nspeech_batch = 4",
+        "[workers.capacity]\nspeech_batch = 3",
+    );
+    assert!(load_bytes(worker_too_small.as_bytes()).is_err());
+    assert!(
+        load_bytes(
+            valid
+                .replace("max_batch_size = 4", "max_batch_size = 5")
+                .as_bytes()
+        )
+        .is_err()
+    );
+    let under_admitted = valid.replacen("speech_batch = 4", "speech_batch = 3", 1);
+    assert!(load_bytes(under_admitted.as_bytes()).is_err());
+}
+
+#[test]
 fn rejects_worker_profile_counterexamples_without_normalizing_arrays() {
     let base = valid_config("127.0.0.1:30000", 30_000, "info");
     let cases = [
@@ -961,7 +991,7 @@ global = 64
 generation_http = 8
 speech_http = 8
 transcription_http = 8
-speech_batch = 8
+speech_batch = 32
 speech_websocket = 8
 realtime_websocket = 8
 control = 8
@@ -983,7 +1013,7 @@ health_path = "/health"
 generation_http = 8
 speech_http = 8
 transcription_http = 8
-speech_batch = 8
+speech_batch = 32
 speech_websocket = 8
 realtime_websocket = 8
 control = 8

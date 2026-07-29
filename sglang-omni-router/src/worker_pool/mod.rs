@@ -372,11 +372,17 @@ impl WorkerPool {
             return Err(DispatchError::AdmissionClassMismatch);
         }
         if !requirement.profile.is_well_formed() {
-            return self.dispatch_candidates(admission, class, false, Vec::new());
+            return self.dispatch_candidates(admission, class, None, false, Vec::new());
         }
         let (profile_found, candidates) =
             build_policy_candidates(&self.records, requirement, self.voice_owner.as_ref());
-        self.dispatch_candidates(admission, class, profile_found, candidates)
+        self.dispatch_candidates(
+            admission,
+            class,
+            Some(requirement.capacity_units()),
+            profile_found,
+            candidates,
+        )
     }
 
     pub(crate) fn voice_state_enabled(&self) -> bool {
@@ -440,13 +446,13 @@ impl WorkerPool {
 
     fn dispatch_candidates(
         &self,
-        admission: AdmissionLease,
+        mut admission: AdmissionLease,
         class: CapacityClass,
+        capacity_units: Option<u32>,
         profile_found: bool,
-        candidates: Vec<PolicyCandidate>,
+        mut candidates: Vec<PolicyCandidate>,
     ) -> Result<RequestLease, DispatchError> {
-        let ordered = self.selector.order(candidates, class, self.records.len());
-
+        let policy_guard = self.selector.least_requests_guard(class, candidates.len());
         let gate = self.gate.read().map_err(|_| DispatchError::Internal)?;
         if !gate.open {
             return Err(DispatchError::Draining);
@@ -454,11 +460,20 @@ impl WorkerPool {
         if !profile_found {
             return Err(DispatchError::NoEligibleProfile);
         }
-        if ordered.is_empty() {
+        if candidates.is_empty() {
             return Err(DispatchError::Unavailable);
         }
+        let units = capacity_units.ok_or(DispatchError::NoEligibleProfile)?;
+        if class == CapacityClass::SpeechBatch {
+            self.admission
+                .reserve_deferred_class(&mut admission, units)?;
+        } else if units != 1 || !admission.has_class_permit() {
+            return Err(DispatchError::Internal);
+        }
+        self.selector
+            .order_in_place(&mut candidates, class, self.records.len());
         let mut still_eligible = false;
-        for candidate in ordered {
+        for candidate in candidates {
             let record = candidate.record;
             if !record.available_for_dispatch() {
                 continue;
@@ -467,12 +482,14 @@ impl WorkerPool {
             let Some(slot) = record.slot(class) else {
                 return Err(DispatchError::Internal);
             };
-            if let Ok(exact) = Arc::clone(&slot.semaphore).try_acquire_owned() {
+            if let Ok(exact) = Arc::clone(&slot.semaphore).try_acquire_many_owned(units) {
                 drop(gate);
+                drop(policy_guard);
                 return Ok(RequestLease::new(admission, exact, record, class));
             }
         }
         drop(gate);
+        drop(policy_guard);
         if still_eligible {
             Err(DispatchError::Overloaded)
         } else {
@@ -530,7 +547,7 @@ impl WorkerPool {
     ) -> Option<HomogeneousMediaHttp<'_>> {
         if !matches!(
             service,
-            ServiceClass::SpeechHttp | ServiceClass::SpeechBatch | ServiceClass::TranscriptionHttp
+            ServiceClass::SpeechHttp | ServiceClass::TranscriptionHttp
         ) {
             return None;
         }
@@ -683,7 +700,7 @@ impl HomogeneousMediaHttp<'_> {
             .map(PolicyCandidate::new)
             .collect();
         self.pool
-            .dispatch_candidates(admission, class, true, candidates)
+            .dispatch_candidates(admission, class, Some(1), true, candidates)
     }
 }
 
@@ -703,7 +720,7 @@ impl HomogeneousGenerationHttp<'_> {
             .map(PolicyCandidate::new)
             .collect();
         self.pool
-            .dispatch_candidates(admission, class, true, candidates)
+            .dispatch_candidates(admission, class, Some(1), true, candidates)
     }
 }
 
@@ -754,11 +771,7 @@ fn build_homogeneous_generation_cohorts(
 
 fn build_homogeneous_media_cohorts(records: &[Arc<WorkerRecord>]) -> Vec<HomogeneousMediaCohort> {
     let mut result = Vec::new();
-    for service in [
-        ServiceClass::SpeechHttp,
-        ServiceClass::SpeechBatch,
-        ServiceClass::TranscriptionHttp,
-    ] {
+    for service in [ServiceClass::SpeechHttp, ServiceClass::TranscriptionHttp] {
         let mut processed_scopes = Vec::with_capacity(records.len());
         for record in records {
             if !record
@@ -916,9 +929,9 @@ pub(crate) mod benchmark {
     use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
     use super::profile::{
-        InputModality, MessageContentForm, ModelSelection, OutputModality, ProfileRequirement,
-        RegistrationId, RouteRequirement, ServiceClass, ServiceProfile, StreamMode, TrustDomain,
-        WorkerId,
+        BatchFeature, InputModality, MessageContentForm, ModelSelection, OutputModality,
+        ProfileRequirement, ReferenceForm, RegistrationId, RouteRequirement, ServiceClass,
+        ServiceProfile, SpeechResponseFormat, SpeechTask, StreamMode, TrustDomain, WorkerId,
     };
     use super::{
         AdmissionController, CapacityClass, CapacitySlot, Disposition, Gate, HealthCell,
@@ -941,6 +954,101 @@ pub(crate) mod benchmark {
     pub(crate) struct CandidateBatch(Vec<PolicyCandidate>);
 
     pub(crate) struct ExactBatch(Vec<Arc<WorkerRecord>>);
+
+    pub(crate) struct BatchFixture {
+        dispatch_pool: WorkerPool,
+        requirement: RouteRequirement,
+    }
+
+    impl BatchFixture {
+        pub(crate) fn new(units: u16) -> Result<Self, &'static str> {
+            if units == 0 || units > 32 {
+                return Err("batch benchmark units must be between 1 and 32");
+            }
+            let target = ResolvedTarget::from_parts("http://127.0.0.1:30000/", "/health", None)
+                .ok_or("batch benchmark target failed to build")?;
+            let telemetry = Arc::new(crate::telemetry::Telemetry::new(["worker-0"].into_iter()));
+            let mut capacities = std::array::from_fn(|_| None);
+            capacities[super::class_index(CapacityClass::SpeechBatch)] = Some(CapacitySlot {
+                limit: 32,
+                semaphore: Arc::new(Semaphore::new(32)),
+            });
+            let health = HealthCell::unknown();
+            health.store(HealthState::Healthy);
+            let record = Arc::new(WorkerRecord {
+                worker_id: WorkerId::new(String::from("worker-0")),
+                default_model_id: Some(String::from("tts")),
+                registration_id: RegistrationId::from_startup_ordinal(0),
+                target,
+                trust_domain: TrustDomain::new(String::from("local")),
+                profiles: vec![ServiceProfile::SpeechBatch {
+                    model_ids: vec![String::from("tts")],
+                    response_formats: vec![SpeechResponseFormat::Wav],
+                    tasks: vec![SpeechTask::TextToSpeech],
+                    reference_forms: vec![ReferenceForm::None],
+                    managed_voice: false,
+                    max_batch_size: 32,
+                    effective_features: vec![BatchFeature::Model],
+                }],
+                capacities,
+                health,
+                disposition: AtomicU8::new(Disposition::Serving as u8),
+                immediate_probe: Notify::new(),
+                telemetry: Arc::clone(&telemetry),
+            });
+            let records = vec![record];
+            let targets: Vec<_> = records.iter().map(|record| record.target.clone()).collect();
+            let resolver = StaticResolver::from_targets(&targets).ok_or("resolver must build")?;
+            let health_client = build_health_client(
+                Arc::new(resolver),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            )
+            .map_err(|_| "health client must build")?;
+            let gate = Arc::new(RwLock::new(Gate::open()));
+            let dispatch_pool = WorkerPool {
+                homogeneous_generation_http: build_homogeneous_generation_cohorts(&records),
+                homogeneous_media_http: build_homogeneous_media_cohorts(&records),
+                realtime_defaults_unambiguous: compute_realtime_defaults_unambiguous(&records),
+                records,
+                required_services: vec![ServiceClass::SpeechBatch],
+                voice_owner: None,
+                gate: Arc::clone(&gate),
+                admission: AdmissionController::new(gate, 1, [32; 7]),
+                selector: Selector::new(RoutingStrategy::RoundRobin),
+                generation_client: Some(health_client.clone()),
+                media_client: None,
+                health_client,
+                telemetry,
+            };
+            let requirement = RouteRequirement::new(
+                ProfileRequirement::SpeechBatch {
+                    models: vec![ModelSelection::Explicit(String::from("tts")); usize::from(units)],
+                    response_formats: vec![SpeechResponseFormat::Wav],
+                    tasks: vec![SpeechTask::TextToSpeech],
+                    reference_forms: vec![ReferenceForm::None],
+                    managed_voice: false,
+                    batch_size: units,
+                    effective_features: vec![BatchFeature::Model],
+                },
+                TrustDomain::new(String::from("local")),
+                false,
+            );
+            Ok(Self {
+                dispatch_pool,
+                requirement,
+            })
+        }
+
+        pub(crate) fn dispatch(&self) -> bool {
+            let Ok(admission) = self.dispatch_pool.try_admit(CapacityClass::SpeechBatch) else {
+                return false;
+            };
+            self.dispatch_pool
+                .dispatch(admission, &self.requirement)
+                .is_ok()
+        }
+    }
 
     impl Fixture {
         pub(crate) fn new(size: usize, strategy: RoutingStrategy) -> Result<Self, &'static str> {
@@ -1141,7 +1249,7 @@ pub(crate) mod benchmark {
 #[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use std::panic::AssertUnwindSafe;
-    use std::sync::atomic::AtomicU8;
+    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier, Mutex, RwLock};
     use std::thread;
     use std::time::Duration;
@@ -1152,10 +1260,11 @@ mod tests {
     use super::health::{HealthCell, HealthState};
     use super::permit::{AdmissionController, Gate, class_index};
     use super::profile::{
-        ChatAudioFormat, InputModality, MediaPlacement, MessageContentForm, ModelSelection,
-        OutputModality, ProfileRequirement, ReferenceForm, RegistrationId, RouteRequirement,
-        ServiceClass, ServiceProfile, SpeechResponseFormat, SpeechTask, SpeechWebsocketInput,
-        StreamMode, TrustDomain, WorkerId,
+        ChatAudioFormat, InputModality, MediaPlacement, MediaProfile, MessageContentForm,
+        ModelSelection, OutputModality, ProfileRequirement, RealtimeProtocol, ReferenceForm,
+        RegistrationId, RouteRequirement, ServiceClass, ServiceProfile, SpeechResponseFormat,
+        SpeechTask, SpeechWebsocketInput, StreamMode, TranscriptionResponseFormat, TrustDomain,
+        WorkerId,
     };
     use super::resolver::{ResolvedTarget, StaticResolver, build_health_client};
     use super::{
@@ -1352,6 +1461,25 @@ mod tests {
             max_batch_size: 4,
             effective_features: vec![super::profile::BatchFeature::Model],
         }
+    }
+
+    fn speech_batch_requirement(batch_size: u16) -> RouteRequirement {
+        RouteRequirement::new(
+            ProfileRequirement::SpeechBatch {
+                models: vec![
+                    ModelSelection::Explicit(String::from("tts"));
+                    usize::from(batch_size)
+                ],
+                response_formats: vec![SpeechResponseFormat::Wav],
+                tasks: vec![SpeechTask::TextToSpeech],
+                reference_forms: vec![ReferenceForm::None],
+                managed_voice: false,
+                batch_size,
+                effective_features: vec![super::profile::BatchFeature::Model],
+            },
+            TrustDomain::new(String::from("local")),
+            false,
+        )
     }
 
     fn media_speech_profile(
@@ -1958,6 +2086,523 @@ mod tests {
     }
 
     #[test]
+    fn every_non_batch_requirement_keeps_one_capacity_unit() {
+        let trust = || TrustDomain::new(String::from("local"));
+        let requirements = [
+            generation_requirement(),
+            SpeechSurface::Http.requirement(SpeechResponseFormat::Wav, StreamMode::NonStreaming),
+            RouteRequirement::new(
+                ProfileRequirement::TranscriptionHttp {
+                    model: ModelSelection::Explicit(String::from("asr")),
+                    response_format: TranscriptionResponseFormat::Json,
+                    media_profile: MediaProfile::Audio,
+                    stream_mode: StreamMode::NonStreaming,
+                },
+                trust(),
+                false,
+            ),
+            SpeechSurface::Websocket.requirement(SpeechResponseFormat::Pcm, StreamMode::Streaming),
+            RouteRequirement::new(
+                ProfileRequirement::RealtimeWebsocket {
+                    protocol: RealtimeProtocol::OpenaiRealtimeV1,
+                    expected_default_model_id: String::from("omni"),
+                },
+                trust(),
+                false,
+            ),
+            RouteRequirement::new(ProfileRequirement::VoiceControl, trust(), true),
+        ];
+        assert!(
+            requirements
+                .iter()
+                .all(|requirement| requirement.capacity_units() == 1)
+        );
+        assert_eq!(speech_batch_requirement(4).capacity_units(), 4);
+    }
+
+    #[test]
+    fn snapshot_before_reserve_model_has_a_barrier_controlled_incast_witness() {
+        // A tie is already dispersed by the existing round-robin rank. The
+        // actual race is several arrivals observing the same unique minimum
+        // before any of them publishes its reservation.
+        let loads = Arc::new([AtomicUsize::new(0), AtomicUsize::new(1)]);
+        let snapshots_read = Arc::new(Barrier::new(2));
+        let mut contenders = Vec::new();
+        for _ in 0..2 {
+            let loads = Arc::clone(&loads);
+            let snapshots_read = Arc::clone(&snapshots_read);
+            contenders.push(thread::spawn(move || {
+                let snapshot = [
+                    loads[0].load(Ordering::Relaxed),
+                    loads[1].load(Ordering::Relaxed),
+                ];
+                snapshots_read.wait();
+                let selected = usize::from(snapshot[1] < snapshot[0]);
+                loads[selected].fetch_add(1, Ordering::Relaxed);
+                selected
+            }));
+        }
+        let selected: Vec<_> = contenders
+            .into_iter()
+            .map(|contender| contender.join().expect("join old-race witness"))
+            .collect();
+        assert_eq!(selected, [0, 0]);
+        assert_eq!(
+            loads
+                .iter()
+                .map(|load| load.load(Ordering::Relaxed))
+                .collect::<Vec<_>>(),
+            [2, 1]
+        );
+    }
+
+    #[test]
+    fn least_requests_linearizes_simultaneous_selection_and_reservation() {
+        const REQUESTS: usize = 32;
+        const PREEXISTING_UNITS: u32 = 8;
+        let pool = Arc::new(fixture_pool(RoutingStrategy::LeastRequests, 2, REQUESTS));
+        let preexisting = Arc::clone(
+            &pool.records[1]
+                .slot(CapacityClass::GenerationHttp)
+                .expect("second generation slot")
+                .semaphore,
+        )
+        .try_acquire_many_owned(PREEXISTING_UNITS)
+        .expect("create one unique lower-load worker");
+        let start = Arc::new(Barrier::new(REQUESTS + 1));
+        let mut dispatchers = Vec::with_capacity(REQUESTS);
+        for _ in 0..REQUESTS {
+            let pool = Arc::clone(&pool);
+            let start = Arc::clone(&start);
+            dispatchers.push(thread::spawn(move || {
+                let admission = pool
+                    .try_admit(CapacityClass::GenerationHttp)
+                    .expect("concurrent admission");
+                start.wait();
+                pool.dispatch(admission, &generation_requirement())
+                    .expect("concurrent least-request dispatch")
+            }));
+        }
+        start.wait();
+        let leases: Vec<_> = dispatchers
+            .into_iter()
+            .map(|dispatcher| dispatcher.join().expect("join concurrent dispatcher"))
+            .collect();
+        let per_worker = [
+            leases
+                .iter()
+                .filter(|lease| lease.registration_id().startup_ordinal() == 0)
+                .count(),
+            leases
+                .iter()
+                .filter(|lease| lease.registration_id().startup_ordinal() == 1)
+                .count(),
+        ];
+        assert_eq!(per_worker.iter().sum::<usize>(), REQUESTS);
+        let preexisting_units = usize::try_from(PREEXISTING_UNITS).expect("test units fit usize");
+        let occupied = [per_worker[0], per_worker[1] + preexisting_units];
+        let expected = (REQUESTS + preexisting_units) / 2;
+        assert_eq!(occupied, [expected, expected], "{per_worker:?}");
+        drop(leases);
+        drop(preexisting);
+    }
+
+    #[test]
+    fn policy_guards_are_class_local_and_bypassed_by_round_robin_and_control() {
+        let least = Arc::new(Selector::new(RoutingStrategy::LeastRequests));
+        let generation = least
+            .least_requests_guard(CapacityClass::GenerationHttp, 2)
+            .expect("least requests uses a data-plane guard");
+        let speech = least
+            .least_requests_guard(CapacityClass::SpeechHttp, 2)
+            .expect("a different class has an independent guard");
+        drop(speech);
+
+        let (attempting, attempted) = std::sync::mpsc::channel();
+        let (acquired, received) = std::sync::mpsc::channel();
+        let contender = Arc::clone(&least);
+        let waiter = thread::spawn(move || {
+            attempting.send(()).expect("publish guard attempt");
+            let _guard = contender
+                .least_requests_guard(CapacityClass::GenerationHttp, 2)
+                .expect("same class uses the guard");
+            acquired.send(()).expect("publish guard acquisition");
+        });
+        attempted
+            .recv_timeout(Duration::from_secs(1))
+            .expect("same-class contender reached the guard");
+        assert!(received.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(generation);
+        received
+            .recv_timeout(Duration::from_secs(1))
+            .expect("same-class guard is released");
+        waiter.join().expect("join policy waiter");
+
+        let round_robin = Selector::new(RoutingStrategy::RoundRobin);
+        assert!(
+            round_robin
+                .least_requests_guard(CapacityClass::GenerationHttp, 2)
+                .is_none()
+        );
+        assert!(
+            least
+                .least_requests_guard(CapacityClass::Control, 2)
+                .is_none()
+        );
+        assert!(
+            least
+                .least_requests_guard(CapacityClass::GenerationHttp, 1)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn least_requests_dispatch_uses_the_production_class_guard() {
+        let pool = Arc::new(fixture_pool(RoutingStrategy::LeastRequests, 2, 1));
+        let guard = pool
+            .selector
+            .least_requests_guard(CapacityClass::GenerationHttp, 2)
+            .expect("hold production generation guard");
+        let admission = pool
+            .try_admit(CapacityClass::GenerationHttp)
+            .expect("guard-use admission");
+        let (attempting, attempted) = std::sync::mpsc::channel();
+        let (finished, completion) = std::sync::mpsc::channel();
+        let dispatch_pool = Arc::clone(&pool);
+        let dispatcher = thread::spawn(move || {
+            attempting.send(()).expect("publish dispatch attempt");
+            let lease = dispatch_pool
+                .dispatch(admission, &generation_requirement())
+                .expect("dispatch after guard release");
+            finished.send(lease).expect("publish guarded dispatch");
+        });
+        attempted
+            .recv_timeout(Duration::from_secs(1))
+            .expect("dispatcher reached production dispatch");
+        assert!(completion.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(guard);
+        let lease = completion
+            .recv_timeout(Duration::from_secs(1))
+            .expect("dispatch must proceed when the production guard is released");
+        dispatcher.join().expect("join guarded dispatcher");
+        drop(lease);
+    }
+
+    #[test]
+    fn speech_batch_owns_item_credits_atomically_and_never_splits() {
+        let record = record_with_default_class(
+            0,
+            CapacityClass::SpeechBatch,
+            4,
+            "local",
+            "tts",
+            vec![speech_batch_profile_for("tts")],
+        );
+        let pool = pool_with_records(
+            RoutingStrategy::LeastRequests,
+            ServiceClass::SpeechBatch,
+            vec![record],
+        );
+        let lease = pool
+            .dispatch(
+                pool.try_admit(CapacityClass::SpeechBatch)
+                    .expect("batch envelope admission"),
+                &speech_batch_requirement(4),
+            )
+            .expect("maximum batch dispatch");
+        assert_eq!(
+            pool.admission.available(CapacityClass::SpeechBatch),
+            (511, 508)
+        );
+        assert_eq!(
+            pool.records[0]
+                .slot(CapacityClass::SpeechBatch)
+                .expect("batch slot")
+                .semaphore
+                .available_permits(),
+            0
+        );
+        let occupied = pool
+            .operations_snapshot()
+            .expect("occupied batch operations snapshot");
+        assert_eq!(occupied.admission[0].in_flight, 1);
+        assert_eq!(occupied.admission[4].in_flight, 4);
+        assert_eq!(occupied.workers[0].capacity[0].in_flight, 4);
+        drop(lease);
+        assert_eq!(
+            pool.admission.available(CapacityClass::SpeechBatch),
+            (512, 512)
+        );
+        assert_eq!(
+            pool.records[0]
+                .slot(CapacityClass::SpeechBatch)
+                .expect("batch slot")
+                .semaphore
+                .available_permits(),
+            4
+        );
+
+        let one = pool
+            .dispatch(
+                pool.try_admit(CapacityClass::SpeechBatch)
+                    .expect("single-item batch admission"),
+                &speech_batch_requirement(1),
+            )
+            .expect("single-item batch dispatch");
+        assert_eq!(
+            pool.admission.available(CapacityClass::SpeechBatch),
+            (511, 511)
+        );
+        assert_eq!(
+            pool.records[0]
+                .slot(CapacityClass::SpeechBatch)
+                .expect("batch slot")
+                .semaphore
+                .available_permits(),
+            3
+        );
+        drop(one);
+
+        let unsplittable = pool_with_records(
+            RoutingStrategy::LeastRequests,
+            ServiceClass::SpeechBatch,
+            vec![
+                record_with_default_class(
+                    0,
+                    CapacityClass::SpeechBatch,
+                    3,
+                    "local",
+                    "tts",
+                    vec![speech_batch_profile_for("tts")],
+                ),
+                record_with_default_class(
+                    1,
+                    CapacityClass::SpeechBatch,
+                    3,
+                    "local",
+                    "tts",
+                    vec![speech_batch_profile_for("tts")],
+                ),
+            ],
+        );
+        assert_eq!(
+            unsplittable
+                .dispatch(
+                    unsplittable
+                        .try_admit(CapacityClass::SpeechBatch)
+                        .expect("unsplittable envelope admission"),
+                    &speech_batch_requirement(4),
+                )
+                .err(),
+            Some(DispatchError::Overloaded)
+        );
+        assert_eq!(
+            unsplittable.admission.available(CapacityClass::SpeechBatch),
+            (512, 512)
+        );
+        assert!(unsplittable.records.iter().all(|record| {
+            record
+                .slot(CapacityClass::SpeechBatch)
+                .is_some_and(|slot| slot.semaphore.available_permits() == 3)
+        }));
+
+        let mut class_limited = pool_with_records(
+            RoutingStrategy::RoundRobin,
+            ServiceClass::SpeechBatch,
+            vec![record_with_default_class(
+                0,
+                CapacityClass::SpeechBatch,
+                8,
+                "local",
+                "tts",
+                vec![speech_batch_profile_for("tts")],
+            )],
+        );
+        let mut classes = [8; 7];
+        classes[class_index(CapacityClass::SpeechBatch)] = 3;
+        class_limited.admission =
+            AdmissionController::new(Arc::clone(&class_limited.gate), 8, classes);
+        assert_eq!(
+            class_limited
+                .dispatch(
+                    class_limited
+                        .try_admit(CapacityClass::SpeechBatch)
+                        .expect("class-limited envelope admission"),
+                    &speech_batch_requirement(4),
+                )
+                .err(),
+            Some(DispatchError::Overloaded)
+        );
+        assert_eq!(
+            class_limited
+                .admission
+                .available(CapacityClass::SpeechBatch),
+            (8, 3)
+        );
+        assert_eq!(
+            class_limited.records[0]
+                .slot(CapacityClass::SpeechBatch)
+                .expect("class-limited batch slot")
+                .semaphore
+                .available_permits(),
+            8
+        );
+    }
+
+    #[test]
+    fn speech_batch_profile_boundary_and_multi_unit_fallback_are_exact() {
+        let profile_limited = pool_with_records(
+            RoutingStrategy::RoundRobin,
+            ServiceClass::SpeechBatch,
+            vec![record_with_default_class(
+                0,
+                CapacityClass::SpeechBatch,
+                8,
+                "local",
+                "tts",
+                vec![speech_batch_profile_for("tts")],
+            )],
+        );
+        let over_profile = speech_batch_requirement(5);
+        assert!(over_profile.profile.is_well_formed());
+        assert_eq!(
+            profile_limited
+                .dispatch(
+                    profile_limited
+                        .try_admit(CapacityClass::SpeechBatch)
+                        .expect("over-profile envelope admission"),
+                    &over_profile,
+                )
+                .err(),
+            Some(DispatchError::NoEligibleProfile)
+        );
+        assert_eq!(
+            profile_limited
+                .admission
+                .available(CapacityClass::SpeechBatch),
+            (512, 512)
+        );
+        assert_eq!(
+            profile_limited.records[0]
+                .slot(CapacityClass::SpeechBatch)
+                .expect("profile-limited batch slot")
+                .semaphore
+                .available_permits(),
+            8
+        );
+
+        let fallback = pool_with_records(
+            RoutingStrategy::RoundRobin,
+            ServiceClass::SpeechBatch,
+            vec![
+                record_with_default_class(
+                    0,
+                    CapacityClass::SpeechBatch,
+                    4,
+                    "local",
+                    "tts",
+                    vec![speech_batch_profile_for("tts")],
+                ),
+                record_with_default_class(
+                    1,
+                    CapacityClass::SpeechBatch,
+                    4,
+                    "local",
+                    "tts",
+                    vec![speech_batch_profile_for("tts")],
+                ),
+            ],
+        );
+        let first_slot = Arc::clone(
+            &fallback.records[0]
+                .slot(CapacityClass::SpeechBatch)
+                .expect("first fallback slot")
+                .semaphore,
+        );
+        let first_occupied = first_slot
+            .try_acquire_many_owned(2)
+            .expect("partially occupy first fallback worker");
+        let lease = fallback
+            .dispatch(
+                fallback
+                    .try_admit(CapacityClass::SpeechBatch)
+                    .expect("fallback envelope admission"),
+                &speech_batch_requirement(4),
+            )
+            .expect("second worker satisfies the complete batch");
+        assert_eq!(lease.worker_id().as_str(), "worker-1");
+        assert_eq!(
+            fallback.records[0]
+                .slot(CapacityClass::SpeechBatch)
+                .expect("first fallback slot")
+                .semaphore
+                .available_permits(),
+            2
+        );
+        assert_eq!(
+            fallback.records[1]
+                .slot(CapacityClass::SpeechBatch)
+                .expect("second fallback slot")
+                .semaphore
+                .available_permits(),
+            0
+        );
+        drop(lease);
+        drop(first_occupied);
+        assert!(fallback.records.iter().all(|record| {
+            record
+                .slot(CapacityClass::SpeechBatch)
+                .is_some_and(|slot| slot.semaphore.available_permits() == 4)
+        }));
+        assert_eq!(
+            fallback.admission.available(CapacityClass::SpeechBatch),
+            (512, 512)
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_speech_batch_returns_every_item_credit() {
+        let record = record_with_default_class(
+            0,
+            CapacityClass::SpeechBatch,
+            4,
+            "local",
+            "tts",
+            vec![speech_batch_profile_for("tts")],
+        );
+        let pool = Arc::new(pool_with_records(
+            RoutingStrategy::RoundRobin,
+            ServiceClass::SpeechBatch,
+            vec![record],
+        ));
+        let lease = pool
+            .dispatch(
+                pool.try_admit(CapacityClass::SpeechBatch)
+                    .expect("cancelled batch admission"),
+                &speech_batch_requirement(4),
+            )
+            .expect("cancelled batch dispatch");
+        let task = tokio::spawn(async move {
+            let _lease = lease;
+            std::future::pending::<()>().await;
+        });
+        task.abort();
+        assert!(task.await.expect_err("batch task cancelled").is_cancelled());
+        assert_eq!(
+            pool.admission.available(CapacityClass::SpeechBatch),
+            (512, 512)
+        );
+        assert_eq!(
+            pool.records[0]
+                .slot(CapacityClass::SpeechBatch)
+                .expect("batch slot")
+                .semaphore
+                .available_permits(),
+            4
+        );
+    }
+
+    #[test]
     fn drain_linearizes_against_admitted_and_reserved_work() {
         let pool = fixture_pool(RoutingStrategy::RoundRobin, 1, 1);
         let requirement = generation_requirement();
@@ -2019,6 +2664,53 @@ mod tests {
                 .map(|slot| slot.semaphore.available_permits()),
             Some(1)
         );
+    }
+
+    #[test]
+    fn least_requests_dispatch_and_drain_complete_without_lock_inversion() {
+        const DISPATCHERS: usize = 16;
+        let pool = Arc::new(fixture_pool(RoutingStrategy::LeastRequests, 2, DISPATCHERS));
+        let admissions: Vec<_> = (0..DISPATCHERS)
+            .map(|_| {
+                pool.try_admit(CapacityClass::GenerationHttp)
+                    .expect("pre-drain admission")
+            })
+            .collect();
+        let start = Arc::new(Barrier::new(DISPATCHERS + 2));
+        let (finished, completions) = std::sync::mpsc::channel();
+        let mut threads = Vec::with_capacity(DISPATCHERS + 1);
+        for admission in admissions {
+            let pool = Arc::clone(&pool);
+            let start = Arc::clone(&start);
+            let finished = finished.clone();
+            threads.push(thread::spawn(move || {
+                start.wait();
+                match pool.dispatch(admission, &generation_requirement()) {
+                    Ok(lease) => drop(lease),
+                    Err(DispatchError::Draining) => {}
+                    Err(error) => panic!("unexpected dispatch result: {error}"),
+                }
+                finished.send(()).expect("publish dispatch completion");
+            }));
+        }
+        let drain_pool = Arc::clone(&pool);
+        let drain_start = Arc::clone(&start);
+        let drain_finished = finished.clone();
+        threads.push(thread::spawn(move || {
+            drain_start.wait();
+            drain_pool.drain().expect("least-request drain");
+            drain_finished.send(()).expect("publish drain completion");
+        }));
+        drop(finished);
+        start.wait();
+        for _ in 0..=DISPATCHERS {
+            completions
+                .recv_timeout(Duration::from_secs(2))
+                .expect("dispatch/drain lock order must complete");
+        }
+        for thread in threads {
+            thread.join().expect("join dispatch/drain thread");
+        }
     }
 
     #[test]
@@ -3529,7 +4221,7 @@ mod tests {
                 record_with_default_class(
                     0,
                     CapacityClass::SpeechBatch,
-                    1,
+                    2,
                     "local",
                     "tts",
                     vec![batch_profile(vec![ReferenceForm::Direct])],
@@ -3537,7 +4229,7 @@ mod tests {
                 record_with_default_class(
                     1,
                     CapacityClass::SpeechBatch,
-                    1,
+                    2,
                     "local",
                     "tts",
                     vec![batch_profile(vec![

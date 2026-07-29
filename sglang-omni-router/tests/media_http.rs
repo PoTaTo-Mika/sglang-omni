@@ -314,7 +314,7 @@ fn config(address: SocketAddr, routes: &[MediaRoute], workers: &[(&Worker, bool)
         .collect::<Vec<_>>()
         .join(", ");
     let mut output = format!(
-        "schema_version = 1\n\n[server]\nlisten = \"{address}\"\nmax_connections = 64\n\n[shutdown]\ndrain_timeout_ms = 5000\n\n[logging]\nformat = \"json\"\nfilter = \"error\"\n\n[router]\nrequired_services = [{required_services}]\n\n[admission]\nglobal = 32\ngeneration_http = 1\nspeech_http = 8\ntranscription_http = 8\nspeech_batch = 8\nspeech_websocket = 1\nrealtime_websocket = 1\ncontrol = 1\n\n[health]\ninterval_ms = 1000\ntimeout_ms = 500\nsuccess_threshold = 1\nfailure_threshold = 3\nmax_concurrent_probes = 8\n\n[http_media]\nroutes = [{enabled_routes}]\ntrust_domain = \"local\"\nbuffered_request_max_bytes = 1024\nbuffered_request_total_bytes = 4096\nstreamed_request_max_bytes = 8192\nconnect_timeout_ms = 1000\nrequest_timeout_ms = 5000\npool_idle_timeout_ms = 1000\npool_max_idle_per_host = 4\n"
+        "schema_version = 1\n\n[server]\nlisten = \"{address}\"\nmax_connections = 64\n\n[shutdown]\ndrain_timeout_ms = 5000\n\n[logging]\nformat = \"json\"\nfilter = \"error\"\n\n[router]\nrequired_services = [{required_services}]\n\n[admission]\nglobal = 32\ngeneration_http = 1\nspeech_http = 8\ntranscription_http = 8\nspeech_batch = 16\nspeech_websocket = 1\nrealtime_websocket = 1\ncontrol = 1\n\n[health]\ninterval_ms = 1000\ntimeout_ms = 500\nsuccess_threshold = 1\nfailure_threshold = 3\nmax_concurrent_probes = 8\n\n[http_media]\nroutes = [{enabled_routes}]\ntrust_domain = \"local\"\nbuffered_request_max_bytes = 1024\nbuffered_request_total_bytes = 4096\nstreamed_request_max_bytes = 8192\nconnect_timeout_ms = 1000\nrequest_timeout_ms = 5000\npool_idle_timeout_ms = 1000\npool_max_idle_per_host = 4\n"
     );
     for (index, (worker, alternate)) in workers.iter().enumerate() {
         let speech_formats = if *alternate {
@@ -327,7 +327,12 @@ fn config(address: SocketAddr, routes: &[MediaRoute], workers: &[(&Worker, bool)
             worker.address
         ));
         for route in routes {
-            output.push_str(&format!("{} = 8\n", route.service_name()));
+            let capacity = if *route == MediaRoute::SpeechBatch {
+                16
+            } else {
+                8
+            };
+            output.push_str(&format!("{} = {capacity}\n", route.service_name()));
         }
         for route in routes {
             output.push('\n');
@@ -511,9 +516,17 @@ fn relays_all_media_routes_with_exact_bytes_headers_and_large_direct_uploads() {
         "b".repeat(2_048)
     )
     .into_bytes();
-    let (response, capture) = roundtrip("/v1/audio/speech/batch", "application/json", &large_batch);
-    assert!(response.starts_with(b"HTTP/1.1 200"));
-    assert_eq!(capture.body, large_batch);
+    let captures_before = worker.captures().len();
+    let response = request(
+        router.address,
+        "POST",
+        "/v1/audio/speech/batch",
+        Some("application/json"),
+        &large_batch,
+    )
+    .expect("large batch rejection");
+    assert!(response.starts_with(b"HTTP/1.1 413"));
+    assert_eq!(worker.captures().len(), captures_before);
 
     let large_multipart = multipart_body(false, 2_048);
     let (response, capture) = roundtrip(

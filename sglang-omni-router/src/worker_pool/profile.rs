@@ -454,6 +454,13 @@ impl RouteRequirement {
         self.service_class().capacity()
     }
 
+    pub(super) fn capacity_units(&self) -> u32 {
+        match &self.profile {
+            ProfileRequirement::SpeechBatch { batch_size, .. } => u32::from(*batch_size),
+            _ => 1,
+        }
+    }
+
     pub(super) fn trust_domain(&self) -> &TrustDomain {
         &self.trust_domain
     }
@@ -1093,12 +1100,19 @@ pub(crate) fn validate_workers(
         }
         for (index, profile) in worker.service_profiles.iter().enumerate() {
             profile.validate()?;
-            if worker
-                .capacity
-                .get(profile.service_class().capacity())
-                .is_none()
-            {
+            let Some(profile_capacity) = worker.capacity.get(profile.service_class().capacity())
+            else {
                 return invalid("workers.capacity", "missing capacity for a service profile");
+            };
+            if matches!(
+                profile,
+                ServiceProfile::SpeechBatch { max_batch_size, .. }
+                    if u32::from(*max_batch_size) > profile_capacity
+            ) {
+                return invalid(
+                    "workers.service_profiles.max_batch_size",
+                    "must not exceed workers.capacity.speech_batch",
+                );
             }
             if profile.requires_owner() && voice_owner != Some(worker.worker_id.as_str()) {
                 return invalid(
@@ -1783,7 +1797,7 @@ mod tests {
     fn worker_default_membership_is_validated_independently_for_every_service() {
         let mut multi = worker(0);
         multi.capacity.speech_http = Some(1);
-        multi.capacity.speech_batch = Some(1);
+        multi.capacity.speech_batch = Some(2);
         multi.capacity.transcription_http = Some(1);
         multi.capacity.speech_websocket = Some(1);
         multi.service_profiles.extend([

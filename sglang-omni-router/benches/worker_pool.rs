@@ -16,7 +16,7 @@ mod worker_pool;
 
 use config::RoutingStrategy;
 use criterion::{BatchSize, BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use worker_pool::benchmark::Fixture;
+use worker_pool::benchmark::{BatchFixture, Fixture};
 
 fn worker_pool(c: &mut Criterion) {
     for size in [1_usize, 2, 8, 64, 256] {
@@ -80,6 +80,14 @@ fn worker_pool(c: &mut Criterion) {
             |b, _| {
                 b.iter(|| black_box(least.homogeneous_dispatch()));
             },
+        );
+    }
+    for units in [1_u16, 8, 16, 32] {
+        let batch = BatchFixture::new(units).expect("speech-batch benchmark fixture must be valid");
+        c.bench_with_input(
+            BenchmarkId::new("speech_batch_multi_unit_dispatch", units),
+            &units,
+            |b, _| b.iter(|| black_box(batch.dispatch())),
         );
     }
 }

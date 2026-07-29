@@ -189,13 +189,14 @@ async fn handle(
         .pool
         .try_admit(route.capacity())
         .map_err(map_admission)?;
-    let direct_proof = if framing.content_length.is_some_and(|length| {
-        length > media.buffered_max
-            && length <= media.streamed_max
-            && !framing.transfer_framed
-            && !framing.has_route_hint
-            && !framing.has_content_encoding
-    }) {
+    let direct_proof = if route != HttpMediaRoute::SpeechBatch
+        && framing.content_length.is_some_and(|length| {
+            length > media.buffered_max
+                && length <= media.streamed_max
+                && !framing.transfer_framed
+                && !framing.has_route_hint
+                && !framing.has_content_encoding
+        }) {
         media.pool.homogeneous_media_http(
             media
                 .ordinary_trust

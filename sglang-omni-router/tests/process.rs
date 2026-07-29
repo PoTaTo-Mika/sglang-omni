@@ -493,10 +493,10 @@ fn serves_exact_local_health_and_operations_routes_and_shuts_down_cleanly() {
     assert!(diagnostics.starts_with("HTTP/1.1 200"));
     assert_exact_content_length(&diagnostics);
     assert!(diagnostics.contains(
-        r#"{"lifecycle":"serving","ready":false,"admission":[{"class":"global","limit":8,"in_flight":0},{"class":"generation_http","limit":4,"in_flight":0}"#
+        r#"{"lifecycle":"serving","ready":false,"admission":[{"class":"global","unit":"request_envelopes","limit":8,"in_flight":0},{"class":"generation_http","unit":"requests","limit":4,"in_flight":0}"#
     ));
     assert!(diagnostics.contains(
-        r#""workers":[{"worker_id":"worker-1","registration_ordinal":0,"health":"unknown","disposition":"serving","capacity":[{"class":"generation_http","limit":4,"in_flight":0}]}]"#
+        r#""workers":[{"worker_id":"worker-1","registration_ordinal":0,"health":"unknown","disposition":"serving","capacity":[{"class":"generation_http","unit":"requests","limit":4,"in_flight":0}]}]"#
     ));
     for forbidden in [
         "base_url",

@@ -7,7 +7,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::error::ConfigError;
-use crate::worker_pool::profile::{ServiceClass, WorkerConfig, validate_workers};
+use crate::worker_pool::profile::{ServiceClass, ServiceProfile, WorkerConfig, validate_workers};
 
 /// Maximum accepted configuration size, in bytes.
 pub const MAX_CONFIG_BYTES: usize = 64 * 1024;
@@ -497,6 +497,7 @@ impl Config {
             &self.router.required_services,
             self.router.voice_owner_worker_id.as_deref(),
         )?;
+        self.validate_speech_batch_admission()?;
         Ok(())
     }
 
@@ -1000,21 +1001,44 @@ impl Config {
                 "must be between 1 and 1000000",
             ));
         }
-        let class_limits = [
+        let envelope_class_limits = [
             self.admission.generation_http,
             self.admission.speech_http,
             self.admission.transcription_http,
-            self.admission.speech_batch,
             self.admission.speech_websocket,
             self.admission.realtime_websocket,
             self.admission.control,
         ];
-        if class_limits.iter().any(|limit| {
+        if envelope_class_limits.iter().any(|limit| {
             !(1..=MAX_CLASS_ADMISSION).contains(limit) || *limit > self.admission.global
         }) {
             return Err(ConfigError::invalid(
                 "admission",
-                "class limits must be between 1 and 65535 and not exceed global",
+                "request and session class limits must be between 1 and 65535 and not exceed global",
+            ));
+        }
+        if !(1..=MAX_CLASS_ADMISSION).contains(&self.admission.speech_batch) {
+            return Err(ConfigError::invalid(
+                "admission.speech_batch",
+                "must be between 1 and 65535 item credits",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_speech_batch_admission(&self) -> Result<(), ConfigError> {
+        if self.workers.iter().any(|worker| {
+            worker.service_profiles.iter().any(|profile| {
+                matches!(
+                    profile,
+                    ServiceProfile::SpeechBatch { max_batch_size, .. }
+                        if u32::from(*max_batch_size) > self.admission.speech_batch
+                )
+            })
+        }) {
+            return Err(ConfigError::invalid(
+                "admission.speech_batch",
+                "must fit every workers.service_profiles.max_batch_size",
             ));
         }
         Ok(())
