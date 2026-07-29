@@ -12,6 +12,7 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::{Notify, Semaphore};
 
 use crate::config::Config;
+use crate::telemetry::Telemetry;
 
 pub(crate) use health::{HealthState, HealthSupervisor, HealthTaskError};
 #[allow(unused_imports)] // Branch-owned lease API is consumed by later route modules.
@@ -113,6 +114,7 @@ struct WorkerRecord {
     health: HealthCell,
     disposition: AtomicU8,
     immediate_probe: Notify,
+    telemetry: Arc<Telemetry>,
 }
 
 impl WorkerRecord {
@@ -190,6 +192,7 @@ pub(crate) struct WorkerPool {
     health_client: reqwest::Client,
     generation_client: Option<reqwest::Client>,
     media_client: Option<reqwest::Client>,
+    telemetry: Arc<Telemetry>,
 }
 
 struct HomogeneousGenerationCohort {
@@ -219,6 +222,12 @@ pub(crate) struct HomogeneousGenerationHttp<'a> {
 
 impl WorkerPool {
     pub(crate) fn build(config: &Config) -> Result<Self, crate::error::RouterError> {
+        let telemetry = Arc::new(Telemetry::new(
+            config
+                .workers
+                .iter()
+                .map(|worker| worker.worker_id.as_str()),
+        ));
         let targets: Vec<_> = config
             .workers
             .iter()
@@ -297,6 +306,7 @@ impl WorkerPool {
                 health: HealthCell::unknown(),
                 disposition: AtomicU8::new(Disposition::Serving as u8),
                 immediate_probe: Notify::new(),
+                telemetry: Arc::clone(&telemetry),
             }));
         }
         let homogeneous_generation_http = build_homogeneous_generation_cohorts(&records);
@@ -320,7 +330,12 @@ impl WorkerPool {
             health_client,
             generation_client,
             media_client,
+            telemetry,
         })
+    }
+
+    pub(crate) fn telemetry(&self) -> &Arc<Telemetry> {
+        &self.telemetry
     }
 
     pub(crate) fn start_health(&self, config: &Config) -> HealthSupervisor {
@@ -352,6 +367,7 @@ impl WorkerPool {
         requirement: &RouteRequirement,
     ) -> Result<RequestLease, DispatchError> {
         let class = requirement.capacity_class();
+        let _dispatch_duration = self.telemetry.dispatch_timer(class);
         if admission.class() != class {
             return Err(DispatchError::AdmissionClassMismatch);
         }
@@ -372,6 +388,7 @@ impl WorkerPool {
         admission: AdmissionLease,
     ) -> Result<RequestLease, DispatchError> {
         let class = CapacityClass::Control;
+        let _dispatch_duration = self.telemetry.dispatch_timer(class);
         if admission.class() != class {
             return Err(DispatchError::AdmissionClassMismatch);
         }
@@ -653,6 +670,7 @@ pub(crate) struct HomogeneousMediaHttp<'a> {
 impl HomogeneousMediaHttp<'_> {
     pub(crate) fn dispatch(self, admission: AdmissionLease) -> Result<RequestLease, DispatchError> {
         let class = self.cohort.service.capacity();
+        let _dispatch_duration = self.pool.telemetry.dispatch_timer(class);
         if admission.class() != class {
             return Err(DispatchError::AdmissionClassMismatch);
         }
@@ -672,6 +690,7 @@ impl HomogeneousMediaHttp<'_> {
 impl HomogeneousGenerationHttp<'_> {
     pub(crate) fn dispatch(self, admission: AdmissionLease) -> Result<RequestLease, DispatchError> {
         let class = CapacityClass::GenerationHttp;
+        let _dispatch_duration = self.pool.telemetry.dispatch_timer(class);
         if admission.class() != class {
             return Err(DispatchError::AdmissionClassMismatch);
         }
@@ -927,6 +946,12 @@ pub(crate) mod benchmark {
         pub(crate) fn new(size: usize, strategy: RoutingStrategy) -> Result<Self, &'static str> {
             let target = ResolvedTarget::from_parts("http://127.0.0.1:30000/", "/health", None)
                 .ok_or("benchmark target failed to build")?;
+            let worker_ids: Vec<_> = (0..size)
+                .map(|ordinal| format!("worker-{ordinal}"))
+                .collect();
+            let telemetry = Arc::new(crate::telemetry::Telemetry::new(
+                worker_ids.iter().map(String::as_str),
+            ));
             let mut records = Vec::with_capacity(size);
             let mut saturated = Vec::with_capacity(size.saturating_sub(1));
             for registration_ordinal in 0..size {
@@ -962,6 +987,7 @@ pub(crate) mod benchmark {
                     health,
                     disposition: AtomicU8::new(Disposition::Serving as u8),
                     immediate_probe: Notify::new(),
+                    telemetry: Arc::clone(&telemetry),
                 }));
             }
             let trust_domain = TrustDomain::new(String::from("local"));
@@ -1000,6 +1026,7 @@ pub(crate) mod benchmark {
                 generation_client: Some(health_client.clone()),
                 media_client: None,
                 health_client,
+                telemetry,
             };
             Ok(Self {
                 records,
@@ -1260,6 +1287,19 @@ mod tests {
         exact_limit: usize,
         profiles: Vec<ServiceProfile>,
     ) -> Arc<WorkerRecord> {
+        let telemetry = Arc::new(crate::telemetry::Telemetry::new(
+            (0..=id).map(|_| "fixture-worker"),
+        ));
+        record_with_profiles_and_telemetry(id, class, exact_limit, profiles, telemetry)
+    }
+
+    fn record_with_profiles_and_telemetry(
+        id: usize,
+        class: CapacityClass,
+        exact_limit: usize,
+        profiles: Vec<ServiceProfile>,
+        telemetry: Arc<crate::telemetry::Telemetry>,
+    ) -> Arc<WorkerRecord> {
         let mut capacities = std::array::from_fn(|_| None);
         capacities[class_index(class)] = Some(CapacitySlot {
             limit: exact_limit,
@@ -1281,6 +1321,7 @@ mod tests {
             health: HealthCell::unknown(),
             disposition: AtomicU8::new(super::Disposition::Serving as u8),
             immediate_probe: tokio::sync::Notify::new(),
+            telemetry,
         })
     }
 
@@ -1412,12 +1453,132 @@ mod tests {
             generation_client: Some(health_client.clone()),
             media_client: None,
             health_client,
+            telemetry: Arc::new(crate::telemetry::Telemetry::new(std::iter::empty())),
         }
     }
 
     fn fixture_pool(strategy: RoutingStrategy, size: usize, exact_limit: usize) -> WorkerPool {
         let records: Vec<_> = (0..size).map(|id| record(id, exact_limit)).collect();
         pool_with_records(strategy, ServiceClass::GenerationHttp, records)
+    }
+
+    #[test]
+    fn telemetry_distinguishes_workers_and_ignores_failed_dispatches() {
+        let telemetry = Arc::new(crate::telemetry::Telemetry::new(
+            ["worker-0", "worker-1"].into_iter(),
+        ));
+        let records = vec![
+            record_with_profiles_and_telemetry(
+                0,
+                CapacityClass::GenerationHttp,
+                1,
+                vec![generation_profile()],
+                Arc::clone(&telemetry),
+            ),
+            record_with_profiles_and_telemetry(
+                1,
+                CapacityClass::GenerationHttp,
+                1,
+                vec![generation_profile()],
+                Arc::clone(&telemetry),
+            ),
+        ];
+        let pool = pool_with_records(
+            RoutingStrategy::RoundRobin,
+            ServiceClass::GenerationHttp,
+            records,
+        );
+        let first = pool
+            .dispatch(
+                pool.try_admit(CapacityClass::GenerationHttp)
+                    .expect("admit first"),
+                &generation_requirement(),
+            )
+            .expect("dispatch first");
+        let second = pool
+            .dispatch(
+                pool.try_admit(CapacityClass::GenerationHttp)
+                    .expect("admit second"),
+                &generation_requirement(),
+            )
+            .expect("dispatch second");
+        assert_eq!(
+            pool.dispatch(
+                pool.try_admit(CapacityClass::GenerationHttp)
+                    .expect("admit failed dispatch"),
+                &generation_requirement(),
+            )
+            .err(),
+            Some(DispatchError::Overloaded)
+        );
+        assert_eq!(
+            telemetry.worker_dispatch_count(0, CapacityClass::GenerationHttp),
+            1
+        );
+        assert_eq!(
+            telemetry.worker_dispatch_count(1, CapacityClass::GenerationHttp),
+            1
+        );
+        assert_eq!(
+            pool.telemetry.dispatch_count(CapacityClass::GenerationHttp),
+            3
+        );
+        assert_eq!(pool.telemetry.dispatch_count(CapacityClass::SpeechHttp), 0);
+
+        let upstream_headers = first.upstream_headers_timer();
+        drop(upstream_headers);
+        assert_eq!(
+            telemetry.upstream_headers_count(CapacityClass::GenerationHttp),
+            1
+        );
+        assert_eq!(
+            telemetry.upstream_headers_count(CapacityClass::SpeechHttp),
+            0
+        );
+        drop(first);
+        drop(second);
+        assert_eq!(
+            telemetry.worker_request_count(0, CapacityClass::GenerationHttp),
+            1
+        );
+        assert_eq!(
+            telemetry.worker_request_count(1, CapacityClass::GenerationHttp),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_task_records_its_exact_worker_lease_once() {
+        let telemetry = Arc::new(crate::telemetry::Telemetry::new(["worker-0"].into_iter()));
+        let record = record_with_profiles_and_telemetry(
+            0,
+            CapacityClass::GenerationHttp,
+            1,
+            vec![generation_profile()],
+            Arc::clone(&telemetry),
+        );
+        let pool = pool_with_records(
+            RoutingStrategy::RoundRobin,
+            ServiceClass::GenerationHttp,
+            vec![record],
+        );
+        let lease = pool
+            .dispatch(
+                pool.try_admit(CapacityClass::GenerationHttp)
+                    .expect("admit cancelled request"),
+                &generation_requirement(),
+            )
+            .expect("dispatch cancelled request");
+        let task = tokio::spawn(async move {
+            let _lease = lease;
+            std::future::pending::<()>().await;
+        });
+        task.abort();
+        assert!(task.await.expect_err("task is cancelled").is_cancelled());
+        assert_eq!(
+            telemetry.worker_request_count(0, CapacityClass::GenerationHttp),
+            1
+        );
     }
 
     #[test]

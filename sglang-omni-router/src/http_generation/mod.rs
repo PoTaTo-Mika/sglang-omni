@@ -18,6 +18,7 @@ use tracing::error;
 use crate::classification;
 use crate::config::Config;
 use crate::error::{HttpFault, RouterError};
+use crate::telemetry::Telemetry;
 use crate::worker_pool::{
     AdmissionError, CapacityClass, DispatchError, RequestLease, TrustDomain, WorkerPool,
 };
@@ -40,6 +41,7 @@ pub(crate) struct HttpGeneration {
     streamed_max: u64,
     buffered_budget: Arc<Semaphore>,
     classification_slots: Arc<Semaphore>,
+    telemetry: Arc<Telemetry>,
     request_timeout: std::time::Duration,
 }
 
@@ -64,6 +66,7 @@ impl HttpGeneration {
             .generation_client()
             .ok_or(RouterError::WorkerPoolInvariant)?;
         Ok(Some(Arc::new(Self {
+            telemetry: Arc::clone(pool.telemetry()),
             client,
             pool,
             trust: TrustDomain::new(http_generation.trust_domain.clone()),
@@ -161,12 +164,17 @@ async fn handle(
     .await?;
     let classify_pool = Arc::clone(&generation.pool);
     let classify_trust = generation.trust.clone();
-    let (bytes, budget, classified) =
-        classify_with_cpu_slot(&generation.classification_slots, deadline, move || {
+    let (bytes, budget, classified) = classify_with_cpu_slot(
+        &generation.classification_slots,
+        &generation.telemetry,
+        CapacityClass::GenerationHttp,
+        deadline,
+        move || {
             let classified = classify(&bytes, &classify_pool, &classify_trust)?;
             Ok((bytes, budget, classified))
-        })
-        .await?;
+        },
+    )
+    .await?;
     let lease = generation
         .pool
         .dispatch(admission, &classified.requirement)
@@ -308,6 +316,7 @@ async fn send_once(
         .body(body);
     let _attempt =
         authorize_upstream_attempt_at(deadline, upload.as_ref(), tokio::time::Instant::now())?;
+    let upstream_headers = lease.upstream_headers_timer();
     let sent = tokio::select! {
         biased;
         result = request.send() => result,
@@ -315,6 +324,7 @@ async fn send_once(
             return Err(deadline_fault(upload.as_ref()));
         }
     };
+    drop(upstream_headers);
     let response = match sent {
         Ok(response) => response,
         Err(_source) => {
@@ -391,6 +401,8 @@ fn finish_buffered_classification<T>(
 
 pub(crate) async fn classify_with_cpu_slot<T>(
     slots: &Arc<Semaphore>,
+    telemetry: &Arc<Telemetry>,
+    class: CapacityClass,
     deadline: tokio::time::Instant,
     operation: impl FnOnce() -> Result<T, HttpFault> + Send + 'static,
 ) -> Result<T, HttpFault>
@@ -401,13 +413,13 @@ where
     let slot = tokio::select! {
         biased;
         () = tokio::time::sleep_until(deadline) => return Err(HttpFault::UpstreamTimeout),
-        result = classification::acquire(slots) => result,
+        result = classification::acquire(slots, telemetry, class) => result,
     }
     .map_err(|source| {
         log_classification_error(source);
         HttpFault::InternalError
     })?;
-    let classified = classification::run_with_slot(slot, move || {
+    let classified = classification::run_with_slot(slot, telemetry, class, move || {
         check_precommit_deadline_at(deadline, None, tokio::time::Instant::now())?;
         operation()
     })
@@ -555,6 +567,10 @@ mod tests {
 
     struct AlwaysReady;
 
+    fn telemetry() -> Arc<crate::telemetry::Telemetry> {
+        Arc::new(crate::telemetry::Telemetry::new(std::iter::empty()))
+    }
+
     impl http_body::Body for AlwaysReady {
         type Data = Bytes;
         type Error = io::Error;
@@ -650,8 +666,11 @@ mod tests {
             .expect("hold the sole classification slot");
         let ran = Arc::new(AtomicBool::new(false));
         let task_ran = Arc::clone(&ran);
+        let telemetry = telemetry();
         let classifier = super::classify_with_cpu_slot(
             &slots,
+            &telemetry,
+            crate::worker_pool::CapacityClass::GenerationHttp,
             tokio::time::Instant::now() + Duration::from_secs(1),
             move || {
                 task_ran.store(true, Ordering::Release);
@@ -681,6 +700,8 @@ mod tests {
         let task_ran = Arc::clone(&ran);
         let result = super::classify_with_cpu_slot(
             &slots,
+            &telemetry(),
+            crate::worker_pool::CapacityClass::GenerationHttp,
             tokio::time::Instant::now() + Duration::from_millis(10),
             move || {
                 task_ran.store(true, Ordering::Release);
@@ -701,6 +722,8 @@ mod tests {
         let classifier = tokio::spawn(async move {
             super::classify_with_cpu_slot(
                 &task_slots,
+                &telemetry(),
+                crate::worker_pool::CapacityClass::GenerationHttp,
                 tokio::time::Instant::now() + Duration::from_millis(50),
                 move || {
                     entered_tx.send(()).expect("announce classifier entry");
@@ -733,6 +756,8 @@ mod tests {
         let classifier = tokio::spawn(async move {
             super::classify_with_cpu_slot(
                 &task_slots,
+                &telemetry(),
+                crate::worker_pool::CapacityClass::GenerationHttp,
                 tokio::time::Instant::now() + Duration::from_secs(1),
                 move || {
                     entered_tx.send(()).expect("announce classifier entry");

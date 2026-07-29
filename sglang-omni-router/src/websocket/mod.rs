@@ -24,6 +24,7 @@ use crate::speech_facts::{
     read_field as read_shared_speech_field, reference_forms,
     response_format as classify_response_format, task as classify_task,
 };
+use crate::telemetry::Telemetry;
 use crate::worker_pool::{
     AdmissionError, CapacityClass, DefaultModelResolution, DispatchError, ModelSelection,
     ProfileRequirement, RealtimeProtocol, RouteRequirement, ServiceClass, SpeechResponseFormat,
@@ -61,6 +62,7 @@ pub(crate) struct WebsocketGateway {
     realtime: Option<TrustDomain>,
     tracker: SessionTracker,
     classification_slots: Arc<tokio::sync::Semaphore>,
+    telemetry: Arc<Telemetry>,
 }
 
 impl WebsocketGateway {
@@ -72,6 +74,7 @@ impl WebsocketGateway {
     ) -> Option<Arc<Self>> {
         let policy = config.websocket.clone()?;
         Some(Arc::new(Self {
+            telemetry: Arc::clone(pool.telemetry()),
             pool,
             speech: policy
                 .speech
@@ -178,11 +181,16 @@ async fn run_speech(
     let classify_trust = trust.clone();
     let classified = setup_or_drain(
         &mut drain,
-        classification::run(&classify_slots, move || {
-            let requirement =
-                classify_speech(config_text.as_bytes(), &classify_pool, &classify_trust);
-            (config_text, requirement)
-        }),
+        classification::run(
+            &classify_slots,
+            &gateway.telemetry,
+            CapacityClass::SpeechWebsocket,
+            move || {
+                let requirement =
+                    classify_speech(config_text.as_bytes(), &classify_pool, &classify_trust);
+                (config_text, requirement)
+            },
+        ),
     )
     .await;
     let (config_text, requirement) = match classified {

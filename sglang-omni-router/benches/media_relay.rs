@@ -17,6 +17,8 @@ mod http_generation;
 mod http_media;
 #[path = "../src/speech_facts.rs"]
 mod speech_facts;
+#[path = "../src/telemetry.rs"]
+mod telemetry;
 #[path = "../src/worker_pool/mod.rs"]
 mod worker_pool;
 

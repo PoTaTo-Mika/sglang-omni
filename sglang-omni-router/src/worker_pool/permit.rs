@@ -3,6 +3,8 @@ use std::sync::{Arc, RwLock};
 use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use crate::telemetry::DurationGuard;
+
 use super::profile::{CapacityClass, RegistrationId, WorkerId};
 use super::{ResolvedTarget, WorkerRecord};
 
@@ -78,6 +80,7 @@ pub(crate) struct RequestLease {
     admission: AdmissionLease,
     pub(super) registration: Arc<WorkerRecord>,
     class: CapacityClass,
+    started: std::time::Instant,
 }
 
 impl RequestLease {
@@ -87,12 +90,18 @@ impl RequestLease {
         registration: Arc<WorkerRecord>,
         class: CapacityClass,
     ) -> Self {
-        Self {
+        let lease = Self {
             exact,
             admission,
             registration,
             class,
-        }
+            started: std::time::Instant::now(),
+        };
+        lease
+            .registration
+            .telemetry
+            .record_dispatch(lease.registration.registration_id.startup_ordinal(), class);
+        lease
     }
 
     pub(crate) fn worker_id(&self) -> &WorkerId {
@@ -123,6 +132,22 @@ impl RequestLease {
 
     pub(super) fn admission(&self) -> &AdmissionLease {
         &self.admission
+    }
+
+    pub(crate) fn upstream_headers_timer(&self) -> DurationGuard<'_> {
+        self.registration
+            .telemetry
+            .upstream_headers_timer(self.class)
+    }
+}
+
+impl Drop for RequestLease {
+    fn drop(&mut self) {
+        self.registration.telemetry.record_worker_request(
+            self.registration.registration_id.startup_ordinal(),
+            self.class,
+            self.started.elapsed(),
+        );
     }
 }
 

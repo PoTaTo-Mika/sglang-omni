@@ -20,6 +20,7 @@ use crate::http_generation::response_body::DirectResponseBody;
 use crate::http_generation::{
     classify_with_cpu_slot, read_buffered, reserve_budget, snapshot_upload,
 };
+use crate::telemetry::Telemetry;
 use crate::worker_pool::{
     AdmissionError, CapacityClass, DispatchError, RequestLease, ServiceClass, TrustDomain,
     WorkerPool,
@@ -42,6 +43,7 @@ pub(crate) struct HttpMedia {
     streamed_max: u64,
     buffered_budget: Arc<Semaphore>,
     classification_slots: Arc<Semaphore>,
+    telemetry: Arc<Telemetry>,
     request_timeout: std::time::Duration,
 }
 
@@ -100,6 +102,7 @@ impl HttpMedia {
             .media_client()
             .ok_or(RouterError::WorkerPoolInvariant)?;
         Ok(Some(Arc::new(Self {
+            telemetry: Arc::clone(pool.telemetry()),
             pool,
             client,
             ordinary_trust: config
@@ -243,8 +246,12 @@ async fn handle(
         .ordinary_trust
         .clone()
         .ok_or(HttpFault::InternalError)?;
-    let (bytes, budget, classified) =
-        classify_with_cpu_slot(&media.classification_slots, deadline, move || {
+    let (bytes, budget, classified) = classify_with_cpu_slot(
+        &media.classification_slots,
+        &media.telemetry,
+        route.capacity(),
+        deadline,
+        move || {
             let classified = classify(
                 route,
                 &bytes,
@@ -253,8 +260,9 @@ async fn handle(
                 &classify_trust,
             )?;
             Ok((bytes, budget, classified))
-        })
-        .await?;
+        },
+    )
+    .await?;
     let lease = media
         .pool
         .dispatch(admission, &classified.requirement)
@@ -353,11 +361,13 @@ async fn send_once(
         .header(CONTENT_LENGTH, length)
         .header(REQUEST_ID_HEADER, request_id)
         .body(body);
+    let upstream_headers = lease.upstream_headers_timer();
     let sent = tokio::select! {
         biased;
         result = request.send() => result,
         () = tokio::time::sleep_until(deadline) => return Err(deadline_fault(upload.as_ref())),
     };
+    drop(upstream_headers);
     let response = match sent {
         Ok(response) => response,
         Err(_source) => {

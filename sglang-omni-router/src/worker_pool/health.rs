@@ -279,6 +279,7 @@ mod tests {
             health: HealthCell::unknown(),
             disposition: AtomicU8::new(Disposition::Serving as u8),
             immediate_probe: Notify::new(),
+            telemetry: Arc::new(crate::telemetry::Telemetry::new(std::iter::empty())),
         });
         let client = test_client(std::slice::from_ref(&record), Duration::from_secs(1));
         let mut supervisor = HealthSupervisor::start(
@@ -321,6 +322,7 @@ mod tests {
             health: HealthCell::unknown(),
             disposition: AtomicU8::new(Disposition::Serving as u8),
             immediate_probe: Notify::new(),
+            telemetry: Arc::new(crate::telemetry::Telemetry::new(std::iter::empty())),
         });
         let client = test_client(std::slice::from_ref(&record), Duration::from_millis(50));
         let mut supervisor = HealthSupervisor::start(
@@ -368,6 +370,7 @@ mod tests {
             health: HealthCell::unknown(),
             disposition: AtomicU8::new(Disposition::Serving as u8),
             immediate_probe: Notify::new(),
+            telemetry: Arc::new(crate::telemetry::Telemetry::new(std::iter::empty())),
         });
         let client = test_client(std::slice::from_ref(&record), Duration::from_secs(1));
         let mut supervisor = HealthSupervisor::start(
@@ -431,6 +434,7 @@ mod tests {
             health: HealthCell::unknown(),
             disposition: AtomicU8::new(Disposition::Serving as u8),
             immediate_probe: Notify::new(),
+            telemetry: Arc::new(crate::telemetry::Telemetry::new(std::iter::empty())),
         });
         let client = test_client(std::slice::from_ref(&record), Duration::from_secs(5));
         let mut supervisor = HealthSupervisor::start(
@@ -537,6 +541,7 @@ mod tests {
             health: HealthCell::unknown(),
             disposition: AtomicU8::new(Disposition::Serving as u8),
             immediate_probe: Notify::new(),
+            telemetry: Arc::new(crate::telemetry::Telemetry::new(std::iter::empty())),
         });
         let client = test_client(std::slice::from_ref(&record), Duration::from_secs(1));
         let mut supervisor = HealthSupervisor::start(
@@ -618,6 +623,7 @@ mod tests {
                     health: HealthCell::unknown(),
                     disposition: AtomicU8::new(Disposition::Serving as u8),
                     immediate_probe: Notify::new(),
+                    telemetry: Arc::new(crate::telemetry::Telemetry::new(std::iter::empty())),
                 })
             })
             .collect();

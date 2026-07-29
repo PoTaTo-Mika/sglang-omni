@@ -10,18 +10,26 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use crate::telemetry::{ConnectionGuard, Telemetry};
+
 /// TCP listener that bounds sockets accepted into Axum connection tasks.
 pub(super) struct BoundedTcpListener {
     listener: TcpListener,
     permits: Arc<Semaphore>,
+    telemetry: Arc<Telemetry>,
 }
 
 impl BoundedTcpListener {
     /// Wraps a bound TCP listener with exactly `max_connections` permits.
-    pub(super) fn new(listener: TcpListener, max_connections: usize) -> Self {
+    pub(super) fn new(
+        listener: TcpListener,
+        max_connections: usize,
+        telemetry: Arc<Telemetry>,
+    ) -> Self {
         Self {
             listener,
             permits: Arc::new(Semaphore::new(max_connections)),
+            telemetry,
         }
     }
 }
@@ -31,12 +39,18 @@ impl Listener for BoundedTcpListener {
     type Addr = SocketAddr;
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        if self.permits.available_permits() == 0 {
+            self.telemetry.record_connection_capacity_wait();
+        }
         let permit = match Arc::clone(&self.permits).acquire_owned().await {
             Ok(permit) => permit,
             Err(_closed) => pending().await,
         };
         let (stream, address) = Listener::accept(&mut self.listener).await;
-        (ConnectionIo::new(stream, permit), address)
+        (
+            ConnectionIo::new(stream, permit, self.telemetry.connection_accepted()),
+            address,
+        )
     }
 
     fn local_addr(&self) -> io::Result<Self::Addr> {
@@ -48,13 +62,15 @@ impl Listener for BoundedTcpListener {
 pub(super) struct ConnectionIo {
     stream: TcpStream,
     _permit: OwnedSemaphorePermit,
+    _telemetry: ConnectionGuard,
 }
 
 impl ConnectionIo {
-    fn new(stream: TcpStream, permit: OwnedSemaphorePermit) -> Self {
+    fn new(stream: TcpStream, permit: OwnedSemaphorePermit, telemetry: ConnectionGuard) -> Self {
         Self {
             stream,
             _permit: permit,
+            _telemetry: telemetry,
         }
     }
 }
@@ -125,7 +141,8 @@ mod tests {
             .await
             .expect("bind isolated listener");
         let address = tcp.local_addr().expect("read isolated listener address");
-        (BoundedTcpListener::new(tcp, capacity), address)
+        let telemetry = Arc::new(crate::telemetry::Telemetry::new(std::iter::empty()));
+        (BoundedTcpListener::new(tcp, capacity, telemetry), address)
     }
 
     async fn write_all(stream: &TcpStream, mut bytes: &[u8]) {
@@ -177,11 +194,13 @@ mod tests {
     #[tokio::test]
     async fn bounds_accepted_wrappers_and_wakes_after_drop() {
         let (mut listener, address) = listener(1).await;
+        assert_eq!(listener.telemetry.connection_counts(), (0, 0, 0));
         let _first_client = TcpStream::connect(address)
             .await
             .expect("connect first client");
         let (first_io, _) = listener.accept().await;
         assert_eq!(listener.permits.available_permits(), 0);
+        assert_eq!(listener.telemetry.connection_counts(), (1, 1, 0));
 
         let _second_client = TcpStream::connect(address)
             .await
@@ -192,14 +211,17 @@ mod tests {
                 .is_err(),
             "second wrapper must wait while the only permit is owned"
         );
+        assert_eq!(listener.telemetry.connection_counts(), (1, 1, 1));
 
         drop(first_io);
         let (second_io, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept())
             .await
             .expect("waiting accept should wake after wrapper drop");
         assert_eq!(listener.permits.available_permits(), 0);
+        assert_eq!(listener.telemetry.connection_counts(), (2, 1, 1));
         drop(second_io);
         assert_eq!(listener.permits.available_permits(), 1);
+        assert_eq!(listener.telemetry.connection_counts(), (2, 0, 1));
     }
 
     #[tokio::test]

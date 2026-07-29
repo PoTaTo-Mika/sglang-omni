@@ -182,11 +182,13 @@ async fn send_once(
             .header(CONTENT_LENGTH, length)
             .body(body);
     }
+    let upstream_headers = lease.upstream_headers_timer();
     let response = tokio::select! {
         biased;
         result = request.send() => result,
         () = tokio::time::sleep_until(deadline) => return Err(HttpFault::UpstreamTimeout),
     };
+    drop(upstream_headers);
     let response = match response {
         Ok(response) => response,
         Err(_source) => {

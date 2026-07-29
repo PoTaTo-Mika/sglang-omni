@@ -27,6 +27,7 @@ mod operations;
 mod server;
 mod shutdown;
 mod speech_facts;
+mod telemetry;
 mod websocket;
 mod worker_pool;
 

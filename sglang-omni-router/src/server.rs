@@ -101,7 +101,7 @@ pub(crate) async fn serve(config: Config) -> Result<(), RouterError> {
         .await
         .map_err(RouterError::Bind)?;
     let max_connections = config.server.max_connections_usize()?;
-    let listener = BoundedTcpListener::new(listener, max_connections);
+    let listener = BoundedTcpListener::new(listener, max_connections, Arc::clone(pool.telemetry()));
     let (shutdown_sender, shutdown_receiver) = oneshot::channel::<()>();
     lifecycle.enter_serving()?;
     let mut health = pool.start_health(&config);
@@ -389,7 +389,12 @@ async fn metrics(State(state): State<AppState>, request: Request<Body>) -> Respo
         Ok(snapshot) => snapshot,
         Err(_) => return crate::error::HttpFault::InternalError.into_response(),
     };
-    operations::metrics_response(lifecycle, state.is_ready(), &snapshot)
+    operations::metrics_response(
+        lifecycle,
+        state.is_ready(),
+        &snapshot,
+        state.pool.telemetry(),
+    )
 }
 
 async fn diagnostics(State(state): State<AppState>, request: Request<Body>) -> Response<Body> {

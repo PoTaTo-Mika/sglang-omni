@@ -9,6 +9,8 @@
 mod config;
 #[path = "../src/error.rs"]
 mod error;
+#[path = "../src/telemetry.rs"]
+mod telemetry;
 #[path = "../src/worker_pool/mod.rs"]
 mod worker_pool;
 

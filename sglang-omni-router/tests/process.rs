@@ -483,7 +483,10 @@ fn serves_exact_local_health_and_operations_routes_and_shuts_down_cleanly() {
     assert!(metrics.contains("sglang_omni_router_lifecycle{state=\"serving\"} 1\n"));
     assert!(metrics.contains("sglang_omni_router_ready 0\n"));
     assert!(metrics.contains("sglang_omni_router_admission_limit{class=\"generation_http\"} 4\n"));
-    assert!(!metrics.contains("worker-1"));
+    assert!(metrics.contains(
+        "sglang_omni_router_worker_dispatch_total{worker_id=\"worker-1\",class=\"generation_http\"} 0\n"
+    ));
+    assert!(metrics.contains("# TYPE sglang_omni_router_runtime_workers gauge\n"));
     assert!(!metrics.contains("omni\""));
 
     let diagnostics = request(address, "GET", "/diagnostics");

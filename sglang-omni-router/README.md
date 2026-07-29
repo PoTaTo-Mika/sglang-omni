@@ -697,9 +697,14 @@ curl http://127.0.0.1:30000/diagnostics
 
 `/v1/models` is the sorted, deduplicated union of profile model IDs and worker
 defaults; it is manifest state, not a live worker query. `/metrics` exposes
-fixed-label lifecycle/readiness, worker health/disposition, admission, and
-aggregate exact-capacity gauges. `/diagnostics` returns the same bounded state
-as JSON and includes only worker IDs, startup registration ordinals,
+fixed-label lifecycle/readiness, worker health/disposition, admission,
+aggregate exact capacity, per-worker dispatch and exact-lease duration totals,
+class-level exact-lease histograms, dispatch and upstream-header duration,
+classifier wait/run ownership, accepted connection ownership, and scrape-time
+Tokio runtime gauges. Its only
+manifest-derived label is the immutable worker ID; it never uses model, URL,
+request, header, query, or error-text labels. `/diagnostics` returns bounded
+state as JSON and includes only worker IDs, startup registration ordinals,
 health/disposition, and configured/in-flight capacity—never URLs, IPs, model
 payloads, or request data. Operations endpoints are health-independent,
 bodyless HTTP/1.1 GETs with no query, and are not registered on non-loopback
@@ -720,9 +725,9 @@ exits successfully.
 tracing events currently cover process lifecycle transitions: start, drain,
 forced shutdown/deadline failure, and clean stop. There is no per-request
 access log, worker-selection log, health-transition log, or request-latency
-histogram in this process. Use the local proxy and client-side measurements
-when those records are required; `/metrics` and `/diagnostics` expose bounded
-state and current permit occupancy.
+outcome log in this process. Use client-side measurements when request outcome
+records or downstream first-byte timing are required; `/metrics` exposes
+bounded performance histograms and ownership gauges without logging requests.
 
 Lifecycle logs do not include request bodies, query data, arbitrary headers,
 worker URLs, or manifest contents. Configuration and client errors use stable

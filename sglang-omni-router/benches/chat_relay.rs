@@ -13,6 +13,8 @@ mod config;
 mod error;
 #[path = "../src/http_generation/mod.rs"]
 mod http_generation;
+#[path = "../src/telemetry.rs"]
+mod telemetry;
 #[path = "../src/worker_pool/mod.rs"]
 mod worker_pool;
 

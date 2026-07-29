@@ -15,6 +15,7 @@ use crate::config::Config;
 use crate::error::{HttpFault, RouterError};
 use crate::http_generation::headers::{REQUEST_ID_HEADER, validate_bodyless_request};
 use crate::lifecycle::State as LifecycleState;
+use crate::telemetry::Telemetry;
 use crate::worker_pool::{CapacityClass, OperationsSnapshot};
 
 const JSON_CONTENT_TYPE: &str = "application/json";
@@ -74,11 +75,12 @@ pub(crate) fn metrics_response(
     lifecycle: LifecycleState,
     ready: bool,
     snapshot: &OperationsSnapshot,
+    telemetry: &Telemetry,
 ) -> Response<Body> {
     response(
         StatusCode::OK,
         METRICS_CONTENT_TYPE,
-        Bytes::from(render_metrics(lifecycle, ready, snapshot)),
+        Bytes::from(render_metrics(lifecycle, ready, snapshot, telemetry)),
     )
 }
 
@@ -164,7 +166,12 @@ fn render_models<'a>(ids: impl Iterator<Item = &'a str>) -> Result<Bytes, Router
         .map_err(|_| RouterError::WorkerPoolInvariant)
 }
 
-fn render_metrics(lifecycle: LifecycleState, ready: bool, snapshot: &OperationsSnapshot) -> String {
+fn render_metrics(
+    lifecycle: LifecycleState,
+    ready: bool,
+    snapshot: &OperationsSnapshot,
+    telemetry: &Telemetry,
+) -> String {
     let mut output = String::new();
     output.push_str("# HELP sglang_omni_router_lifecycle Router lifecycle state.\n");
     output.push_str("# TYPE sglang_omni_router_lifecycle gauge\n");
@@ -210,6 +217,7 @@ fn render_metrics(lifecycle: LifecycleState, ready: bool, snapshot: &OperationsS
 
     render_admission_metrics(&mut output, snapshot);
     render_worker_capacity_metrics(&mut output, snapshot);
+    telemetry.render(&mut output);
     output
 }
 
@@ -550,12 +558,18 @@ mod tests {
         assert_eq!(ids, ["alpha", "realtime-only", "shared", "zeta"]);
     }
 
-    #[test]
-    fn metrics_text_is_complete_exact_and_fixed_order() {
-        let rendered = render_metrics(LifecycleState::Serving, true, &representative_snapshot());
-        assert_eq!(
-            rendered,
-            concat!(
+    #[tokio::test]
+    async fn metrics_text_is_complete_exact_and_fixed_order() {
+        let telemetry =
+            crate::telemetry::Telemetry::new(["worker-a", "worker-b", "worker-c"].into_iter());
+        let rendered = render_metrics(
+            LifecycleState::Serving,
+            true,
+            &representative_snapshot(),
+            &telemetry,
+        );
+        assert!(
+            rendered.starts_with(concat!(
                 "# HELP sglang_omni_router_lifecycle Router lifecycle state.\n",
                 "# TYPE sglang_omni_router_lifecycle gauge\n",
                 "sglang_omni_router_lifecycle{state=\"starting\"} 0\n",
@@ -613,8 +627,11 @@ mod tests {
                 "sglang_omni_router_worker_capacity_in_flight{class=\"speech_websocket\"} 5\n",
                 "sglang_omni_router_worker_capacity_in_flight{class=\"realtime_websocket\"} 6\n",
                 "sglang_omni_router_worker_capacity_in_flight{class=\"control\"} 8\n",
-            )
+            )),
+            "existing metric prefix or order changed"
         );
+        assert!(rendered.contains("# TYPE sglang_omni_router_worker_dispatch_total counter\n"));
+        assert!(rendered.contains("# TYPE sglang_omni_router_runtime_workers gauge\n"));
     }
 
     #[test]
