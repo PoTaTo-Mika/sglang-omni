@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from contextlib import aclosing
 from dataclasses import replace
 from typing import Any, AsyncIterator, Callable
 
@@ -59,13 +58,11 @@ class Client:
         req_id = request_id or str(uuid.uuid4())
         omni_request = self._build_omni_request(request)
         if request.stream:
-            coordinator_stream = self._coordinator.stream(req_id, omni_request)
-            async with aclosing(coordinator_stream):
-                async for msg in coordinator_stream:
-                    if isinstance(msg, StreamMessage):
-                        yield self._stream_builder(req_id, msg)
-                    else:
-                        yield self._result_builder(req_id, msg.result)
+            async for msg in self._coordinator.stream(req_id, omni_request):
+                if isinstance(msg, StreamMessage):
+                    yield self._stream_builder(req_id, msg)
+                else:
+                    yield self._result_builder(req_id, msg.result)
             return
 
         result = await self._coordinator.submit(req_id, omni_request)
@@ -172,33 +169,31 @@ class Client:
         need to touch numpy / raw bytes.
         """
         streamed_text = ""
-        generate_stream = self.generate(request, request_id=request_id)
-        async with aclosing(generate_stream):
-            async for chunk in generate_stream:
-                audio_b64: str | None = None
-                if chunk.modality == "audio" and chunk.audio_data is not None:
-                    audio_b64 = audio_to_base64(
-                        chunk.audio_data,
-                        sample_rate=chunk.sample_rate or DEFAULT_SAMPLE_RATE,
-                        output_format=audio_format,
-                    )
-
-                text = chunk.text
-                if chunk.modality == "text" and text:
-                    if chunk.finish_reason is None:
-                        streamed_text += text
-                    elif streamed_text and text.startswith(streamed_text):
-                        text = text[len(streamed_text) :] or None
-
-                yield CompletionStreamChunk(
-                    request_id=request_id,
-                    text=text,
-                    modality=chunk.modality,
-                    audio_b64=audio_b64,
-                    finish_reason=chunk.finish_reason,
-                    usage=chunk.usage,
-                    stage_name=chunk.stage_name,
+        async for chunk in self.generate(request, request_id=request_id):
+            audio_b64: str | None = None
+            if chunk.modality == "audio" and chunk.audio_data is not None:
+                audio_b64 = audio_to_base64(
+                    chunk.audio_data,
+                    sample_rate=chunk.sample_rate or DEFAULT_SAMPLE_RATE,
+                    output_format=audio_format,
                 )
+
+            text = chunk.text
+            if chunk.modality == "text" and text:
+                if chunk.finish_reason is None:
+                    streamed_text += text
+                elif streamed_text and text.startswith(streamed_text):
+                    text = text[len(streamed_text) :] or None
+
+            yield CompletionStreamChunk(
+                request_id=request_id,
+                text=text,
+                modality=chunk.modality,
+                audio_b64=audio_b64,
+                finish_reason=chunk.finish_reason,
+                usage=chunk.usage,
+                stage_name=chunk.stage_name,
+            )
 
     # ------------------------------------------------------------------
     # High-level: text-to-speech

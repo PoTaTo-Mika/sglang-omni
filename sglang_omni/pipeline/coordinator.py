@@ -90,9 +90,6 @@ class Coordinator:
         self._stream_queues: dict[
             str, asyncio.Queue[CompleteMessage | StreamMessage]
         ] = {}
-        # Abort messages carry only the request ID. A strongly held task keeps
-        # local admission closed and lets the broadcast survive caller cancellation.
-        self._abort_tasks: dict[str, asyncio.Task[bool]] = {}
         self._admin_ops: dict[str, _AdminPendingOperation] = {}
         self._admin_lock = asyncio.Lock()
 
@@ -331,10 +328,14 @@ class Coordinator:
         self, request_id: str, request: OmniRequest | Any
     ) -> AsyncIterator[CompleteMessage | StreamMessage]:
         """Submit a request and yield stream events until completion."""
+        if request_id in self._stream_queues:
+            raise ValueError(f"Request {request_id} already streaming")
+
         queue: asyncio.Queue[CompleteMessage | StreamMessage] = asyncio.Queue()
+        self._stream_queues[request_id] = queue
 
         try:
-            await self._submit_request(request_id, request, stream_queue=queue)
+            await self._submit_request(request_id, request)
             expected_terminal_stages = self._expected_terminal_stages(request_id)
 
             completed_stages: set[str] = set()
@@ -353,31 +354,16 @@ class Coordinator:
                 else:
                     yield msg
         finally:
-            if self._stream_queues.get(request_id) is queue:
-                try:
-                    if request_id in self._requests:
-                        try:
-                            await self.abort(request_id)
-                        except Exception:
-                            # The coordinator-owned abort task logs its own failure.
-                            # Do not replace the exception already leaving the stream.
-                            pass
-                finally:
-                    if self._stream_queues.get(request_id) is queue:
-                        self._stream_queues.pop(request_id, None)
-                        self._completion_futures.pop(request_id, None)
+            self._stream_queues.pop(request_id, None)
+            self._completion_futures.pop(request_id, None)
 
     async def _submit_request(
-        self,
-        request_id: str,
-        request: OmniRequest | Any,
-        *,
-        stream_queue: asyncio.Queue[CompleteMessage | StreamMessage] | None = None,
+        self, request_id: str, request: OmniRequest | Any
     ) -> None:
         """Submit a request without waiting for completion."""
         if self._fatal_error is not None:
             raise RuntimeError(self._fatal_error)
-        if self._request_id_is_reserved(request_id):
+        if request_id in self._requests:
             raise ValueError(f"Request {request_id} already exists")
 
         if self.entry_stage not in self._stages:
@@ -398,8 +384,6 @@ class Coordinator:
         loop = asyncio.get_running_loop()
         future: asyncio.Future = loop.create_future()
         self._completion_futures[request_id] = future
-        if stream_queue is not None:
-            self._stream_queues[request_id] = stream_queue
 
         payload = StagePayload(
             request_id=request_id,
@@ -423,9 +407,7 @@ class Coordinator:
         )
 
         # Update state
-        info = self._requests.get(request_id)
-        if info is not None:
-            info.state = RequestState.RUNNING
+        self._requests[request_id].state = RequestState.RUNNING
 
         logger.info(
             "Coordinator submitted req=%s to %s at %s",
@@ -434,20 +416,7 @@ class Coordinator:
             entry_info.control_endpoint,
         )
 
-    def _request_id_is_reserved(self, request_id: str) -> bool:
-        """Return whether any coordinator owner still holds this request ID."""
-        return (
-            request_id in self._requests
-            or request_id in self._completion_futures
-            or request_id in self._stream_queues
-            or request_id in self._abort_tasks
-        )
-
-    def _reject_completion_future(
-        self,
-        request_id: str,
-        exc: BaseException,
-    ) -> None:
+    def _reject_completion_future(self, request_id: str, exc: BaseException) -> None:
         # Note: (Akazaakane) Non-streaming callers await the completion future,
         # so errors must be propagated with set_exception(). Streaming callers
         # receive errors through the stream queue and never await that future;
@@ -469,14 +438,10 @@ class Coordinator:
         Returns:
             True if aborted, False if not found
         """
-        abort_task = self._abort_tasks.get(request_id)
-        if abort_task is not None:
-            return await asyncio.shield(abort_task)
-
-        info = self._requests.get(request_id)
-        if info is None:
+        if request_id not in self._requests:
             return False
 
+        info = self._requests[request_id]
         if info.state in (
             RequestState.COMPLETED,
             RequestState.FAILED,
@@ -484,33 +449,18 @@ class Coordinator:
         ):
             return False
 
-        abort_task = asyncio.create_task(
-            self._run_abort(request_id),
-            name=f"coordinator-abort-{request_id}",
-        )
-        self._abort_tasks[request_id] = abort_task
-        abort_task.add_done_callback(
-            lambda done, rid=request_id: self._on_abort_task_done(rid, done)
-        )
-        return await asyncio.shield(abort_task)
-
-    async def _run_abort(
-        self,
-        request_id: str,
-    ) -> bool:
+        # Broadcast abort to all stages
         await self.control_plane.broadcast_abort(AbortMessage(request_id=request_id))
 
-        info = self._requests.get(request_id)
-        if info is None:
-            return False
-
+        # Update state
         info.state = RequestState.ABORTED
+
+        # Resolve future with error
         self._reject_completion_future(
             request_id, asyncio.CancelledError(f"Request {request_id} aborted")
         )
-        stream_queue = self._stream_queues.get(request_id)
-        if stream_queue is not None:
-            await stream_queue.put(
+        if request_id in self._stream_queues:
+            await self._stream_queues[request_id].put(
                 CompleteMessage(
                     request_id=request_id,
                     from_stage="coordinator",
@@ -519,29 +469,12 @@ class Coordinator:
                 )
             )
 
+        # Cleanup request tracking
         self._requests.pop(request_id, None)
         self._partial_results.pop(request_id, None)
 
         logger.info("Coordinator aborted req=%s", request_id)
         return True
-
-    def _on_abort_task_done(
-        self,
-        request_id: str,
-        task: asyncio.Task[bool],
-    ) -> None:
-        if self._abort_tasks.get(request_id) is task:
-            self._abort_tasks.pop(request_id, None)
-        if task.cancelled():
-            logger.warning("Coordinator abort task cancelled for req=%s", request_id)
-            return
-        exc = task.exception()
-        if exc is not None:
-            logger.warning(
-                "Failed to abort request %s",
-                request_id,
-                exc_info=(type(exc), exc, exc.__traceback__),
-            )
 
     async def run_completion_loop(self) -> None:
         """Run the completion receiving loop.
