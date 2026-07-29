@@ -1311,7 +1311,7 @@ fn validate_model_ids(values: &[String]) -> Result<(), ConfigError> {
     Ok(())
 }
 
-fn valid_model_id(value: &str) -> bool {
+pub(crate) fn valid_model_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= MAX_MODEL_ID_BYTES
 }
 

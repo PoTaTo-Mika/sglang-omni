@@ -440,8 +440,9 @@ selects the correlated `sse`/`streaming` requirement.
 
 ### Realtime
 
-Every realtime worker in one route trust domain must have the same nonempty
-default model:
+Every realtime worker has a nonempty default model. Workers in one route trust
+domain may have different defaults; clients select one with the decoded
+`model` query parameter. Without `model`, the defaults must agree:
 
 ```toml
 [workers.capacity]
@@ -620,7 +621,9 @@ example and event vocabulary, see the repository's
 ### Realtime WebSocket
 
 Connect an OpenAI Realtime V1 client to
-`ws://127.0.0.1:30000/v1/realtime`. The router expects the worker to send
+`ws://127.0.0.1:30000/v1/realtime?model=MODEL_ID`. If `model` is omitted, the
+router uses the trust-scoped common worker default and rejects heterogeneous
+defaults as ambiguous. The router expects the selected worker to send
 `session.created` first and then relays text events in both directions. The
 [realtime playground](../playground/qwen-omni/realtime/README.md) shows the
 worker-side event protocol used by SGLang-Omni.
@@ -693,7 +696,7 @@ draining. `GET /ready` starts at `503` and returns `200` only while serving and
 every
 `router.required_services` class has at least one healthy serving profile. It
 also checks each enabled route's exact trust domain, the voice owner when
-enabled, and the unique realtime default. Permit saturation does not change
+enabled, and realtime service availability. Permit saturation does not change
 readiness. Worker health uses a status-only exact `GET /health` by default;
 response bodies are not parsed or buffered. No public `/health` alias is
 registered.
@@ -805,7 +808,7 @@ and audit commands are recorded in [DEPENDENCIES.md](DEPENDENCIES.md).
   contents.
 - **`/ready` stays `503`:** workers start `unknown`. Verify the pinned address,
   `health_path`, probe thresholds, every required service, enabled-route trust
-  domain, and realtime default agreement. `/diagnostics` shows health and
+  domain, and realtime service availability. `/diagnostics` shows health and
   disposition without exposing targets.
 - **`422 no_compatible_worker`:** the request's model, modalities, content
   form, placement, format, stream mode, task, reference form, batch features,

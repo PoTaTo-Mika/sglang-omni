@@ -626,28 +626,6 @@ impl Config {
                 ServiceClass::RealtimeWebsocket,
                 "websocket.realtime",
             )?;
-            let mut default = None;
-            for worker in self.workers.iter().filter(|worker| {
-                worker.trust_domain == route.trust_domain
-                    && worker
-                        .service_profiles
-                        .iter()
-                        .any(|profile| profile.service_class() == ServiceClass::RealtimeWebsocket)
-            }) {
-                let Some(candidate) = worker.default_model_id.as_deref() else {
-                    return Err(ConfigError::invalid(
-                        "websocket.realtime.trust_domain",
-                        "realtime workers require one unambiguous default model",
-                    ));
-                };
-                if default.is_some_and(|current| current != candidate) {
-                    return Err(ConfigError::invalid(
-                        "websocket.realtime.trust_domain",
-                        "realtime default model is ambiguous",
-                    ));
-                }
-                default = Some(candidate);
-            }
         }
         let _frame = websocket.frame_max_usize()?;
         let _message = websocket.worker_message_max_usize()?;

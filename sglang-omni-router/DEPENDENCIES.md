@@ -227,3 +227,15 @@ configuration, and upgrade I/O. It unifies on tungstenite 0.29.0 and introduces
 no second WebSocket stack. The prior deny-list entry for `ws` is removed; all
 other forbidden Axum features remain denied. Remove this feature with the two
 terminating routes.
+
+## Branch 11 Axum `query` feature
+
+Axum remains exactly 0.8.9 with defaults disabled. The `websocket` module owns
+the `query` feature only for typed optional-model parsing during the realtime
+handshake. `form_urlencoded` and `serde_urlencoded` were already locked through
+Reqwest; `serde_path_to_error` 0.1.20 is the sole new locked package. This adds
+no runtime, TLS, native-code, build-script, or task stack. Strict raw
+percent-triplet and decoded-component UTF-8 prevalidation remains necessary
+because form decoding is lossy. Remove the feature and its lockfile-only
+package if realtime handshake query classification is removed or an existing
+owned parser provides the same typed, duplicate-aware contract.

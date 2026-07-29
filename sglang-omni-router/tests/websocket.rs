@@ -3,17 +3,18 @@
 //! Real-socket ordering and exact-replay tests for terminating WebSockets.
 
 use std::fs;
+use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use axum::Router;
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocketUpgrade};
-use axum::http::StatusCode;
+use axum::http::{StatusCode, Uri};
 use axum::routing::get;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
@@ -62,6 +63,7 @@ impl Drop for ChildGuard {
 #[derive(Clone)]
 struct WorkerState {
     speech_config: Arc<Mutex<Option<String>>>,
+    realtime_path: Arc<Mutex<Option<String>>>,
     realtime_release: Arc<Notify>,
     realtime_control: Arc<Notify>,
 }
@@ -113,8 +115,10 @@ async fn speech_worker(
 
 async fn realtime_worker(
     State(state): State<WorkerState>,
+    uri: Uri,
     upgrade: WebSocketUpgrade,
 ) -> impl axum::response::IntoResponse {
+    *state.realtime_path.lock().await = Some(uri.to_string());
     state.realtime_release.notified().await;
     upgrade.on_upgrade(move |socket| async move {
         let (mut sink, mut stream) = socket.split();
@@ -276,6 +280,94 @@ async fn wait_ready(address: SocketAddr) {
     }
 }
 
+fn websocket_status(address: SocketAddr, path: &str) -> u16 {
+    let mut stream = std::net::TcpStream::connect(address).expect("connect raw websocket client");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set raw websocket read timeout");
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: Upgrade, close\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+    )
+    .expect("write raw websocket request");
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .expect("read raw websocket response");
+    response
+        .split_whitespace()
+        .nth(1)
+        .and_then(|status| status.parse().ok())
+        .expect("parse websocket response status")
+}
+
+async fn wait_for_healthy_workers(address: SocketAddr, expected: usize) {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("build metrics client");
+    let expected_metric =
+        format!("sglang_omni_router_workers_by_health{{health=\"healthy\"}} {expected}\n");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(response) = client.get(format!("http://{address}/metrics")).send().await
+            && let Ok(metrics) = response.text().await
+            && metrics.contains(&expected_metric)
+        {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "workers did not become healthy"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+async fn wait_for_realtime_ownership_zero(address: SocketAddr) {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("build diagnostics client");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(response) = client
+            .get(format!("http://{address}/diagnostics"))
+            .send()
+            .await
+            && let Ok(body) = response.text().await
+            && let Ok(diagnostics) = serde_json::from_str::<serde_json::Value>(&body)
+        {
+            let admission_zero = diagnostics["admission"].as_array().is_some_and(|entries| {
+                entries.iter().all(|entry| {
+                    !matches!(
+                        entry["class"].as_str(),
+                        Some("global" | "realtime_websocket")
+                    ) || entry["in_flight"].as_u64() == Some(0)
+                })
+            });
+            let exact_zero = diagnostics["workers"].as_array().is_some_and(|workers| {
+                workers.iter().all(|worker| {
+                    worker["capacity"].as_array().is_some_and(|entries| {
+                        entries.iter().all(|entry| {
+                            entry["class"].as_str() != Some("realtime_websocket")
+                                || entry["in_flight"].as_u64() == Some(0)
+                        })
+                    })
+                })
+            });
+            if admission_zero && exact_zero {
+                return;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "realtime ownership did not return to zero"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 #[tokio::test]
 async fn speech_exact_replay_and_realtime_precommit_and_server_first_ordering() {
     let worker_listener = TcpListener::bind("127.0.0.1:0")
@@ -287,6 +379,7 @@ async fn speech_exact_replay_and_realtime_precommit_and_server_first_ordering() 
     drop(router_probe);
     let state = WorkerState {
         speech_config: Arc::new(Mutex::new(None)),
+        realtime_path: Arc::new(Mutex::new(None)),
         realtime_release: Arc::new(Notify::new()),
         realtime_control: Arc::new(Notify::new()),
     };
@@ -361,7 +454,9 @@ async fn speech_exact_replay_and_realtime_precommit_and_server_first_ordering() 
     let _closed = next_speech.close(None).await;
     drop(next_speech);
 
-    let realtime_url = format!("ws://{router_address}/v1/realtime?model=ignored");
+    let exact_realtime_path =
+        "/v1/realtime?unknown=first&model=%6F%6D%6E%69&unknown=second%2fvalue";
+    let realtime_url = format!("ws://{router_address}{exact_realtime_path}");
     let mut realtime_request = realtime_url
         .into_client_request()
         .expect("build realtime request");
@@ -391,6 +486,10 @@ async fn speech_exact_replay_and_realtime_precommit_and_server_first_ordering() 
         .await
         .expect("join realtime connect")
         .expect("complete realtime downstream handshake");
+    assert_eq!(
+        state.realtime_path.lock().await.as_deref(),
+        Some(exact_realtime_path)
+    );
     assert_eq!(
         response
             .headers()
@@ -464,4 +563,249 @@ async fn speech_exact_replay_and_realtime_precommit_and_server_first_ordering() 
 
     worker_task.abort();
     let _joined = worker_task.await;
+}
+
+#[derive(Clone)]
+struct HeterogeneousWorkerState {
+    model: &'static str,
+    handshakes: Arc<AtomicUsize>,
+    paths: Arc<Mutex<Vec<String>>>,
+}
+
+async fn heterogeneous_realtime_worker(
+    State(state): State<HeterogeneousWorkerState>,
+    uri: Uri,
+    upgrade: WebSocketUpgrade,
+) -> impl axum::response::IntoResponse {
+    state.handshakes.fetch_add(1, Ordering::Relaxed);
+    state.paths.lock().await.push(uri.to_string());
+    upgrade.on_upgrade(move |mut socket| async move {
+        let created = format!(
+            r#"{{"type":"session.created","session":{{"model":"{}"}}}}"#,
+            state.model
+        );
+        if socket.send(Message::Text(created.into())).await.is_err() {
+            return;
+        }
+        while let Some(message) = socket.next().await {
+            match message {
+                Ok(Message::Text(_)) => {
+                    let selected = format!(r#"{{"type":"test.worker","model":"{}"}}"#, state.model);
+                    if socket.send(Message::Text(selected.into())).await.is_err() {
+                        return;
+                    }
+                }
+                Ok(Message::Close(frame)) => {
+                    let _closed = socket.send(Message::Close(frame)).await;
+                    return;
+                }
+                Ok(Message::Binary(_) | Message::Ping(_) | Message::Pong(_)) => {}
+                Err(_) => return,
+            }
+        }
+    })
+}
+
+fn heterogeneous_router_config(router: SocketAddr, alpha: SocketAddr, beta: SocketAddr) -> String {
+    let worker = |id: &str, model: &str, address: SocketAddr| {
+        format!(
+            r#"
+[[workers]]
+worker_id = "{id}"
+base_url = "http://{id}.invalid:{}"
+resolved_ip = "127.0.0.1"
+trust_domain = "local"
+default_model_id = "{model}"
+
+[workers.capacity]
+realtime_websocket = 1
+
+[[workers.service_profiles]]
+service = "realtime_websocket"
+protocols = ["openai_realtime_v1"]
+"#,
+            address.port()
+        )
+    };
+    format!(
+        r#"schema_version = 1
+
+[server]
+listen = "{router}"
+
+[shutdown]
+drain_timeout_ms = 5000
+
+[logging]
+format = "json"
+filter = "error"
+
+[router]
+required_services = ["realtime_websocket"]
+
+[admission]
+global = 1
+generation_http = 1
+speech_http = 1
+transcription_http = 1
+speech_batch = 1
+speech_websocket = 1
+realtime_websocket = 1
+control = 1
+
+[health]
+interval_ms = 100
+timeout_ms = 50
+success_threshold = 1
+failure_threshold = 1
+max_concurrent_probes = 2
+
+[websocket.realtime]
+trust_domain = "local"
+{}{}
+"#,
+        worker("alpha", "omni-alpha", alpha),
+        worker("beta", "omni-beta", beta)
+    )
+}
+
+#[tokio::test]
+async fn heterogeneous_realtime_query_selection_is_pinned_and_rejection_is_pre_admission() {
+    let alpha_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind alpha worker");
+    let beta_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind beta worker");
+    let alpha_address = alpha_listener.local_addr().expect("alpha address");
+    let beta_address = beta_listener.local_addr().expect("beta address");
+    let handshakes = Arc::new(AtomicUsize::new(0));
+    let alpha_paths = Arc::new(Mutex::new(Vec::new()));
+    let beta_paths = Arc::new(Mutex::new(Vec::new()));
+    let alpha_state = HeterogeneousWorkerState {
+        model: "omni-alpha",
+        handshakes: Arc::clone(&handshakes),
+        paths: Arc::clone(&alpha_paths),
+    };
+    let beta_state = HeterogeneousWorkerState {
+        model: "omni-beta",
+        handshakes: Arc::clone(&handshakes),
+        paths: Arc::clone(&beta_paths),
+    };
+    let alpha_task = tokio::spawn(async move {
+        axum::serve(
+            alpha_listener,
+            Router::new()
+                .route("/health", get(health))
+                .route("/v1/realtime", get(heterogeneous_realtime_worker))
+                .with_state(alpha_state),
+        )
+        .await
+        .expect("serve alpha worker");
+    });
+    let beta_task = tokio::spawn(async move {
+        axum::serve(
+            beta_listener,
+            Router::new()
+                .route("/health", get(health))
+                .route("/v1/realtime", get(heterogeneous_realtime_worker))
+                .with_state(beta_state),
+        )
+        .await
+        .expect("serve beta worker");
+    });
+
+    let router_probe = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve router port");
+    let router_address = router_probe.local_addr().expect("router address");
+    drop(router_probe);
+    let directory = TestDir::new();
+    let config = directory.config(&heterogeneous_router_config(
+        router_address,
+        alpha_address,
+        beta_address,
+    ));
+    let child = Command::new(env!("CARGO_BIN_EXE_sgl-omni-router"))
+        .arg("--config")
+        .arg(config)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start heterogeneous router");
+    let _child = ChildGuard(child);
+
+    wait_for_healthy_workers(router_address, 2).await;
+    wait_ready(router_address).await;
+    assert_eq!(
+        websocket_status(router_address, "/v1/realtime"),
+        400,
+        "absent model is ambiguous"
+    );
+    assert_eq!(
+        websocket_status(router_address, "/v1/realtime?model=unknown"),
+        422,
+        "unknown model is incompatible"
+    );
+    for path in [
+        "/v1/realtime?model=a&model=b",
+        "/v1/realtime?model=",
+        "/v1/realtime?model=%",
+        "/v1/realtime?model=%FF",
+    ] {
+        assert_eq!(websocket_status(router_address, path), 400, "{path}");
+    }
+    assert_eq!(handshakes.load(Ordering::Relaxed), 0);
+    wait_for_realtime_ownership_zero(router_address).await;
+
+    let beta_path = "/v1/realtime?trace=first&model=omni%2Dbeta&trace=second%2fvalue&flag";
+    let (mut beta, _) = connect_async(format!("ws://{router_address}{beta_path}"))
+        .await
+        .expect("select beta worker");
+    let created = beta
+        .next()
+        .await
+        .expect("beta session.created")
+        .expect("valid beta event")
+        .into_text()
+        .expect("beta event text");
+    assert!(created.contains(r#""model":"omni-beta""#));
+    let later_model = r#"{"type":"session.update","session":{"model":"omni-alpha"}}"#;
+    beta.send(ClientMessage::Text(later_model.into()))
+        .await
+        .expect("send later model-bearing event");
+    let pinned = beta
+        .next()
+        .await
+        .expect("pinned worker response")
+        .expect("valid pinned response")
+        .into_text()
+        .expect("pinned response text");
+    assert!(pinned.contains(r#""model":"omni-beta""#));
+    assert_eq!(alpha_paths.lock().await.len(), 0);
+    assert_eq!(beta_paths.lock().await.as_slice(), [beta_path]);
+    beta.close(None).await.expect("close beta session");
+    drop(beta);
+    wait_for_realtime_ownership_zero(router_address).await;
+
+    let (mut alpha, _) = connect_async(format!(
+        "ws://{router_address}/v1/realtime?model=omni-alpha"
+    ))
+    .await
+    .expect("select alpha worker");
+    let created = alpha
+        .next()
+        .await
+        .expect("alpha session.created")
+        .expect("valid alpha event")
+        .into_text()
+        .expect("alpha event text");
+    assert!(created.contains(r#""model":"omni-alpha""#));
+    alpha.close(None).await.expect("close alpha session");
+    drop(alpha);
+    wait_for_realtime_ownership_zero(router_address).await;
+    assert_eq!(handshakes.load(Ordering::Relaxed), 2);
+
+    alpha_task.abort();
+    beta_task.abort();
+    let _alpha = alpha_task.await;
+    let _beta = beta_task.await;
 }

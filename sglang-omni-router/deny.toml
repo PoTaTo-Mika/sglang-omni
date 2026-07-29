@@ -48,7 +48,7 @@ deny = ["fs", "full", "io-std", "io-uring", "parking_lot", "process", "taskdump"
 
 [[bans.features]]
 name = "axum"
-deny = ["default", "form", "http2", "json", "macros", "multipart", "query"]
+deny = ["default", "form", "http2", "json", "macros", "multipart"]
 
 [[bans.features]]
 name = "clap"

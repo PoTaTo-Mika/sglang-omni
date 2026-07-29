@@ -22,7 +22,7 @@ pub(crate) use profile::{
     BatchFeature, CapacityClass, ChatAudioFormat, MediaPlacement, MediaProfile, MessageContentForm,
     ModelSelection, ProfileRequirement, RealtimeProtocol, ReferenceForm, RegistrationId,
     RouteRequirement, ServiceClass, SpeechResponseFormat, SpeechTask, SpeechWebsocketInput,
-    StreamMode, TranscriptionResponseFormat, TrustDomain, WorkerId,
+    StreamMode, TranscriptionResponseFormat, TrustDomain, WorkerId, valid_model_id,
 };
 #[allow(unused_imports)]
 // Exact target is consumed by later route modules through RequestLease.
@@ -188,7 +188,6 @@ pub(crate) struct WorkerPool {
     selector: Selector,
     homogeneous_generation_http: Vec<HomogeneousGenerationCohort>,
     homogeneous_media_http: Vec<HomogeneousMediaCohort>,
-    realtime_defaults_unambiguous: bool,
     health_client: reqwest::Client,
     generation_client: Option<reqwest::Client>,
     media_client: Option<reqwest::Client>,
@@ -311,7 +310,6 @@ impl WorkerPool {
         }
         let homogeneous_generation_http = build_homogeneous_generation_cohorts(&records);
         let homogeneous_media_http = build_homogeneous_media_cohorts(&records);
-        let realtime_defaults_unambiguous = compute_realtime_defaults_unambiguous(&records);
 
         Ok(Self {
             records,
@@ -326,7 +324,6 @@ impl WorkerPool {
             selector: Selector::new(config.router.strategy),
             homogeneous_generation_http,
             homogeneous_media_http,
-            realtime_defaults_unambiguous,
             health_client,
             generation_client,
             media_client,
@@ -561,11 +558,6 @@ impl WorkerPool {
         self.gate.read().is_ok_and(|gate| {
             gate.open
                 && self.required_services.iter().all(|class| {
-                    if *class == ServiceClass::RealtimeWebsocket
-                        && !self.realtime_defaults_unambiguous
-                    {
-                        return false;
-                    }
                     self.records
                         .iter()
                         .any(|record| record.serves_class(*class, self.voice_owner.as_ref()))
@@ -847,33 +839,6 @@ fn service_rows_equal(
         })
 }
 
-fn compute_realtime_defaults_unambiguous(records: &[Arc<WorkerRecord>]) -> bool {
-    let mut scopes: Vec<(&TrustDomain, &str)> = Vec::new();
-    for record in records {
-        if !record
-            .profiles
-            .iter()
-            .any(|profile| profile.service_class() == ServiceClass::RealtimeWebsocket)
-        {
-            continue;
-        }
-        let Some(default) = record.default_model_id() else {
-            return false;
-        };
-        if let Some((_, expected)) = scopes
-            .iter()
-            .find(|(trust_domain, _)| *trust_domain == &record.trust_domain)
-        {
-            if *expected != default {
-                return false;
-            }
-        } else {
-            scopes.push((&record.trust_domain, default));
-        }
-    }
-    true
-}
-
 fn build_policy_candidates(
     records: &[Arc<WorkerRecord>],
     requirement: &RouteRequirement,
@@ -938,7 +903,6 @@ pub(crate) mod benchmark {
         HealthState, PolicyCandidate, RequestLease, ResolvedTarget, Selector, StaticResolver,
         WorkerPool, WorkerRecord, build_health_client, build_homogeneous_generation_cohorts,
         build_homogeneous_media_cohorts, build_policy_candidates,
-        compute_realtime_defaults_unambiguous,
     };
     use crate::config::RoutingStrategy;
 
@@ -1009,7 +973,6 @@ pub(crate) mod benchmark {
             let dispatch_pool = WorkerPool {
                 homogeneous_generation_http: build_homogeneous_generation_cohorts(&records),
                 homogeneous_media_http: build_homogeneous_media_cohorts(&records),
-                realtime_defaults_unambiguous: compute_realtime_defaults_unambiguous(&records),
                 records,
                 required_services: vec![ServiceClass::SpeechBatch],
                 voice_owner: None,
@@ -1124,7 +1087,6 @@ pub(crate) mod benchmark {
             let dispatch_pool = WorkerPool {
                 homogeneous_generation_http: build_homogeneous_generation_cohorts(&records),
                 homogeneous_media_http: build_homogeneous_media_cohorts(&records),
-                realtime_defaults_unambiguous: compute_realtime_defaults_unambiguous(&records),
                 records: records.clone(),
                 required_services: vec![ServiceClass::GenerationHttp],
                 voice_owner: None,
@@ -1270,7 +1232,7 @@ mod tests {
     use super::{
         AdmissionClass, AdmissionError, CapacityClass, CapacitySlot, DispatchError, Disposition,
         PolicyCandidate, Selector, WorkerPool, WorkerRecord, build_homogeneous_generation_cohorts,
-        build_homogeneous_media_cohorts, compute_realtime_defaults_unambiguous,
+        build_homogeneous_media_cohorts,
     };
 
     type ProfileMutation = fn(&mut ServiceProfile);
@@ -1567,7 +1529,6 @@ mod tests {
         .expect("test health client must build");
         let homogeneous_generation_http = build_homogeneous_generation_cohorts(&records);
         let homogeneous_media_http = build_homogeneous_media_cohorts(&records);
-        let realtime_defaults_unambiguous = compute_realtime_defaults_unambiguous(&records);
         WorkerPool {
             records,
             required_services: vec![required_service],
@@ -1577,7 +1538,6 @@ mod tests {
             selector: Selector::new(strategy),
             homogeneous_generation_http,
             homogeneous_media_http,
-            realtime_defaults_unambiguous,
             generation_client: Some(health_client.clone()),
             media_client: None,
             health_client,
@@ -3411,7 +3371,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_default_matching_and_realtime_readiness_fail_closed() {
+    fn worker_default_matching_and_realtime_readiness_is_service_based() {
         let alias = record_with_default(0, 1, "local", "other", vec![generation_profile_for("D")]);
         let pool = pool_with_records(
             RoutingStrategy::RoundRobin,
@@ -3466,8 +3426,7 @@ mod tests {
                 realtime_record(3, "remote", "R"),
             ],
         );
-        assert!(!ambiguous.realtime_defaults_unambiguous);
-        assert!(!ambiguous.is_ready());
+        assert!(ambiguous.is_ready());
         assert_eq!(
             ambiguous.resolve_default_model_id(
                 &TrustDomain::new(String::from("local")),
@@ -3482,6 +3441,24 @@ mod tests {
             ),
             super::DefaultModelResolution::Unique("R")
         );
+        let explicit_b = RouteRequirement::new(
+            ProfileRequirement::RealtimeWebsocket {
+                protocol: super::profile::RealtimeProtocol::OpenaiRealtimeV1,
+                expected_default_model_id: String::from("B"),
+            },
+            TrustDomain::new(String::from("local")),
+            false,
+        );
+        let lease = ambiguous
+            .dispatch(
+                ambiguous
+                    .try_admit(CapacityClass::RealtimeWebsocket)
+                    .expect("heterogeneous realtime admission"),
+                &explicit_b,
+            )
+            .expect("explicit default dispatches in a heterogeneous pool");
+        assert_eq!(lease.worker_id().as_str(), "worker-1");
+        drop(lease);
 
         let unique = pool_with_records(
             RoutingStrategy::RoundRobin,
@@ -3493,7 +3470,6 @@ mod tests {
                 realtime_record(3, "remote", "R"),
             ],
         );
-        assert!(unique.realtime_defaults_unambiguous);
         assert!(unique.is_ready());
         assert_eq!(
             unique.resolve_default_model_id(
@@ -3517,7 +3493,7 @@ mod tests {
                     .expect("realtime admission"),
                 &realtime,
             )
-            .expect("unique realtime default dispatches");
+            .expect("common realtime default dispatches");
         assert_eq!(lease.worker_id().as_str(), "worker-0");
     }
 

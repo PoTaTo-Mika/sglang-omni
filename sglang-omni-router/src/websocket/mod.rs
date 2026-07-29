@@ -3,14 +3,14 @@ use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
 
-use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{Query, State};
 use axum::http::header::{CONNECTION, UPGRADE};
 use axum::http::{HeaderMap, HeaderName, StatusCode, Uri, Version};
 use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
-use serde::Deserializer as _;
 use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer as _};
 use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::Message as UpstreamMessage;
 use tokio_tungstenite::tungstenite::error::CapacityError;
@@ -28,7 +28,7 @@ use crate::telemetry::Telemetry;
 use crate::worker_pool::{
     AdmissionError, CapacityClass, DefaultModelResolution, DispatchError, ModelSelection,
     ProfileRequirement, RealtimeProtocol, RouteRequirement, ServiceClass, SpeechResponseFormat,
-    SpeechWebsocketInput, StreamMode, TrustDomain, WorkerPool,
+    SpeechWebsocketInput, StreamMode, TrustDomain, WorkerPool, valid_model_id,
 };
 
 mod session;
@@ -39,6 +39,11 @@ use session::{DrainState, PendingSession, SessionSupervisor, close_message};
 
 const SPEECH_PATH: &str = "/v1/audio/speech/stream";
 const REALTIME_PATH: &str = "/v1/realtime";
+
+#[derive(Deserialize)]
+struct RealtimeQuery {
+    model: Option<String>,
+}
 
 fn downstream_text_to_upstream(
     text: axum::extract::ws::Utf8Bytes,
@@ -383,13 +388,13 @@ pub(crate) async fn realtime(
     if validate_upgrade(version, &uri, &headers, REALTIME_PATH, &gateway.policy).is_err() {
         return HttpFault::MalformedRequest.into_response();
     }
-    let model = match gateway
-        .pool
-        .resolve_default_model_id(&trust, ServiceClass::RealtimeWebsocket)
-    {
-        DefaultModelResolution::Unique(model) => model.to_owned(),
-        DefaultModelResolution::Ambiguous => return HttpFault::AmbiguousModel.into_response(),
-        DefaultModelResolution::NoService => return HttpFault::RouterUnavailable.into_response(),
+    let model = match realtime_model(&uri, || {
+        gateway
+            .pool
+            .resolve_default_model_id(&trust, ServiceClass::RealtimeWebsocket)
+    }) {
+        Ok(model) => model,
+        Err(fault) => return fault.into_response(),
     };
     let admission = match gateway.pool.try_admit(CapacityClass::RealtimeWebsocket) {
         Ok(admission) => admission,
@@ -468,7 +473,7 @@ async fn run_realtime(
         Ok(Some(Ok(UpstreamMessage::Text(text))))
             if text.len()
                 <= usize::try_from(gateway.policy.worker_message_max_bytes).unwrap_or(0)
-                && is_event_type(text.as_bytes(), "session.created") =>
+                && parse_event_kind(text.as_bytes()) == Some(EventKind::SessionCreated) =>
         {
             text
         }
@@ -957,10 +962,70 @@ where
     Ok(())
 }
 
-fn is_event_type(bytes: &[u8], expected: &str) -> bool {
-    struct EventVisitor<'a>(&'a str);
-    impl<'de> Visitor<'de> for EventVisitor<'_> {
-        type Value = bool;
+fn realtime_model<'a>(
+    uri: &Uri,
+    resolve_default: impl FnOnce() -> DefaultModelResolution<'a>,
+) -> Result<String, HttpFault> {
+    validate_query_encoding(uri.query().unwrap_or_default())?;
+    let Query(query) =
+        Query::<RealtimeQuery>::try_from_uri(uri).map_err(|_| HttpFault::MalformedRequest)?;
+    match query.model {
+        Some(model) if valid_model_id(&model) => Ok(model),
+        Some(_) => Err(HttpFault::MalformedRequest),
+        None => match resolve_default() {
+            DefaultModelResolution::Unique(model) => Ok(model.to_owned()),
+            DefaultModelResolution::Ambiguous => Err(HttpFault::AmbiguousModel),
+            DefaultModelResolution::NoService => Err(HttpFault::RouterUnavailable),
+        },
+    }
+}
+
+fn validate_query_encoding(query: &str) -> Result<(), HttpFault> {
+    let mut decoded = Vec::with_capacity(query.len());
+    for component in query.split('&').flat_map(|pair| pair.splitn(2, '=')) {
+        decoded.clear();
+        let bytes = component.as_bytes();
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == b'%' {
+                let high = bytes.get(index + 1).and_then(|byte| hex_value(*byte));
+                let low = bytes.get(index + 2).and_then(|byte| hex_value(*byte));
+                let (Some(high), Some(low)) = (high, low) else {
+                    return Err(HttpFault::MalformedRequest);
+                };
+                decoded.push((high << 4) | low);
+                index += 3;
+            } else {
+                decoded.push(bytes[index]);
+                index += 1;
+            }
+        }
+        std::str::from_utf8(&decoded).map_err(|_| HttpFault::MalformedRequest)?;
+    }
+    Ok(())
+}
+
+const fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EventKind {
+    SessionCreated,
+    SessionConfigured,
+    Error,
+    Other,
+}
+
+fn parse_event_kind(bytes: &[u8]) -> Option<EventKind> {
+    struct EventVisitor;
+    impl<'de> Visitor<'de> for EventVisitor {
+        type Value = Option<EventKind>;
         fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
             formatter.write_str("a realtime event object")
         }
@@ -976,21 +1041,30 @@ fn is_event_type(bytes: &[u8], expected: &str) -> bool {
                     let _ignored = map.next_value::<IgnoredAny>()?;
                 }
             }
-            Ok(event_type.flatten().as_deref() == Some(self.0))
+            Ok(event_type
+                .flatten()
+                .map(|event_type| match event_type.as_str() {
+                    "session.created" => EventKind::SessionCreated,
+                    "session.configured" => EventKind::SessionConfigured,
+                    "error" => EventKind::Error,
+                    _ => EventKind::Other,
+                }))
         }
     }
     if exceeds_nesting_limit(bytes) {
-        return false;
+        return None;
     }
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
-    deserializer
-        .deserialize_map(EventVisitor(expected))
-        .is_ok_and(|valid| valid)
-        && deserializer.end().is_ok()
+    let event = deserializer.deserialize_map(EventVisitor).ok()?;
+    deserializer.end().ok()?;
+    event
 }
 
 fn is_speech_setup_event(bytes: &[u8]) -> bool {
-    is_event_type(bytes, "session.configured") || is_event_type(bytes, "error")
+    matches!(
+        parse_event_kind(bytes),
+        Some(EventKind::SessionConfigured | EventKind::Error)
+    )
 }
 
 fn set_once<E, T>(slot: &mut Option<T>, value: T, field: &'static str) -> Result<(), E>
@@ -1011,14 +1085,15 @@ mod tests {
     use axum::http::{HeaderMap, HeaderValue, Uri, Version};
 
     use crate::config::WebsocketConfig;
+    use crate::error::HttpFault;
     use crate::worker_pool::{
-        ModelSelection, ProfileRequirement, ReferenceForm, SpeechResponseFormat, SpeechTask,
-        StreamMode, TrustDomain,
+        DefaultModelResolution, ModelSelection, ProfileRequirement, ReferenceForm,
+        SpeechResponseFormat, SpeechTask, StreamMode, TrustDomain,
     };
 
     use super::{
-        is_event_type, is_speech_setup_event, parse_speech_config, speech_requirement,
-        validate_upgrade, websocket_message_too_large,
+        EventKind, is_speech_setup_event, parse_event_kind, parse_speech_config, realtime_model,
+        speech_requirement, validate_upgrade, websocket_message_too_large,
     };
 
     #[test]
@@ -1185,26 +1260,109 @@ mod tests {
     }
 
     #[test]
-    fn realtime_first_event_is_duplicate_aware() {
-        assert!(is_event_type(
-            br#"{"type":"session.created","session":{}}"#,
-            "session.created"
-        ));
-        assert!(!is_event_type(
-            br#"{"type":"session.created","type":"other"}"#,
-            "session.created"
-        ));
-        assert!(!is_event_type(
-            br#"{"type":"session.updated"}"#,
-            "session.created"
-        ));
-        assert!(is_event_type(
-            br#"{"type":"session.configured"}"#,
-            "session.configured"
-        ));
-        assert!(is_speech_setup_event(
-            br#"{"type":"error","message":"worker validation"}"#
-        ));
+    fn realtime_query_matrix_is_strict_and_default_aware() {
+        let explicit = |value: &str| {
+            let uri: Uri = format!("/v1/realtime?{value}")
+                .parse()
+                .expect("valid test URI");
+            realtime_model(&uri, || DefaultModelResolution::NoService)
+        };
+        assert_eq!(explicit("model=omni"), Ok(String::from("omni")));
+        assert_eq!(
+            explicit("unknown=first&mo%64el=qwen%2FOmni&unknown=second"),
+            Ok(String::from("qwen/Omni"))
+        );
+        assert_eq!(explicit("model=qwen+omni"), Ok(String::from("qwen omni")));
+
+        let absent: Uri = "/v1/realtime?unknown=retained"
+            .parse()
+            .expect("valid absent-model URI");
+        assert_eq!(
+            realtime_model(&absent, || DefaultModelResolution::Unique("common")),
+            Ok(String::from("common"))
+        );
+        assert_eq!(
+            realtime_model(&absent, || DefaultModelResolution::Ambiguous),
+            Err(HttpFault::AmbiguousModel)
+        );
+        assert_eq!(
+            realtime_model(&absent, || DefaultModelResolution::NoService),
+            Err(HttpFault::RouterUnavailable)
+        );
+
+        for query in [
+            "model=a&model=b",
+            "model=a&mo%64el=b",
+            "model=",
+            "model=%",
+            "model=%2",
+            "model=%GG",
+            "model=%FF",
+        ] {
+            assert_eq!(
+                explicit(query),
+                Err(HttpFault::MalformedRequest),
+                "query should fail: {query}"
+            );
+        }
+        assert_eq!(
+            explicit(&format!("model={}", "x".repeat(257))),
+            Err(HttpFault::MalformedRequest)
+        );
+        let encoded_e_acute = "%C3%A9".repeat(128);
+        assert_eq!(
+            explicit(&format!("model={encoded_e_acute}")),
+            Ok("é".repeat(128))
+        );
+        assert_eq!(
+            explicit(&format!("model={encoded_e_acute}a")),
+            Err(HttpFault::MalformedRequest)
+        );
+    }
+
+    #[test]
+    fn realtime_event_kind_matrix_is_strict() {
+        for (bytes, expected) in [
+            (
+                br#"{"type":"session.created","session":{}}"#.as_slice(),
+                Some(EventKind::SessionCreated),
+            ),
+            (
+                br#"{"type":"session.configured"}"#.as_slice(),
+                Some(EventKind::SessionConfigured),
+            ),
+            (
+                br#"{"type":"error","message":"worker validation"}"#.as_slice(),
+                Some(EventKind::Error),
+            ),
+            (
+                br#"{"type":"audio.start"}"#.as_slice(),
+                Some(EventKind::Other),
+            ),
+            (
+                br#"{"type":"session.\u0063reated"}"#.as_slice(),
+                Some(EventKind::SessionCreated),
+            ),
+        ] {
+            assert_eq!(parse_event_kind(bytes), expected);
+        }
+        for bytes in [
+            br#"{}"#.as_slice(),
+            br#"{"type":null}"#.as_slice(),
+            br#"{"type":7}"#.as_slice(),
+            br#"{"type":"session.created","type":"session.created"}"#.as_slice(),
+            br#"{"type":null,"type":"error"}"#.as_slice(),
+            br#"{"type":"session.created"} trailing"#.as_slice(),
+        ] {
+            assert_eq!(parse_event_kind(bytes), None);
+        }
+        let nested = format!(
+            r#"{{"type":"session.created","ignored":{}}}"#,
+            "[".repeat(129) + &"]".repeat(129)
+        );
+        assert_eq!(parse_event_kind(nested.as_bytes()), None);
+        assert!(is_speech_setup_event(br#"{"type":"session.configured"}"#));
+        assert!(is_speech_setup_event(br#"{"type":"error"}"#));
         assert!(!is_speech_setup_event(br#"{"type":"audio.start"}"#));
     }
 

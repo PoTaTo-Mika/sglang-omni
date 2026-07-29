@@ -842,7 +842,7 @@ fn validates_optional_websocket_routes_and_shared_bounds() {
 }
 
 #[test]
-fn realtime_websocket_requires_one_trust_scoped_default() {
+fn realtime_websocket_allows_heterogeneous_worker_defaults() {
     let prefix = worker_config_prefix("realtime_websocket");
     let worker = |id: &str, default: &str, port: u16| {
         format!(
@@ -861,7 +861,7 @@ fn realtime_websocket_requires_one_trust_scoped_default() {
         worker("a", "omni-a", 9),
         worker("b", "omni-b", 10)
     );
-    assert!(load_bytes(ambiguous.as_bytes()).is_err());
+    load_bytes(ambiguous.as_bytes()).expect("query-selected realtime defaults may differ");
 }
 
 #[test]
