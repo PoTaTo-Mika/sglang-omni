@@ -217,9 +217,9 @@ curl -N -X POST http://localhost:8000/v1/audio/speech \
 Streaming returns 16-bit mono PCM bytes (`audio/pcm`) with sample-rate metadata
 in response headers. It does not include in-band JSON events, final usage, or a
 terminal sentinel. When the client does not set `initial_codec_chunk_frames`,
-streaming requests default to a 1-frame first vocoder chunk for lower
-first-audio latency. Set `initial_codec_chunk_frames` to `0` to use the model's
-steady chunk size from the start.
+the model selects a continuity-safe first vocoder chunk. Set the field explicitly
+to override that default, or set it to `0` to use the model's steady chunk size
+from the start.
 
 ### Batch Speech
 

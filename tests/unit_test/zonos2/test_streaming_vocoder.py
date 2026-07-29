@@ -21,6 +21,7 @@ import torch
 
 from sglang_omni.models.zonos2.components import streaming_vocoder
 from sglang_omni.models.zonos2.components.streaming_vocoder import (
+    _STREAM_INITIAL_CHUNK_FRAMES,
     DAC_HOP_LENGTH,
     Zonos2StreamingVocoderScheduler,
 )
@@ -31,6 +32,7 @@ from sglang_omni.models.zonos2.payload_types import (
 )
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import OmniRequest, StagePayload
+from sglang_omni.scheduling.streaming_vocoder import INITIAL_CODEC_CHUNK_FRAMES_PARAM
 
 HOP = DAC_HOP_LENGTH
 WITHHOLD = N_CODEBOOKS - 1  # trailing delay/flush rows trimmed before decode
@@ -77,6 +79,23 @@ def _scheduler(steady=32, initial=5, overlap=2):
         initial_chunk_frames=initial,
         overlap_frames=overlap,
     )
+
+
+def test_model_default_initial_chunk_is_continuity_safe():
+    sch = Zonos2StreamingVocoderScheduler(device="cpu")
+    assert sch._default_initial_chunk_frames == _STREAM_INITIAL_CHUNK_FRAMES == 40
+
+
+def test_request_initial_chunk_zero_overrides_model_default():
+    sch = Zonos2StreamingVocoderScheduler(device="cpu")
+    state = sch.create_stream_state("req")
+    sch.latch_stream_contract(
+        "req",
+        state,
+        {INITIAL_CODEC_CHUNK_FRAMES_PARAM: 0},
+        origin="metadata",
+    )
+    assert state.initial_chunk_frames == 0
 
 
 def _codes(n_frames: int) -> torch.Tensor:
