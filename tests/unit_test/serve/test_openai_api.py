@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 from typing import Any
 
 import pytest
@@ -61,11 +62,13 @@ class FaultInjectingCoordinator(Coordinator):
         request_id: str,
         request: OmniRequest | Any,
         *,
+        completion_future: asyncio.Future | None = None,
         stream_queue: asyncio.Queue[CompleteMessage | StreamMessage] | None = None,
     ) -> None:
         await super()._submit_request(
             request_id,
             request,
+            completion_future=completion_future,
             stream_queue=stream_queue,
         )
         if not isinstance(request, OmniRequest):
@@ -911,6 +914,130 @@ def test_chat_asgi_task_cancellation_aborts_backend_and_stays_cancelled() -> Non
         assert request_id not in coordinator._requests
         assert request_id not in coordinator._stream_queues
         assert request_id not in coordinator._completion_futures
+
+    asyncio.run(_run())
+
+
+def test_nonstream_chat_disconnect_aborts_backend_and_cleans_state() -> None:
+    async def _run() -> None:
+        client, coordinator, control_plane = _streaming_client()
+        app = create_app(client, model_name="qwen3-omni")
+        disconnected = asyncio.Event()
+        disconnect_receive_started = asyncio.Event()
+        request_id = "req-nonstream-chat-disconnect"
+        body = json.dumps(
+            {
+                "model": "qwen3-omni",
+                "messages": [{"role": "user", "content": "hello"}],
+                "request_id": request_id,
+                "stream": False,
+            }
+        ).encode()
+        receive_calls = 0
+
+        async def receive() -> dict[str, Any]:
+            nonlocal receive_calls
+            receive_calls += 1
+            if receive_calls == 1:
+                return {
+                    "type": "http.request",
+                    "body": body,
+                    "more_body": False,
+                }
+            assert receive_calls == 2
+            disconnect_receive_started.set()
+            await disconnected.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(_message: dict[str, Any]) -> None:
+            return
+
+        scope = _http_scope(path="/v1/chat/completions", spec_version="2.4")
+        scope["headers"] = [
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(body)).encode()),
+        ]
+        task = asyncio.create_task(app(scope, receive, send))
+        for _ in range(100):
+            if request_id in coordinator._requests:
+                break
+            await asyncio.sleep(0)
+
+        await disconnect_receive_started.wait()
+        assert receive_calls == 2
+        disconnected.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert receive_calls == 2
+        assert [msg.request_id for msg in control_plane.aborts] == [request_id]
+        assert request_id not in coordinator._requests
+        assert request_id not in coordinator._completion_futures
+        assert request_id not in coordinator._abort_tasks
+
+    asyncio.run(_run())
+
+
+def test_nonstream_transcription_disconnect_aborts_backend_and_cleans_state() -> None:
+    async def _run() -> None:
+        client, coordinator, control_plane = _streaming_client()
+        app = create_app(client, model_name="whisper")
+        disconnected = asyncio.Event()
+        disconnect_receive_started = asyncio.Event()
+        boundary = "sglang-omni-boundary"
+        body = (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="file"; filename="sample.wav"\r\n'
+            "Content-Type: audio/wav\r\n"
+            "\r\n"
+            "audio\r\n"
+            f"--{boundary}--\r\n"
+        ).encode()
+        receive_calls = 0
+
+        async def receive() -> dict[str, Any]:
+            nonlocal receive_calls
+            receive_calls += 1
+            if receive_calls == 1:
+                return {
+                    "type": "http.request",
+                    "body": body,
+                    "more_body": False,
+                }
+            assert receive_calls == 2
+            disconnect_receive_started.set()
+            await disconnected.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(_message: dict[str, Any]) -> None:
+            return
+
+        scope = _http_scope(path="/v1/audio/transcriptions", spec_version="2.4")
+        scope["headers"] = [
+            (
+                b"content-type",
+                f"multipart/form-data; boundary={boundary}".encode(),
+            ),
+            (b"content-length", str(len(body)).encode()),
+        ]
+        task = asyncio.create_task(app(scope, receive, send))
+        for _ in range(100):
+            if coordinator._requests:
+                break
+            await asyncio.sleep(0)
+        request_id = next(iter(coordinator._requests))
+
+        await disconnect_receive_started.wait()
+        assert receive_calls == 2
+        disconnected.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert receive_calls == 2
+        assert [msg.request_id for msg in control_plane.aborts] == [request_id]
+        assert request_id not in coordinator._requests
+        assert request_id not in coordinator._completion_futures
+        assert request_id not in coordinator._abort_tasks
 
     asyncio.run(_run())
 

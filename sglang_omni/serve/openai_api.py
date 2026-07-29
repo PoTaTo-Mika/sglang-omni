@@ -25,9 +25,9 @@ import logging
 import math
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine
 from contextlib import aclosing, suppress
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, TypeVar
 
 from fastapi import (
     Depends,
@@ -115,6 +115,7 @@ from sglang_omni.serve.speech_ws import SpeechWebSocketSession
 from sglang_omni.serve.transcription_adapters import resolve_adapter
 
 logger = logging.getLogger(__name__)
+_T = TypeVar("_T")
 STREAM_DONE_SENTINEL = "[DONE]"
 HTTP_DISCONNECT_POLL_INTERVAL_S = 0.05
 HTTP_DISCONNECT_CANCEL_TIMEOUT_S = 0.1
@@ -657,7 +658,10 @@ def _common_model_info_value(
 
 def _register_chat_completions(app: FastAPI) -> None:
     @app.post("/v1/chat/completions")
-    async def chat_completions(req: ChatCompletionRequest) -> Response:
+    async def chat_completions(
+        request: Request,
+        req: ChatCompletionRequest,
+    ) -> Response:
         client: Client = app.state.client
         default_model: str = app.state.model_name
 
@@ -688,15 +692,18 @@ def _register_chat_completions(app: FastAPI) -> None:
                 media_type="text/event-stream",
             )
 
-        return await _chat_non_stream(
-            client,
-            gen_req,
-            request_id,
-            response_id,
-            created,
-            model,
-            req,
-            audio_format,
+        return await _await_until_disconnect(
+            request,
+            _chat_non_stream(
+                client,
+                gen_req,
+                request_id,
+                response_id,
+                created,
+                model,
+                req,
+                audio_format,
+            ),
         )
 
 
@@ -1573,6 +1580,38 @@ async def _close_async_iterator_if_supported(stream: AsyncIterator[Any]) -> None
     await close()
 
 
+async def _await_until_disconnect(
+    request: Request,
+    operation: Coroutine[Any, Any, _T],
+) -> _T:
+    """Run one non-streaming operation until it completes or ASGI disconnects."""
+    operation_task = asyncio.create_task(operation)
+    disconnect_task = asyncio.create_task(request.receive())
+    try:
+        done, _ = await asyncio.wait(
+            {operation_task, disconnect_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if operation_task in done:
+            return operation_task.result()
+
+        message = disconnect_task.result()
+        if message["type"] != "http.disconnect":
+            raise RuntimeError(
+                f"Unexpected ASGI message while awaiting disconnect: {message['type']}"
+            )
+        raise asyncio.CancelledError
+    finally:
+        for task in (operation_task, disconnect_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(
+            operation_task,
+            disconnect_task,
+            return_exceptions=True,
+        )
+
+
 async def _abort_and_close_speech_stream(
     client: Client,
     request_id: str,
@@ -1587,6 +1626,7 @@ async def _abort_and_close_speech_stream(
 def _register_transcriptions(app: FastAPI) -> None:
     @app.post("/v1/audio/transcriptions")
     async def create_transcription(
+        request: Request,
         file: UploadFile = File(...),
         model: str | None = Form(default=None),
         language: str | None = Form(default=None),
@@ -1653,7 +1693,10 @@ def _register_transcriptions(app: FastAPI) -> None:
         )
 
         try:
-            result = await client.completion(gen_req, request_id=request_id)
+            result = await _await_until_disconnect(
+                request,
+                client.completion(gen_req, request_id=request_id),
+            )
         except ClientError as exc:
             if _is_bad_request_error(exc):
                 raise HTTPException(status_code=400, detail=str(exc)) from exc

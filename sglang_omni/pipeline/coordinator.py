@@ -318,14 +318,30 @@ class Coordinator:
 
     async def submit(self, request_id: str, request: OmniRequest | Any) -> Any:
         """Submit a request to the pipeline and wait for completion."""
-        await self._submit_request(request_id, request)
-
-        future = self._completion_futures[request_id]
+        future = asyncio.get_running_loop().create_future()
         try:
-            result = await future
-            return result
+            await self._submit_request(
+                request_id,
+                request,
+                completion_future=future,
+            )
+            return await future
         finally:
-            self._completion_futures.pop(request_id, None)
+            if self._completion_futures.get(request_id) is future:
+                should_abort = not future.done() or future.cancelled()
+                if not future.done():
+                    future.cancel()
+                try:
+                    if should_abort:
+                        try:
+                            await self.abort(request_id)
+                        except Exception:
+                            # The coordinator-owned abort task logs its own failure.
+                            # Preserve the error or cancellation leaving submit().
+                            pass
+                finally:
+                    if self._completion_futures.get(request_id) is future:
+                        self._completion_futures.pop(request_id, None)
 
     async def stream(
         self, request_id: str, request: OmniRequest | Any
@@ -372,6 +388,7 @@ class Coordinator:
         request_id: str,
         request: OmniRequest | Any,
         *,
+        completion_future: asyncio.Future | None = None,
         stream_queue: asyncio.Queue[CompleteMessage | StreamMessage] | None = None,
     ) -> None:
         """Submit a request without waiting for completion."""
@@ -394,9 +411,12 @@ class Coordinator:
             terminal_stages=self._resolve_terminal_stages(request),
         )
 
-        # Create future for completion
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future = loop.create_future()
+        # Publish the caller's exact completion owner after validation.
+        future = (
+            completion_future
+            if completion_future is not None
+            else asyncio.get_running_loop().create_future()
+        )
         self._completion_futures[request_id] = future
         if stream_queue is not None:
             self._stream_queues[request_id] = stream_queue
