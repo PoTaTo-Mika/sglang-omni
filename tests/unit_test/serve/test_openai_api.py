@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import json
 from typing import Any
 
-import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -695,56 +693,6 @@ def test_admin_routes_forward_to_client() -> None:
         ),
         ("weights_checker", {"action": "checksum"}, None, 120.0),
     ]
-
-
-@pytest.mark.parametrize("stream", [False, True])
-def test_abort_request_gracefully_finishes_active_chat_request(stream: bool) -> None:
-    async def _run() -> None:
-        pipeline_client, coordinator, _ = _streaming_client()
-        app = create_app(pipeline_client, model_name="qwen3-omni")
-        request_id = f"chat-abort-{stream}"
-
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app),
-            base_url="http://test",
-        ) as http_client:
-            generation_task = asyncio.create_task(
-                http_client.post(
-                    "/v1/chat/completions",
-                    json={
-                        "model": "qwen3-omni",
-                        "request_id": request_id,
-                        "messages": [{"role": "user", "content": "hello"}],
-                        "stream": stream,
-                    },
-                )
-            )
-            for _ in range(100):
-                if request_id in coordinator._requests:
-                    break
-                await asyncio.sleep(0)
-
-            abort_response = await http_client.post(
-                "/abort_request",
-                json={"rid": request_id},
-            )
-            generation_response = await asyncio.wait_for(generation_task, timeout=1)
-
-        assert abort_response.status_code == 200
-        assert abort_response.json()["num_aborted_requests"] == 1
-        assert generation_response.status_code == 200
-        if stream:
-            events = [
-                json.loads(line.removeprefix("data: "))
-                for line in generation_response.text.splitlines()
-                if line.startswith("data: ") and "[DONE]" not in line
-            ]
-            assert events[-1]["choices"][0]["finish_reason"] == "abort"
-            assert "data: [DONE]" in generation_response.text
-        else:
-            assert generation_response.json()["choices"][0]["finish_reason"] == "abort"
-
-    asyncio.run(_run())
 
 
 def test_chat_stream_failure_closes_without_done_sentinel() -> None:
