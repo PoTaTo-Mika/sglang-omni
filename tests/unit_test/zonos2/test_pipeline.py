@@ -19,8 +19,16 @@ from sglang_omni.models.zonos2.config import (
     Zonos2PipelineConfig,
 )
 from sglang_omni.models.zonos2.engine_builder import Zonos2EngineBuilder
-from sglang_omni.models.zonos2.request_builders import build_zonos2_state
-from sglang_omni.proto import StagePayload
+from sglang_omni.models.zonos2.request_builders import (
+    build_zonos2_state,
+    build_zonos2_stream_metadata,
+)
+from sglang_omni.models.zonos2.streaming_contract import (
+    DEFAULT_ZONOS2_PRODUCER_FIRST_FLUSH_ROWS,
+    DEFAULT_ZONOS2_STREAM_INITIAL_CHUNK_FRAMES,
+)
+from sglang_omni.proto import OmniRequest, StagePayload
+from sglang_omni.scheduling.streaming_vocoder import INITIAL_CODEC_CHUNK_FRAMES_PARAM
 from sglang_omni.serve.speech_service import SpeechRequestValidator
 
 
@@ -64,6 +72,32 @@ def test_zonos2_streaming_pipeline_routes_chunks_to_vocoder() -> None:
 
     assert stages_by_name["tts_engine"].stream_to == ["vocoder"]
     assert stages_by_name["vocoder"].can_accept_stream_before_payload is True
+    assert (
+        stages_by_name["tts_engine"].factory_args["stream_emit_first_chunk_frames"]
+        == DEFAULT_ZONOS2_PRODUCER_FIRST_FLUSH_ROWS
+        == 58
+    )
+
+
+@pytest.mark.parametrize(
+    ("params", "expected"),
+    [
+        ({"stream": True}, DEFAULT_ZONOS2_STREAM_INITIAL_CHUNK_FRAMES),
+        ({"stream": True, INITIAL_CODEC_CHUNK_FRAMES_PARAM: 0}, 0),
+    ],
+)
+def test_zonos2_stream_metadata_resolves_default_and_explicit_zero(
+    params: dict, expected: int
+) -> None:
+    payload = StagePayload(
+        request_id="req",
+        request=OmniRequest(inputs="", params=params),
+        data={},
+    )
+
+    metadata = build_zonos2_stream_metadata(payload, n_codebooks=9)
+
+    assert metadata[INITIAL_CODEC_CHUNK_FRAMES_PARAM] == expected
 
 
 def test_zonos2_multi_gpu_uses_typed_gpu_one_process() -> None:

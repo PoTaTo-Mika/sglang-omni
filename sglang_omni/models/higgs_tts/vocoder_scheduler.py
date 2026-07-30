@@ -46,7 +46,7 @@ class HiggsStreamingVocoderScheduler(StreamingVocoderBase[_HiggsStreamState, Non
         *,
         stream_stride: int = DEFAULT_HIGGS_STREAM_STRIDE,
         stream_followup_stride: int = DEFAULT_HIGGS_STREAM_FOLLOWUP_STRIDE,
-        initial_chunk_frames: int = 0,
+        initial_chunk_frames: int = DEFAULT_HIGGS_INITIAL_CHUNK_FRAMES,
         stream_overlap_tokens: int = 8,
         stream_holdback_tokens: int = 4,
         max_batch_size: int = 4,
