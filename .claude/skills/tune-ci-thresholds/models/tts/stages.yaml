@@ -788,7 +788,7 @@ tts_serving_batch32_speed:
         label: "Latency p50 (s)"
         scale: 1
         digits: 3
-      status: PENDING
+      status: OK
     latency_p95_advisory_s:
       source: "SERVING_BATCH32_LATENCY_P95_ADVISORY_S_REF"
       json_file: "tts-serving-ci0/benchmark/results.json"

@@ -16,9 +16,9 @@ from typing import Literal
 from urllib.request import ProxyHandler, build_opener
 
 import pytest
-
 from benchmarks.tts_serving.spec import load_spec
 from sglang_omni.utils import find_available_port
+
 from tests.test_model.tts_ci_config import (
     THRESHOLD_SLACK_HIGHER,
     THRESHOLD_SLACK_LOWER,
