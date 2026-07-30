@@ -25,7 +25,6 @@ from sglang_omni.models.zonos2.request_builders import (
 )
 from sglang_omni.models.zonos2.streaming_contract import (
     DEFAULT_ZONOS2_PRODUCER_FIRST_FLUSH_ROWS,
-    DEFAULT_ZONOS2_STREAM_INITIAL_CHUNK_FRAMES,
 )
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.scheduling.streaming_vocoder import INITIAL_CODEC_CHUNK_FRAMES_PARAM
@@ -82,12 +81,13 @@ def test_zonos2_streaming_pipeline_routes_chunks_to_vocoder() -> None:
 @pytest.mark.parametrize(
     ("params", "expected"),
     [
-        ({"stream": True}, DEFAULT_ZONOS2_STREAM_INITIAL_CHUNK_FRAMES),
+        ({"stream": True}, None),
         ({"stream": True, INITIAL_CODEC_CHUNK_FRAMES_PARAM: 0}, 0),
+        ({"stream": True, INITIAL_CODEC_CHUNK_FRAMES_PARAM: 5}, 5),
     ],
 )
-def test_zonos2_stream_metadata_resolves_default_and_explicit_zero(
-    params: dict, expected: int
+def test_zonos2_stream_metadata_preserves_request_override_provenance(
+    params: dict, expected: int | None
 ) -> None:
     payload = StagePayload(
         request_id="req",
@@ -97,7 +97,10 @@ def test_zonos2_stream_metadata_resolves_default_and_explicit_zero(
 
     metadata = build_zonos2_stream_metadata(payload, n_codebooks=9)
 
-    assert metadata[INITIAL_CODEC_CHUNK_FRAMES_PARAM] == expected
+    if expected is None:
+        assert INITIAL_CODEC_CHUNK_FRAMES_PARAM not in metadata
+    else:
+        assert metadata[INITIAL_CODEC_CHUNK_FRAMES_PARAM] == expected
 
 
 def test_zonos2_multi_gpu_uses_typed_gpu_one_process() -> None:

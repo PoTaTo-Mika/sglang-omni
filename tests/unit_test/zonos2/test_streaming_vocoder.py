@@ -122,7 +122,7 @@ def test_default_producer_flush_immediately_unlocks_first_vocoder_chunk():
     runner = SimpleNamespace(
         _outbox=queue.Queue(),
         _stream_emit_chunk_frames=32,
-        _stream_emit_first_chunk_frames=24,
+        _stream_emit_first_chunk_frames=DEFAULT_ZONOS2_PRODUCER_FIRST_FLUSH_ROWS,
     )
     scheduler_output = SimpleNamespace(
         requests=[SimpleNamespace(request_id="req", data=data)]
@@ -160,6 +160,96 @@ def test_default_producer_flush_immediately_unlocks_first_vocoder_chunk():
     assert (
         np.frombuffer(audio_messages[0].data["audio_waveform"], dtype=np.float32).size
         > 0
+    )
+
+
+def _run_producer_callback(
+    *,
+    request_params: dict,
+    configured_first_rows: int,
+    generated_rows: int,
+) -> queue.Queue:
+    payload = StagePayload(
+        request_id="req",
+        request=OmniRequest(inputs="", params=request_params),
+        data={},
+    )
+    data = SimpleNamespace(
+        req=SimpleNamespace(finished=lambda: False, is_retracted=False),
+        output_codes=list(_codes(generated_rows)),
+        stream_metadata=build_zonos2_stream_metadata(payload, n_codebooks=N_CODEBOOKS),
+        _stream_emit_idx=0,
+    )
+    outbox = queue.Queue()
+    runner = SimpleNamespace(
+        _outbox=outbox,
+        _stream_emit_chunk_frames=32,
+        _stream_emit_first_chunk_frames=configured_first_rows,
+    )
+    callbacks.extract_zonos2_output(
+        runner,
+        None,
+        SimpleNamespace(
+            requests=[SimpleNamespace(request_id=payload.request_id, data=data)]
+        ),
+        None,
+    )
+    return outbox
+
+
+@pytest.mark.parametrize(
+    ("configured_first_rows", "expected_flush_rows"),
+    [(0, 32), (100, 100)],
+)
+def test_missing_request_override_honors_configured_producer_boundary(
+    configured_first_rows: int,
+    expected_flush_rows: int,
+) -> None:
+    before = _run_producer_callback(
+        request_params={"stream": True},
+        configured_first_rows=configured_first_rows,
+        generated_rows=expected_flush_rows - 1,
+    )
+    assert before.empty()
+
+    at_boundary = _run_producer_callback(
+        request_params={"stream": True},
+        configured_first_rows=configured_first_rows,
+        generated_rows=expected_flush_rows,
+    )
+    assert at_boundary.get_nowait().data.shape == (
+        expected_flush_rows,
+        N_CODEBOOKS,
+    )
+
+
+@pytest.mark.parametrize(
+    ("request_override", "expected_flush_rows"),
+    [(0, DEFAULT_ZONOS2_PRODUCER_FIRST_FLUSH_ROWS), (5, 23)],
+)
+def test_request_override_wins_over_configured_producer_boundary(
+    request_override: int,
+    expected_flush_rows: int,
+) -> None:
+    request_params = {
+        "stream": True,
+        INITIAL_CODEC_CHUNK_FRAMES_PARAM: request_override,
+    }
+    before = _run_producer_callback(
+        request_params=request_params,
+        configured_first_rows=100,
+        generated_rows=expected_flush_rows - 1,
+    )
+    assert before.empty()
+
+    at_boundary = _run_producer_callback(
+        request_params=request_params,
+        configured_first_rows=100,
+        generated_rows=expected_flush_rows,
+    )
+    assert at_boundary.get_nowait().data.shape == (
+        expected_flush_rows,
+        N_CODEBOOKS,
     )
 
 
