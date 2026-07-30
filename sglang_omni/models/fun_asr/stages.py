@@ -19,6 +19,7 @@ from sglang_omni.models.fun_asr.encoder_service import (
 from sglang_omni.models.fun_asr.request_builders import (
     fun_asr_prompt_overhead_tokens,
     make_fun_asr_scheduler_adapters,
+    make_fun_asr_stream_output_builder,
 )
 from sglang_omni.models.fun_asr.tool_funcs.audio_lengths import (
     fun_asr_low_frame_rate_length,
@@ -138,6 +139,7 @@ def create_sglang_fun_asr_executor(
     pre_lm_max_batch_wait_ms: int = 4,
     request_build_max_workers: int = 8,
     request_build_max_pending: int | None = 16,
+    stream_emit_interval_s: float = 0.05,
     server_args_overrides: dict[str, Any] | None = None,
 ):
     if pre_lm_max_batch_size < 1:
@@ -255,6 +257,10 @@ def create_sglang_fun_asr_executor(
             context_length=context_length,
             audio_encoder_service=audio_encoder_service,
         )
+        stream_output_builder = make_fun_asr_stream_output_builder(
+            tokenizer=tokenizer,
+            min_emit_interval_s=stream_emit_interval_s,
+        )
 
         return OmniScheduler(
             tp_worker=model_worker,
@@ -268,6 +274,7 @@ def create_sglang_fun_asr_executor(
             model_runner=ModelRunner(model_worker, output_proc),
             request_builder=request_builder,
             result_adapter=result_adapter,
+            stream_output_builder=stream_output_builder,
             enable_async_decode=enable_async_decode,
             async_decode_min_batch_size=async_decode_min_batch_size,
             request_build_max_workers=request_build_max_workers,
