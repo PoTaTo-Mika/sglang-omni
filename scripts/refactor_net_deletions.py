@@ -541,7 +541,7 @@ def format_html(
     commit_section = _format_html_commit_section(report.commits)
     file_metric_label = "Touches" if report.commits else "Files"
 
-    return f"""<!doctype html>
+    rendered = f"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -825,6 +825,7 @@ def format_html(
   </main>
 </body>
 </html>"""
+    return "\n".join(line.rstrip() for line in rendered.splitlines())
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
