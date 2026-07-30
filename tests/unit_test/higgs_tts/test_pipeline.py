@@ -1011,7 +1011,7 @@ def test_higgs_stream_metadata_resolves_model_default_and_explicit_zero(
     assert metadata["initial_codec_chunk_frames"] == expected
 
 
-def test_higgs_producer_flushes_default_initial_chunk_at_row_27() -> None:
+def test_higgs_producer_flushes_default_initial_chunk_at_row_47() -> None:
     runner = object.__new__(HiggsTTSModelRunner)
     runner._outbox = queue.Queue()
     runner._vocoder_target = "vocoder"
@@ -1037,7 +1037,7 @@ def test_higgs_producer_flushes_default_initial_chunk_at_row_27() -> None:
     )
     sched_req = SimpleNamespace(request_id="req", data=data)
 
-    for row in range(26):
+    for row in range(46):
         runner._queue_or_emit_code_chunk(
             sched_req,
             torch.full((8,), row, dtype=torch.long),
@@ -1047,12 +1047,15 @@ def test_higgs_producer_flushes_default_initial_chunk_at_row_27() -> None:
 
     runner._queue_or_emit_code_chunk(
         sched_req,
-        torch.full((8,), 26, dtype=torch.long),
+        torch.full((8,), 46, dtype=torch.long),
     )
     message = runner._outbox.get_nowait()
 
-    assert message.data.shape == (27, 8)
-    assert message.metadata["initial_codec_chunk_frames"] == 20
+    assert message.data.shape == (47, 8)
+    assert (
+        message.metadata["initial_codec_chunk_frames"]
+        == DEFAULT_HIGGS_INITIAL_CHUNK_FRAMES
+    )
 
 
 def test_higgs_model_runner_marks_sampler_finish_cg() -> None:
