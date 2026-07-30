@@ -76,13 +76,17 @@ The dashboard also includes a `Reusable shared surfaces` panel that links the
 TTS refactor design doc and the shared files developers should check before
 adding new model-local code.
 
-The configured scope covers the six models migrated by the refactor and their
-shared runtime paths. New model integrations are outside this scope. In
-particular, ZONOS2 PR #1112 contributes no files or lines to the configured
-path set; its model-local adoption of shared hooks is not counted.
+The dashboard uses commit-sum mode rather than diffing the baseline against the
+latest `main`. Its reviewed allowlist is
+`scripts/tts_refactor_commits.json`. This follows the original #985 snapshot
+method and prevents unrelated work in shared directories from changing the
+result. Model integrations such as #858 and #1112 are excluded. File counts in
+this mode are commit file touches, not unique paths. Add a merged refactor PR's
+immutable merge SHA to the allowlist to include it in future deployments.
+Stacked PR #930 is represented by its landing PR #927 rather than counted
+twice; its standalone non-test net contribution in the old snapshot was zero.
 
-For the whole TTS refactor, choose one stable baseline and keep using it. The
-parent of the first landed TTS refactor PR is a reasonable baseline:
+The parent of the first landed TTS refactor PR is the stable history boundary:
 
 ```bash
 git rev-parse 4e4c98a^1
@@ -94,27 +98,13 @@ Generate the dashboard once:
 python3 scripts/refactor_net_deletions.py \
   --base 4e4c98a^1 \
   --head origin/main \
+  --mode commit-sum \
+  --commit-file scripts/tts_refactor_commits.json \
   --format html \
   --output /data/jaxan/tts-refactor-dashboard/index.html \
   --title "TTS Refactor Progress" \
   --refresh-seconds 300 \
-  --path sglang_omni/models/fishaudio_s2_pro \
-  --path sglang_omni/models/higgs_tts \
-  --path sglang_omni/models/moss_tts \
-  --path sglang_omni/models/moss_tts_local \
-  --path sglang_omni/models/qwen3_tts \
-  --path sglang_omni/models/voxtral_tts \
-  --path sglang_omni/pipeline \
-  --path sglang_omni/scheduling \
-  --path sglang_omni/serve \
-  --path tests/unit_test/fishaudio_s2_pro \
-  --path tests/unit_test/higgs_tts \
-  --path tests/unit_test/moss_tts \
-  --path tests/unit_test/moss_tts_local \
-  --path tests/unit_test/qwen3_tts \
-  --path tests/unit_test/voxtral_tts \
-  --path tests/test_model/test_tts_ci.py \
-  --path tests/test_model/tts_ci_config.py \
+  --scope-note "Counts only the reviewed TTS refactor commit allowlist; model integrations and unrelated main commits are excluded." \
   --list-test-files \
   --list-non-test-files
 ```
@@ -129,27 +119,13 @@ while true; do
     --repo /data/jaxan/sglang-omni \
     --base 4e4c98a^1 \
     --head origin/main \
+    --mode commit-sum \
+    --commit-file scripts/tts_refactor_commits.json \
     --format html \
     --output /data/jaxan/tts-refactor-dashboard/index.html \
     --title "TTS Refactor Progress" \
     --refresh-seconds 300 \
-    --path sglang_omni/models/fishaudio_s2_pro \
-    --path sglang_omni/models/higgs_tts \
-    --path sglang_omni/models/moss_tts \
-    --path sglang_omni/models/moss_tts_local \
-    --path sglang_omni/models/qwen3_tts \
-    --path sglang_omni/models/voxtral_tts \
-    --path sglang_omni/pipeline \
-    --path sglang_omni/scheduling \
-    --path sglang_omni/serve \
-    --path tests/unit_test/fishaudio_s2_pro \
-    --path tests/unit_test/higgs_tts \
-    --path tests/unit_test/moss_tts \
-    --path tests/unit_test/moss_tts_local \
-    --path tests/unit_test/qwen3_tts \
-    --path tests/unit_test/voxtral_tts \
-    --path tests/test_model/test_tts_ci.py \
-    --path tests/test_model/tts_ci_config.py \
+    --scope-note "Counts only the reviewed TTS refactor commit allowlist; model integrations and unrelated main commits are excluded." \
     --list-test-files \
     --list-non-test-files
   sleep 300

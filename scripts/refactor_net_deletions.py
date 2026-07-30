@@ -116,6 +116,12 @@ class Totals:
         self.added += file_stat.added
         self.deleted += file_stat.deleted
 
+    def merge(self, other: Totals) -> None:
+        self.files += other.files
+        self.binary_files += other.binary_files
+        self.added += other.added
+        self.deleted += other.deleted
+
     def to_dict(self) -> dict[str, int]:
         return {
             "files": self.files,
@@ -133,6 +139,13 @@ class DiffSpec:
 
 
 @dataclass(frozen=True)
+class CommitSummary:
+    revision: str
+    subject: str
+    totals: dict[str, Totals]
+
+
+@dataclass(frozen=True)
 class Report:
     repo: str
     diff_label: str
@@ -140,6 +153,7 @@ class Report:
     totals: dict[str, Totals]
     files: tuple[FileStat, ...]
     pathspecs: tuple[str, ...] = ()
+    commits: tuple[CommitSummary, ...] = ()
 
     @property
     def target_met(self) -> bool:
@@ -245,6 +259,109 @@ def build_report(
     )
 
 
+def select_commits(
+    repo: Path,
+    base: str,
+    head: str,
+    title_prefix: str | None,
+    explicit_commits: Sequence[str],
+) -> tuple[tuple[str, str], ...]:
+    raw = _run_git(
+        repo,
+        ("log", "--reverse", "--format=%H%x09%s", f"{base}..{head}"),
+    )
+    history = tuple(
+        line.split("\t", 1)
+        for line in raw.decode("utf-8", "replace").splitlines()
+        if line
+    )
+    explicit_revisions = {
+        _run_git(repo, ("rev-parse", commit)).decode().strip()
+        for commit in explicit_commits
+    }
+    history_revisions = {revision for revision, _ in history}
+    missing = explicit_revisions - history_revisions
+    if missing:
+        raise ValueError(
+            "explicit commits are outside the selected history: "
+            + ", ".join(sorted(missing))
+        )
+
+    selected = tuple(
+        (revision, subject)
+        for revision, subject in history
+        if revision in explicit_revisions
+        or (title_prefix is not None and subject.startswith(title_prefix))
+    )
+    if not selected:
+        raise ValueError("commit-sum mode selected no commits")
+    return selected
+
+
+def load_commit_file(path: Path) -> tuple[str, ...]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("schema_version") != 1:
+        raise ValueError(f"unsupported commit file schema: {path}")
+    commits = payload.get("commits")
+    if not isinstance(commits, list) or not commits:
+        raise ValueError(f"commit file has no commits: {path}")
+
+    revisions = []
+    for entry in commits:
+        if not isinstance(entry, dict) or not isinstance(entry.get("revision"), str):
+            raise TypeError(f"invalid commit entry in {path}")
+        revisions.append(entry["revision"])
+    if len(revisions) != len(set(revisions)):
+        raise ValueError(f"commit file contains duplicate revisions: {path}")
+    return tuple(revisions)
+
+
+def build_commit_sum_report(
+    repo: Path,
+    commits: Sequence[tuple[str, str]],
+    base: str,
+    head: str,
+    pathspecs: Sequence[str] = (),
+) -> Report:
+    totals = {
+        "non_test": Totals(),
+        "test": Totals(),
+        "all": Totals(),
+    }
+    files: list[FileStat] = []
+    commit_summaries: list[CommitSummary] = []
+    for revision, subject in commits:
+        commit_report = build_report(
+            repo,
+            DiffSpec(
+                label=f"{revision}^..{revision}",
+                git_args=(f"{revision}^", revision),
+            ),
+            "commit",
+            pathspecs,
+        )
+        files.extend(commit_report.files)
+        for category, commit_totals in commit_report.totals.items():
+            totals[category].merge(commit_totals)
+        commit_summaries.append(
+            CommitSummary(
+                revision=revision,
+                subject=subject,
+                totals=commit_report.totals,
+            )
+        )
+
+    return Report(
+        repo=str(repo),
+        diff_label=f"{len(commits)} allowlisted commits in {base}..{head}",
+        mode="commit-sum",
+        totals=totals,
+        files=tuple(files),
+        pathspecs=tuple(pathspecs),
+        commits=tuple(commit_summaries),
+    )
+
+
 def format_text(
     report: Report, list_test_files: bool, list_non_test_files: bool
 ) -> str:
@@ -263,12 +380,24 @@ def format_text(
     ]
 
     if list_test_files:
-        lines.extend(["", "Excluded test files:"])
+        label = (
+            "Excluded test file touches:" if report.commits else "Excluded test files:"
+        )
+        lines.extend(["", label])
         lines.extend(_format_file_list(report.files, is_test=True))
 
     if list_non_test_files:
-        lines.extend(["", "Counted non-test files:"])
+        label = (
+            "Counted non-test file touches:"
+            if report.commits
+            else "Counted non-test files:"
+        )
+        lines.extend(["", label])
         lines.extend(_format_file_list(report.files, is_test=False))
+
+    if report.commits:
+        lines.extend(["", "Counted commits:"])
+        lines.extend(_format_commit_lines(report.commits))
 
     return "\n".join(lines)
 
@@ -276,6 +405,7 @@ def format_text(
 def format_markdown(
     report: Report, list_test_files: bool, list_non_test_files: bool
 ) -> str:
+    file_label = "Touches" if report.commits else "Files"
     lines = [
         "### Refactor Net Deletion Tracking",
         "",
@@ -284,7 +414,7 @@ def format_markdown(
         f"- Paths: `{_format_pathspecs(report.pathspecs)}`",
         f"- Target: non-test net deleted > 0 (**{_format_target(report)}**)",
         "",
-        "| Category | Files | Binary | Added | Deleted | Net deleted |",
+        f"| Category | {file_label} | Binary | Added | Deleted | Net deleted |",
         "| --- | ---: | ---: | ---: | ---: | ---: |",
     ]
 
@@ -297,14 +427,37 @@ def format_markdown(
         )
 
     if list_test_files:
-        lines.extend(["", "<details><summary>Excluded test files</summary>", ""])
+        label = (
+            "Excluded test file touches" if report.commits else "Excluded test files"
+        )
+        lines.extend(["", f"<details><summary>{label}</summary>", ""])
         lines.extend(f"- `{path}`" for path in _matching_paths(report.files, True))
         lines.extend(["", "</details>"])
 
     if list_non_test_files:
-        lines.extend(["", "<details><summary>Counted non-test files</summary>", ""])
+        label = (
+            "Counted non-test file touches"
+            if report.commits
+            else "Counted non-test files"
+        )
+        lines.extend(["", f"<details><summary>{label}</summary>", ""])
         lines.extend(f"- `{path}`" for path in _matching_paths(report.files, False))
         lines.extend(["", "</details>"])
+
+    if report.commits:
+        lines.extend(
+            [
+                "",
+                "| Commit | Subject | Non-test added | Non-test deleted | Net deleted |",
+                "| --- | --- | ---: | ---: | ---: |",
+            ]
+        )
+        for commit in report.commits:
+            totals = commit.totals["non_test"]
+            lines.append(
+                f"| `{commit.revision[:8]}` | {commit.subject} | "
+                f"{totals.added} | {totals.deleted} | {totals.net_deleted} |"
+            )
 
     return "\n".join(lines)
 
@@ -320,6 +473,16 @@ def format_json(report: Report) -> str:
             "met": report.target_met,
         },
         "totals": {key: value.to_dict() for key, value in report.totals.items()},
+        "commits": [
+            {
+                "revision": commit.revision,
+                "subject": commit.subject,
+                "totals": {
+                    key: value.to_dict() for key, value in commit.totals.items()
+                },
+            }
+            for commit in report.commits
+        ],
         "files": [
             {
                 **asdict(file_stat),
@@ -360,13 +523,23 @@ def format_html(
 
     file_sections = []
     if list_non_test_files:
+        section_title = (
+            "Counted non-test file touches"
+            if report.commits
+            else "Counted non-test files"
+        )
         file_sections.append(
-            _format_html_file_section("Counted non-test files", report.files, False)
+            _format_html_file_section(section_title, report.files, False)
         )
     if list_test_files:
-        file_sections.append(
-            _format_html_file_section("Excluded test files", report.files, True)
+        section_title = (
+            "Excluded test file touches" if report.commits else "Excluded test files"
         )
+        file_sections.append(
+            _format_html_file_section(section_title, report.files, True)
+        )
+    commit_section = _format_html_commit_section(report.commits)
+    file_metric_label = "Touches" if report.commits else "Files"
 
     return f"""<!doctype html>
 <html lang="en">
@@ -583,6 +756,27 @@ def format_html(
       font-size: 12px;
       overflow-wrap: anywhere;
     }}
+    .commit-table {{
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }}
+    .commit-table-wrap {{
+      overflow-x: auto;
+    }}
+    .commit-table th, .commit-table td {{
+      border-bottom: 1px solid var(--border);
+      padding: 8px;
+      text-align: right;
+      vertical-align: top;
+    }}
+    .commit-table th:first-child, .commit-table td:first-child,
+    .commit-table th:nth-child(2), .commit-table td:nth-child(2) {{
+      text-align: left;
+    }}
+    .commit-table td:nth-child(2) {{
+      max-width: 520px;
+    }}
     @media (max-width: 840px) {{
       header {{ display: block; }}
       .status {{ text-align: left; margin-top: 12px; }}
@@ -611,9 +805,9 @@ def format_html(
     </header>
 
     <section class="grid">
-      {_format_html_total_card("Non-test", report.totals["non_test"])}
-      {_format_html_total_card("Test", report.totals["test"])}
-      {_format_html_total_card("All", report.totals["all"])}
+      {_format_html_total_card("Non-test", report.totals["non_test"], file_metric_label)}
+      {_format_html_total_card("Test", report.totals["test"], file_metric_label)}
+      {_format_html_total_card("All", report.totals["all"], file_metric_label)}
     </section>
 
     <section class="context">
@@ -622,6 +816,8 @@ def format_html(
       implementation deletion target.
       {scope_notes_html}
     </section>
+
+    {commit_section}
 
     {_format_html_resources()}
 
@@ -660,13 +856,29 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--mode",
-        choices=("merge-base", "direct", "worktree", "staged"),
+        choices=("merge-base", "direct", "worktree", "staged", "commit-sum"),
         default="merge-base",
         help=(
             "Diff mode: merge-base uses base...head, direct uses base head, "
             "worktree compares the working tree with merge-base(base, head), "
-            "and staged compares the index with merge-base(base, head)."
+            "staged compares the index with merge-base(base, head), and "
+            "commit-sum adds the first-parent diffs of allowlisted commits."
         ),
+    )
+    parser.add_argument(
+        "--commit-title-prefix",
+        help="In commit-sum mode, include commits whose subjects start with this.",
+    )
+    parser.add_argument(
+        "--commit",
+        action="append",
+        default=[],
+        help="In commit-sum mode, include this commit explicitly. May be repeated.",
+    )
+    parser.add_argument(
+        "--commit-file",
+        type=Path,
+        help="In commit-sum mode, load explicit commits from this JSON file.",
     )
     parser.add_argument(
         "--format",
@@ -728,8 +940,34 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
     repo = Path(args.repo).resolve()
 
-    diff_spec = resolve_diff_spec(repo, args)
-    report = build_report(repo, diff_spec, args.mode, args.path)
+    if args.mode == "commit-sum":
+        if args.diff_range:
+            raise ValueError("--range cannot be used with commit-sum mode")
+        explicit_commits = list(args.commit)
+        if args.commit_file:
+            commit_file = args.commit_file
+            if not commit_file.is_absolute():
+                commit_file = repo / commit_file
+            explicit_commits.extend(load_commit_file(commit_file))
+        commits = select_commits(
+            repo,
+            args.base,
+            args.head,
+            args.commit_title_prefix,
+            explicit_commits,
+        )
+        report = build_commit_sum_report(
+            repo,
+            commits,
+            args.base,
+            args.head,
+            args.path,
+        )
+    else:
+        if args.commit_title_prefix or args.commit or args.commit_file:
+            raise ValueError("commit selectors require commit-sum mode")
+        diff_spec = resolve_diff_spec(repo, args)
+        report = build_report(repo, diff_spec, args.mode, args.path)
 
     if args.format == "json":
         output = format_json(report)
@@ -810,7 +1048,8 @@ def _parse_numstat_count(value: str) -> int | None:
 
 
 def _format_table(report: Report) -> str:
-    rows = [("Category", "Files", "Binary", "Added", "Deleted", "Net deleted")]
+    file_label = "Touches" if report.commits else "Files"
+    rows = [("Category", file_label, "Binary", "Added", "Deleted", "Net deleted")]
     for key, label in (("non_test", "non-test"), ("test", "test"), ("all", "all")):
         totals = report.totals[key]
         rows.append(
@@ -841,7 +1080,9 @@ def _format_pathspecs(pathspecs: Sequence[str]) -> str:
     return ", ".join(pathspecs)
 
 
-def _format_html_total_card(label: str, totals: Totals) -> str:
+def _format_html_total_card(
+    label: str, totals: Totals, file_metric_label: str = "Files"
+) -> str:
     net_class = "positive" if totals.net_deleted > 0 else "negative"
     if totals.net_deleted == 0:
         net_class = "zero"
@@ -856,7 +1097,7 @@ def _format_html_total_card(label: str, totals: Totals) -> str:
         <div class="metric-row">
           {_format_html_metric("Added", totals.added)}
           {_format_html_metric("Deleted", totals.deleted)}
-          {_format_html_metric("Files", totals.files)}
+          {_format_html_metric(file_metric_label, totals.files)}
           {_format_html_metric("Binary", totals.binary_files)}
         </div>
       </article>"""
@@ -885,6 +1126,47 @@ def _format_html_file_section(
       <ul class="file-list">
         {items}
       </ul>
+    </section>"""
+
+
+def _format_html_commit_section(commits: Sequence[CommitSummary]) -> str:
+    if not commits:
+        return ""
+    rows = []
+    for commit in commits:
+        non_test = commit.totals["non_test"]
+        test = commit.totals["test"]
+        revision = html.escape(commit.revision[:8])
+        rows.append(
+            "<tr>"
+            f'<td><a class="link" href="'
+            f"https://github.com/sgl-project/sglang-omni/commit/{commit.revision}"
+            f'">{revision}</a></td>'
+            f"<td>{html.escape(commit.subject)}</td>"
+            f"<td>{non_test.added}</td>"
+            f"<td>{non_test.deleted}</td>"
+            f"<td>{non_test.net_deleted:+d}</td>"
+            f"<td>{test.net_deleted:+d}</td>"
+            "</tr>"
+        )
+    return f"""
+    <section class="card" style="margin-top: 12px;">
+      <h2>Counted refactor commits</h2>
+      <div class="commit-table-wrap">
+        <table class="commit-table">
+          <thead>
+            <tr>
+              <th>Commit</th>
+              <th>Subject</th>
+              <th>Non-test added</th>
+              <th>Non-test deleted</th>
+              <th>Non-test net</th>
+              <th>Test net</th>
+            </tr>
+          </thead>
+          <tbody>{"".join(rows)}</tbody>
+        </table>
+      </div>
     </section>"""
 
 
@@ -950,6 +1232,17 @@ def _format_file_list(files: Sequence[FileStat], is_test: bool) -> list[str]:
     if not paths:
         return ["  (none)"]
     return [f"  {path}" for path in paths]
+
+
+def _format_commit_lines(commits: Sequence[CommitSummary]) -> list[str]:
+    return [
+        "  "
+        f"{commit.revision[:8]} {commit.subject}: "
+        f"{commit.totals['non_test'].added} added, "
+        f"{commit.totals['non_test'].deleted} deleted, "
+        f"{commit.totals['non_test'].net_deleted:+d} net deleted"
+        for commit in commits
+    ]
 
 
 if __name__ == "__main__":

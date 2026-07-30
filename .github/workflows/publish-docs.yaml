@@ -46,28 +46,13 @@ jobs:
           python3 scripts/refactor_net_deletions.py \
             --base '4e4c98a^1' \
             --head HEAD \
+            --mode commit-sum \
+            --commit-file scripts/tts_refactor_commits.json \
             --format html \
             --output docs/_build/html/tts-refactor/index.html \
             --title 'TTS Refactor Progress' \
             --refresh-seconds 300 \
-            --scope-note 'ZONOS2 integration PR #1112 is outside this six-model refactor scope; its merge commit contributes 0 files and 0 lines to the configured paths.' \
-            --path sglang_omni/models/fishaudio_s2_pro \
-            --path sglang_omni/models/higgs_tts \
-            --path sglang_omni/models/moss_tts \
-            --path sglang_omni/models/moss_tts_local \
-            --path sglang_omni/models/qwen3_tts \
-            --path sglang_omni/models/voxtral_tts \
-            --path sglang_omni/pipeline \
-            --path sglang_omni/scheduling \
-            --path sglang_omni/serve \
-            --path tests/unit_test/fishaudio_s2_pro \
-            --path tests/unit_test/higgs_tts \
-            --path tests/unit_test/moss_tts \
-            --path tests/unit_test/moss_tts_local \
-            --path tests/unit_test/qwen3_tts \
-            --path tests/unit_test/voxtral_tts \
-            --path tests/test_model/test_tts_ci.py \
-            --path tests/test_model/tts_ci_config.py \
+            --scope-note 'Counts only merge commits in scripts/tts_refactor_commits.json. Model integrations #858 and #1112 and unrelated main commits are excluded.' \
             --list-test-files \
             --list-non-test-files
 

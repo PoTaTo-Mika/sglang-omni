@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 import sys
 from pathlib import Path
 
@@ -149,3 +150,78 @@ def test_format_html_dashboard_escapes_paths_and_lists_test_files() -> None:
     assert "sglang_omni/foo&lt;bar&gt;.py" in rendered
     assert "tests/unit_test/test_foo.py" in rendered
     assert "+3" in rendered
+
+
+def test_commit_sum_excludes_unrelated_history(tmp_path: Path) -> None:
+    def git(*args: str) -> str:
+        completed = subprocess.run(
+            ("git", *args),
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return completed.stdout.strip()
+
+    git("init", "-q")
+    git("config", "user.name", "Test")
+    git("config", "user.email", "test@example.com")
+    source = tmp_path / "module.py"
+    source.write_text("a\nb\nc\n", encoding="utf-8")
+    git("add", "module.py")
+    git("commit", "-qm", "baseline")
+    baseline = git("rev-parse", "HEAD")
+
+    source.write_text("a\nb\nc\nd\n", encoding="utf-8")
+    git("commit", "-qam", "T1 migration")
+    t1 = git("rev-parse", "HEAD")
+
+    source.write_text("a\nd\n", encoding="utf-8")
+    git("commit", "-qam", "[TTS Refactor] remove duplicate code")
+
+    source.write_text("a\nd\nfeature\n", encoding="utf-8")
+    git("commit", "-qam", "[Feature] unrelated addition")
+
+    commits = refactor_net_deletions.select_commits(
+        tmp_path,
+        baseline,
+        "HEAD",
+        "[TTS Refactor]",
+        (t1,),
+    )
+    report = refactor_net_deletions.build_commit_sum_report(
+        tmp_path,
+        commits,
+        baseline,
+        "HEAD",
+    )
+
+    assert [subject for _, subject in commits] == [
+        "T1 migration",
+        "[TTS Refactor] remove duplicate code",
+    ]
+    assert report.totals["non_test"].added == 1
+    assert report.totals["non_test"].deleted == 2
+    assert report.totals["non_test"].net_deleted == 1
+    assert len(report.commits) == 2
+    rendered = refactor_net_deletions.format_html(
+        report,
+        title="Commit sum",
+        issue_url=None,
+        refresh_seconds=0,
+        list_test_files=False,
+        list_non_test_files=False,
+    )
+    assert "Counted refactor commits" in rendered
+    assert "[TTS Refactor] remove duplicate code" in rendered
+    assert "[Feature] unrelated addition" not in rendered
+
+
+def test_tts_commit_allowlist_excludes_model_integrations() -> None:
+    revisions = refactor_net_deletions.load_commit_file(
+        SCRIPT_PATH.with_name("tts_refactor_commits.json")
+    )
+
+    assert len(revisions) == 20
+    assert "6cafa0c491c8ff8826bc649e1fd815808b7fbef0" not in revisions
+    assert "6ef910be36c68de565f2fed76639fa0d4772eecc" not in revisions
