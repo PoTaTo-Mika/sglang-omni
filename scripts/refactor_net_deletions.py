@@ -338,6 +338,7 @@ def format_html(
     refresh_seconds: int,
     list_test_files: bool,
     list_non_test_files: bool,
+    scope_notes: Sequence[str] = (),
 ) -> str:
     generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     status_class = "met" if report.target_met else "miss"
@@ -352,6 +353,10 @@ def format_html(
     refresh_meta = ""
     if refresh_seconds > 0:
         refresh_meta = f'<meta http-equiv="refresh" content="{refresh_seconds}">'
+
+    scope_notes_html = "".join(
+        f'<div class="scope-note">{html.escape(note)}</div>' for note in scope_notes
+    )
 
     file_sections = []
     if list_non_test_files:
@@ -516,6 +521,10 @@ def format_html(
       padding: 1px 5px;
       border-radius: 4px;
     }}
+    .scope-note {{
+      margin-top: 8px;
+      color: var(--text);
+    }}
     .link {{ color: var(--blue); text-decoration: none; font-weight: 700; }}
     .link:hover {{ text-decoration: underline; }}
     .resource-grid {{
@@ -611,6 +620,7 @@ def format_html(
       Progress is measured as <code>deleted non-test lines - added non-test lines</code>.
       Files classified as tests are reported separately and do not offset the
       implementation deletion target.
+      {scope_notes_html}
     </section>
 
     {_format_html_resources()}
@@ -691,6 +701,12 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="Add an HTML meta-refresh interval in seconds. Defaults to disabled.",
     )
     parser.add_argument(
+        "--scope-note",
+        action="append",
+        default=[],
+        help="Add a scope note to HTML output. May be repeated.",
+    )
+    parser.add_argument(
         "--list-test-files",
         action="store_true",
         help="List changed test files excluded from the progress target.",
@@ -728,6 +744,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.refresh_seconds,
             args.list_test_files,
             args.list_non_test_files,
+            args.scope_note,
         )
     else:
         output = format_text(report, args.list_test_files, args.list_non_test_files)

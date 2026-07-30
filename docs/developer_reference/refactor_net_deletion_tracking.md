@@ -76,6 +76,11 @@ The dashboard also includes a `Reusable shared surfaces` panel that links the
 TTS refactor design doc and the shared files developers should check before
 adding new model-local code.
 
+The configured scope covers the six models migrated by the refactor and their
+shared runtime paths. New model integrations are outside this scope. In
+particular, ZONOS2 PR #1112 contributes no files or lines to the configured
+path set; its model-local adoption of shared hooks is not counted.
+
 For the whole TTS refactor, choose one stable baseline and keep using it. The
 parent of the first landed TTS refactor PR is a reasonable baseline:
 

@@ -132,6 +132,7 @@ def test_format_html_dashboard_escapes_paths_and_lists_test_files() -> None:
         refresh_seconds=300,
         list_test_files=True,
         list_non_test_files=True,
+        scope_notes=("Excluded integration <#1112> contributes 0 scoped files.",),
     )
 
     assert "<title>TTS &lt;Progress&gt;</title>" in rendered
@@ -143,6 +144,7 @@ def test_format_html_dashboard_escapes_paths_and_lists_test_files() -> None:
         in rendered
     )
     assert "Reusable shared surfaces" in rendered
+    assert "Excluded integration &lt;#1112&gt; contributes 0 scoped files." in rendered
     assert "sglang_omni/scheduling/reference_encoder.py" in rendered
     assert "sglang_omni/foo&lt;bar&gt;.py" in rendered
     assert "tests/unit_test/test_foo.py" in rendered

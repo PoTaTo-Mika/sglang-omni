@@ -50,6 +50,7 @@ jobs:
             --output docs/_build/html/tts-refactor/index.html \
             --title 'TTS Refactor Progress' \
             --refresh-seconds 300 \
+            --scope-note 'ZONOS2 integration PR #1112 is outside this six-model refactor scope; its merge commit contributes 0 files and 0 lines to the configured paths.' \
             --path sglang_omni/models/fishaudio_s2_pro \
             --path sglang_omni/models/higgs_tts \
             --path sglang_omni/models/moss_tts \
