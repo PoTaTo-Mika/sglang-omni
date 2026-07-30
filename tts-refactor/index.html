@@ -1,0 +1,490 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="300">
+  <title>TTS Refactor Progress</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --text: #172033;
+      --muted: #667085;
+      --border: #d9dee8;
+      --green: #157f3b;
+      --green-bg: #e8f6ee;
+      --red: #b42318;
+      --red-bg: #fdecec;
+      --amber: #b54708;
+      --blue: #175cd3;
+      --shadow: 0 1px 2px rgba(16, 24, 40, 0.08);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      letter-spacing: 0;
+    }
+    main {
+      width: min(1180px, calc(100vw - 32px));
+      margin: 0 auto;
+      padding: 28px 0 36px;
+    }
+    header {
+      display: flex;
+      justify-content: space-between;
+      gap: 20px;
+      align-items: flex-start;
+      margin-bottom: 18px;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 28px;
+      line-height: 1.2;
+      font-weight: 720;
+    }
+    .subline {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px 14px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+    .status {
+      min-width: 156px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+      padding: 12px 14px;
+      text-align: right;
+    }
+    .status .label {
+      display: inline-block;
+      border-radius: 999px;
+      padding: 4px 9px;
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .status.met .label { color: var(--green); background: var(--green-bg); }
+    .status.miss .label { color: var(--red); background: var(--red-bg); }
+    .status .target {
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+      margin: 18px 0;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      padding: 16px;
+    }
+    .card h2 {
+      margin: 0 0 12px;
+      font-size: 14px;
+      line-height: 1.25;
+      color: var(--muted);
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+    .net {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+    .net strong {
+      font-size: 34px;
+      line-height: 1;
+      font-weight: 760;
+    }
+    .net span {
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .metric-row {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 8px;
+      border-top: 1px solid var(--border);
+      padding-top: 12px;
+    }
+    .metric .name {
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 2px;
+    }
+    .metric .value {
+      font-size: 16px;
+      font-weight: 700;
+    }
+    .positive { color: var(--green); }
+    .negative { color: var(--red); }
+    .zero { color: var(--amber); }
+    .context {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      padding: 14px 16px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.55;
+    }
+    .context code {
+      color: var(--text);
+      background: #eef1f6;
+      padding: 1px 5px;
+      border-radius: 4px;
+    }
+    .link { color: var(--blue); text-decoration: none; font-weight: 700; }
+    .link:hover { text-decoration: underline; }
+    .resource-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 10px;
+    }
+    .resource {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px;
+      background: #fbfcfe;
+      min-width: 0;
+    }
+    .resource a {
+      color: var(--blue);
+      text-decoration: none;
+      font-size: 13px;
+      font-weight: 760;
+      overflow-wrap: anywhere;
+    }
+    .resource a:hover { text-decoration: underline; }
+    .resource code {
+      display: block;
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 11px;
+      overflow-wrap: anywhere;
+    }
+    .resource p {
+      margin: 8px 0 0;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    .files {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 12px;
+    }
+    .file-list {
+      margin: 0;
+      padding: 0;
+      list-style: none;
+      max-height: 360px;
+      overflow: auto;
+      border-top: 1px solid var(--border);
+    }
+    .file-list li {
+      padding: 8px 0;
+      border-bottom: 1px solid var(--border);
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      font-size: 12px;
+      overflow-wrap: anywhere;
+    }
+    @media (max-width: 840px) {
+      header { display: block; }
+      .status { text-align: left; margin-top: 12px; }
+      .grid, .files, .resource-grid { grid-template-columns: 1fr; }
+      .metric-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>TTS Refactor Progress</h1>
+        <div class="subline">
+          <span>Generated 2026-07-30 07:02:50 UTC</span>
+          <span>Diff <code>4e4c98a^1...origin/main</code></span>
+          <span>Mode <code>merge-base</code></span>
+          <span>Paths <code>sglang_omni/models/fishaudio_s2_pro, sglang_omni/models/higgs_tts, sglang_omni/models/moss_tts, sglang_omni/models/moss_tts_local, sglang_omni/models/qwen3_tts, sglang_omni/models/voxtral_tts, sglang_omni/pipeline, sglang_omni/scheduling, sglang_omni/serve, tests/unit_test/fishaudio_s2_pro, tests/unit_test/higgs_tts, tests/unit_test/moss_tts, tests/unit_test/moss_tts_local, tests/unit_test/qwen3_tts, tests/unit_test/voxtral_tts, tests/test_model/test_tts_ci.py, tests/test_model/tts_ci_config.py</code></span>
+          <a class="link" href="https://github.com/sgl-project/sglang-omni/issues/985">Roadmap issue</a>
+        </div>
+      </div>
+      <div class="status met">
+        <span class="label">On track</span>
+        <div class="target">non-test net deleted &gt; 0</div>
+      </div>
+    </header>
+
+    <section class="grid">
+      
+      <article class="card">
+        <h2>Non-test</h2>
+        <div class="net">
+          <strong class="positive">+246</strong>
+          <span>net deleted</span>
+        </div>
+        <div class="metric-row">
+          <div class="metric"><div class="name">Added</div><div class="value">7102</div></div>
+          <div class="metric"><div class="name">Deleted</div><div class="value">7348</div></div>
+          <div class="metric"><div class="name">Files</div><div class="value">98</div></div>
+          <div class="metric"><div class="name">Binary</div><div class="value">0</div></div>
+        </div>
+      </article>
+      
+      <article class="card">
+        <h2>Test</h2>
+        <div class="net">
+          <strong class="negative">-2887</strong>
+          <span>net deleted</span>
+        </div>
+        <div class="metric-row">
+          <div class="metric"><div class="name">Added</div><div class="value">3843</div></div>
+          <div class="metric"><div class="name">Deleted</div><div class="value">956</div></div>
+          <div class="metric"><div class="name">Files</div><div class="value">22</div></div>
+          <div class="metric"><div class="name">Binary</div><div class="value">0</div></div>
+        </div>
+      </article>
+      
+      <article class="card">
+        <h2>All</h2>
+        <div class="net">
+          <strong class="negative">-2641</strong>
+          <span>net deleted</span>
+        </div>
+        <div class="metric-row">
+          <div class="metric"><div class="name">Added</div><div class="value">10945</div></div>
+          <div class="metric"><div class="name">Deleted</div><div class="value">8304</div></div>
+          <div class="metric"><div class="name">Files</div><div class="value">120</div></div>
+          <div class="metric"><div class="name">Binary</div><div class="value">0</div></div>
+        </div>
+      </article>
+    </section>
+
+    <section class="context">
+      Progress is measured as <code>deleted non-test lines - added non-test lines</code>.
+      Files classified as tests are reported separately and do not offset the
+      implementation deletion target.
+    </section>
+
+    
+    <section class="card" style="margin-top: 12px;">
+      <h2>Reusable shared surfaces</h2>
+      <div class="context" style="box-shadow: none; margin-bottom: 10px;">
+        Start here before adding new model-local code. Reuse these shared files
+        when a new refactor touches state, engine construction, reference
+        encoding, vocoder mechanics, capability metadata, or stage caches.
+        <a class="link" href="https://osgbw74w8zwb.sg.larksuite.com/docx/L3XId4GHYoJqSKxwXYqlXaBrgNd">Open the design doc</a>.
+      </div>
+      <div class="resource-grid">
+        
+        <article class="resource">
+          <a href="https://osgbw74w8zwb.sg.larksuite.com/docx/L3XId4GHYoJqSKxwXYqlXaBrgNd">TTS refactor design doc</a>
+          
+          <p>External RFC/design source for the TTS refactor roadmap and shared-surface decisions.</p>
+        </article>
+
+        <article class="resource">
+          <a href="https://github.com/sgl-project/sglang-omni/blob/main/sglang_omni/scheduling/pipeline_state.py">PipelineStateBase</a>
+          <code>sglang_omni/scheduling/pipeline_state.py</code>
+          <p>Per-request state serialization, tensor-safe value handling, and usage accounting.</p>
+        </article>
+
+        <article class="resource">
+          <a href="https://github.com/sgl-project/sglang-omni/blob/main/sglang_omni/scheduling/engine_factory.py">TtsEngineBuilder</a>
+          <code>sglang_omni/scheduling/engine_factory.py</code>
+          <p>Template for TTS SGLang AR engine startup, model-local hooks, and scheduler construction.</p>
+        </article>
+
+        <article class="resource">
+          <a href="https://github.com/sgl-project/sglang-omni/blob/main/sglang_omni/scheduling/reference_encoder.py">ReferenceEncodeService</a>
+          <code>sglang_omni/scheduling/reference_encoder.py</code>
+          <p>Bounded cache and same-key single-flight for uploaded/reference audio artifacts.</p>
+        </article>
+
+        <article class="resource">
+          <a href="https://github.com/sgl-project/sglang-omni/blob/main/sglang_omni/scheduling/stage_cache.py">StageOutputCache</a>
+          <code>sglang_omni/scheduling/stage_cache.py</code>
+          <p>Small bounded LRU cache for non-AR stage outputs and encoded artifacts.</p>
+        </article>
+
+        <article class="resource">
+          <a href="https://github.com/sgl-project/sglang-omni/blob/main/sglang_omni/scheduling/vocoder_base.py">BatchVocoderBase</a>
+          <code>sglang_omni/scheduling/vocoder_base.py</code>
+          <p>SimpleScheduler-backed base for batched non-streaming vocoder stages.</p>
+        </article>
+
+        <article class="resource">
+          <a href="https://github.com/sgl-project/sglang-omni/blob/main/sglang_omni/models/model_capabilities.py">ModelCapabilities</a>
+          <code>sglang_omni/models/model_capabilities.py</code>
+          <p>Static model capability declarations for routing, docs, and review checks.</p>
+        </article>
+
+        <article class="resource">
+          <a href="https://github.com/sgl-project/sglang-omni/blob/main/sglang_omni/scheduling/speaker_cache.py">SpeakerArtifactCache</a>
+          <code>sglang_omni/scheduling/speaker_cache.py</code>
+          <p>Process-wide LRU cache for uploaded-speaker feature artifacts.</p>
+        </article>
+
+        <article class="resource">
+          <a href="https://github.com/sgl-project/sglang-omni/blob/main/docs/developer_reference/reference_encode_service.md">ReferenceEncodeService docs</a>
+          <code>docs/developer_reference/reference_encode_service.md</code>
+          <p>Usage rules, cache-key contract, and migration notes for reference encoding.</p>
+        </article>
+      </div>
+    </section>
+
+    
+    <section class="card" style="margin-top: 12px;">
+      <h2>Counted non-test files</h2>
+      <ul class="file-list">
+        <li>sglang_omni/models/fishaudio_s2_pro/README.md</li>
+<li>sglang_omni/models/fishaudio_s2_pro/__init__.py</li>
+<li>sglang_omni/models/fishaudio_s2_pro/bootstrap.py</li>
+<li>sglang_omni/models/fishaudio_s2_pro/config.py</li>
+<li>sglang_omni/models/fishaudio_s2_pro/engine_builder.py</li>
+<li>sglang_omni/models/fishaudio_s2_pro/fish_scheduler.py</li>
+<li>sglang_omni/models/fishaudio_s2_pro/fish_speech/content_sequence.py</li>
+<li>sglang_omni/models/fishaudio_s2_pro/fish_speech/conversation.py</li>
+<li>sglang_omni/models/fishaudio_s2_pro/fish_speech/models/text2semantic/__init__.py</li>
+<li>sglang_omni/models/fishaudio_s2_pro/fish_speech/models/text2semantic/audio_decoder.py</li>
+<li>sglang_omni/models/fishaudio_s2_pro/fish_speech/models/text2semantic/configuration.py</li>
+<li>sglang_omni/models/fishaudio_s2_pro/fish_speech/models/text2semantic/modeling.py</li>
+<li>sglang_omni/models/fishaudio_s2_pro/fish_speech/models/text2semantic/utils.py</li>
+<li>sglang_omni/models/fishaudio_s2_pro/payload_types.py</li>
+<li>sglang_omni/models/fishaudio_s2_pro/request_builders.py</li>
+<li>sglang_omni/models/fishaudio_s2_pro/stages.py</li>
+<li>sglang_omni/models/fishaudio_s2_pro/streaming_vocoder.py</li>
+<li>sglang_omni/models/fishaudio_s2_pro/tokenizer.py</li>
+<li>sglang_omni/models/higgs_tts/__init__.py</li>
+<li>sglang_omni/models/higgs_tts/_vendored/__init__.py</li>
+<li>sglang_omni/models/higgs_tts/_vendored/higgs_audio_v2_tokenizer_hf.py</li>
+<li>sglang_omni/models/higgs_tts/audio_codec.py</li>
+<li>sglang_omni/models/higgs_tts/config.py</li>
+<li>sglang_omni/models/higgs_tts/_vendored/higgs_audio_v2_tokenizer_config.json -&gt; sglang_omni/models/higgs_tts/configs/higgs_audio_v2_tokenizer.json</li>
+<li>sglang_omni/models/higgs_tts/engine_builder.py</li>
+<li>sglang_omni/models/higgs_tts/model_runner.py</li>
+<li>sglang_omni/models/higgs_tts/payload_types.py</li>
+<li>sglang_omni/models/higgs_tts/request_builders.py</li>
+<li>sglang_omni/models/higgs_tts/stages.py</li>
+<li>sglang_omni/models/higgs_tts/utils.py</li>
+<li>sglang_omni/models/higgs_tts/vocoder_scheduler.py</li>
+<li>sglang_omni/models/moss_tts/__init__.py</li>
+<li>sglang_omni/models/moss_tts/codec.py</li>
+<li>sglang_omni/models/moss_tts/config.py</li>
+<li>sglang_omni/models/moss_tts/engine_builder.py</li>
+<li>sglang_omni/models/moss_tts/model_runner.py</li>
+<li>sglang_omni/models/moss_tts/payload_types.py</li>
+<li>sglang_omni/models/moss_tts/request_builders.py</li>
+<li>sglang_omni/models/moss_tts/sglang_model.py</li>
+<li>sglang_omni/models/moss_tts/stages.py</li>
+<li>sglang_omni/models/moss_tts_local/__init__.py</li>
+<li>sglang_omni/models/moss_tts_local/config.py</li>
+<li>sglang_omni/models/moss_tts_local/engine_builder.py</li>
+<li>sglang_omni/models/moss_tts_local/payload_types.py</li>
+<li>sglang_omni/models/moss_tts_local/request_builders.py</li>
+<li>sglang_omni/models/moss_tts_local/sglang_model.py</li>
+<li>sglang_omni/models/moss_tts_local/stages.py</li>
+<li>sglang_omni/models/moss_tts_local/streaming_vocoder.py</li>
+<li>sglang_omni/models/moss_tts_local/vocoder_decoder.py</li>
+<li>sglang_omni/models/qwen3_tts/__init__.py</li>
+<li>sglang_omni/models/qwen3_tts/config.py</li>
+<li>sglang_omni/models/qwen3_tts/engine_builder.py</li>
+<li>sglang_omni/models/qwen3_tts/payload_types.py</li>
+<li>sglang_omni/models/qwen3_tts/request_builders.py</li>
+<li>sglang_omni/models/qwen3_tts/sglang_model.py</li>
+<li>sglang_omni/models/qwen3_tts/stages.py</li>
+<li>sglang_omni/models/voxtral_tts/__init__.py</li>
+<li>sglang_omni/models/voxtral_tts/acoustic_transformer.py</li>
+<li>sglang_omni/models/voxtral_tts/audio_tokenizer.py</li>
+<li>sglang_omni/models/voxtral_tts/config.py</li>
+<li>sglang_omni/models/voxtral_tts/io.py</li>
+<li>sglang_omni/models/voxtral_tts/pipeline/engine_builder.py</li>
+<li>sglang_omni/models/voxtral_tts/pipeline/stages.py</li>
+<li>sglang_omni/models/voxtral_tts/pipeline/state_io.py</li>
+<li>sglang_omni/models/voxtral_tts/voxtral_tts_audio_generation.py</li>
+<li>sglang_omni/pipeline/control_plane.py</li>
+<li>sglang_omni/pipeline/coordinator.py</li>
+<li>sglang_omni/pipeline/mp_runner.py</li>
+<li>sglang_omni/pipeline/relay_io.py</li>
+<li>sglang_omni/pipeline/runtime_config.py</li>
+<li>sglang_omni/pipeline/stage/runtime.py</li>
+<li>sglang_omni/pipeline/stage_workers.py</li>
+<li>sglang_omni/scheduling/bootstrap.py</li>
+<li>sglang_omni/scheduling/engine_factory.py</li>
+<li>sglang_omni/scheduling/generation_batch_policy.py</li>
+<li>sglang_omni/scheduling/omni_scheduler.py</li>
+<li>sglang_omni/scheduling/pipeline_state.py</li>
+<li>sglang_omni/scheduling/prepared_request_queue.py</li>
+<li>sglang_omni/scheduling/reference_encoder.py</li>
+<li>sglang_omni/scheduling/sglang_backend/output_processor.py</li>
+<li>sglang_omni/scheduling/stage_cache.py</li>
+<li>sglang_omni/scheduling/streaming_simple_scheduler.py</li>
+<li>sglang_omni/scheduling/streaming_vocoder.py</li>
+<li>sglang_omni/scheduling/typed_tensor.py</li>
+<li>sglang_omni/scheduling/types.py</li>
+<li>sglang_omni/scheduling/vocoder_base.py</li>
+<li>sglang_omni/serve/__init__.py</li>
+<li>sglang_omni/serve/launcher.py</li>
+<li>sglang_omni/serve/openai_api.py</li>
+<li>sglang_omni/serve/protocol.py</li>
+<li>sglang_omni/serve/realtime/manager.py</li>
+<li>sglang_omni/serve/realtime/vad.py</li>
+<li>sglang_omni/serve/speech_service.py</li>
+<li>sglang_omni/serve/speech_voices.py</li>
+<li>sglang_omni/serve/speech_ws.py</li>
+<li>sglang_omni/serve/transcription_adapters/__init__.py</li>
+<li>sglang_omni/serve/transcription_adapters/base.py</li>
+<li>sglang_omni/serve/transcription_adapters/moss_transcribe_diarize.py</li>
+      </ul>
+    </section>
+    <section class="card" style="margin-top: 12px;">
+      <h2>Excluded test files</h2>
+      <ul class="file-list">
+        <li>tests/test_model/test_tts_ci.py</li>
+<li>tests/test_model/tts_ci_config.py</li>
+<li>tests/unit_test/fishaudio_s2_pro/test_pipeline.py</li>
+<li>tests/unit_test/fishaudio_s2_pro/test_streaming_vocoder.py</li>
+<li>tests/unit_test/fishaudio_s2_pro/test_tts.py</li>
+<li>tests/unit_test/fishaudio_s2_pro/test_vocoder.py</li>
+<li>tests/unit_test/higgs_tts/test_async_decode_runner.py</li>
+<li>tests/unit_test/higgs_tts/test_audio_codec.py</li>
+<li>tests/unit_test/higgs_tts/test_cli_decode_mode.py</li>
+<li>tests/unit_test/higgs_tts/test_pipeline.py</li>
+<li>tests/unit_test/higgs_tts/test_reference_encode_hook.py</li>
+<li>tests/unit_test/higgs_tts/test_request_builders.py</li>
+<li>tests/unit_test/higgs_tts/test_rollout_serialization.py</li>
+<li>tests/unit_test/higgs_tts/test_syncfree_launch_cache.py</li>
+<li>tests/unit_test/moss_tts/test_pipeline.py</li>
+<li>tests/unit_test/moss_tts_local/test_pipeline.py</li>
+<li>tests/unit_test/moss_tts_local/test_streaming_vocoder.py</li>
+<li>tests/unit_test/moss_tts_local/test_vocoder_cuda_graph.py</li>
+<li>tests/unit_test/moss_tts_local/test_vocoder_decoder.py</li>
+<li>tests/unit_test/qwen3_tts/test_pipeline.py</li>
+<li>tests/unit_test/qwen3_tts/test_predictor_cuda_graph.py</li>
+<li>tests/unit_test/voxtral_tts/test_pipeline.py</li>
+      </ul>
+    </section>
+  </main>
+</body>
+</html>
