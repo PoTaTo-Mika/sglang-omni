@@ -7,10 +7,10 @@ import html
 import json
 import subprocess
 import sys
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Sequence
 
 TEST_DIRECTORY_NAMES = frozenset(
     {
@@ -773,8 +773,7 @@ def resolve_diff_spec(repo: Path, args: argparse.Namespace) -> DiffSpec:
 def _run_git(repo: Path, args: Sequence[str]) -> bytes:
     completed = subprocess.run(
         ("git", "-C", str(repo), *args),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         check=False,
     )
     if completed.returncode != 0:
