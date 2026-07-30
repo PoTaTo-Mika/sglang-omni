@@ -222,6 +222,7 @@ metric_sources:
           total: "metrics.by_stage_and_workload.soak-300s.batch_32_all_valid.successful_request_count"
           ok: "metrics.by_stage_and_workload.soak-300s.batch_32_all_valid.metric_sample_counts.latency_s"
         paths:
+          latency_p50_s: "metrics.by_stage_and_workload.soak-300s.batch_32_all_valid.latency_s.p50"
           latency_p95_s: "metrics.by_stage_and_workload.soak-300s.batch_32_all_valid.latency_s.p95"
       ws_normal:
         constant_filter: "^SERVING_WS_NORMAL_"

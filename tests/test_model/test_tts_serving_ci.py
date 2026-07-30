@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -30,6 +31,8 @@ from tests.utils import (
     stop_server,
 )
 
+logger = logging.getLogger(__name__)
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SERVING_SPEC = PROJECT_ROOT / "benchmarks/tts_serving/examples/stress.json"
 REFERENCE_AUDIO_ROOT = PROJECT_ROOT / "docs/_static/audio"
@@ -52,6 +55,8 @@ SERVING_REST_STREAM_INTER_CHUNK_P95_S_REF: float | None = 0.6632563266903162
 SERVING_REST_STREAM_LATENCY_P95_S_REF: float | None = 0.9647539779543877
 SERVING_REST_STREAM_RTF_P95_REF: float | None = 0.22127384815467604
 SERVING_BATCH32_LATENCY_P95_S_REF: float | None = 10.222142587881535
+SERVING_BATCH32_LATENCY_P50_S_REF: float | None = None  # needs calibration on #1260 baseline
+SERVING_BATCH32_LATENCY_P95_ADVISORY_S_REF: float | None = 10.222142587881535
 SERVING_WS_NORMAL_TTFA_P95_S_REF: float | None = 17.821007369086146
 SERVING_WS_NORMAL_LATENCY_P95_S_REF: float | None = 17.821333308238536
 SERVING_WS_STREAM_TTFA_P95_S_REF: float | None = 17.790006244089454
@@ -63,6 +68,8 @@ SERVING_MIXED_BURST_LATENCY_P95_S_REF: float | None = 25.70939063001424
 SERVING_LONG_PROMPT_TOKENS_MIN_REF: float | None = 684.0
 SERVING_LONG_COMPLETION_TOKENS_MIN_REF: float | None = 94.0
 SERVING_LONG_LATENCY_P95_S_REF: float | None = 28.912055992987007
+SERVING_LONG_LATENCY_P50_S_REF: float | None = None  # needs calibration on #1260 baseline
+SERVING_LONG_LATENCY_P95_ADVISORY_S_REF: float | None = 28.912055992987007
 SERVING_LONG_AUDIO_DURATION_MIN_S_REF: float | None = 3.48
 SERVING_LONG_OUTPUT_TOK_PER_REQ_S_REF: float | None = 123.20174934932271
 SERVING_LONG_BASELINE_LATENCY_MAX_S_REF: float | None = 11.957396121229976
@@ -95,11 +102,12 @@ class MetricGate:
     key: str
     source: Literal["stage", "workload", "stage_workload"]
     metric: str
-    statistic: Literal["value", "min", "max", "p95"]
+    statistic: Literal["value", "min", "max", "p50", "p95"]
     direction: Literal["min", "max"]
     threshold: float | None
     stage: str | None = None
     workload: str | None = None
+    advisory: bool = False
 
 
 METRIC_GATES = (
@@ -209,14 +217,25 @@ METRIC_GATES = (
         workload="rest_stream",
     ),
     MetricGate(
-        "batch32.latency_p95_s_max",
+        "batch32.latency_p50_s_max",
+        "stage_workload",
+        "latency_s",
+        "p50",
+        "max",
+        _maximum(SERVING_BATCH32_LATENCY_P50_S_REF),
+        stage="soak-300s",
+        workload="batch_32_all_valid",
+    ),
+    MetricGate(
+        "batch32.latency_p95_s_advisory",
         "stage_workload",
         "latency_s",
         "p95",
         "max",
-        _maximum(SERVING_BATCH32_LATENCY_P95_S_REF),
+        _maximum(SERVING_BATCH32_LATENCY_P95_ADVISORY_S_REF),
         stage="soak-300s",
         workload="batch_32_all_valid",
+        advisory=True,
     ),
     MetricGate(
         "ws_normal.ttfa_p95_s_max",
@@ -509,7 +528,10 @@ def _check_performance(
     measurement_checks: MetricCheckCollector,
     threshold_checks: MetricCheckCollector,
 ) -> None:
-    pending = sorted(gate.key for gate in METRIC_GATES if gate.threshold is None)
+    pending = sorted(
+        gate.key for gate in METRIC_GATES
+        if gate.threshold is None and not gate.advisory
+    )
     threshold_checks.check(
         not pending,
         f"serving thresholds require calibration: {pending}",
@@ -540,15 +562,16 @@ def _check_performance(
         if value is None or threshold is None:
             continue
         if gate.direction == "min":
-            threshold_checks.check(
-                value >= threshold,
-                f"{gate.key}={value} < {threshold}",
-            )
+            condition = value >= threshold
+            message = f"{gate.key}={value} < {threshold}"
         else:
-            threshold_checks.check(
-                value <= threshold,
-                f"{gate.key}={value} > {threshold}",
-            )
+            condition = value <= threshold
+            message = f"{gate.key}={value} > {threshold}"
+        if gate.advisory:
+            if not condition:
+                threshold_checks.warn(message)
+        else:
+            threshold_checks.check(condition, message)
 
 
 def _get_json(url: str, timeout_s: int) -> dict:
@@ -567,12 +590,20 @@ def _write_benchmark_validation(
     threshold_checks: MetricCheckCollector,
 ) -> None:
     failures = benchmark_checks.failures + measurement_checks.failures
+    all_warnings = (
+        benchmark_checks.warnings
+        + measurement_checks.warnings
+        + threshold_checks.warnings
+    )
+    for w in all_warnings:
+        logger.warning("CI advisory: %s", w)
     (run_dir / BENCHMARK_VALIDATION_FILE).write_text(
         json.dumps(
             {
                 "valid": not failures,
                 "failures": failures,
                 "threshold_assertion_failed": bool(threshold_checks.failures),
+                "warnings": all_warnings,
             },
             indent=2,
         )

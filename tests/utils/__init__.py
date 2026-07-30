@@ -55,9 +55,13 @@ class MetricCheckCollector:
 
     label: str = "CI metric checks"
     failures: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
     def fail(self, message: str) -> None:
         self.failures.append(message)
+
+    def warn(self, message: str) -> None:
+        self.warnings.append(message)
 
     def check(self, condition: bool, message: str) -> None:
         if not condition:

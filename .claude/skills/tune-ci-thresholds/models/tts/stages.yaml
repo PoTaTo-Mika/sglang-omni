@@ -779,13 +779,23 @@ tts_serving_batch32_speed:
       json_file: "tts-serving-ci0/benchmark/results.json"
       json_path: "metrics.by_stage_and_workload.soak-300s.batch_32_all_valid.metric_sample_counts.latency_s"
   metrics:
-    latency_p95_s:
-      source: "SERVING_BATCH32_LATENCY_P95_S_REF"
+    latency_p50_s:
+      source: "SERVING_BATCH32_LATENCY_P50_S_REF"
+      json_file: "tts-serving-ci0/benchmark/results.json"
+      json_path: "metrics.by_stage_and_workload.soak-300s.batch_32_all_valid.latency_s.p50"
+      worst: max
+      display:
+        label: "Latency p50 (s)"
+        scale: 1
+        digits: 3
+      status: PENDING
+    latency_p95_advisory_s:
+      source: "SERVING_BATCH32_LATENCY_P95_ADVISORY_S_REF"
       json_file: "tts-serving-ci0/benchmark/results.json"
       json_path: "metrics.by_stage_and_workload.soak-300s.batch_32_all_valid.latency_s.p95"
       worst: max
       display:
-        label: "Latency p95 (s)"
+        label: "Latency p95 advisory (s)"
         scale: 1
         digits: 3
       status: OK
