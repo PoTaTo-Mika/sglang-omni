@@ -151,6 +151,10 @@
       padding: 1px 5px;
       border-radius: 4px;
     }
+    .scope-note {
+      margin-top: 8px;
+      color: var(--text);
+    }
     .link { color: var(--blue); text-decoration: none; font-weight: 700; }
     .link:hover { text-decoration: underline; }
     .resource-grid {
@@ -223,7 +227,7 @@
       <div>
         <h1>TTS Refactor Progress</h1>
         <div class="subline">
-          <span>Generated 2026-07-30 07:05:42 UTC</span>
+          <span>Generated 2026-07-30 07:13:01 UTC</span>
           <span>Diff <code>4e4c98a^1...origin/main</code></span>
           <span>Mode <code>merge-base</code></span>
           <span>Paths <code>sglang_omni/models/fishaudio_s2_pro, sglang_omni/models/higgs_tts, sglang_omni/models/moss_tts, sglang_omni/models/moss_tts_local, sglang_omni/models/qwen3_tts, sglang_omni/models/voxtral_tts, sglang_omni/pipeline, sglang_omni/scheduling, sglang_omni/serve, tests/unit_test/fishaudio_s2_pro, tests/unit_test/higgs_tts, tests/unit_test/moss_tts, tests/unit_test/moss_tts_local, tests/unit_test/qwen3_tts, tests/unit_test/voxtral_tts, tests/test_model/test_tts_ci.py, tests/test_model/tts_ci_config.py</code></span>
@@ -285,6 +289,7 @@
       Progress is measured as <code>deleted non-test lines - added non-test lines</code>.
       Files classified as tests are reported separately and do not offset the
       implementation deletion target.
+      <div class="scope-note">ZONOS2 integration PR #1112 is outside this six-model refactor scope; its merge commit contributes 0 files and 0 lines to the configured paths.</div>
     </section>
 
     
