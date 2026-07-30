@@ -15,6 +15,8 @@ CLIENT="$HERE/load_client.py"
 : "${GPU_ID:=0}"
 : "${MAX_RUNNING_REQUESTS:=160}"
 : "${CONC_PER_REPLICA:=$MAX_RUNNING_REQUESTS}"
+: "${DP1_CLIENT_CONCS:=$CONC_PER_REPLICA}"
+: "${DP3_CLIENT_CONCS:=$CONC_PER_REPLICA $CONC_PER_REPLICA $CONC_PER_REPLICA}"
 : "${MAX_TOTAL_TOKENS:=54000}"
 : "${SECS:=110}"
 : "${WARMUP_SECS:=20}"
@@ -116,6 +118,8 @@ dataset=$SEEDTTS_META
 gpu_id=$GPU_ID
 max_running_requests=$MAX_RUNNING_REQUESTS
 concurrency_per_replica=$CONC_PER_REPLICA
+dp1_client_concs=$DP1_CLIENT_CONCS
+dp3_client_concs=$DP3_CLIENT_CONCS
 max_total_tokens_per_replica=$MAX_TOTAL_TOKENS
 secs=$SECS
 warmup_secs=$WARMUP_SECS
@@ -207,16 +211,23 @@ PY
 }
 
 run_condition() {
-  local dp=$1 rep=$2 server_cores=$3 client_cores_text=$4
+  local dp=$1 rep=$2 server_cores=$3 client_cores_text=$4 client_concs_text=$5
   local label="dp${dp}_r${rep}"
   local condition_dir="$OUT/$label"
   local state_root="$STATE_BASE/$label"
   local launcher="$WT/examples/mps_dp/launch.sh"
   local state run_id idle_mib load_mib status=0
-  local -a client_cores=() pids=()
+  local -a client_cores=() client_concs=() pids=()
   read -r -a client_cores <<< "$client_cores_text"
+  read -r -a client_concs <<< "$client_concs_text"
   [ "${#client_cores[@]}" -eq "$dp" ] \
     || die "$label needs $dp client core entries"
+  [ "${#client_concs[@]}" -eq "$dp" ] \
+    || die "$label needs $dp client concurrency entries"
+  for conc in "${client_concs[@]}"; do
+    [[ "$conc" =~ ^[1-9][0-9]*$ ]] \
+      || die "$label client concurrencies must be positive integers"
+  done
 
   mkdir -p "$condition_dir"
   CURRENT_STATE_ROOT="$state_root"
@@ -241,7 +252,7 @@ run_condition() {
   for ((i=0; i<dp; i++)); do
     setsid numactl -C "${client_cores[$i]}" \
       "$PYTHON" "$CLIENT" --port "$((BASE_PORT + i))" --model higgs \
-        --conc "$CONC_PER_REPLICA" --secs "$SECS" \
+        --conc "${client_concs[$i]}" --secs "$SECS" \
         --warmup-secs "$WARMUP_SECS" --voice-clone \
         --ref-format references --meta "$SEEDTTS_META" --save-latencies \
         --out "$condition_dir/client_$i.json" \
@@ -271,11 +282,15 @@ run_condition() {
 
 for ((rep=1; rep<=REPS; rep++)); do
   if ((rep % 2 == 1)); then
-    run_condition 1 "$rep" "$DP1_SERVER_CORES" "$DP1_CLIENT_CORES"
-    run_condition 3 "$rep" "$DP3_SERVER_CORES" "$DP3_CLIENT_CORES"
+    run_condition 1 "$rep" "$DP1_SERVER_CORES" "$DP1_CLIENT_CORES" \
+      "$DP1_CLIENT_CONCS"
+    run_condition 3 "$rep" "$DP3_SERVER_CORES" "$DP3_CLIENT_CORES" \
+      "$DP3_CLIENT_CONCS"
   else
-    run_condition 3 "$rep" "$DP3_SERVER_CORES" "$DP3_CLIENT_CORES"
-    run_condition 1 "$rep" "$DP1_SERVER_CORES" "$DP1_CLIENT_CORES"
+    run_condition 3 "$rep" "$DP3_SERVER_CORES" "$DP3_CLIENT_CORES" \
+      "$DP3_CLIENT_CONCS"
+    run_condition 1 "$rep" "$DP1_SERVER_CORES" "$DP1_CLIENT_CORES" \
+      "$DP1_CLIENT_CONCS"
   fi
 done
 
