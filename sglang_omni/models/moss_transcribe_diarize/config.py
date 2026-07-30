@@ -5,12 +5,7 @@ from __future__ import annotations
 
 from typing import Any, ClassVar
 
-from sglang_omni.config import (
-    PipelineConfig,
-    SchedulingConfig,
-    StageConfig,
-    StageRuntimeConfig,
-)
+from sglang_omni.config import PipelineConfig, StageConfig
 from sglang_omni.config.runtime import resolve_stage_static_factory_args
 from sglang_omni.models.moss_transcribe_diarize import (  # noqa: F401
     hf_config as _hf_config,
@@ -52,7 +47,6 @@ class MossTranscribeDiarizePipelineConfig(PipelineConfig):
                 "request_build_max_pending": 16,
             },
             gpu=0,
-            runtime=StageRuntimeConfig(scheduling=SchedulingConfig()),
             terminal=True,
         )
     ]
