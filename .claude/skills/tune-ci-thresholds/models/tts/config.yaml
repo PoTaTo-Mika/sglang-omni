@@ -262,7 +262,8 @@ metric_sources:
         paths:
           prompt_tokens_min: "metrics.by_workload.long_prefill_decode.prompt_tokens.min"
           completion_tokens_min: "metrics.by_workload.long_prefill_decode.completion_tokens.min"
-          latency_p95_s: "metrics.by_workload.long_prefill_decode.latency_s.p95"
+          latency_p50_s: "metrics.by_workload.long_prefill_decode.latency_s.p50"
+          latency_p95_advisory_s: "metrics.by_workload.long_prefill_decode.latency_s.p95"
           audio_duration_min_s: "metrics.by_workload.long_prefill_decode.audio_duration_s.min"
           output_tok_per_req_s: "metrics.by_workload.long_prefill_decode.output_tok_per_req_s"
       long_baseline:

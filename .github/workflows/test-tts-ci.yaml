@@ -254,6 +254,7 @@ jobs:
             */benchmark/results.json
             */benchmark/manifest.json
             */benchmark.wall_time.json
+            */benchmark_validation.json
           artifact-upload-name: tts-stage-serving-results
           artifact-upload-path: ${{ env.OMNI_CI_HOME }}/tts-stage-results/serving
           artifact-if-no-files-found: error

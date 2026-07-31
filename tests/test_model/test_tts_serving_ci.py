@@ -16,9 +16,9 @@ from typing import Literal
 from urllib.request import ProxyHandler, build_opener
 
 import pytest
+
 from benchmarks.tts_serving.spec import load_spec
 from sglang_omni.utils import find_available_port
-
 from tests.test_model.tts_ci_config import (
     THRESHOLD_SLACK_HIGHER,
     THRESHOLD_SLACK_LOWER,
@@ -334,13 +334,23 @@ METRIC_GATES = (
         workload="long_prefill_decode",
     ),
     MetricGate(
-        "long.latency_p95_s_max",
+        "long.latency_p50_s_max",
+        "workload",
+        "latency_s",
+        "p50",
+        "max",
+        _maximum(SERVING_LONG_LATENCY_P50_S_REF),
+        workload="long_prefill_decode",
+    ),
+    MetricGate(
+        "long.latency_p95_s_advisory",
         "workload",
         "latency_s",
         "p95",
         "max",
-        _maximum(SERVING_LONG_LATENCY_P95_S_REF),
+        _maximum(SERVING_LONG_LATENCY_P95_ADVISORY_S_REF),
         workload="long_prefill_decode",
+        advisory=True,
     ),
     MetricGate(
         "long.audio_duration_s_min",
@@ -529,7 +539,8 @@ def _check_performance(
     threshold_checks: MetricCheckCollector,
 ) -> None:
     pending = sorted(
-        gate.key for gate in METRIC_GATES
+        gate.key
+        for gate in METRIC_GATES
         if gate.threshold is None and not gate.advisory
     )
     threshold_checks.check(

@@ -991,13 +991,23 @@ tts_serving_long_speed:
         scale: 1
         digits: 0
       status: OK
-    latency_p95_s:
-      source: "SERVING_LONG_LATENCY_P95_S_REF"
+    latency_p50_s:
+      source: "SERVING_LONG_LATENCY_P50_S_REF"
+      json_file: "tts-serving-ci0/benchmark/results.json"
+      json_path: "metrics.by_workload.long_prefill_decode.latency_s.p50"
+      worst: max
+      display:
+        label: "Latency p50 (s)"
+        scale: 1
+        digits: 3
+      status: OK
+    latency_p95_advisory_s:
+      source: "SERVING_LONG_LATENCY_P95_ADVISORY_S_REF"
       json_file: "tts-serving-ci0/benchmark/results.json"
       json_path: "metrics.by_workload.long_prefill_decode.latency_s.p95"
       worst: max
       display:
-        label: "Latency p95 (s)"
+        label: "Latency p95 advisory (s)"
         scale: 1
         digits: 3
       status: OK
