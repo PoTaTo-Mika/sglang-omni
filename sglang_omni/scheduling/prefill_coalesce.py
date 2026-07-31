@@ -23,9 +23,7 @@ def validate_prefill_coalesce_requests(value: object) -> int:
     # Reject non-integral and non-finite counts before int() changes their
     # meaning: YAML `-0.5` would land as 0 (silently off) and `2.9` as 2, while
     # int(inf) raises OverflowError, which callers do not catch.
-    if isinstance(value, float) and not (
-        math.isfinite(value) and value.is_integer()
-    ):
+    if isinstance(value, float) and not (math.isfinite(value) and value.is_integer()):
         raise ValueError(
             f"prefill_coalesce_requests must be a finite integer, got {value!r}"
         )
