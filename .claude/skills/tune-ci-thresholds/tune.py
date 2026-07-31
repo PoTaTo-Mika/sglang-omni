@@ -148,7 +148,11 @@ METRIC_SPECS = {
         worst="min", label="Prompt tokens min", digits=0, scale=1, group="speed"
     ),
     "latency_mean_s":       dict(worst="max", label="Latency mean (s)",      digits=3, scale=1,   group="speed"),
+    "latency_p50_s":        dict(worst="max", label="Latency p50 (s)",       digits=3, scale=1,   group="speed"),
     "latency_p95_s":        dict(worst="max", label="Latency p95 (s)",       digits=3, scale=1,   group="speed"),
+    "latency_p95_advisory_s": dict(
+        worst="max", label="Latency p95 advisory (s)", digits=3, scale=1, group="speed"
+    ),
     "latency_max_s":        dict(worst="max", label="Latency max (s)",       digits=3, scale=1,   group="speed"),
     "rtf_mean":             dict(worst="max", label="RTF mean",              digits=4, scale=1,   group="speed"),
     "rtf_p95":              dict(worst="max", label="RTF p95",               digits=4, scale=1,   group="speed"),
@@ -273,6 +277,13 @@ def match_metric(name, nested):
         return "audio_duration_min_s"
     if "LATENCY_MEAN" in name:
         return "latency_mean_s"
+    if "LATENCY_P50" in name:
+        return "latency_p50_s"
+    # Advisory p95 gates (warn-only) must be routed to a distinct metric key
+    # so discover never collapses them with the hard-gate LATENCY_P95_S_REF
+    # for the same stage/workload.
+    if "LATENCY_P95" in name and "ADVISORY" in name:
+        return "latency_p95_advisory_s"
     if "LATENCY_P95" in name:
         return "latency_p95_s"
     if "LATENCY_MAX" in name:
