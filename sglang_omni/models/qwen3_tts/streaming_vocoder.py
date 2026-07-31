@@ -195,8 +195,13 @@ class Qwen3TTSStreamingVocoderScheduler(
         if is_final:
             return True
         generated_frames = state.total_frames - state.ref_frames
-        next_frames = state.next_decode_generated_frames or self._stream_stride
+        next_frames = self._next_decode_threshold(state)
         return generated_frames >= next_frames
+
+    def _next_decode_threshold(self, state: _Qwen3TTSStreamState) -> int:
+        if state.next_decode_generated_frames:
+            return state.next_decode_generated_frames
+        return state.initial_chunk_frames or self._stream_stride
 
     def decode_delta(
         self,
@@ -210,7 +215,7 @@ class Qwen3TTSStreamingVocoderScheduler(
         if generated_frames <= state.emitted_generated_frames:
             return None
 
-        next_frames = state.next_decode_generated_frames or self._stream_stride
+        next_frames = self._next_decode_threshold(state)
         if not is_final and generated_frames < next_frames:
             state.next_decode_generated_frames = next_frames
             return None

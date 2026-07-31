@@ -1094,12 +1094,54 @@ def _qwen3_tts_stream_item(
     )
 
 
-def test_qwen3_tts_streaming_vocoder_splits_first_decode_once() -> None:
+def test_qwen3_tts_streaming_vocoder_decodes_initial_chunk_early() -> None:
     scheduler = Qwen3TTSStreamingVocoderScheduler(
         _FakeQwen3TTSTokenizer(),
         device="cpu",
     )
     payload = make_payload(inputs="target", params={"stream": True})
+    scheduler._on_streaming_new_request(payload.request_id, payload)
+
+    scheduler._on_chunk(
+        payload.request_id,
+        _qwen3_tts_stream_item(
+            torch.ones((4, 2), dtype=torch.long),
+            chunk_id=0,
+            ref_code_len=0,
+        ),
+    )
+    assert scheduler.outbox.qsize() == 0
+    scheduler._on_chunk(
+        payload.request_id,
+        _qwen3_tts_stream_item(torch.ones((1, 2), dtype=torch.long), chunk_id=1),
+    )
+    assert scheduler.outbox.qsize() == 1
+
+    first = scheduler.outbox.get_nowait()
+    assert len(first.data["audio_waveform"]) == 5 * 4 * 4
+
+    scheduler._on_chunk(
+        payload.request_id,
+        _qwen3_tts_stream_item(torch.ones((15, 2), dtype=torch.long), chunk_id=2),
+    )
+    assert scheduler.outbox.qsize() == 0
+    scheduler._on_chunk(
+        payload.request_id,
+        _qwen3_tts_stream_item(torch.ones((1, 2), dtype=torch.long), chunk_id=3),
+    )
+    assert scheduler.outbox.qsize() == 1
+    assert len(scheduler._decoder.decode_inputs) == 2
+
+
+def test_qwen3_tts_streaming_vocoder_zero_initial_chunk_uses_steady_stride() -> None:
+    scheduler = Qwen3TTSStreamingVocoderScheduler(
+        _FakeQwen3TTSTokenizer(),
+        device="cpu",
+    )
+    payload = make_payload(
+        inputs="target",
+        params={"stream": True, "initial_codec_chunk_frames": 0},
+    )
     scheduler._on_streaming_new_request(payload.request_id, payload)
 
     scheduler._on_chunk(
@@ -1115,24 +1157,7 @@ def test_qwen3_tts_streaming_vocoder_splits_first_decode_once() -> None:
         payload.request_id,
         _qwen3_tts_stream_item(torch.ones((1, 2), dtype=torch.long), chunk_id=1),
     )
-    assert scheduler.outbox.qsize() == 2
-
-    first = scheduler.outbox.get_nowait()
-    second = scheduler.outbox.get_nowait()
-    assert len(first.data["audio_waveform"]) == 5 * 4 * 4
-    assert len(second.data["audio_waveform"]) == 11 * 4 * 4
-
-    scheduler._on_chunk(
-        payload.request_id,
-        _qwen3_tts_stream_item(torch.ones((15, 2), dtype=torch.long), chunk_id=2),
-    )
-    assert scheduler.outbox.qsize() == 0
-    scheduler._on_chunk(
-        payload.request_id,
-        _qwen3_tts_stream_item(torch.ones((1, 2), dtype=torch.long), chunk_id=3),
-    )
     assert scheduler.outbox.qsize() == 1
-    assert len(scheduler._decoder.decode_inputs) == 2
 
 
 def test_qwen3_tts_stream_output_prepends_reference_once() -> None:
