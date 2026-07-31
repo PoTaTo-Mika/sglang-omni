@@ -34,9 +34,7 @@ from sglang_omni.scheduling.speaker_cache import (
     SpeakerCacheKey,
     get_speaker_artifact_cache,
 )
-from sglang_omni.scheduling.streaming_vocoder import (
-    INITIAL_CODEC_CHUNK_FRAMES_PARAM,
-)
+from sglang_omni.scheduling.streaming_vocoder import INITIAL_CODEC_CHUNK_FRAMES_PARAM
 from sglang_omni.utils.audio_payload import audio_data_uri_from_reference
 
 QWEN3_TTS_DEFAULT_MAX_NEW_TOKENS = 2048
