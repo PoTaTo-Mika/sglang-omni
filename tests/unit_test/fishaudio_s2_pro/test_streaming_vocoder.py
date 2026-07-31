@@ -317,12 +317,14 @@ def test_streaming_vocoder_done_before_payload_finalizes_after_new_request() -> 
 def test_streaming_vocoder_final_payload_preserves_usage_without_redecode() -> None:
     scheduler, thread = _start_scheduler()
     usage = {"prompt_tokens": 5, "completion_tokens": 4, "total_tokens": 9}
+    payload = _payload("req", stream=True, code_len=4, usage=usage)
+    payload.data["finish_reason"] = "length"
     try:
         scheduler.inbox.put(
             IncomingMessage(
                 "req",
                 "new_request",
-                _payload("req", stream=True, code_len=4, usage=usage),
+                payload,
             )
         )
         scheduler.inbox.put(IncomingMessage("req", "stream_chunk", _chunk(1)))
@@ -340,6 +342,7 @@ def test_streaming_vocoder_final_payload_preserves_usage_without_redecode() -> N
         assert data["usage"] == usage
         assert data["sample_rate"] == 44100
         assert data["modality"] == "audio"
+        assert data["finish_reason"] == "length"
         assert "audio_data" not in data
         assert "audio_waveform" not in data
         assert len(scheduler._codec.calls) == 2
