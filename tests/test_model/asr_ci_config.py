@@ -43,7 +43,8 @@ class AsrCiPreset:
     model_path: str
     display_name: str
     thresholds: AsrCiThresholdPreset
-    # note (Jeffro): False means threshold assertions are skipped while Qwen3-ASR awaits threshold calibration
+    # note (Jeffro): False means threshold assertions are skipped while a
+    # newly onboarded model awaits calibration;
     gate_thresholds: bool = True
 
 
@@ -87,16 +88,6 @@ FUN_ASR_LATENCY_P95_THRESHOLD_S = round(
 FUN_ASR_RTF_MEAN_THRESHOLD = round(FUN_ASR_RTF_MEAN_MAX * THRESHOLD_SLACK_LOWER, 4)
 FUN_ASR_RTF_P95_THRESHOLD = round(FUN_ASR_RTF_P95_MAX * THRESHOLD_SLACK_LOWER, 4)
 
-
-# note (Jeffro): Qwen3-ASR still runs report-only (gate_thresholds=False). The
-# references below are the fresh tune-ci-thresholds worst-of-5 calibration on
-# the current 2x H100 DP=2 topology called for in #1214, observed at commit
-# 88696bf5. EN reproduced the pre-#1093 stage-2 values exactly; ZH is calibrated
-# here for the first time, replacing the former inert 1.0 placeholders. The
-# speed references replace values carried over from before #1093 that had never
-# been observed on this topology. None of these values gate CI while the flag is
-# False.
-# ref: https://github.com/sgl-project/sglang-omni/pull/1093/changes#diff-806bffc1dc635f8f13348c3cc6ce6f1d5626e3cf32484339ebcc3058da71d189
 QWEN3_ASR_EN_CORPUS_WER_MAX = 0.0122
 QWEN3_ASR_EN_SAMPLE_WER_MAX = 0.1819
 QWEN3_ASR_ZH_CORPUS_WER_MAX = 0.0063
@@ -162,7 +153,6 @@ ASR_CI_PRESETS: dict[str, AsrCiPreset] = {
             rtf_mean_max=QWEN3_ASR_RTF_MEAN_THRESHOLD,
             rtf_p95_max=QWEN3_ASR_RTF_P95_THRESHOLD,
         ),
-        gate_thresholds=False,
     ),
 }
 
