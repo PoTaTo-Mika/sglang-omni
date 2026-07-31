@@ -300,6 +300,7 @@ def test_qwen3_tts_maps_references_and_keeps_upstream_sampling_defaults() -> Non
     assert state.ref_audio == "voice.wav"
     assert state.ref_text == "reference"
     assert state.x_vector_only_mode is False
+    assert state.non_streaming_mode is False
     assert state.generation_kwargs == {"max_new_tokens": 2048}
 
 
