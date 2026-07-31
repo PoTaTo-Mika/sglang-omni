@@ -39,7 +39,6 @@ from sglang.srt.managers.scheduler import validate_input_length
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.utils import broadcast_pyobj
 
-from sglang_omni.config.schema import SchedulingConfig
 from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.profiler.event_recorder import (
     emit_model_path_end as _emit_model_path_end,
@@ -60,6 +59,10 @@ from sglang_omni.proto.admin import (
     ADMIN_WEIGHTS_CHECKER,
 )
 from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
+from sglang_omni.scheduling.prefill_coalesce import (
+    validate_prefill_coalesce_requests,
+    validate_prefill_coalesce_wait_ms,
+)
 from sglang_omni.vendor.sglang.server_args import override_server_args
 
 logger = logging.getLogger(__name__)
@@ -280,23 +283,10 @@ class OmniScheduler:
                 "requests"
             )
 
-        # Note (maydomine): Revalidate here because direct construction can
-        # bypass the typed YAML and CLI entrypoints.
-        validated = SchedulingConfig(
-            prefill_coalesce_requests=prefill_coalesce_requests,
-            prefill_coalesce_wait_ms=prefill_coalesce_wait_ms,
-        )
-        requests = validated.prefill_coalesce_requests
-        wait_ms = validated.prefill_coalesce_wait_ms
-        if requests is None or wait_ms is None:
-            # Note (maydomine): Reject explicit nulls rather than guessing
-            # whether they mean the concrete defaults or disabled coalescing.
-            raise ValueError(
-                "prefill_coalesce_requests and prefill_coalesce_wait_ms must "
-                "be concrete values at the scheduler (got "
-                f"requests={requests!r}, wait_ms={wait_ms!r}); use 0 to "
-                "disable coalescing instead of None"
-            )
+        # Note: (maydomine) Validate here as well as in the CLI because per-stage
+        # YAML reaches the scheduler through factory_args.
+        requests = validate_prefill_coalesce_requests(prefill_coalesce_requests)
+        wait_ms = validate_prefill_coalesce_wait_ms(prefill_coalesce_wait_ms)
         if requests > 1 and int(server_args.tp_size) > 1:
             logger.warning(
                 "Prefill admission coalescing is disabled for "
