@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 import torch
 
+from sglang_omni.config.manager import ConfigManager
 from sglang_omni.models.qwen3_omni.pending_text_queue import PendingTextTensorQueue
 from sglang_omni.models.qwen3_tts import request_builders as qwen3_request_builders
 from sglang_omni.models.qwen3_tts.config import Qwen3TTSPipelineConfig
@@ -27,7 +28,11 @@ from sglang_omni.models.qwen3_tts.request_builders import (
     build_sglang_qwen3_tts_request,
     derive_qwen3_tts_sampling_seeds,
 )
+from sglang_omni.models.qwen3_tts.streaming_vocoder import (
+    Qwen3TTSStreamingVocoderScheduler,
+)
 from sglang_omni.models.registry import PIPELINE_CONFIG_REGISTRY
+from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.sampling import seed as sampling_seed
 from sglang_omni.scheduling.messages import IncomingMessage
@@ -38,6 +43,17 @@ from sglang_omni.scheduling.speaker_cache import (
 )
 from sglang_omni.scheduling.types import RequestOutput
 from tests.unit_test.fakes import FakeExecutionBridge, FakeServerArgs
+
+
+def test_low_vram_example_pins_talker_memory_fraction() -> None:
+    config = ConfigManager.from_file(
+        "examples/configs/qwen3_tts_1_7b_low_vram.yaml"
+    ).config
+
+    assert isinstance(config, Qwen3TTSPipelineConfig)
+    assert config.runtime_overrides["tts_engine"]["server_args_overrides"] == {
+        "mem_fraction_static": 0.55
+    }
 
 
 def install_fake_sglang(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -229,6 +245,8 @@ def test_qwen3_tts_config_and_registry_contracts() -> None:
     assert "device" not in config.stages[1].factory_args
     assert "device" not in config.stages[2].factory_args
     assert {stage.process for stage in config.stages} == {"pipeline"}
+    assert config.stages[1].stream_to == ["vocoder"]
+    assert config.stages[2].can_accept_stream_before_payload is True
     assert (
         PIPELINE_CONFIG_REGISTRY.get_config("Qwen3TTSForConditionalGeneration")
         is Qwen3TTSPipelineConfig
@@ -960,6 +978,13 @@ def test_qwen3_tts_vocoder_batches_decode_requests(
     decode_batch_sizes: list[int] = []
 
     class FakeTokenizer:
+        model = SimpleNamespace(
+            decoder=SimpleNamespace(total_upsample=4),
+        )
+
+        def get_output_sample_rate(self):
+            return 24000
+
         def decode(self, encoded):
             decode_batch_sizes.append(len(encoded))
             return [
@@ -978,6 +1003,8 @@ def test_qwen3_tts_vocoder_batches_decode_requests(
         max_batch_size=2,
         max_batch_wait_ms=3,
     )
+    assert scheduler.create_stream_state("request").initial_chunk_frames == 5
+    assert scheduler._stream_left_context_frames == 25
     first = make_payload(inputs="first")
     first.data = Qwen3TTSState(
         audio_codes=torch.tensor([[1, 2], [3, 4]]),
@@ -1001,6 +1028,210 @@ def test_qwen3_tts_vocoder_batches_decode_requests(
     assert "audio_codes" not in results[0].data
     second_audio = np.frombuffer(results[1].data["audio_waveform"], dtype=np.float32)
     assert second_audio.tolist() == [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+
+
+class _FakeQwen3TTSDecoder:
+    total_upsample = 4
+
+    def __init__(self) -> None:
+        self.decode_inputs: list[torch.Tensor] = []
+
+    def chunked_decode(self, codes: torch.Tensor) -> torch.Tensor:
+        self.decode_inputs.append(codes.detach().clone())
+        return (
+            codes[:, :1]
+            .to(torch.float32)
+            .repeat_interleave(self.total_upsample, dim=-1)
+        )
+
+
+class _FakeQwen3TTSTokenizer:
+    def __init__(self) -> None:
+        self.model = SimpleNamespace(decoder=_FakeQwen3TTSDecoder())
+
+    def get_output_sample_rate(self) -> int:
+        return 24000
+
+    def decode(self, encoded):
+        waveforms = [
+            item["audio_codes"][:, 0]
+            .to(torch.float32)
+            .repeat_interleave(self.model.decoder.total_upsample)
+            .numpy()
+            for item in encoded
+        ]
+        return waveforms, self.get_output_sample_rate()
+
+
+def test_qwen3_tts_streaming_vocoder_buffers_five_initial_frames() -> None:
+    scheduler = Qwen3TTSStreamingVocoderScheduler(
+        _FakeQwen3TTSTokenizer(),
+        device="cpu",
+    )
+
+    assert scheduler.create_stream_state("request").initial_chunk_frames == 5
+
+
+def _qwen3_tts_stream_item(
+    codes: torch.Tensor,
+    *,
+    chunk_id: int,
+    ref_code_len: int | None = None,
+) -> StreamItem:
+    metadata = {
+        "modality": "audio_codes",
+        "stream": True,
+        "num_quantizers": int(codes.shape[-1]),
+    }
+    if ref_code_len is not None:
+        metadata["ref_code_len"] = ref_code_len
+    return StreamItem(
+        chunk_id=chunk_id,
+        data=codes,
+        from_stage="tts_engine",
+        metadata=metadata,
+    )
+
+
+def test_qwen3_tts_streaming_vocoder_splits_first_decode_once() -> None:
+    scheduler = Qwen3TTSStreamingVocoderScheduler(
+        _FakeQwen3TTSTokenizer(),
+        device="cpu",
+    )
+    payload = make_payload(inputs="target", params={"stream": True})
+    scheduler._on_streaming_new_request(payload.request_id, payload)
+
+    scheduler._on_chunk(
+        payload.request_id,
+        _qwen3_tts_stream_item(
+            torch.ones((15, 2), dtype=torch.long),
+            chunk_id=0,
+            ref_code_len=0,
+        ),
+    )
+    assert scheduler.outbox.qsize() == 0
+    scheduler._on_chunk(
+        payload.request_id,
+        _qwen3_tts_stream_item(torch.ones((1, 2), dtype=torch.long), chunk_id=1),
+    )
+    assert scheduler.outbox.qsize() == 2
+
+    first = scheduler.outbox.get_nowait()
+    second = scheduler.outbox.get_nowait()
+    assert len(first.data["audio_waveform"]) == 5 * 4 * 4
+    assert len(second.data["audio_waveform"]) == 11 * 4 * 4
+
+    scheduler._on_chunk(
+        payload.request_id,
+        _qwen3_tts_stream_item(torch.ones((15, 2), dtype=torch.long), chunk_id=2),
+    )
+    assert scheduler.outbox.qsize() == 0
+    scheduler._on_chunk(
+        payload.request_id,
+        _qwen3_tts_stream_item(torch.ones((1, 2), dtype=torch.long), chunk_id=3),
+    )
+    assert scheduler.outbox.qsize() == 1
+    assert len(scheduler._decoder.decode_inputs) == 2
+
+
+def test_qwen3_tts_stream_output_prepends_reference_once() -> None:
+    from sglang_omni.models.qwen3_tts.request_builders import (
+        make_qwen3_tts_scheduler_adapters,
+    )
+
+    payload = make_payload(inputs="target", params={"stream": True})
+    _, _, stream_output_builder = make_qwen3_tts_scheduler_adapters(
+        model=None,
+        wrapper=None,
+    )
+    data = Qwen3TTSSGLangRequestData(
+        ref_code=torch.tensor([[10, 11], [12, 13]]),
+        latest_stream_code_chunk=torch.tensor([1, 2]),
+        stage_payload=payload,
+    )
+
+    first = stream_output_builder(payload.request_id, data, None)
+    assert len(first) == 1
+    assert first[0].data.tolist() == [[10, 11], [12, 13], [1, 2]]
+    assert first[0].metadata["ref_code_len"] == 2
+    assert first[0].metadata["num_quantizers"] == 2
+
+    data.latest_stream_code_chunk = torch.tensor([3, 4])
+    second = stream_output_builder(payload.request_id, data, None)
+    assert second[0].data.tolist() == [[3, 4]]
+    assert "ref_code_len" not in second[0].metadata
+
+
+def test_qwen3_tts_streaming_vocoder_matches_full_decode() -> None:
+    tokenizer = _FakeQwen3TTSTokenizer()
+    scheduler = Qwen3TTSStreamingVocoderScheduler(
+        tokenizer,
+        device="cpu",
+        stream_stride=1,
+        stream_followup_stride=2,
+        initial_chunk_frames=1,
+        stream_left_context_frames=2,
+    )
+    all_codes = torch.tensor(
+        [[10, 11], [12, 13], [1, 2], [3, 4], [5, 6]],
+        dtype=torch.long,
+    )
+    payload = make_payload(inputs="target", params={"stream": True})
+    payload.data = Qwen3TTSState(
+        audio_codes=all_codes,
+        ref_code_len=2,
+        prompt_tokens=2,
+        completion_tokens=3,
+    ).to_dict()
+
+    scheduler._on_streaming_new_request(payload.request_id, payload)
+    scheduler._on_chunk(
+        payload.request_id,
+        _qwen3_tts_stream_item(
+            all_codes[:3],
+            chunk_id=0,
+            ref_code_len=2,
+        ),
+    )
+    first_messages = []
+    while not scheduler.outbox.empty():
+        first_messages.append(scheduler.outbox.get_nowait())
+    assert len(first_messages) == 1
+    first_audio = np.frombuffer(
+        first_messages[0].data["audio_waveform"],
+        dtype=np.float32,
+    )
+    assert first_audio.size == 4
+
+    scheduler._on_chunk(
+        payload.request_id,
+        _qwen3_tts_stream_item(all_codes[3:], chunk_id=1),
+    )
+    scheduler._on_done(payload.request_id)
+    messages = first_messages
+    while not scheduler.outbox.empty():
+        messages.append(scheduler.outbox.get_nowait())
+
+    stream_audio = np.concatenate(
+        [
+            np.frombuffer(message.data["audio_waveform"], dtype=np.float32)
+            for message in messages
+            if message.type == "stream"
+        ]
+    )
+    expected = all_codes[2:, 0].to(torch.float32).repeat_interleave(4).numpy()
+    np.testing.assert_array_equal(stream_audio, expected)
+    result = next(message for message in messages if message.type == "result")
+    assert result.data.data == {
+        "modality": "audio",
+        "sample_rate": 24000,
+        "usage": {
+            "prompt_tokens": 2,
+            "completion_tokens": 3,
+            "total_tokens": 5,
+        },
+    }
+    assert payload.request_id not in scheduler._stream_states
 
 
 def test_qwen3_tts_result_adapter_keeps_code_handoff_tensor_native() -> None:
@@ -1545,6 +1776,7 @@ def test_qwen3_tts_collect_codes_excludes_semantic_eos(
     )
 
     assert [chunk.tolist() for chunk in requests[0].data.output_codes] == [[1, 2]]
+    assert requests[0].data.latest_stream_code_chunk.tolist() == [1, 2]
     assert len(requests[0].data.pending_feedback_queue) == 1
     assert requests[1].data.output_codes == []
     assert len(requests[1].data.pending_feedback_queue) == 0
@@ -2102,7 +2334,11 @@ def test_qwen3_tts_engine_applies_compat_overrides_and_reenables_cuda_graph(
     monkeypatch.setattr(
         request_builders_mod,
         "make_qwen3_tts_scheduler_adapters",
-        lambda **kwargs: (lambda payload: payload, lambda data: data),
+        lambda **kwargs: (
+            lambda payload: payload,
+            lambda data: data,
+            lambda request_id, data, output: [],
+        ),
     )
     monkeypatch.setattr(
         stages,

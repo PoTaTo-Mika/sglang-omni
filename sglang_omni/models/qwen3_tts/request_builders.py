@@ -24,6 +24,7 @@ from sglang_omni.sampling.seed import (
     derive_sampling_seed,
     new_random_sampling_seed,
 )
+from sglang_omni.scheduling.messages import OutgoingMessage
 from sglang_omni.scheduling.reference_encoder import (
     KeyedReferenceEncodeHook,
     ReferenceEncodeService,
@@ -32,6 +33,9 @@ from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
 from sglang_omni.scheduling.speaker_cache import (
     SpeakerCacheKey,
     get_speaker_artifact_cache,
+)
+from sglang_omni.scheduling.streaming_vocoder import (
+    INITIAL_CODEC_CHUNK_FRAMES_PARAM,
 )
 from sglang_omni.utils.audio_payload import audio_data_uri_from_reference
 
@@ -101,6 +105,8 @@ class Qwen3TTSSGLangRequestData(SGLangARRequestData):
 
     enforce_request_limits: bool = True
     output_codes: list[torch.Tensor] = field(default_factory=list)
+    latest_stream_code_chunk: torch.Tensor | None = None
+    stream_ref_sent: bool = False
     ref_code: torch.Tensor | None = None
     ref_code_len: int = 0
     prompt_input_embeds: torch.Tensor | None = None
@@ -445,24 +451,27 @@ def build_generation_kwargs(
         explicit_fields = set()
 
     selected_fields = set()
-    for field in _GENERATION_FIELDS:
-        value = params.get(field)
+    for field_name in _GENERATION_FIELDS:
+        value = params.get(field_name)
         if value is None:
             continue
-        if field in _IMPLICIT_SAMPLING_DEFAULTS and field not in explicit_fields:
-            if value in _IMPLICIT_SAMPLING_DEFAULTS[field]:
+        if (
+            field_name in _IMPLICIT_SAMPLING_DEFAULTS
+            and field_name not in explicit_fields
+        ):
+            if value in _IMPLICIT_SAMPLING_DEFAULTS[field_name]:
                 continue
-        selected_fields.add(field)
+        selected_fields.add(field_name)
 
     max_new_tokens = params.get("max_new_tokens")
     if max_new_tokens is None:
         max_new_tokens = QWEN3_TTS_DEFAULT_MAX_NEW_TOKENS
     generation_kwargs: dict[str, Any] = {"max_new_tokens": int(max_new_tokens)}
-    for field in _GENERATION_FIELDS:
-        if field == "max_new_tokens":
+    for field_name in _GENERATION_FIELDS:
+        if field_name == "max_new_tokens":
             continue
-        if field in selected_fields and params.get(field) is not None:
-            generation_kwargs[field] = params[field]
+        if field_name in selected_fields and params.get(field_name) is not None:
+            generation_kwargs[field_name] = params[field_name]
     return generation_kwargs
 
 
@@ -1086,4 +1095,60 @@ def make_qwen3_tts_scheduler_adapters(*, model: Any, wrapper: Any):
     def result_adapter(data: Qwen3TTSSGLangRequestData) -> StagePayload:
         return apply_sglang_qwen3_tts_result(data.stage_payload, data)
 
-    return request_builder, result_adapter
+    def stream_output_builder(
+        request_id: str,
+        data: Qwen3TTSSGLangRequestData,
+        req_output: Any,
+    ) -> list[OutgoingMessage]:
+        del req_output
+        params = data.stage_payload.request.params
+        if not isinstance(params, dict) or not params.get("stream"):
+            return []
+
+        codes = data.latest_stream_code_chunk
+        if codes is None:
+            return []
+        data.latest_stream_code_chunk = None
+        if codes.ndim == 1:
+            codes = codes.unsqueeze(0)
+        elif codes.ndim != 2:
+            raise ValueError(
+                f"Qwen3-TTS stream codes must be [Q] or [T, Q], got {tuple(codes.shape)}"
+            )
+
+        metadata: dict[str, Any] = {
+            "modality": "audio_codes",
+            "stream": True,
+            "num_quantizers": int(codes.shape[-1]),
+        }
+        if not data.stream_ref_sent:
+            ref_code = data.ref_code
+            ref_code_len = 0
+            if ref_code is not None and ref_code.numel() > 0:
+                ref_code = ref_code.to(device=codes.device, dtype=torch.long)
+                if ref_code.ndim != 2 or ref_code.shape[-1] != codes.shape[-1]:
+                    raise ValueError(
+                        "Qwen3-TTS reference codes must have shape [T, Q] matching "
+                        f"stream codes, got {tuple(ref_code.shape)} and "
+                        f"{tuple(codes.shape)}"
+                    )
+                ref_code_len = int(ref_code.shape[0])
+                codes = torch.cat((ref_code, codes), dim=0)
+            metadata["ref_code_len"] = ref_code_len
+            if INITIAL_CODEC_CHUNK_FRAMES_PARAM in params:
+                metadata[INITIAL_CODEC_CHUNK_FRAMES_PARAM] = params[
+                    INITIAL_CODEC_CHUNK_FRAMES_PARAM
+                ]
+            data.stream_ref_sent = True
+
+        return [
+            OutgoingMessage(
+                request_id=request_id,
+                type="stream",
+                data=codes,
+                target="vocoder",
+                metadata=metadata,
+            )
+        ]
+
+    return request_builder, result_adapter, stream_output_builder

@@ -55,6 +55,16 @@ sgl-omni serve \
   --port 8000
 ```
 
+Use the low-VRAM profile when the default scheduler pool is larger than the
+deployment needs:
+
+```bash
+sgl-omni serve \
+  --model-path Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+  --config examples/configs/qwen3_tts_1_7b_low_vram.yaml \
+  --port 8000
+```
+
 ## Synthesizing Speech
 
 ### Text-only Requests
@@ -180,6 +190,7 @@ for a full Python raw PCM consumer.
 |---|---|---|
 | `Qwen/Qwen3-TTS-12Hz-0.6B-Base` | 0.6B | `examples/configs/qwen3_tts_0_6b.yaml` |
 | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | 1.7B | `examples/configs/qwen3_tts_1_7b.yaml` |
+| `Qwen/Qwen3-TTS-12Hz-1.7B-Base` (low VRAM) | 1.7B | `examples/configs/qwen3_tts_1_7b_low_vram.yaml` |
 
 Both expose an identical request API. The 1.7B model has higher capacity (typically better
 quality) at a larger memory and latency cost; the 0.6B model is lighter and faster.

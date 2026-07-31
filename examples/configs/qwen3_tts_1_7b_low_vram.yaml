@@ -1,0 +1,7 @@
+config_cls: Qwen3TTSPipelineConfig
+model_path: Qwen/Qwen3-TTS-12Hz-1.7B-Base
+
+runtime_overrides:
+  tts_engine:
+    server_args_overrides:
+      mem_fraction_static: 0.55
