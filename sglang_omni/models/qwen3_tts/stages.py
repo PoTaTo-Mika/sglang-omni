@@ -114,10 +114,15 @@ def _compile_qwen3_tts_backbone(model: Any) -> None:
     ]
 
 
-def create_preprocessing_executor(model_path: str) -> SimpleScheduler:
+def create_preprocessing_executor(
+    model_path: str,
+    *,
+    max_concurrency: int = 1,
+) -> SimpleScheduler:
     del model_path
     return SimpleScheduler(
         preprocess_qwen3_tts_payload,
+        max_concurrency=max_concurrency,
         abort_callback=cleanup_prepared_qwen3_tts_request,
     )
 

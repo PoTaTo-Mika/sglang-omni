@@ -1571,6 +1571,19 @@ def test_qwen3_tts_preprocessing_abort_cleans_prepared_state() -> None:
         qwen3_request_builders.cleanup_prepared_qwen3_tts_request(request_id)
 
 
+def test_qwen3_tts_pipeline_parallelizes_preprocessing() -> None:
+    from sglang_omni.models.qwen3_tts.config import Qwen3TTSPipelineConfig
+
+    config = Qwen3TTSPipelineConfig(model_path="model")
+    preprocessing = next(
+        stage
+        for stage in config.stages
+        if stage.name == "preprocessing"
+    )
+
+    assert preprocessing.factory_args["max_concurrency"] == 8
+
+
 def test_qwen3_tts_preprocessing_abort_race_cleans_late_prepared_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
