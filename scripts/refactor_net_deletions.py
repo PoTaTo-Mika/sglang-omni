@@ -108,6 +108,10 @@ class Totals:
     def net_deleted(self) -> int:
         return self.deleted - self.added
 
+    @property
+    def net_change(self) -> int:
+        return self.added - self.deleted
+
     def add(self, file_stat: FileStat) -> None:
         self.files += 1
         if file_stat.added is None or file_stat.deleted is None:
@@ -675,8 +679,8 @@ def format_html(
       font-size: 16px;
       font-weight: 700;
     }}
-    .positive {{ color: var(--green); }}
-    .negative {{ color: var(--red); }}
+    .decrease {{ color: var(--green); }}
+    .increase {{ color: var(--red); }}
     .zero {{ color: var(--amber); }}
     .context {{
       background: var(--panel);
@@ -800,7 +804,7 @@ def format_html(
       </div>
       <div class="status {status_class}">
         <span class="label">{status_label}</span>
-        <div class="target">non-test net deleted &gt; 0</div>
+        <div class="target">non-test net change &lt; 0</div>
       </div>
     </header>
 
@@ -811,9 +815,10 @@ def format_html(
     </section>
 
     <section class="context">
-      Progress is measured as <code>deleted non-test lines - added non-test lines</code>.
-      Files classified as tests are reported separately and do not offset the
-      implementation deletion target.
+      Net change is displayed as <code>added lines - deleted lines</code>.
+      Negative values mean the repository has fewer lines. Files classified as
+      tests are reported separately and do not offset the implementation
+      deletion target.
       {scope_notes_html}
     </section>
 
@@ -1084,16 +1089,16 @@ def _format_pathspecs(pathspecs: Sequence[str]) -> str:
 def _format_html_total_card(
     label: str, totals: Totals, file_metric_label: str = "Files"
 ) -> str:
-    net_class = "positive" if totals.net_deleted > 0 else "negative"
-    if totals.net_deleted == 0:
+    net_class = "decrease" if totals.net_change < 0 else "increase"
+    if totals.net_change == 0:
         net_class = "zero"
 
     return f"""
       <article class="card">
         <h2>{html.escape(label)}</h2>
         <div class="net">
-          <strong class="{net_class}">{totals.net_deleted:+d}</strong>
-          <span>net deleted</span>
+          <strong class="{net_class}">{totals.net_change:+d}</strong>
+          <span>net change</span>
         </div>
         <div class="metric-row">
           {_format_html_metric("Added", totals.added)}
@@ -1146,8 +1151,8 @@ def _format_html_commit_section(commits: Sequence[CommitSummary]) -> str:
             f"<td>{html.escape(commit.subject)}</td>"
             f"<td>{non_test.added}</td>"
             f"<td>{non_test.deleted}</td>"
-            f"<td>{non_test.net_deleted:+d}</td>"
-            f"<td>{test.net_deleted:+d}</td>"
+            f"<td>{non_test.net_change:+d}</td>"
+            f"<td>{test.net_change:+d}</td>"
             "</tr>"
         )
     return f"""

@@ -15,6 +15,11 @@ The target is met when `non-test net deleted > 0`. Test changes are still
 reported, but they are excluded from the progress target so that added coverage
 does not hide whether the refactor is actually shrinking implementation code.
 
+The HTML dashboard uses conventional diff signs for readability:
+`net change = added lines - deleted lines`. A net code reduction is therefore
+displayed as a negative number even though the internal progress target above is
+expressed as a positive `net deleted` value.
+
 ## Test File Detection
 
 A changed file is treated as a test file when either of these rules match:

@@ -149,7 +149,10 @@ def test_format_html_dashboard_escapes_paths_and_lists_test_files() -> None:
     assert "sglang_omni/scheduling/reference_encoder.py" in rendered
     assert "sglang_omni/foo&lt;bar&gt;.py" in rendered
     assert "tests/unit_test/test_foo.py" in rendered
-    assert "+3" in rendered
+    assert "non-test net change &lt; 0" in rendered
+    assert "added lines - deleted lines" in rendered
+    assert '<strong class="decrease">-3</strong>' in rendered
+    assert '<strong class="increase">+5</strong>' in rendered
 
 
 def test_commit_sum_excludes_unrelated_history(tmp_path: Path) -> None:
