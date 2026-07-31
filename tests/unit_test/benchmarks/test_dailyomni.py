@@ -200,7 +200,7 @@ def test_video_send_fn_supports_dailyomni_input_modes(
     )
     session = _FakeSession()
     send_fn = make_video_send_fn(
-        "qwen3-omni",
+        "test-multimodal-model",
         "http://localhost/v1/chat/completions",
         enable_video_input=enable_video,
         enable_audio_input=enable_audio,

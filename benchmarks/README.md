@@ -157,9 +157,9 @@ python -m benchmarks.eval.benchmark_omni_videoamme \
     --video-fps 2 --video-max-frames 128 --video-max-pixels 401408 \
     --enable-audio --asr-device cuda:0 --asr-concurrency 32
 
-# 9. Qwen3-Omni — Daily-Omni (audio-visual temporal reasoning)
+# 9. Daily-Omni (audio-visual temporal reasoning)
 python -m benchmarks.eval.benchmark_omni_dailyomni \
-    --model qwen3-omni --port 8000 \
+    --model your-model-name --port 8000 \
     --max-concurrency 4 \
     --video-fps 2 --video-max-frames 128 --video-max-pixels 401408
 
@@ -195,7 +195,7 @@ python -m benchmarks.eval.benchmark_omni_seedtts \
 | `eval/benchmark_omni_mmmu.py` | MMMU (VLM accuracy + speed) | Qwen3-Omni | `/v1/chat/completions` |
 | `eval/benchmark_omni_videomme.py` | Video-MME (video understanding) | Qwen3-Omni | `/v1/chat/completions` |
 | `eval/benchmark_omni_videoamme.py` | Video-AMME (video + audio question understanding) | Qwen3-Omni | `/v1/chat/completions` |
-| `eval/benchmark_omni_dailyomni.py` | Daily-Omni (audio-visual temporal reasoning) | Qwen3-Omni | `/v1/chat/completions` |
+| `eval/benchmark_omni_dailyomni.py` | Daily-Omni (audio-visual temporal reasoning) | Multimodal models | `/v1/chat/completions` |
 | `eval/benchmark_asr_seedtts.py` | ASR concurrency scaling on SeedTTS EN/ZH | Qwen3-ASR, Fun-ASR | `/v1/audio/transcriptions` |
 
 See [tts_serving/README.md](tts_serving/README.md) for the TTS serving

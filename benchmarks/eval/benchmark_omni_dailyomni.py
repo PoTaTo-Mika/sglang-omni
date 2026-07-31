@@ -9,7 +9,7 @@ Usage:
     python -m benchmarks.dataset.prepare --dataset dailyomni
 
     python -m benchmarks.eval.benchmark_omni_dailyomni \
-        --model qwen3-omni --port 8000 \
+        --model your-model-name --port 8000 \
         --max-concurrency 4 --video-fps 2 \
         --video-max-frames 128 --video-max-pixels 401408
 """
