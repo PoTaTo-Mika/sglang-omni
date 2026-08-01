@@ -946,6 +946,9 @@ def create_sglang_thinker_executor_from_config(
     total_gpu_memory_fraction: float | None = None,
     enable_async_decode: bool = True,
     async_decode_min_batch_size: int = 2,
+    prefill_coalesce_requests: int = 0,
+    prefill_coalesce_wait_ms: float = 60.0,
+    prefill_coalesce_when_idle: bool = False,
 ):
     """Returns OmniScheduler for thinker."""
     # note (luojiaxuan):
@@ -960,14 +963,14 @@ def create_sglang_thinker_executor_from_config(
     # the streaming-SST thinker path benefits out of the box; either key can be
     # overridden via server_args_overrides (set enable_mixed_chunk=False to opt
     # out). Note: mixed-chunk only engages when chunked_prefill_size > 0.
-    overrides: dict[str, Any] = {
-        "disable_cuda_graph": False,
-        "enable_mixed_chunk": True,
-        "chunked_prefill_size": 8192,
-        "sampling_backend": "pytorch",
-    }
-    if server_args_overrides:
-        overrides.update(server_args_overrides)
+    overrides = build_generation_batch_overrides(
+        max_running_requests=64,
+        server_args_overrides=server_args_overrides,
+        disable_cuda_graph=False,
+        enable_mixed_chunk=True,
+        chunked_prefill_size=8192,
+        sampling_backend="pytorch",
+    )
     overrides["tp_size"] = tp_size
     has_explicit_colocated_mem_fraction = (
         total_gpu_memory_fraction is not None
@@ -989,6 +992,10 @@ def create_sglang_thinker_executor_from_config(
         model_path,
         context_length=thinker_max_seq_len,
         **overrides,
+    )
+    validate_generation_batch_policy(
+        model_name="Qwen3-Omni thinker",
+        server_args=server_args,
     )
     if total_gpu_memory_fraction is None:
         encoder_reserve_applied = _apply_qwen_thinker_encoder_reserve(
@@ -1030,6 +1037,9 @@ def create_sglang_thinker_executor_from_config(
         total_gpu_memory_fraction=effective_total_gpu_memory_fraction,
         enable_async_decode=enable_async_decode,
         async_decode_min_batch_size=async_decode_min_batch_size,
+        prefill_coalesce_requests=prefill_coalesce_requests,
+        prefill_coalesce_wait_ms=prefill_coalesce_wait_ms,
+        prefill_coalesce_when_idle=prefill_coalesce_when_idle,
     )
     post_load_process_mem = get_process_gpu_memory_bytes(gpu_id)
     logger.info(

@@ -19,6 +19,7 @@ from sglang_omni.models.fun_asr.encoder_service import (
 from sglang_omni.models.fun_asr.request_builders import (
     fun_asr_prompt_overhead_tokens,
     make_fun_asr_scheduler_adapters,
+    make_fun_asr_stream_output_builder,
 )
 from sglang_omni.models.fun_asr.tool_funcs.audio_lengths import (
     fun_asr_low_frame_rate_length,
@@ -59,7 +60,9 @@ def _compile_fun_asr_audio_encoder(
     """
     import contextlib
 
-    from sglang.srt.model_executor.cuda_graph_runner import set_torch_compile_config
+    from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
+
+    from sglang_omni.models.fun_asr.sglang_model import _sanm_mask_from_lengths
 
     if warmup_lfr_frames < 2:
         # Note (wilsonzheng0327) Sizes 0/1 are always shape-specialized by
@@ -81,16 +84,35 @@ def _compile_fun_asr_audio_encoder(
         # set, so a normal tensor here compiles a graph the service's
         # inference-mode tensors fail, forcing a full recompile on the first
         # real request
-        warmup = torch.zeros(
-            (1, int(warmup_lfr_frames), int(model.config.encoder_config.input_size)),
-            device=param.device,
-            dtype=param.dtype,
-        )
-        model.multi_modal_projector(model.audio_tower(warmup))
+        t = int(warmup_lfr_frames)
+        feat_dim = int(model.config.encoder_config.input_size)
+
+        # note(guozhihao-224): Dynamo specializes B=0/1 and mask=None vs tensor;
+        # B1/None + B1/mask + B2/mask cover the mask branch and the B>=2 dynamic graph.
+        for batch, with_mask in ((1, False), (1, True), (2, True)):
+            xs = (
+                torch.zeros(
+                    (batch, feat_dim, t), device=param.device, dtype=param.dtype
+                )
+                .permute(0, 2, 1)
+                .contiguous()
+            )
+            mask = (
+                _sanm_mask_from_lengths(
+                    torch.full((batch,), t, device=param.device, dtype=torch.long),
+                    t,
+                    dtype=param.dtype,
+                    device=param.device,
+                )
+                if with_mask
+                else None
+            )
+            model.multi_modal_projector(model.audio_tower(xs, mask), mask)
     logger.info(
         "Compiled Fun-ASR audio encoder + adaptor "
         "(dynamic=True, warmup_lfr_frames=%d, "
-        "warmup_inference_mode=%s)",
+        "warmup_inference_mode=%s, "
+        "signatures=B1/None+B1/mask+B2/mask)",
         warmup_lfr_frames,
         warmup_inference_mode,
     )
@@ -113,10 +135,21 @@ def create_sglang_fun_asr_executor(
     enable_pre_lm_encoder: bool = True,
     pre_lm_cache_max_entries: int = 4096,
     pre_lm_cache_size_bytes: int = 2 * 1024**3,
+    pre_lm_max_batch_size: int = 8,
+    pre_lm_max_batch_wait_ms: int = 4,
     request_build_max_workers: int = 8,
     request_build_max_pending: int | None = 16,
+    stream_emit_interval_s: float = 0.05,
     server_args_overrides: dict[str, Any] | None = None,
 ):
+    if pre_lm_max_batch_size < 1:
+        raise ValueError(
+            f"pre_lm_max_batch_size must be >= 1, got {pre_lm_max_batch_size}"
+        )
+    if pre_lm_max_batch_wait_ms < 0:
+        raise ValueError(
+            f"pre_lm_max_batch_wait_ms must be >= 0, got {pre_lm_max_batch_wait_ms}"
+        )
 
     gpu_id = int(device.split(":")[-1]) if ":" in device else 0
 
@@ -183,7 +216,7 @@ def create_sglang_fun_asr_executor(
     )
 
     if want_cuda_graph:
-        model_worker.model_runner.init_device_graphs()
+        model_worker.model_runner.init_cuda_graphs()
 
     if enable_encoder_torch_compile:
         _compile_fun_asr_audio_encoder(
@@ -208,10 +241,12 @@ def create_sglang_fun_asr_executor(
                 model,
                 model_path=model_path,
                 feature_extractor=feature_extractor,
-                mm_attention_backend=getattr(server_args, "mm_attention_backend", None),
+                mm_attention_backend=server_args.mm_attention_backend,
             ),
             cache_max_entries=pre_lm_cache_max_entries,
             cache_max_bytes=pre_lm_cache_size_bytes,
+            max_batch_size=pre_lm_max_batch_size,
+            max_batch_wait_ms=pre_lm_max_batch_wait_ms,
         )
 
     try:
@@ -221,6 +256,10 @@ def create_sglang_fun_asr_executor(
             max_new_tokens=max_new_tokens,
             context_length=context_length,
             audio_encoder_service=audio_encoder_service,
+        )
+        stream_output_builder = make_fun_asr_stream_output_builder(
+            tokenizer=tokenizer,
+            min_emit_interval_s=stream_emit_interval_s,
         )
 
         return OmniScheduler(
@@ -235,6 +274,7 @@ def create_sglang_fun_asr_executor(
             model_runner=ModelRunner(model_worker, output_proc),
             request_builder=request_builder,
             result_adapter=result_adapter,
+            stream_output_builder=stream_output_builder,
             enable_async_decode=enable_async_decode,
             async_decode_min_batch_size=async_decode_min_batch_size,
             request_build_max_workers=request_build_max_workers,

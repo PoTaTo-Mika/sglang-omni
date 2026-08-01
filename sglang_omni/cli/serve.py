@@ -6,7 +6,11 @@ from typing import Annotated, Literal, NoReturn
 import typer
 import yaml
 
-from sglang_omni.config import PipelineConfig, StageConfig
+from sglang_omni.config import (
+    PipelineConfig,
+    StageConfig,
+    apply_stage_process_overrides,
+)
 from sglang_omni.config.manager import ConfigManager
 from sglang_omni.preprocessing.resource_connector import (
     resolve_allowed_local_media_path,
@@ -572,6 +576,7 @@ def apply_thinker_server_args_cli_overrides(
     *,
     cpu_offload_gb: int | None,
     quantization: str | None,
+    thinker_max_running_requests: int | None = None,
 ) -> PipelineConfig:
     updates: dict[str, object] = {}
     if cpu_offload_gb is not None:
@@ -583,6 +588,10 @@ def apply_thinker_server_args_cli_overrides(
         if not quantization:
             raise typer.BadParameter("--quantization must not be empty")
         updates["quantization"] = quantization
+    if thinker_max_running_requests is not None:
+        if thinker_max_running_requests < 1:
+            raise typer.BadParameter("--thinker-max-running-requests must be >= 1")
+        updates["max_running_requests"] = int(thinker_max_running_requests)
 
     if updates:
         _apply_stage_server_args_override(
@@ -919,6 +928,30 @@ def serve(
             help="Run Qwen speech with GPU stages colocated on one GPU.",
         ),
     ] = False,
+    isolate_stage: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--isolate-stage",
+            help=(
+                "Run this model-supported stage in a dedicated process. Repeat "
+                "the flag to isolate multiple stages. When omitted, preserve "
+                "the model's declared process topology. Shorthand for "
+                "--stage-process STAGE=STAGE."
+            ),
+        ),
+    ] = None,
+    stage_process: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--stage-process",
+            metavar="STAGE=PROCESS",
+            help=(
+                "Read left to right: place STAGE in PROCESS. Repeat the flag "
+                "with one process name to colocate several stages in it. Use "
+                "this instead of --isolate-stage for grouped topologies."
+            ),
+        ),
+    ] = None,
     host: Annotated[
         str, typer.Option(help="Server bind address (default: 0.0.0.0).")
     ] = "0.0.0.0",
@@ -1145,8 +1178,8 @@ def serve(
             "--decode_mode",
             help=(
                 "Decode execution mode for the supported generation stage: "
-                "async|sync. Omit this flag to use the pipeline config default "
-                "(async for Higgs TTS). Async mode enables one-step lookahead, "
+                "async|sync. Omit this flag to use the model-specific pipeline "
+                "default. Async mode enables one-step lookahead, "
                 "which can overlap the previous step's host-side collect with "
                 "the next GPU forward. Available for Higgs TTS, MOSS-TTS-Local, "
                 "MOSS-Transcribe-Diarize, and Fun-ASR."
@@ -1161,6 +1194,18 @@ def serve(
             help=(
                 "Decode batches smaller than this bypass async lookahead and "
                 "run synchronously (fast path). Default 2."
+            ),
+        ),
+    ] = None,
+    thinker_max_running_requests: Annotated[
+        int | None,
+        typer.Option(
+            "--thinker-max-running-requests",
+            "--thinker_max_running_requests",
+            min=1,
+            help=(
+                "Override SGLang thinker stage max_running_requests. "
+                "Omit to use the pipeline config default."
             ),
         ),
     ] = None,
@@ -1249,6 +1294,7 @@ def serve(
         merged_config,
         cpu_offload_gb=cpu_offload_gb,
         quantization=quantization,
+        thinker_max_running_requests=thinker_max_running_requests,
     )
     merged_config = apply_parallelism_cli_overrides(
         merged_config,
@@ -1258,6 +1304,11 @@ def serve(
         image_encoder_gpus=image_encoder_gpus,
         talker_gpu=talker_gpu,
         code2wav_gpu=code2wav_gpu,
+    )
+    merged_config = apply_stage_process_overrides(
+        merged_config,
+        isolate_stages=isolate_stage,
+        stage_processes=stage_process,
     )
     merged_config = apply_cuda_graph_cli_overrides(
         merged_config,
