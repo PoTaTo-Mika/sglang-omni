@@ -423,36 +423,13 @@ class Qwen3TTSTalker(nn.Module):
 
         if root_config is not None and self.tts_model_type == "base":
             apply_qwen_tts_transformers_compatibility_patches()
-            from qwen_tts.core.models.modeling_qwen3_tts import (
-                Qwen3TTSSpeakerEncoder,
-                librosa_mel_fn,
-            )
+            from qwen_tts.core.models.modeling_qwen3_tts import Qwen3TTSSpeakerEncoder
 
             self.speaker_encoder = Qwen3TTSSpeakerEncoder(
                 root_config.speaker_encoder_config
             )
-            speaker_device = self.model.codec_embedding.weight.device
-            mel_basis = librosa_mel_fn(
-                sr=self.speaker_encoder_sample_rate,
-                n_fft=1024,
-                n_mels=128,
-                fmin=0,
-                fmax=12000,
-            )
-            self.register_buffer(
-                "_speaker_mel_basis",
-                torch.from_numpy(mel_basis).float().to(speaker_device),
-                persistent=False,
-            )
-            self.register_buffer(
-                "_speaker_hann_window",
-                torch.hann_window(1024, device=speaker_device),
-                persistent=False,
-            )
         else:
             self.speaker_encoder = None
-            self.register_buffer("_speaker_mel_basis", None, persistent=False)
-            self.register_buffer("_speaker_hann_window", None, persistent=False)
         self.speech_tokenizer = None
 
         server_args = get_global_server_args()
@@ -569,39 +546,26 @@ class Qwen3TTSTalker(nn.Module):
 
     @torch.inference_mode()
     def extract_speaker_embedding(self, audio, sr):
+        apply_qwen_tts_transformers_compatibility_patches()
+        from qwen_tts.core.models.modeling_qwen3_tts import mel_spectrogram
+
         if sr != self.speaker_encoder_sample_rate:
             raise ValueError(
                 f"Expected {self.speaker_encoder_sample_rate}Hz reference audio"
             )
         if self.speaker_encoder is None:
             raise RuntimeError("Qwen3-TTS speaker encoder is not loaded")
-        if self._speaker_mel_basis is None or self._speaker_hann_window is None:
-            raise RuntimeError("Qwen3-TTS speaker mel buffers are not initialized")
-        waveform = torch.from_numpy(audio).to(
-            device=self.device,
-            dtype=torch.float32,
-        )
-        waveform = torch.nn.functional.pad(
-            waveform.unsqueeze(0).unsqueeze(1),
-            (384, 384),
-            mode="reflect",
-        ).squeeze(1)
-        spec = torch.stft(
-            waveform,
-            1024,
-            hop_length=256,
-            win_length=1024,
-            window=self._speaker_hann_window,
-            center=False,
-            pad_mode="reflect",
-            normalized=False,
-            onesided=True,
-            return_complex=True,
-        )
-        magnitude = torch.sqrt(torch.view_as_real(spec).pow(2).sum(-1) + 1e-9)
-        mels = torch.matmul(self._speaker_mel_basis, magnitude)
-        mels = torch.log(torch.clamp(mels, min=1e-5)).transpose(1, 2)
-        return self.speaker_encoder(mels.to(self.dtype))[0]
+        mels = mel_spectrogram(
+            torch.from_numpy(audio).unsqueeze(0),
+            n_fft=1024,
+            num_mels=128,
+            sampling_rate=self.speaker_encoder_sample_rate,
+            hop_size=256,
+            win_size=1024,
+            fmin=0,
+            fmax=12000,
+        ).transpose(1, 2)
+        return self.speaker_encoder(mels.to(self.device).to(self.dtype))[0]
 
     @torch.inference_mode()
     def generate_speaker_prompt(self, voice_clone_prompt: dict[str, Any]):
