@@ -13,7 +13,7 @@ tts_higgs_nonstream_wer:
     - "bosonai/higgs-tts-3-4b"
     - "Qwen/Qwen3-ASR-1.7B"
   test_file_sha256: d170f4686a2047346cb39782c69d1bd551af3cb14ef68fc770882d5e7f8b9af3
-  last_discovered_at: 2026-08-01T16:31:53Z
+  last_discovered_at: 2026-08-01T17:23:48Z
   expected_samples: 1088
   threshold_file: "tests/test_model/tts_ci_config.py"
   threshold_file_sha256: 690b2290b06f38d4bb0621403e604db524ce436f4c90061bd07173feebc7f895
@@ -49,7 +49,7 @@ tts_higgs_nonstream_similarity:
     - "bosonai/higgs-tts-3-4b"
     - "Qwen/Qwen3-ASR-1.7B"
   test_file_sha256: d170f4686a2047346cb39782c69d1bd551af3cb14ef68fc770882d5e7f8b9af3
-  last_discovered_at: 2026-08-01T16:31:53Z
+  last_discovered_at: 2026-08-01T17:23:48Z
   expected_samples: 50
   threshold_file: "tests/test_model/tts_ci_config.py"
   threshold_file_sha256: 690b2290b06f38d4bb0621403e604db524ce436f4c90061bd07173feebc7f895
@@ -85,7 +85,7 @@ tts_higgs_nonstream_utmos:
     - "bosonai/higgs-tts-3-4b"
     - "Qwen/Qwen3-ASR-1.7B"
   test_file_sha256: d170f4686a2047346cb39782c69d1bd551af3cb14ef68fc770882d5e7f8b9af3
-  last_discovered_at: 2026-08-01T16:31:53Z
+  last_discovered_at: 2026-08-01T17:23:48Z
   expected_samples: 1088
   threshold_file: "tests/test_model/tts_ci_config.py"
   threshold_file_sha256: 690b2290b06f38d4bb0621403e604db524ce436f4c90061bd07173feebc7f895
@@ -121,7 +121,7 @@ tts_higgs_nonstream_speed:
     - "bosonai/higgs-tts-3-4b"
     - "Qwen/Qwen3-ASR-1.7B"
   test_file_sha256: d170f4686a2047346cb39782c69d1bd551af3cb14ef68fc770882d5e7f8b9af3
-  last_discovered_at: 2026-08-01T16:31:53Z
+  last_discovered_at: 2026-08-01T17:23:48Z
   expected_samples: 1088
   threshold_file: "tests/test_model/tts_ci_config.py"
   threshold_file_sha256: 690b2290b06f38d4bb0621403e604db524ce436f4c90061bd07173feebc7f895
@@ -187,7 +187,7 @@ tts_moss_nonstream_wer:
     - "OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5"
     - "Qwen/Qwen3-ASR-1.7B"
   test_file_sha256: d170f4686a2047346cb39782c69d1bd551af3cb14ef68fc770882d5e7f8b9af3
-  last_discovered_at: 2026-08-01T16:31:53Z
+  last_discovered_at: 2026-08-01T17:23:48Z
   expected_samples: 1088
   threshold_file: "tests/test_model/tts_ci_config.py"
   threshold_file_sha256: 690b2290b06f38d4bb0621403e604db524ce436f4c90061bd07173feebc7f895
@@ -223,7 +223,7 @@ tts_moss_nonstream_similarity:
     - "OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5"
     - "Qwen/Qwen3-ASR-1.7B"
   test_file_sha256: d170f4686a2047346cb39782c69d1bd551af3cb14ef68fc770882d5e7f8b9af3
-  last_discovered_at: 2026-08-01T16:31:53Z
+  last_discovered_at: 2026-08-01T17:23:48Z
   expected_samples: 50
   threshold_file: "tests/test_model/tts_ci_config.py"
   threshold_file_sha256: 690b2290b06f38d4bb0621403e604db524ce436f4c90061bd07173feebc7f895
@@ -259,7 +259,7 @@ tts_moss_nonstream_utmos:
     - "OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5"
     - "Qwen/Qwen3-ASR-1.7B"
   test_file_sha256: d170f4686a2047346cb39782c69d1bd551af3cb14ef68fc770882d5e7f8b9af3
-  last_discovered_at: 2026-08-01T16:31:53Z
+  last_discovered_at: 2026-08-01T17:23:48Z
   expected_samples: 1088
   threshold_file: "tests/test_model/tts_ci_config.py"
   threshold_file_sha256: 690b2290b06f38d4bb0621403e604db524ce436f4c90061bd07173feebc7f895
@@ -295,7 +295,7 @@ tts_moss_nonstream_speed:
     - "OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5"
     - "Qwen/Qwen3-ASR-1.7B"
   test_file_sha256: d170f4686a2047346cb39782c69d1bd551af3cb14ef68fc770882d5e7f8b9af3
-  last_discovered_at: 2026-08-01T16:31:53Z
+  last_discovered_at: 2026-08-01T17:23:48Z
   expected_samples: 1088
   threshold_file: "tests/test_model/tts_ci_config.py"
   threshold_file_sha256: 690b2290b06f38d4bb0621403e604db524ce436f4c90061bd07173feebc7f895
@@ -361,7 +361,7 @@ tts_higgs_stream_wer:
     - "bosonai/higgs-tts-3-4b"
     - "Qwen/Qwen3-ASR-1.7B"
   test_file_sha256: d170f4686a2047346cb39782c69d1bd551af3cb14ef68fc770882d5e7f8b9af3
-  last_discovered_at: 2026-08-01T16:31:53Z
+  last_discovered_at: 2026-08-01T17:23:48Z
   expected_samples: 1088
   threshold_file: "tests/test_model/tts_ci_config.py"
   threshold_file_sha256: 690b2290b06f38d4bb0621403e604db524ce436f4c90061bd07173feebc7f895
@@ -397,7 +397,7 @@ tts_higgs_stream_speed:
     - "bosonai/higgs-tts-3-4b"
     - "Qwen/Qwen3-ASR-1.7B"
   test_file_sha256: d170f4686a2047346cb39782c69d1bd551af3cb14ef68fc770882d5e7f8b9af3
-  last_discovered_at: 2026-08-01T16:31:53Z
+  last_discovered_at: 2026-08-01T17:23:48Z
   expected_samples: 1088
   threshold_file: "tests/test_model/tts_ci_config.py"
   threshold_file_sha256: 690b2290b06f38d4bb0621403e604db524ce436f4c90061bd07173feebc7f895
@@ -453,7 +453,7 @@ tts_moss_stream_wer:
     - "OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5"
     - "Qwen/Qwen3-ASR-1.7B"
   test_file_sha256: d170f4686a2047346cb39782c69d1bd551af3cb14ef68fc770882d5e7f8b9af3
-  last_discovered_at: 2026-08-01T16:31:53Z
+  last_discovered_at: 2026-08-01T17:23:48Z
   expected_samples: 1088
   threshold_file: "tests/test_model/tts_ci_config.py"
   threshold_file_sha256: 690b2290b06f38d4bb0621403e604db524ce436f4c90061bd07173feebc7f895
@@ -489,7 +489,7 @@ tts_moss_stream_speed:
     - "OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5"
     - "Qwen/Qwen3-ASR-1.7B"
   test_file_sha256: d170f4686a2047346cb39782c69d1bd551af3cb14ef68fc770882d5e7f8b9af3
-  last_discovered_at: 2026-08-01T16:31:53Z
+  last_discovered_at: 2026-08-01T17:23:48Z
   expected_samples: 1088
   threshold_file: "tests/test_model/tts_ci_config.py"
   threshold_file_sha256: 690b2290b06f38d4bb0621403e604db524ce436f4c90061bd07173feebc7f895
@@ -539,7 +539,7 @@ tts_serving_closed16_speed:
   context_vars: []
   variant: "closed16"
   test_file_sha256: 45ead086841ba8648abc62c9faa2a9ec0e08762c858e49e693650efb923b2411
-  last_discovered_at: 2026-08-01T16:31:53Z
+  last_discovered_at: 2026-08-01T17:23:48Z
   observation_validity:
     json_file: "tts-serving-ci0/benchmark_validation.json"
     json_path: "valid"
@@ -582,7 +582,7 @@ tts_serving_ramp_speed:
   context_vars: []
   variant: "ramp"
   test_file_sha256: 45ead086841ba8648abc62c9faa2a9ec0e08762c858e49e693650efb923b2411
-  last_discovered_at: 2026-08-01T16:31:53Z
+  last_discovered_at: 2026-08-01T17:23:48Z
   observation_validity:
     json_file: "tts-serving-ci0/benchmark_validation.json"
     json_path: "valid"
@@ -625,7 +625,7 @@ tts_serving_soak_speed:
   context_vars: []
   variant: "soak"
   test_file_sha256: 45ead086841ba8648abc62c9faa2a9ec0e08762c858e49e693650efb923b2411
-  last_discovered_at: 2026-08-01T16:31:53Z
+  last_discovered_at: 2026-08-01T17:23:48Z
   observation_validity:
     json_file: "tts-serving-ci0/benchmark_validation.json"
     json_path: "valid"
@@ -658,7 +658,7 @@ tts_serving_speech_normal_speed:
   context_vars: []
   variant: "speech_normal"
   test_file_sha256: 45ead086841ba8648abc62c9faa2a9ec0e08762c858e49e693650efb923b2411
-  last_discovered_at: 2026-08-01T16:31:53Z
+  last_discovered_at: 2026-08-01T17:23:48Z
   observation_validity:
     json_file: "tts-serving-ci0/benchmark_validation.json"
     json_path: "valid"
@@ -701,7 +701,7 @@ tts_serving_rest_stream_speed:
   context_vars: []
   variant: "rest_stream"
   test_file_sha256: 45ead086841ba8648abc62c9faa2a9ec0e08762c858e49e693650efb923b2411
-  last_discovered_at: 2026-08-01T16:31:53Z
+  last_discovered_at: 2026-08-01T17:23:48Z
   observation_validity:
     json_file: "tts-serving-ci0/benchmark_validation.json"
     json_path: "valid"
@@ -764,7 +764,7 @@ tts_serving_batch32_speed:
   context_vars: []
   variant: "batch32"
   test_file_sha256: 45ead086841ba8648abc62c9faa2a9ec0e08762c858e49e693650efb923b2411
-  last_discovered_at: 2026-08-01T16:31:53Z
+  last_discovered_at: 2026-08-01T17:23:48Z
   observation_validity:
     json_file: "tts-serving-ci0/benchmark_validation.json"
     json_path: "valid"
@@ -797,7 +797,7 @@ tts_serving_ws_normal_speed:
   context_vars: []
   variant: "ws_normal"
   test_file_sha256: 45ead086841ba8648abc62c9faa2a9ec0e08762c858e49e693650efb923b2411
-  last_discovered_at: 2026-08-01T16:31:53Z
+  last_discovered_at: 2026-08-01T17:23:48Z
   observation_validity:
     json_file: "tts-serving-ci0/benchmark_validation.json"
     json_path: "valid"
@@ -840,7 +840,7 @@ tts_serving_ws_stream_speed:
   context_vars: []
   variant: "ws_stream"
   test_file_sha256: 45ead086841ba8648abc62c9faa2a9ec0e08762c858e49e693650efb923b2411
-  last_discovered_at: 2026-08-01T16:31:53Z
+  last_discovered_at: 2026-08-01T17:23:48Z
   observation_validity:
     json_file: "tts-serving-ci0/benchmark_validation.json"
     json_path: "valid"
@@ -903,7 +903,7 @@ tts_serving_mixed_burst_speed:
   context_vars: []
   variant: "mixed_burst"
   test_file_sha256: 45ead086841ba8648abc62c9faa2a9ec0e08762c858e49e693650efb923b2411
-  last_discovered_at: 2026-08-01T16:31:53Z
+  last_discovered_at: 2026-08-01T17:23:48Z
   observation_validity:
     json_file: "tts-serving-ci0/benchmark_validation.json"
     json_path: "valid"
@@ -946,7 +946,7 @@ tts_serving_long_speed:
   context_vars: []
   variant: "long"
   test_file_sha256: 45ead086841ba8648abc62c9faa2a9ec0e08762c858e49e693650efb923b2411
-  last_discovered_at: 2026-08-01T16:31:53Z
+  last_discovered_at: 2026-08-01T17:23:48Z
   observation_validity:
     json_file: "tts-serving-ci0/benchmark_validation.json"
     json_path: "valid"
@@ -1019,7 +1019,7 @@ tts_serving_long_baseline_speed:
   context_vars: []
   variant: "long_baseline"
   test_file_sha256: 45ead086841ba8648abc62c9faa2a9ec0e08762c858e49e693650efb923b2411
-  last_discovered_at: 2026-08-01T16:31:53Z
+  last_discovered_at: 2026-08-01T17:23:48Z
   observation_validity:
     json_file: "tts-serving-ci0/benchmark_validation.json"
     json_path: "valid"
