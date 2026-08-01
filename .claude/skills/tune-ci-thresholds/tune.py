@@ -546,6 +546,58 @@ def _plan_calibration_sha(plan: dict) -> str:
     return plan.get("calibration_git_sha") or plan.get("git_sha") or ""
 
 
+def _ast_without_numbers(source: str) -> str | None:
+    """AST dump with every numeric literal blanked, or None if unparseable."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Constant)
+                and isinstance(node.value, (int, float))
+                and not isinstance(node.value, bool)):
+            node.value = 0
+    return ast.dump(tree)
+
+
+def _git_show(sha: str, path: str) -> str | None:
+    r = subprocess.run(["git", "show", f"{sha}:{path}"], cwd=REPO_ROOT,
+                       capture_output=True, text=True, check=False)
+    return r.stdout if r.returncode == 0 else None
+
+
+def measurement_equivalent_commits(a: str, b: str) -> tuple[bool, list[str]]:
+    """True when nothing between two commits can change a measured metric.
+
+    Threshold constants and this skill's own files do not affect what the
+    benchmarks measure — only whether an assertion passes. Refusing to reuse
+    observations across such a commit throws away hours of valid GPU time for
+    no integrity gain. Anything else (logic, non-Python files) is treated as
+    a real change and blocks reuse.
+    """
+    if a == b:
+        return True, []
+    r = subprocess.run(["git", "diff", "--name-only", f"{a}..{b}"],
+                       cwd=REPO_ROOT, capture_output=True, text=True, check=False)
+    if r.returncode != 0:
+        return False, ["git diff failed (unrelated histories?)"]
+    reasons = []
+    for path in [p for p in r.stdout.split() if p]:
+        if path.startswith(".claude/skills/"):
+            continue                      # calibration tooling, not measured code
+        if not path.endswith(".py"):
+            reasons.append(f"{path}: non-Python change")
+            continue
+        old, new = _git_show(a, path), _git_show(b, path)
+        if old is None or new is None:
+            reasons.append(f"{path}: added or removed")
+            continue
+        da, db = _ast_without_numbers(old), _ast_without_numbers(new)
+        if da is None or db is None or da != db:
+            reasons.append(f"{path}: logic changed")
+    return (not reasons), reasons
+
+
 def audit_git_provenance(run_dir: Path, plan=None) -> dict:
     """Every run{k}.json must record the same git_sha as plan calibration_git_sha."""
     plan = plan or json.loads((run_dir / "plan.json").read_text())
@@ -558,6 +610,9 @@ def audit_git_provenance(run_dir: Path, plan=None) -> dict:
             mismatches=[],
             reason="plan.json has no calibration_git_sha",
         )
+    # Rounds produced after a measurement-equivalent commit are still the same
+    # experiment; only threshold constants or tooling moved underneath them.
+    accepted = {cal_sha} | set(plan.get("equivalent_commits") or [])
     missing_sha = []
     mismatches = []
     repeats = plan["repeats"]
@@ -575,7 +630,7 @@ def audit_git_provenance(run_dir: Path, plan=None) -> dict:
             run_sha = data.get("git_sha")
             if not run_sha:
                 missing_sha.append(f"{sk}/run{k}")
-            elif run_sha != cal_sha:
+            elif run_sha not in accepted:
                 mismatches.append(
                     f"{sk}/run{k}: artifact {run_sha[:8]} != calibration {cal_sha[:8]}"
                 )
@@ -2651,14 +2706,25 @@ def _run_cmd_inner(args, cfg, py, src, out):
         plan_repeats = existing.get("repeats", args.repeats)
         cal_sha = _plan_calibration_sha(existing)
         if cal_sha and gi["sha"] != cal_sha:
+            equivalent, reasons = measurement_equivalent_commits(cal_sha, gi["sha"])
+            if not equivalent:
+                print(
+                    "error: HEAD moved since this run dir was started, and the "
+                    "change can affect what is measured.\n"
+                    f"  calibration_git_sha: {cal_sha}\n"
+                    f"  current HEAD:        {gi['sha']}\n"
+                    + "".join(f"  - {r}\n" for r in reasons[:10]) +
+                    "  Start a **new** --output-dir on the current commit."
+                )
+                return 2
             print(
-                "error: HEAD moved since this run dir was started.\n"
-                f"  calibration_git_sha: {cal_sha}\n"
-                f"  current HEAD:        {gi['sha']}\n"
-                "  Start a **new** --output-dir on the current commit; "
-                "do not --resume across commits."
+                f"note: HEAD moved {cal_sha[:8]} -> {gi['sha'][:8]}, but every "
+                f"change is a threshold constant or calibration-tooling file — "
+                f"no measured code differs, so existing observations stay valid."
             )
-            return 2
+            existing.setdefault("equivalent_commits", [])
+            if gi["sha"] not in existing["equivalent_commits"]:
+                existing["equivalent_commits"].append(gi["sha"])
         if set(sel) - set(plan_stages):
             print(
                 "error: --resume --stages must be a subset of the existing "
@@ -2692,6 +2758,11 @@ def _run_cmd_inner(args, cfg, py, src, out):
             stages_yaml=existing.get("stages_yaml", str(sy)),
             last_resume_at=now_iso(),
             last_resume_git_sha=gi["sha"],
+            # Commits proven not to change any measured code. Rounds recorded
+            # under them are part of the same experiment; provenance accepts
+            # them. Rebuilt field-by-field here, so this must be carried over
+            # explicitly or the proof is lost on the next resume.
+            equivalent_commits=existing.get("equivalent_commits") or [],
         ), indent=2))
         args.repeats = plan_repeats
     else:

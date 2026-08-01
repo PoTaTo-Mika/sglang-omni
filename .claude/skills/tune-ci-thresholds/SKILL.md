@@ -62,8 +62,15 @@ python .claude/skills/tune-ci-thresholds/tune.py strict-audit --run-dir "$RUN"
 python .claude/skills/tune-ci-thresholds/tune.py report --run-dir "$RUN"
 ```
 
-Use `--resume` only to continue the same run directory on the same commit. A new
-user request always gets a new run directory.
+Use `--resume` only to continue the same run directory. A new user request
+always gets a new run directory.
+
+`HEAD` moving does not invalidate the observations already in that directory.
+`--resume` proves whether the commits are **measurement-equivalent** — nothing
+outside `.claude/skills/` changed except numeric constants — and continues when
+they are, blocking only on a change that could alter a measured number. See
+`CONTRACT.md`. Never conclude that existing data is worthless because a gate
+refused; check what actually changed first.
 
 ## GPU execution layouts
 
@@ -240,9 +247,10 @@ mismatch is reported as non-comparable and must not drive threshold changes.
 ## Threshold application
 
 `report` and `apply-plan` call the same `validate_run_ready()` gate. Both refuse
-partial observations, wrong sample scope, missing metrics, mixed commit SHA, or
-a stage left with fewer than `--repeats` clean observations after destructive
-rejection.
+partial observations, wrong sample scope, missing metrics, artifacts from a
+commit that is neither the calibration commit nor measurement-equivalent to it,
+or a stage left with fewer than `--repeats` clean observations after
+destructive rejection.
 
 `apply-plan` is read-only JSON: for each metric it emits `worst_raw`,
 `write_value`, `current_raw`, and `direction` (`tightens` / `loosens` /
