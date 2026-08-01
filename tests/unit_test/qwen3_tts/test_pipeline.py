@@ -7,7 +7,7 @@ import sys
 import threading
 import types
 from collections import deque
-from queue import Queue
+from queue import Empty, Queue
 from types import SimpleNamespace
 
 import numpy as np
@@ -1006,7 +1006,11 @@ def test_qwen3_tts_vocoder_batches_decode_requests(
     )
     assert scheduler.create_stream_state("request").initial_chunk_frames == 1
     assert scheduler._stream_left_context_frames == 25
-    assert scheduler._stream_followup_stride == 64
+    assert scheduler._stream_followup_stride == 8
+    assert scheduler._initial_max_batch_size == 32
+    assert scheduler._initial_batch_wait_s == pytest.approx(0.002)
+    assert scheduler._followup_max_batch_size == 8
+    assert scheduler._followup_batch_wait_s == pytest.approx(0.001)
     first = make_payload(inputs="first")
     first.data = Qwen3TTSState(
         audio_codes=torch.tensor([[1, 2], [3, 4]]),
@@ -1099,6 +1103,7 @@ def test_qwen3_tts_streaming_vocoder_decodes_initial_chunk_early() -> None:
     scheduler = Qwen3TTSStreamingVocoderScheduler(
         _FakeQwen3TTSTokenizer(),
         device="cpu",
+        stream_followup_stride=2,
     )
     payload = make_payload(inputs="target", params={"stream": True})
     scheduler._on_streaming_new_request(payload.request_id, payload)
@@ -1118,7 +1123,7 @@ def test_qwen3_tts_streaming_vocoder_decodes_initial_chunk_early() -> None:
 
     scheduler._on_chunk(
         payload.request_id,
-        _qwen3_tts_stream_item(torch.ones((63, 2), dtype=torch.long), chunk_id=1),
+        _qwen3_tts_stream_item(torch.ones((1, 2), dtype=torch.long), chunk_id=1),
     )
     assert scheduler.outbox.qsize() == 0
     scheduler._on_chunk(
@@ -1254,6 +1259,351 @@ def test_qwen3_tts_streaming_vocoder_matches_full_decode() -> None:
             "total_tokens": 5,
         },
     }
+    assert payload.request_id not in scheduler._stream_states
+
+
+def test_qwen3_tts_async_followup_flushes_before_result() -> None:
+    tokenizer = _FakeQwen3TTSTokenizer()
+    scheduler = Qwen3TTSStreamingVocoderScheduler(
+        tokenizer,
+        device="cpu",
+        stream_stride=1,
+        stream_followup_stride=2,
+        initial_chunk_frames=1,
+        stream_left_context_frames=2,
+        async_decode=True,
+    )
+    all_codes = torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=torch.long)
+    payload = make_payload(inputs="target", params={"stream": True})
+    payload.data = Qwen3TTSState(
+        audio_codes=all_codes,
+        completion_tokens=3,
+    ).to_dict()
+
+    scheduler.on_serving_start()
+    try:
+        scheduler._on_streaming_new_request(payload.request_id, payload)
+        scheduler._on_chunk(
+            payload.request_id,
+            _qwen3_tts_stream_item(
+                all_codes[:1],
+                chunk_id=0,
+                ref_code_len=0,
+            ),
+        )
+        first = scheduler.outbox.get(timeout=1)
+        scheduler._on_chunk(
+            payload.request_id,
+            _qwen3_tts_stream_item(all_codes[1:], chunk_id=1),
+        )
+        scheduler._on_done(payload.request_id)
+
+        followup = scheduler.outbox.get(timeout=1)
+        result = scheduler.outbox.get(timeout=1)
+    finally:
+        scheduler.stop()
+
+    assert first.type == "stream"
+    assert followup.type == "stream"
+    assert result.type == "result"
+    streamed = np.concatenate(
+        [
+            np.frombuffer(message.data["audio_waveform"], dtype=np.float32)
+            for message in (first, followup)
+        ]
+    )
+    expected = all_codes[:, 0].to(torch.float32).repeat_interleave(4).numpy()
+    np.testing.assert_array_equal(streamed, expected)
+    assert payload.request_id not in scheduler._stream_states
+
+
+def test_qwen3_tts_async_initial_batches_ready_requests() -> None:
+    tokenizer = _FakeQwen3TTSTokenizer()
+    scheduler = Qwen3TTSStreamingVocoderScheduler(
+        tokenizer,
+        device="cpu",
+        stream_stride=1,
+        initial_chunk_frames=1,
+        async_decode=True,
+        initial_batch_wait_ms=20,
+    )
+    payloads = [
+        make_payload(inputs="first", params={"stream": True}),
+        make_payload(inputs="second", params={"stream": True}),
+    ]
+    payloads[0].request_id = "req-first"
+    payloads[1].request_id = "req-second"
+
+    scheduler.on_serving_start()
+    try:
+        for payload in payloads:
+            scheduler._on_streaming_new_request(payload.request_id, payload)
+            scheduler._on_chunk(
+                payload.request_id,
+                _qwen3_tts_stream_item(
+                    torch.ones((1, 2), dtype=torch.long),
+                    chunk_id=0,
+                    ref_code_len=0,
+                ),
+            )
+
+        assert scheduler.outbox.get(timeout=1).type == "stream"
+        assert scheduler.outbox.get(timeout=1).type == "stream"
+    finally:
+        for payload in payloads:
+            scheduler.abort(payload.request_id)
+        scheduler.stop()
+
+    assert [
+        int(codes.shape[0]) for codes in tokenizer.model.decoder.decode_inputs
+    ] == [2]
+
+
+def test_qwen3_tts_async_initial_flushes_before_result() -> None:
+    tokenizer = _FakeQwen3TTSTokenizer()
+    scheduler = Qwen3TTSStreamingVocoderScheduler(
+        tokenizer,
+        device="cpu",
+        stream_stride=1,
+        initial_chunk_frames=1,
+        async_decode=True,
+    )
+    payload = make_payload(inputs="target", params={"stream": True})
+    payload.data = Qwen3TTSState(
+        audio_codes=torch.ones((1, 2), dtype=torch.long),
+        completion_tokens=1,
+    ).to_dict()
+
+    scheduler.on_serving_start()
+    try:
+        scheduler._on_streaming_new_request(payload.request_id, payload)
+        scheduler._on_chunk(
+            payload.request_id,
+            _qwen3_tts_stream_item(
+                torch.ones((1, 2), dtype=torch.long),
+                chunk_id=0,
+                ref_code_len=0,
+            ),
+        )
+        scheduler._on_done(payload.request_id)
+        stream = scheduler.outbox.get(timeout=1)
+        result = scheduler.outbox.get(timeout=1)
+    finally:
+        scheduler.stop()
+
+    assert stream.type == "stream"
+    assert result.type == "result"
+    assert payload.request_id not in scheduler._stream_states
+
+
+def test_qwen3_tts_async_followup_round_robins_backlog() -> None:
+    tokenizer = _FakeQwen3TTSTokenizer()
+    scheduler = Qwen3TTSStreamingVocoderScheduler(
+        tokenizer,
+        device="cpu",
+        stream_stride=1,
+        stream_followup_stride=2,
+        initial_chunk_frames=1,
+        stream_left_context_frames=2,
+        async_decode=True,
+    )
+    all_codes = torch.arange(1, 15, dtype=torch.long).reshape(7, 2)
+    payload = make_payload(inputs="target", params={"stream": True})
+    payload.data = Qwen3TTSState(
+        audio_codes=all_codes,
+        completion_tokens=7,
+    ).to_dict()
+
+    scheduler.on_serving_start()
+    try:
+        scheduler._on_streaming_new_request(payload.request_id, payload)
+        scheduler._on_chunk(
+            payload.request_id,
+            _qwen3_tts_stream_item(
+                all_codes[:1],
+                chunk_id=0,
+                ref_code_len=0,
+            ),
+        )
+        messages = [scheduler.outbox.get(timeout=1)]
+        scheduler._on_chunk(
+            payload.request_id,
+            _qwen3_tts_stream_item(all_codes[1:], chunk_id=1),
+        )
+        scheduler._on_done(payload.request_id)
+        messages.extend(scheduler.outbox.get(timeout=1) for _ in range(4))
+    finally:
+        scheduler.stop()
+
+    assert [message.type for message in messages] == [
+        "stream",
+        "stream",
+        "stream",
+        "stream",
+        "result",
+    ]
+    assert [
+        int(codes.shape[-1]) for codes in tokenizer.model.decoder.decode_inputs
+    ] == [1, 3, 4, 4]
+    streamed = np.concatenate(
+        [
+            np.frombuffer(message.data["audio_waveform"], dtype=np.float32)
+            for message in messages[:-1]
+        ]
+    )
+    expected = all_codes[:, 0].to(torch.float32).repeat_interleave(4).numpy()
+    np.testing.assert_array_equal(streamed, expected)
+
+
+def test_qwen3_tts_async_followup_batches_ready_requests() -> None:
+    tokenizer = _FakeQwen3TTSTokenizer()
+    scheduler = Qwen3TTSStreamingVocoderScheduler(
+        tokenizer,
+        device="cpu",
+        stream_stride=1,
+        stream_followup_stride=2,
+        initial_chunk_frames=1,
+        async_decode=True,
+        followup_batch_wait_ms=20,
+    )
+    payloads = [
+        make_payload(inputs="first", params={"stream": True}),
+        make_payload(inputs="second", params={"stream": True}),
+    ]
+    payloads[0].request_id = "req-first"
+    payloads[1].request_id = "req-second"
+
+    scheduler.on_serving_start()
+    try:
+        for payload in payloads:
+            scheduler._on_streaming_new_request(payload.request_id, payload)
+            scheduler._on_chunk(
+                payload.request_id,
+                _qwen3_tts_stream_item(
+                    torch.ones((1, 2), dtype=torch.long),
+                    chunk_id=0,
+                    ref_code_len=0,
+                ),
+            )
+            assert scheduler.outbox.get(timeout=1).type == "stream"
+
+        for payload in payloads:
+            scheduler._on_chunk(
+                payload.request_id,
+                _qwen3_tts_stream_item(
+                    torch.ones((2, 2), dtype=torch.long),
+                    chunk_id=1,
+                ),
+            )
+
+        assert scheduler.outbox.get(timeout=1).type == "stream"
+        assert scheduler.outbox.get(timeout=1).type == "stream"
+    finally:
+        for payload in payloads:
+            scheduler.abort(payload.request_id)
+        scheduler.stop()
+
+    batch_sizes = [
+        int(codes.shape[0]) for codes in tokenizer.model.decoder.decode_inputs
+    ]
+    assert batch_sizes == [1, 1, 2]
+
+
+def test_qwen3_tts_async_followup_drops_late_audio_after_abort() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingDecoder(_FakeQwen3TTSDecoder):
+        def chunked_decode(self, codes: torch.Tensor) -> torch.Tensor:
+            if self.decode_inputs:
+                entered.set()
+                assert release.wait(timeout=2)
+            return super().chunked_decode(codes)
+
+    tokenizer = _FakeQwen3TTSTokenizer()
+    tokenizer.model.decoder = BlockingDecoder()
+    scheduler = Qwen3TTSStreamingVocoderScheduler(
+        tokenizer,
+        device="cpu",
+        stream_stride=1,
+        stream_followup_stride=2,
+        initial_chunk_frames=1,
+        async_decode=True,
+    )
+    payload = make_payload(inputs="target", params={"stream": True})
+
+    scheduler.on_serving_start()
+    try:
+        scheduler._on_streaming_new_request(payload.request_id, payload)
+        scheduler._on_chunk(
+            payload.request_id,
+            _qwen3_tts_stream_item(
+                torch.ones((1, 2), dtype=torch.long),
+                chunk_id=0,
+                ref_code_len=0,
+            ),
+        )
+        scheduler.outbox.get(timeout=1)
+        scheduler._on_chunk(
+            payload.request_id,
+            _qwen3_tts_stream_item(
+                torch.ones((2, 2), dtype=torch.long),
+                chunk_id=1,
+            ),
+        )
+        assert entered.wait(timeout=1)
+        scheduler.abort(payload.request_id)
+        release.set()
+        with pytest.raises(Empty):
+            scheduler.outbox.get(timeout=0.1)
+    finally:
+        release.set()
+        scheduler.stop()
+
+    assert payload.request_id not in scheduler._stream_states
+
+
+def test_qwen3_tts_async_initial_drops_late_audio_after_abort() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingDecoder(_FakeQwen3TTSDecoder):
+        def chunked_decode(self, codes: torch.Tensor) -> torch.Tensor:
+            entered.set()
+            assert release.wait(timeout=2)
+            return super().chunked_decode(codes)
+
+    tokenizer = _FakeQwen3TTSTokenizer()
+    tokenizer.model.decoder = BlockingDecoder()
+    scheduler = Qwen3TTSStreamingVocoderScheduler(
+        tokenizer,
+        device="cpu",
+        stream_stride=1,
+        initial_chunk_frames=1,
+        async_decode=True,
+    )
+    payload = make_payload(inputs="target", params={"stream": True})
+
+    scheduler.on_serving_start()
+    try:
+        scheduler._on_streaming_new_request(payload.request_id, payload)
+        scheduler._on_chunk(
+            payload.request_id,
+            _qwen3_tts_stream_item(
+                torch.ones((1, 2), dtype=torch.long),
+                chunk_id=0,
+                ref_code_len=0,
+            ),
+        )
+        assert entered.wait(timeout=1)
+        scheduler.abort(payload.request_id)
+        release.set()
+        with pytest.raises(Empty):
+            scheduler.outbox.get(timeout=0.1)
+    finally:
+        release.set()
+        scheduler.stop()
+
     assert payload.request_id not in scheduler._stream_states
 
 

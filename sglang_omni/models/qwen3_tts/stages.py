@@ -166,6 +166,10 @@ def create_vocoder_executor(
     stream_followup_stride: int = DEFAULT_QWEN3_TTS_STREAM_FOLLOWUP_STRIDE,
     initial_chunk_frames: int = DEFAULT_QWEN3_TTS_INITIAL_CHUNK_FRAMES,
     stream_left_context_frames: int = DEFAULT_QWEN3_TTS_LEFT_CONTEXT_FRAMES,
+    initial_max_batch_size: int = 32,
+    initial_batch_wait_ms: int = 2,
+    followup_max_batch_size: int = 8,
+    followup_batch_wait_ms: int = 1,
 ) -> SimpleScheduler:
     if gpu_id is not None:
         device = f"cuda:{gpu_id}"
@@ -185,4 +189,8 @@ def create_vocoder_executor(
         stream_left_context_frames=stream_left_context_frames,
         max_batch_size=max_batch_size,
         max_batch_wait_ms=max_batch_wait_ms,
+        initial_max_batch_size=initial_max_batch_size,
+        initial_batch_wait_ms=initial_batch_wait_ms,
+        followup_max_batch_size=followup_max_batch_size,
+        followup_batch_wait_ms=followup_batch_wait_ms,
     )

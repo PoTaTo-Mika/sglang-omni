@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import queue
+import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
@@ -20,7 +23,7 @@ from sglang_omni.scheduling.streaming_vocoder import (
 from sglang_omni.utils.audio_payload import audio_waveform_payload
 
 DEFAULT_QWEN3_TTS_STREAM_STRIDE = 16
-DEFAULT_QWEN3_TTS_STREAM_FOLLOWUP_STRIDE = 64
+DEFAULT_QWEN3_TTS_STREAM_FOLLOWUP_STRIDE = 8
 DEFAULT_QWEN3_TTS_INITIAL_CHUNK_FRAMES = 1
 DEFAULT_QWEN3_TTS_LEFT_CONTEXT_FRAMES = 25
 _QWEN3_TTS_CODEBOOK_SIZE = 2048
@@ -37,6 +40,20 @@ class _Qwen3TTSStreamState:
     num_quantizers: int | None = None
     pending_ref_frames: int = 0
     initial_chunk_frames: int = DEFAULT_QWEN3_TTS_INITIAL_CHUNK_FRAMES
+    initial_pending: bool = False
+    followup_pending: bool = False
+    final_pending: bool = False
+
+
+@dataclass(frozen=True)
+class _Qwen3TTSDecodePlan:
+    decoder_input: torch.Tensor
+    absolute_emitted_frames: int
+    generated_frames: int
+    window_start: int
+
+
+_ASYNC_STOP = None
 
 
 class Qwen3TTSStreamingVocoderScheduler(
@@ -55,6 +72,11 @@ class Qwen3TTSStreamingVocoderScheduler(
         stream_left_context_frames: int = DEFAULT_QWEN3_TTS_LEFT_CONTEXT_FRAMES,
         max_batch_size: int = 8,
         max_batch_wait_ms: int = 2,
+        async_decode: bool | None = None,
+        initial_max_batch_size: int = 32,
+        initial_batch_wait_ms: int = 2,
+        followup_max_batch_size: int = 8,
+        followup_batch_wait_ms: int = 1,
     ) -> None:
         if stream_stride <= 0 or stream_followup_stride <= 0:
             raise ValueError("stream strides must be > 0")
@@ -62,20 +84,54 @@ class Qwen3TTSStreamingVocoderScheduler(
             raise ValueError("initial_chunk_frames must be >= 0")
         if stream_left_context_frames < 0:
             raise ValueError("stream_left_context_frames must be >= 0")
-
+        if initial_max_batch_size <= 0 or followup_max_batch_size <= 0:
+            raise ValueError("async batch sizes must be > 0")
+        if initial_batch_wait_ms < 0 or followup_batch_wait_ms < 0:
+            raise ValueError("async batch waits must be >= 0")
         self._tokenizer = tokenizer
         self._device = torch.device(device)
         self._decoder = tokenizer.model.decoder
         self._samples_per_frame = int(self._decoder.total_upsample)
         self._stream_stride = int(stream_stride)
         self._stream_followup_stride = int(stream_followup_stride)
+        self._initial_max_batch_size = int(initial_max_batch_size)
+        self._initial_batch_wait_s = float(initial_batch_wait_ms) / 1000.0
+        self._followup_max_batch_size = int(followup_max_batch_size)
+        self._followup_batch_wait_s = float(followup_batch_wait_ms) / 1000.0
         self._default_initial_chunk_frames = int(initial_chunk_frames)
         self._stream_left_context_frames = int(stream_left_context_frames)
-        self._decode_stream = (
-            torch.cuda.Stream(device=self._device, priority=-1)
-            if self._device.type == "cuda"
-            else None
+        self._async_decode = (
+            self._device.type == "cuda"
+            if async_decode is None
+            else bool(async_decode)
         )
+        if self._device.type == "cuda":
+            least_priority, greatest_priority = torch.cuda.Stream.priority_range()
+            followup_priority = min(least_priority, greatest_priority + 1)
+            self._decode_stream = torch.cuda.Stream(
+                device=self._device,
+                priority=greatest_priority,
+            )
+            self._followup_decode_stream = (
+                torch.cuda.Stream(
+                    device=self._device,
+                    priority=followup_priority,
+                )
+                if self._async_decode
+                else None
+            )
+        else:
+            self._decode_stream = None
+            self._followup_decode_stream = None
+        self._initial_queue: queue.Queue[
+            tuple[str, _Qwen3TTSStreamState] | None
+        ] = queue.Queue()
+        self._followup_queue: queue.Queue[
+            tuple[str, _Qwen3TTSStreamState] | None
+        ] = queue.Queue()
+        self._async_stop = threading.Event()
+        self._initial_worker: threading.Thread | None = None
+        self._followup_worker: threading.Thread | None = None
         sample_rate = int(tokenizer.get_output_sample_rate())
 
         super().__init__(
@@ -86,6 +142,55 @@ class Qwen3TTSStreamingVocoderScheduler(
             max_batch_size=max_batch_size,
             max_batch_wait_ms=max_batch_wait_ms,
         )
+
+    def start(self) -> None:
+        try:
+            super().start()
+        finally:
+            self._join_async_workers()
+
+    def stop(self) -> None:
+        self._signal_async_stop()
+        super().stop()
+        self._join_async_workers()
+
+    def on_serving_start(self) -> None:
+        if not self._async_decode:
+            return
+        self._initial_queue = queue.Queue()
+        self._followup_queue = queue.Queue()
+        self._async_stop.clear()
+        self._initial_worker = threading.Thread(
+            target=self._run_initial_worker,
+            name="qwen3-tts-vocoder-initial",
+            daemon=True,
+        )
+        self._followup_worker = threading.Thread(
+            target=self._run_followup_worker,
+            name="qwen3-tts-vocoder-followup",
+            daemon=True,
+        )
+        self._initial_worker.start()
+        self._followup_worker.start()
+
+    def on_serving_stop(self) -> None:
+        self._signal_async_stop()
+
+    def _signal_async_stop(self) -> None:
+        if self._async_stop.is_set():
+            return
+        self._async_stop.set()
+        if self._initial_worker is not None:
+            self._initial_queue.put(_ASYNC_STOP)
+        if self._followup_worker is not None:
+            self._followup_queue.put(_ASYNC_STOP)
+
+    def _join_async_workers(self) -> None:
+        for worker in (self._initial_worker, self._followup_worker):
+            if worker is not None and worker is not threading.current_thread():
+                worker.join()
+        self._initial_worker = None
+        self._followup_worker = None
 
     def create_stream_state(self, request_id: str) -> _Qwen3TTSStreamState:
         del request_id
@@ -217,54 +322,110 @@ class Qwen3TTSStreamingVocoderScheduler(
         is_final: bool,
     ) -> torch.Tensor | None:
         del request_id
-        generated_frames = state.total_frames - state.ref_frames
-        if generated_frames <= state.emitted_generated_frames:
+        plan = self._build_decode_plan(state, is_final=is_final)
+        if plan is None:
             return None
+        waveform = self._run_decode_plan(plan, stream=self._decode_stream)
+        return self._commit_decode_plan(state, plan, waveform)
 
+    def _build_decode_plan(
+        self,
+        state: _Qwen3TTSStreamState,
+        *,
+        is_final: bool,
+        max_generated_frames: int | None = None,
+    ) -> _Qwen3TTSDecodePlan | None:
+        available_generated_frames = state.total_frames - state.ref_frames
+        if available_generated_frames <= state.emitted_generated_frames:
+            return None
         next_frames = self._next_decode_threshold(state)
-        if not is_final and generated_frames < next_frames:
+        if not is_final and available_generated_frames < next_frames:
             state.next_decode_generated_frames = next_frames
             return None
 
+        generated_frames = available_generated_frames
+        if max_generated_frames is not None:
+            generated_frames = min(generated_frames, max_generated_frames)
+
         absolute_emitted = state.ref_frames + state.emitted_generated_frames
         window_start = max(0, absolute_emitted - self._stream_left_context_frames)
+        window_end = state.ref_frames + generated_frames
         codes = torch.cat(state.code_chunks, dim=0)
-        codes_window = codes[window_start : state.total_frames]
-        decoder_input = codes_window.transpose(0, 1).unsqueeze(0)
+        decoder_input = (
+            codes[window_start:window_end].transpose(0, 1).unsqueeze(0)
+        )
+        return _Qwen3TTSDecodePlan(
+            decoder_input=decoder_input,
+            absolute_emitted_frames=absolute_emitted,
+            generated_frames=generated_frames,
+            window_start=window_start,
+        )
+
+    def _run_decode_plan(
+        self,
+        plan: _Qwen3TTSDecodePlan,
+        *,
+        stream: torch.cuda.Stream | None,
+    ) -> torch.Tensor:
+        return self._run_decode_plans([plan], stream=stream)[0]
+
+    def _run_decode_plans(
+        self,
+        plans: list[_Qwen3TTSDecodePlan],
+        *,
+        stream: torch.cuda.Stream | None,
+    ) -> list[torch.Tensor]:
+        decoder_input = torch.cat([plan.decoder_input for plan in plans], dim=0)
         with torch.inference_mode():
-            if self._decode_stream is None:
+            if stream is None:
                 waveform = self._decoder.chunked_decode(decoder_input)
             else:
-                with torch.cuda.stream(self._decode_stream):
+                with torch.cuda.stream(stream):
                     waveform = self._decoder.chunked_decode(
                         decoder_input.to(self._device)
                     )
-                torch.cuda.current_stream(self._device).wait_stream(self._decode_stream)
+                stream.synchronize()
         if waveform.ndim == 3:
-            waveform = waveform[0, 0]
+            if waveform.shape[0] != len(plans):
+                raise RuntimeError(
+                    "Qwen3-TTS streaming decoder returned the wrong batch size"
+                )
+            return [waveform[index, 0] for index in range(len(plans))]
         elif waveform.ndim == 2:
-            waveform = waveform[0]
-        else:
-            raise ValueError(
-                "Qwen3-TTS decoder returned unexpected waveform shape "
-                f"{tuple(waveform.shape)}"
-            )
+            if len(plans) != 1:
+                raise RuntimeError(
+                    "Qwen3-TTS streaming decoder dropped the batch dimension"
+                )
+            return [waveform[0]]
+        raise ValueError(
+            "Qwen3-TTS decoder returned unexpected waveform shape "
+            f"{tuple(waveform.shape)}"
+        )
 
-        trim_frames = absolute_emitted - window_start
+    def _commit_decode_plan(
+        self,
+        state: _Qwen3TTSStreamState,
+        plan: _Qwen3TTSDecodePlan,
+        waveform: torch.Tensor,
+    ) -> torch.Tensor:
+        expected_emitted = plan.absolute_emitted_frames - state.ref_frames
+        if state.emitted_generated_frames != expected_emitted:
+            raise RuntimeError("Qwen3-TTS streaming decode plan committed out of order")
+        trim_frames = plan.absolute_emitted_frames - plan.window_start
         trim_samples = min(
             trim_frames * self._samples_per_frame,
             int(waveform.shape[-1]),
         )
-        new_frames = generated_frames - state.emitted_generated_frames
+        new_frames = plan.generated_frames - state.emitted_generated_frames
         emit_samples = new_frames * self._samples_per_frame
         delta = waveform[trim_samples : trim_samples + emit_samples]
         if delta.numel() == 0:
-            return None
+            raise RuntimeError("Qwen3-TTS streaming decoder returned an empty delta")
 
-        state.emitted_generated_frames = generated_frames
+        state.emitted_generated_frames = plan.generated_frames
         state.decoded_chunks += 1
         state.next_decode_generated_frames = (
-            generated_frames + self._stream_followup_stride
+            plan.generated_frames + self._stream_followup_stride
         )
         return delta.detach().to(torch.float32).contiguous()
 
@@ -274,6 +435,12 @@ class Qwen3TTSStreamingVocoderScheduler(
         state: _Qwen3TTSStreamState,
     ) -> list[OutgoingMessage]:
         if not self.should_decode(state, is_final=False):
+            return []
+        if self._async_decode:
+            if state.decoded_chunks:
+                self._schedule_followup(request_id, state)
+            else:
+                self._schedule_initial(request_id, state)
             return []
         waveform = self.decode_delta(request_id, state, is_final=False)
         if waveform is None:
@@ -291,6 +458,293 @@ class Qwen3TTSStreamingVocoderScheduler(
                 self._stream_chunk_message(request_id, waveform[split_samples:]),
             ]
         return [self._stream_chunk_message(request_id, waveform)]
+
+    def _schedule_initial(
+        self,
+        request_id: str,
+        state: _Qwen3TTSStreamState,
+    ) -> None:
+        if state.initial_pending:
+            return
+        if self._initial_worker is None:
+            raise RuntimeError("Qwen3-TTS initial decoder is not running")
+        state.initial_pending = True
+        self._initial_queue.put((request_id, state))
+
+    def _schedule_followup(
+        self,
+        request_id: str,
+        state: _Qwen3TTSStreamState,
+    ) -> None:
+        if state.followup_pending:
+            return
+        if self._followup_worker is None:
+            raise RuntimeError("Qwen3-TTS follow-up decoder is not running")
+        state.followup_pending = True
+        self._followup_queue.put((request_id, state))
+
+    def _collect_async_batch(
+        self,
+        work_queue: queue.Queue[tuple[str, _Qwen3TTSStreamState] | None],
+        *,
+        max_batch_size: int,
+        batch_wait_s: float,
+    ) -> list[tuple[str, _Qwen3TTSStreamState]] | None:
+        queued = work_queue.get()
+        if queued is None or self._async_stop.is_set():
+            return None
+        batch = [queued]
+        deadline = time.monotonic() + batch_wait_s
+        while len(batch) < max_batch_size:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                next_queued = work_queue.get(timeout=remaining)
+            except queue.Empty:
+                break
+            if next_queued is None:
+                return None
+            batch.append(next_queued)
+        return batch
+
+    def _run_initial_worker(self) -> None:
+        while True:
+            batch = self._collect_async_batch(
+                self._initial_queue,
+                max_batch_size=self._initial_max_batch_size,
+                batch_wait_s=self._initial_batch_wait_s,
+            )
+            if batch is None:
+                return
+            self._run_initial_batch(batch)
+
+    def _run_initial_batch(
+        self,
+        batch: list[tuple[str, _Qwen3TTSStreamState]],
+    ) -> None:
+        planned: list[
+            tuple[str, _Qwen3TTSStreamState, _Qwen3TTSDecodePlan]
+        ] = []
+        with self._state_lock:
+            for request_id, state in batch:
+                if (
+                    self._stream_states.get(request_id) is not state
+                    or state.decoded_chunks
+                ):
+                    continue
+                plan = self._build_decode_plan(
+                    state,
+                    is_final=state.final_pending,
+                    max_generated_frames=(
+                        state.initial_chunk_frames or self._stream_stride
+                    ),
+                )
+                if plan is None:
+                    state.initial_pending = False
+                    continue
+                planned.append((request_id, state, plan))
+
+        for group in self._group_decode_plans(planned):
+            try:
+                waveforms = self._run_decode_plans(
+                    [entry[2] for entry in group],
+                    stream=self._decode_stream,
+                )
+            except BaseException as exc:
+                for request_id, state, _ in group:
+                    self._fail_async_stream(request_id, state, exc)
+                continue
+            for entry, waveform in zip(group, waveforms):
+                request_id, state, plan = entry
+                self._commit_initial(request_id, state, plan, waveform)
+
+    @staticmethod
+    def _group_decode_plans(
+        planned: list[
+            tuple[str, _Qwen3TTSStreamState, _Qwen3TTSDecodePlan]
+        ],
+    ) -> list[list[tuple[str, _Qwen3TTSStreamState, _Qwen3TTSDecodePlan]]]:
+        groups: dict[
+            tuple[int, ...],
+            list[tuple[str, _Qwen3TTSStreamState, _Qwen3TTSDecodePlan]],
+        ] = {}
+        for entry in planned:
+            groups.setdefault(tuple(entry[2].decoder_input.shape), []).append(entry)
+        return list(groups.values())
+
+    def _commit_initial(
+        self,
+        request_id: str,
+        state: _Qwen3TTSStreamState,
+        plan: _Qwen3TTSDecodePlan,
+        waveform: torch.Tensor,
+    ) -> None:
+        cleanup_abort = False
+        with self._state_lock:
+            if self._stream_states.get(request_id) is not state:
+                return
+            try:
+                delta = self._commit_decode_plan(state, plan, waveform)
+            except BaseException as exc:
+                self._emit_error(request_id, exc)
+                self._abort_state(request_id)
+                cleanup_abort = True
+            else:
+                state.initial_pending = False
+                if not self._is_aborted(request_id):
+                    self._mark_stream_emitted(request_id)
+                    self.outbox.put(self._stream_chunk_message(request_id, delta))
+                has_remainder = (
+                    state.total_frames - state.ref_frames
+                    > state.emitted_generated_frames
+                )
+                if state.final_pending and not has_remainder:
+                    self._finish_async_stream(request_id, state)
+                elif state.final_pending or self.should_decode(state, is_final=False):
+                    self._schedule_followup(request_id, state)
+        if cleanup_abort:
+            self._cleanup_aborted_request(request_id)
+
+    def _run_followup_worker(self) -> None:
+        while True:
+            batch = self._collect_async_batch(
+                self._followup_queue,
+                max_batch_size=self._followup_max_batch_size,
+                batch_wait_s=self._followup_batch_wait_s,
+            )
+            if batch is None:
+                return
+            self._run_followup_batch(batch)
+
+    def _run_followup_batch(
+        self,
+        batch: list[tuple[str, _Qwen3TTSStreamState]],
+    ) -> None:
+        planned: list[
+            tuple[str, _Qwen3TTSStreamState, _Qwen3TTSDecodePlan]
+        ] = []
+        with self._state_lock:
+            for request_id, state in batch:
+                if self._stream_states.get(request_id) is not state:
+                    continue
+                plan = self._build_decode_plan(
+                    state,
+                    is_final=state.final_pending,
+                    max_generated_frames=(
+                        state.emitted_generated_frames
+                        + self._stream_followup_stride
+                    ),
+                )
+                if plan is None:
+                    state.followup_pending = False
+                    if state.final_pending:
+                        self._finish_async_stream(request_id, state)
+                    continue
+                planned.append((request_id, state, plan))
+
+        for group in self._group_decode_plans(planned):
+            try:
+                waveforms = self._run_decode_plans(
+                    [entry[2] for entry in group],
+                    stream=self._followup_decode_stream,
+                )
+            except BaseException as exc:
+                for request_id, state, _ in group:
+                    self._fail_async_stream(request_id, state, exc)
+                continue
+            for entry, waveform in zip(group, waveforms):
+                request_id, state, plan = entry
+                self._commit_followup(request_id, state, plan, waveform)
+
+    def _commit_followup(
+        self,
+        request_id: str,
+        state: _Qwen3TTSStreamState,
+        plan: _Qwen3TTSDecodePlan,
+        waveform: torch.Tensor,
+    ) -> None:
+        cleanup_abort = False
+        with self._state_lock:
+            if self._stream_states.get(request_id) is not state:
+                return
+            try:
+                delta = self._commit_decode_plan(state, plan, waveform)
+            except BaseException as exc:
+                self._emit_error(request_id, exc)
+                self._abort_state(request_id)
+                cleanup_abort = True
+            else:
+                if not self._is_aborted(request_id):
+                    self._mark_stream_emitted(request_id)
+                    self.outbox.put(self._stream_chunk_message(request_id, delta))
+                has_remainder = (
+                    state.total_frames - state.ref_frames
+                    > state.emitted_generated_frames
+                )
+                if state.final_pending and not has_remainder:
+                    state.followup_pending = False
+                    self._finish_async_stream(request_id, state)
+                elif state.final_pending or self.should_decode(state, is_final=False):
+                    self._followup_queue.put((request_id, state))
+                else:
+                    state.followup_pending = False
+        if cleanup_abort:
+            self._cleanup_aborted_request(request_id)
+
+    def _fail_async_stream(
+        self,
+        request_id: str,
+        state: _Qwen3TTSStreamState,
+        exc: BaseException,
+    ) -> None:
+        cleanup_abort = False
+        with self._state_lock:
+            if self._stream_states.get(request_id) is state:
+                self._emit_error(request_id, exc)
+                self._abort_state(request_id)
+                cleanup_abort = True
+        if cleanup_abort:
+            self._cleanup_aborted_request(request_id)
+
+    def _handle_stream_done(self, request_id: str) -> None:
+        with self._state_lock:
+            if request_id not in self._stream_payloads:
+                if request_id in self._completed_non_streaming_request_ids:
+                    return
+                self._pending_done.add(request_id)
+                return
+            state = self._get_or_create_stream_state(request_id)
+            if self._async_decode and state is not None and (
+                state.initial_pending or state.decoded_chunks
+            ):
+                state.final_pending = True
+                if not state.initial_pending:
+                    self._schedule_followup(request_id, state)
+                return
+        super()._handle_stream_done(request_id)
+
+    def _finish_async_stream(
+        self,
+        request_id: str,
+        state: _Qwen3TTSStreamState,
+    ) -> None:
+        payload = self._stream_payloads.get(request_id)
+        if payload is None or self._is_aborted(request_id):
+            return
+        self.outbox.put(
+            OutgoingMessage(
+                request_id=request_id,
+                type="result",
+                data=StagePayload(
+                    request_id=payload.request_id,
+                    request=payload.request,
+                    data=self.final_result_data(request_id, payload, state),
+                ),
+            )
+        )
+        self._record_completed_stream_request_id(request_id)
+        self._clear_request_state(request_id)
 
     def fallback_full_decode(
         self,
