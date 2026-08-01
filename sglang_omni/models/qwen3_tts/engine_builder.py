@@ -41,7 +41,7 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder):
         dtype: str,
     ) -> dict[str, Any]:
         return {
-            "max_running_requests": 16,
+            "max_running_requests": 32,
             "cuda_graph_max_bs": 32,
             "torch_compile_max_bs": 32,
             "dtype": dtype,

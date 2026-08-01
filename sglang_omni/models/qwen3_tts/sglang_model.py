@@ -1135,8 +1135,7 @@ class Qwen3TTSTalker(nn.Module):
 
         raw_batch_sizes = get_decode_cuda_graph_bs(server_args)
         if raw_batch_sizes is None:
-            # Note: (Jiaxin Deng) mirrors the backbone's default capture list
-            # ([1, 2, 4, 8, 12, 16] at max_running_requests=16).
+            # note (luojiaxuan): mirror the backbone's default capture buckets.
             raw_batch_sizes = (1, 2, 4, *range(8, int(max_batch_size) + 1, 4))
         normalized = sorted(
             {
