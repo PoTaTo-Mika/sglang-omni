@@ -1007,6 +1007,7 @@ def test_qwen3_tts_vocoder_batches_decode_requests(
     assert scheduler.create_stream_state("request").initial_chunk_frames == 1
     assert scheduler._stream_left_context_frames == 25
     assert scheduler._stream_followup_stride == 8
+    assert scheduler._stream_initial_followup_stride == 4
     assert scheduler._initial_max_batch_size == 32
     assert scheduler._initial_batch_wait_s == pytest.approx(0.002)
     assert scheduler._followup_max_batch_size == 8
@@ -1131,6 +1132,33 @@ def test_qwen3_tts_streaming_vocoder_decodes_initial_chunk_early() -> None:
         _qwen3_tts_stream_item(torch.ones((1, 2), dtype=torch.long), chunk_id=2),
     )
     assert scheduler.outbox.qsize() == 1
+    assert len(scheduler._decoder.decode_inputs) == 2
+
+
+def test_qwen3_tts_streaming_vocoder_bridges_to_steady_stride() -> None:
+    scheduler = Qwen3TTSStreamingVocoderScheduler(
+        _FakeQwen3TTSTokenizer(),
+        device="cpu",
+    )
+    payload = make_payload(inputs="target", params={"stream": True})
+    scheduler._on_streaming_new_request(payload.request_id, payload)
+
+    scheduler._on_chunk(
+        payload.request_id,
+        _qwen3_tts_stream_item(
+            torch.ones((1, 2), dtype=torch.long),
+            chunk_id=0,
+            ref_code_len=0,
+        ),
+    )
+    state = scheduler._stream_states[payload.request_id]
+    assert state.next_decode_generated_frames == 5
+
+    scheduler._on_chunk(
+        payload.request_id,
+        _qwen3_tts_stream_item(torch.ones((4, 2), dtype=torch.long), chunk_id=1),
+    )
+    assert state.next_decode_generated_frames == 13
     assert len(scheduler._decoder.decode_inputs) == 2
 
 
@@ -1507,6 +1535,86 @@ def test_qwen3_tts_async_followup_batches_ready_requests() -> None:
         int(codes.shape[0]) for codes in tokenizer.model.decoder.decode_inputs
     ]
     assert batch_sizes == [1, 1, 2]
+
+
+def test_qwen3_tts_followup_queue_prioritizes_playback_deadline() -> None:
+    scheduler = Qwen3TTSStreamingVocoderScheduler(
+        _FakeQwen3TTSTokenizer(),
+        device="cpu",
+        async_decode=True,
+        followup_batch_wait_ms=0,
+    )
+    later = scheduler.create_stream_state("later")
+    later.playback_deadline_s = 20.0
+    earlier = scheduler.create_stream_state("earlier")
+    earlier.playback_deadline_s = 10.0
+    scheduler._enqueue_followup("later", later)
+    scheduler._enqueue_followup("earlier", earlier)
+
+    assert scheduler._collect_followup_batch() == [("earlier", earlier)]
+
+
+@pytest.mark.parametrize("worker", ["initial", "followup"])
+def test_qwen3_tts_async_worker_propagates_process_exit(
+    monkeypatch: pytest.MonkeyPatch,
+    worker: str,
+) -> None:
+    scheduler = Qwen3TTSStreamingVocoderScheduler(
+        _FakeQwen3TTSTokenizer(),
+        device="cpu",
+        stream_stride=1,
+        stream_followup_stride=1,
+    )
+    state = scheduler.create_stream_state("request")
+    state.num_quantizers = 2
+    state.code_chunks.append(torch.ones((1, 2), dtype=torch.long))
+    state.total_frames = 1
+    if worker == "followup":
+        state.decoded_chunks = 1
+    scheduler._stream_states["request"] = state
+
+    def interrupt(*args, **kwargs):
+        del args, kwargs
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(scheduler, "_run_decode_plans", interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        if worker == "initial":
+            scheduler._run_initial_batch([("request", state)])
+        else:
+            scheduler._run_followup_batch([("request", state)])
+
+
+@pytest.mark.parametrize("commit", ["initial", "followup"])
+def test_qwen3_tts_async_commit_propagates_process_exit(
+    monkeypatch: pytest.MonkeyPatch,
+    commit: str,
+) -> None:
+    scheduler = Qwen3TTSStreamingVocoderScheduler(
+        _FakeQwen3TTSTokenizer(),
+        device="cpu",
+        stream_stride=1,
+    )
+    state = scheduler.create_stream_state("request")
+    state.num_quantizers = 2
+    state.code_chunks.append(torch.ones((1, 2), dtype=torch.long))
+    state.total_frames = 1
+    scheduler._stream_states["request"] = state
+    plan = scheduler._build_decode_plan(state, is_final=False)
+    assert plan is not None
+
+    def interrupt(*args, **kwargs):
+        del args, kwargs
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(scheduler, "_commit_decode_plan", interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        if commit == "initial":
+            scheduler._commit_initial("request", state, plan, torch.ones(4))
+        else:
+            scheduler._commit_followup("request", state, plan, torch.ones(4))
 
 
 def test_qwen3_tts_async_followup_drops_late_audio_after_abort() -> None:

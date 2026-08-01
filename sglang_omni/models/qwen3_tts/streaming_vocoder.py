@@ -7,6 +7,7 @@ import queue
 import threading
 import time
 from dataclasses import dataclass, field
+from itertools import count
 from typing import Any, Mapping
 
 import torch
@@ -24,6 +25,7 @@ from sglang_omni.utils.audio_payload import audio_waveform_payload
 
 DEFAULT_QWEN3_TTS_STREAM_STRIDE = 16
 DEFAULT_QWEN3_TTS_STREAM_FOLLOWUP_STRIDE = 8
+DEFAULT_QWEN3_TTS_STREAM_INITIAL_FOLLOWUP_STRIDE = 4
 DEFAULT_QWEN3_TTS_INITIAL_CHUNK_FRAMES = 1
 DEFAULT_QWEN3_TTS_LEFT_CONTEXT_FRAMES = 25
 _QWEN3_TTS_CODEBOOK_SIZE = 2048
@@ -43,6 +45,7 @@ class _Qwen3TTSStreamState:
     initial_pending: bool = False
     followup_pending: bool = False
     final_pending: bool = False
+    playback_deadline_s: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -68,6 +71,7 @@ class Qwen3TTSStreamingVocoderScheduler(
         device: str,
         stream_stride: int = DEFAULT_QWEN3_TTS_STREAM_STRIDE,
         stream_followup_stride: int = DEFAULT_QWEN3_TTS_STREAM_FOLLOWUP_STRIDE,
+        stream_initial_followup_stride: int | None = None,
         initial_chunk_frames: int = DEFAULT_QWEN3_TTS_INITIAL_CHUNK_FRAMES,
         stream_left_context_frames: int = DEFAULT_QWEN3_TTS_LEFT_CONTEXT_FRAMES,
         max_batch_size: int = 8,
@@ -80,6 +84,11 @@ class Qwen3TTSStreamingVocoderScheduler(
     ) -> None:
         if stream_stride <= 0 or stream_followup_stride <= 0:
             raise ValueError("stream strides must be > 0")
+        if (
+            stream_initial_followup_stride is not None
+            and stream_initial_followup_stride <= 0
+        ):
+            raise ValueError("stream_initial_followup_stride must be > 0")
         if initial_chunk_frames < 0:
             raise ValueError("initial_chunk_frames must be >= 0")
         if stream_left_context_frames < 0:
@@ -94,6 +103,14 @@ class Qwen3TTSStreamingVocoderScheduler(
         self._samples_per_frame = int(self._decoder.total_upsample)
         self._stream_stride = int(stream_stride)
         self._stream_followup_stride = int(stream_followup_stride)
+        self._stream_initial_followup_stride = int(
+            min(
+                DEFAULT_QWEN3_TTS_STREAM_INITIAL_FOLLOWUP_STRIDE,
+                self._stream_followup_stride,
+            )
+            if stream_initial_followup_stride is None
+            else stream_initial_followup_stride
+        )
         self._initial_max_batch_size = int(initial_max_batch_size)
         self._initial_batch_wait_s = float(initial_batch_wait_ms) / 1000.0
         self._followup_max_batch_size = int(followup_max_batch_size)
@@ -124,9 +141,10 @@ class Qwen3TTSStreamingVocoderScheduler(
         self._initial_queue: queue.Queue[tuple[str, _Qwen3TTSStreamState] | None] = (
             queue.Queue()
         )
-        self._followup_queue: queue.Queue[tuple[str, _Qwen3TTSStreamState] | None] = (
-            queue.Queue()
-        )
+        self._followup_queue: queue.PriorityQueue[
+            tuple[float, int, str, _Qwen3TTSStreamState | None]
+        ] = queue.PriorityQueue()
+        self._followup_sequence = count()
         self._async_stop = threading.Event()
         self._initial_worker: threading.Thread | None = None
         self._followup_worker: threading.Thread | None = None
@@ -156,7 +174,8 @@ class Qwen3TTSStreamingVocoderScheduler(
         if not self._async_decode:
             return
         self._initial_queue = queue.Queue()
-        self._followup_queue = queue.Queue()
+        self._followup_queue = queue.PriorityQueue()
+        self._followup_sequence = count()
         self._async_stop.clear()
         self._initial_worker = threading.Thread(
             target=self._run_initial_worker,
@@ -181,7 +200,9 @@ class Qwen3TTSStreamingVocoderScheduler(
         if self._initial_worker is not None:
             self._initial_queue.put(_ASYNC_STOP)
         if self._followup_worker is not None:
-            self._followup_queue.put(_ASYNC_STOP)
+            self._followup_queue.put(
+                (float("inf"), next(self._followup_sequence), "", _ASYNC_STOP)
+            )
 
     def _join_async_workers(self) -> None:
         for worker in (self._initial_worker, self._followup_worker):
@@ -420,10 +441,17 @@ class Qwen3TTSStreamingVocoderScheduler(
 
         state.emitted_generated_frames = plan.generated_frames
         state.decoded_chunks += 1
-        state.next_decode_generated_frames = (
-            plan.generated_frames + self._stream_followup_stride
+        followup_stride = (
+            self._stream_initial_followup_stride
+            if state.decoded_chunks == 1
+            else self._stream_followup_stride
         )
-        return delta.detach().to(torch.float32).contiguous()
+        state.next_decode_generated_frames = plan.generated_frames + followup_stride
+        delta = delta.detach().to(torch.float32).contiguous()
+        now = time.monotonic()
+        duration_s = float(delta.numel()) / float(self._sample_rate)
+        state.playback_deadline_s = max(state.playback_deadline_s, now) + duration_s
+        return delta
 
     def _decode_and_emit(
         self,
@@ -477,7 +505,21 @@ class Qwen3TTSStreamingVocoderScheduler(
         if self._followup_worker is None:
             raise RuntimeError("Qwen3-TTS follow-up decoder is not running")
         state.followup_pending = True
-        self._followup_queue.put((request_id, state))
+        self._enqueue_followup(request_id, state)
+
+    def _enqueue_followup(
+        self,
+        request_id: str,
+        state: _Qwen3TTSStreamState,
+    ) -> None:
+        self._followup_queue.put(
+            (
+                state.playback_deadline_s,
+                next(self._followup_sequence),
+                request_id,
+                state,
+            )
+        )
 
     def _collect_async_batch(
         self,
@@ -545,7 +587,7 @@ class Qwen3TTSStreamingVocoderScheduler(
                     [entry[2] for entry in group],
                     stream=self._decode_stream,
                 )
-            except BaseException as exc:
+            except Exception as exc:
                 for request_id, state, _ in group:
                     self._fail_async_stream(request_id, state, exc)
                 continue
@@ -578,7 +620,7 @@ class Qwen3TTSStreamingVocoderScheduler(
                 return
             try:
                 delta = self._commit_decode_plan(state, plan, waveform)
-            except BaseException as exc:
+            except Exception as exc:
                 self._emit_error(request_id, exc)
                 self._abort_state(request_id)
                 cleanup_abort = True
@@ -600,14 +642,31 @@ class Qwen3TTSStreamingVocoderScheduler(
 
     def _run_followup_worker(self) -> None:
         while True:
-            batch = self._collect_async_batch(
-                self._followup_queue,
-                max_batch_size=self._followup_max_batch_size,
-                batch_wait_s=self._followup_batch_wait_s,
-            )
+            batch = self._collect_followup_batch()
             if batch is None:
                 return
             self._run_followup_batch(batch)
+
+    def _collect_followup_batch(
+        self,
+    ) -> list[tuple[str, _Qwen3TTSStreamState]] | None:
+        _, _, request_id, state = self._followup_queue.get()
+        if state is None or self._async_stop.is_set():
+            return None
+        batch = [(request_id, state)]
+        deadline = time.monotonic() + self._followup_batch_wait_s
+        while len(batch) < self._followup_max_batch_size:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                _, _, request_id, state = self._followup_queue.get(timeout=remaining)
+            except queue.Empty:
+                break
+            if state is None:
+                return None
+            batch.append((request_id, state))
+        return batch
 
     def _run_followup_batch(
         self,
@@ -621,9 +680,7 @@ class Qwen3TTSStreamingVocoderScheduler(
                 plan = self._build_decode_plan(
                     state,
                     is_final=state.final_pending,
-                    max_generated_frames=(
-                        state.emitted_generated_frames + self._stream_followup_stride
-                    ),
+                    max_generated_frames=self._next_decode_threshold(state),
                 )
                 if plan is None:
                     state.followup_pending = False
@@ -638,7 +695,7 @@ class Qwen3TTSStreamingVocoderScheduler(
                     [entry[2] for entry in group],
                     stream=self._followup_decode_stream,
                 )
-            except BaseException as exc:
+            except Exception as exc:
                 for request_id, state, _ in group:
                     self._fail_async_stream(request_id, state, exc)
                 continue
@@ -659,7 +716,7 @@ class Qwen3TTSStreamingVocoderScheduler(
                 return
             try:
                 delta = self._commit_decode_plan(state, plan, waveform)
-            except BaseException as exc:
+            except Exception as exc:
                 self._emit_error(request_id, exc)
                 self._abort_state(request_id)
                 cleanup_abort = True
@@ -675,7 +732,7 @@ class Qwen3TTSStreamingVocoderScheduler(
                     state.followup_pending = False
                     self._finish_async_stream(request_id, state)
                 elif state.final_pending or self.should_decode(state, is_final=False):
-                    self._followup_queue.put((request_id, state))
+                    self._enqueue_followup(request_id, state)
                 else:
                     state.followup_pending = False
         if cleanup_abort:
