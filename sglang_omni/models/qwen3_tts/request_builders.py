@@ -632,6 +632,29 @@ class _Qwen3TTSAdhocReferenceHook(
         )
         return voice_clone_prompt, prompt_items[0].ref_text
 
+    def encode_batch(
+        self,
+        items: list[_Qwen3TTSAdhocReferenceInput],
+    ) -> list[tuple[dict[str, Any], str | None]]:
+        with torch.no_grad():
+            prompt_items = self._wrapper.create_voice_clone_prompt(
+                ref_audio=[item.ref_audio for item in items],
+                ref_text=[item.ref_text for item in items],
+                x_vector_only_mode=[item.x_vector_only_mode for item in items],
+            )
+        if len(prompt_items) != len(items):
+            raise ValueError(
+                "Qwen3-TTS voice-clone batch returned "
+                f"{len(prompt_items)} prompts for {len(items)} inputs"
+            )
+        return [
+            (
+                self._wrapper._prompt_items_to_voice_clone_prompt([prompt_item]),
+                prompt_item.ref_text,
+            )
+            for prompt_item in prompt_items
+        ]
+
     def store_artifact(self, artifact: tuple[dict[str, Any], str | None]) -> dict:
         voice_clone_prompt, ref_text = artifact
         return _cacheable_qwen3_tts_voice_prompt(
@@ -757,41 +780,49 @@ def _prepare_qwen3_tts_base_request(
     state: Qwen3TTSState,
     model: Any,
     wrapper: Any,
+    reference_artifact: tuple[dict[str, Any], str | None] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    speaker_cache = get_speaker_artifact_cache()
-    cache_key = _qwen3_tts_uploaded_voice_cache_key(state)
-    cached_artifact = speaker_cache.get(cache_key) if cache_key is not None else None
-    cached_prompt = (
-        _qwen3_tts_voice_prompt_from_cache(cached_artifact)
-        if isinstance(cached_artifact, dict)
-        else None
-    )
-    if cached_prompt is not None:
-        voice_clone_prompt, ref_text = cached_prompt
-    elif cache_key is None:
-        reference_service = _get_qwen3_tts_adhoc_reference_service(model, wrapper)
-        voice_clone_prompt, ref_text = reference_service.get_or_encode(
-            state,
-            desc="Qwen3-TTS ad-hoc reference",
-        )
+    if reference_artifact is not None:
+        voice_clone_prompt, ref_text = reference_artifact
     else:
-        with torch.no_grad():
-            prompt_items = wrapper.create_voice_clone_prompt(
-                ref_audio=state.ref_audio,
-                ref_text=state.ref_text,
-                x_vector_only_mode=state.x_vector_only_mode,
-            )
-        if len(prompt_items) != 1:
-            raise ValueError("Qwen3-TTS expects exactly one voice-clone prompt")
-        voice_clone_prompt = wrapper._prompt_items_to_voice_clone_prompt(prompt_items)
-        ref_text = prompt_items[0].ref_text
-        speaker_cache.put(
-            cache_key,
-            _cacheable_qwen3_tts_voice_prompt(
-                voice_clone_prompt,
-                ref_text=ref_text,
-            ),
+        speaker_cache = get_speaker_artifact_cache()
+        cache_key = _qwen3_tts_uploaded_voice_cache_key(state)
+        cached_artifact = (
+            speaker_cache.get(cache_key) if cache_key is not None else None
         )
+        cached_prompt = (
+            _qwen3_tts_voice_prompt_from_cache(cached_artifact)
+            if isinstance(cached_artifact, dict)
+            else None
+        )
+        if cached_prompt is not None:
+            voice_clone_prompt, ref_text = cached_prompt
+        elif cache_key is None:
+            reference_service = _get_qwen3_tts_adhoc_reference_service(model, wrapper)
+            voice_clone_prompt, ref_text = reference_service.get_or_encode(
+                state,
+                desc="Qwen3-TTS ad-hoc reference",
+            )
+        else:
+            with torch.no_grad():
+                prompt_items = wrapper.create_voice_clone_prompt(
+                    ref_audio=state.ref_audio,
+                    ref_text=state.ref_text,
+                    x_vector_only_mode=state.x_vector_only_mode,
+                )
+            if len(prompt_items) != 1:
+                raise ValueError("Qwen3-TTS expects exactly one voice-clone prompt")
+            voice_clone_prompt = wrapper._prompt_items_to_voice_clone_prompt(
+                prompt_items
+            )
+            ref_text = prompt_items[0].ref_text
+            speaker_cache.put(
+                cache_key,
+                _cacheable_qwen3_tts_voice_prompt(
+                    voice_clone_prompt,
+                    ref_text=ref_text,
+                ),
+            )
 
     input_id = wrapper._tokenize_texts([wrapper._build_assistant_text(state.text)])[0]
     ref_id = (
@@ -851,8 +882,10 @@ def _prepare_qwen3_tts_request(
     *,
     model: Any,
     wrapper: Any,
+    state: Qwen3TTSState | None = None,
+    reference_artifact: tuple[dict[str, Any], str | None] | None = None,
 ) -> Qwen3TTSPreparedRequest:
-    state = build_qwen3_tts_state(payload)
+    state = build_qwen3_tts_state(payload) if state is None else state
 
     _validate_qwen3_tts_model_task(model, state)
     gen_kwargs = wrapper._merge_generate_kwargs(**state.generation_kwargs)
@@ -866,6 +899,7 @@ def _prepare_qwen3_tts_request(
             state=state,
             model=model,
             wrapper=wrapper,
+            reference_artifact=reference_artifact,
         )
     elif state.task_type == QWEN3_TTS_TASK_CUSTOM_VOICE:
         (
@@ -927,6 +961,56 @@ def _prepare_qwen3_tts_request(
     )
 
 
+def _prepare_qwen3_tts_requests(
+    payloads: list[StagePayload],
+    *,
+    model: Any,
+    wrapper: Any,
+) -> list[Qwen3TTSPreparedRequest]:
+    states = [build_qwen3_tts_state(payload) for payload in payloads]
+    for state in states:
+        _validate_qwen3_tts_model_task(model, state)
+
+    batched_indices = [
+        index
+        for index, state in enumerate(states)
+        if state.task_type == QWEN3_TTS_TASK_BASE
+        and _qwen3_tts_uploaded_voice_cache_key(state) is None
+    ]
+    reference_artifacts: dict[int, tuple[dict[str, Any], str | None]] = {}
+    if batched_indices:
+        reference_service = _get_qwen3_tts_adhoc_reference_service(model, wrapper)
+        artifacts = reference_service.get_or_encode_batch(
+            [states[index] for index in batched_indices],
+            descs=["Qwen3-TTS ad-hoc reference"] * len(batched_indices),
+        )
+        reference_artifacts.update(zip(batched_indices, artifacts, strict=True))
+
+    return [
+        _prepare_qwen3_tts_request(
+            payload,
+            model=model,
+            wrapper=wrapper,
+            state=state,
+            reference_artifact=reference_artifacts.get(index),
+        )
+        for index, (payload, state) in enumerate(zip(payloads, states, strict=True))
+    ]
+
+
+def _prepared_qwen3_tts_payload(
+    payload: StagePayload,
+    prepared: Qwen3TTSPreparedRequest,
+) -> StagePayload:
+    data = prepared.state.to_dict()
+    data[_QWEN3_TTS_PREPARED_MARKER] = payload.request_id
+    return StagePayload(
+        request_id=payload.request_id,
+        request=payload.request,
+        data=data,
+    )
+
+
 def preprocess_qwen3_tts_payload(payload: StagePayload) -> StagePayload:
     """Run Qwen3-TTS prompt/audio preprocessing outside the AR scheduler."""
 
@@ -946,13 +1030,35 @@ def preprocess_qwen3_tts_payload(payload: StagePayload) -> StagePayload:
     with _PREPARED_REQUESTS_LOCK:
         _PREPARED_REQUESTS[payload.request_id] = prepared
 
-    data = prepared.state.to_dict()
-    data[_QWEN3_TTS_PREPARED_MARKER] = payload.request_id
-    return StagePayload(
-        request_id=payload.request_id,
-        request=payload.request,
-        data=data,
+    return _prepared_qwen3_tts_payload(payload, prepared)
+
+
+def preprocess_qwen3_tts_payloads(
+    payloads: list[StagePayload],
+) -> list[StagePayload]:
+    """Batch Qwen3-TTS reference encoding before AR admission."""
+
+    with _PREPARED_REQUESTS_LOCK:
+        context = _PREPROCESSING_CONTEXT
+    if context is None:
+        raise RuntimeError(
+            "Qwen3-TTS preprocessing context is not initialized; "
+            "create_sglang_tts_engine_executor must register it before requests run"
+        )
+
+    prepared_requests = _prepare_qwen3_tts_requests(
+        payloads,
+        model=context.model,
+        wrapper=context.wrapper,
     )
+    with _PREPARED_REQUESTS_LOCK:
+        for payload, prepared in zip(payloads, prepared_requests, strict=True):
+            _PREPARED_REQUESTS[payload.request_id] = prepared
+
+    return [
+        _prepared_qwen3_tts_payload(payload, prepared)
+        for payload, prepared in zip(payloads, prepared_requests, strict=True)
+    ]
 
 
 def build_sglang_qwen3_tts_request(

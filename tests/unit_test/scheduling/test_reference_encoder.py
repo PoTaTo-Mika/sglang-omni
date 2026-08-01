@@ -192,6 +192,64 @@ def test_key_none_bypasses_cache() -> None:
     assert stats["entries"] == 0
 
 
+def test_batch_encode_combines_misses_and_preserves_cache_semantics() -> None:
+    class _BatchHook(_TensorHook):
+        def __init__(self) -> None:
+            super().__init__()
+            self.batches: list[list[str]] = []
+
+        def encode_batch(self, items: list[str]) -> list[torch.Tensor]:
+            self.batches.append(list(items))
+            return [self.encode_one(item) for item in items]
+
+    hook = _BatchHook()
+    service = ReferenceEncodeService(hook, max_items=16, max_bytes=1024)
+
+    first = service.get_or_encode_batch(
+        ["a", "b", "a", "uncacheable-c"],
+    )
+    second = service.get_or_encode_batch(["a", "b"])
+
+    assert hook.batches == [["a", "b", "uncacheable-c"]]
+    assert hook.calls == Counter({"a": 1, "b": 1, "uncacheable-c": 1})
+    assert torch.equal(first[0], first[2])
+    assert torch.equal(first[0], second[0])
+    assert torch.equal(first[1], second[1])
+    stats = service.stats()
+    assert stats["hits"] == 2
+    assert stats["misses"] == 2
+    assert stats["merged"] == 1
+    assert stats["uncacheable"] == 1
+    assert stats["entries"] == 2
+
+
+def test_batch_encode_failure_clears_single_flight_state() -> None:
+    class _FlakyBatchHook(_TensorHook):
+        def __init__(self) -> None:
+            super().__init__()
+            self.batch_calls = 0
+
+        def encode_batch(self, items: list[str]) -> list[torch.Tensor]:
+            self.batch_calls += 1
+            if self.batch_calls == 1:
+                raise ValueError("batch boom")
+            return [self.encode_one(item) for item in items]
+
+    hook = _FlakyBatchHook()
+    service = ReferenceEncodeService(hook, max_items=16, max_bytes=1024)
+
+    with pytest.raises(ValueError, match="batch boom"):
+        service.get_or_encode_batch(["a", "a"], descs=["first", "duplicate"])
+
+    results = service.get_or_encode_batch(["a", "a"])
+
+    assert len(results) == 2
+    assert torch.equal(results[0], results[1])
+    assert hook.batch_calls == 2
+    assert hook.calls["a"] == 1
+    assert service.stats()["entries"] == 1
+
+
 def test_exception_propagates_to_all_waiters_and_does_not_poison() -> None:
     release = threading.Event()
     entered = threading.Event()

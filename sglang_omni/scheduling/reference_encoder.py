@@ -224,6 +224,128 @@ class ReferenceEncodeService(Generic[InputT, ArtifactT, StoredT]):
         self._maybe_log()
         return self._hook.load_artifact(stored)
 
+    def get_or_encode_batch(
+        self,
+        raw_inputs: list[Any],
+        *,
+        descs: list[str | None] | None = None,
+    ) -> list[ArtifactT]:
+        if not raw_inputs:
+            return []
+        if descs is None:
+            descriptions = [None] * len(raw_inputs)
+        elif len(descs) != len(raw_inputs):
+            raise ValueError("descs must match raw_inputs")
+        else:
+            descriptions = descs
+
+        items = [self._hook.normalize_input(raw_input) for raw_input in raw_inputs]
+        keys = [self._hook.cache_key(item) for item in items]
+        results: dict[int, ArtifactT] = {}
+        cached: list[tuple[int, StoredT]] = []
+        followers: list[tuple[int, concurrent.futures.Future[StoredT], str | None]] = []
+        pending: list[
+            tuple[
+                int,
+                InputT,
+                ReferenceEncodeKey | None,
+                str | None,
+                concurrent.futures.Future[StoredT] | None,
+                str | None,
+            ]
+        ] = []
+
+        with self._lock:
+            for index, (item, key, desc) in enumerate(
+                zip(items, keys, descriptions, strict=True)
+            ):
+                if key is None:
+                    self._uncacheable += 1
+                    pending.append((index, item, None, None, None, desc))
+                    continue
+                cache_key = key.to_string()
+                stored = self._cache.get(cache_key)
+                if stored is not None:
+                    self._hits += 1
+                    cached.append((index, stored))
+                elif cache_key in self._inflight:
+                    self._merged += 1
+                    followers.append((index, self._inflight[cache_key], desc))
+                else:
+                    self._misses += 1
+                    future: concurrent.futures.Future[StoredT] = (
+                        concurrent.futures.Future()
+                    )
+                    self._inflight[cache_key] = future
+                    pending.append((index, item, key, cache_key, future, desc))
+
+        for index, stored in cached:
+            results[index] = self._hook.load_artifact(stored)
+
+        if pending:
+            try:
+                artifacts = self._hook.encode_batch([entry[1] for entry in pending])
+                if len(artifacts) != len(pending):
+                    raise ValueError(
+                        "Reference encode batch returned "
+                        f"{len(artifacts)} artifacts for {len(pending)} inputs"
+                    )
+            except BaseException as exc:
+                for entry in pending:
+                    self._add_exception_note(exc, entry[5])
+                leaders = [entry for entry in pending if entry[4] is not None]
+                with self._lock:
+                    for entry in leaders:
+                        self._inflight.pop(cast(str, entry[3]), None)
+                    self._failed += len(pending)
+                for entry in leaders:
+                    cast(concurrent.futures.Future[StoredT], entry[4]).set_exception(
+                        exc
+                    )
+                raise
+
+            errors: list[BaseException] = []
+            for entry, artifact in zip(pending, artifacts, strict=True):
+                index, item, key, cache_key, leader_fut, desc = entry
+                if key is None:
+                    results[index] = artifact
+                    continue
+                assert cache_key is not None and leader_fut is not None
+                try:
+                    stored = self._hook.store_artifact(artifact)
+                    should_cache = self._hook.revalidate(item, key)
+                    with self._lock:
+                        if should_cache:
+                            self._cache.put(cache_key, stored)
+                        self._inflight.pop(cache_key, None)
+                except BaseException as exc:
+                    self._add_exception_note(exc, desc)
+                    with self._lock:
+                        self._inflight.pop(cache_key, None)
+                        self._failed += 1
+                    leader_fut.set_exception(exc)
+                    errors.append(exc)
+                else:
+                    leader_fut.set_result(stored)
+                    results[index] = self._hook.load_artifact(stored)
+
+            if errors:
+                raise errors[0]
+
+        for index, follower_fut, desc in followers:
+            try:
+                stored = follower_fut.result(timeout=self._timeout_s)
+            except concurrent.futures.TimeoutError as exc:
+                self._add_exception_note(exc, desc)
+                raise
+            except BaseException as exc:
+                self._add_exception_note(exc, desc)
+                raise _fresh_exception(exc) from exc
+            results[index] = self._hook.load_artifact(stored)
+
+        self._maybe_log()
+        return [results[index] for index in range(len(raw_inputs))]
+
     def stats(self) -> dict[str, int]:
         with self._lock:
             return {

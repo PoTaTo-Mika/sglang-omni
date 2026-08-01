@@ -15,6 +15,7 @@ from sglang_omni.models.qwen3_tts.compat import (
 from sglang_omni.models.qwen3_tts.request_builders import (
     cleanup_prepared_qwen3_tts_request,
     preprocess_qwen3_tts_payload,
+    preprocess_qwen3_tts_payloads,
 )
 from sglang_omni.models.qwen3_tts.streaming_vocoder import (
     DEFAULT_QWEN3_TTS_INITIAL_CHUNK_FRAMES,
@@ -119,10 +120,21 @@ def create_preprocessing_executor(
     model_path: str,
     *,
     max_concurrency: int = 1,
+    max_batch_size: int = 1,
+    max_batch_wait_ms: int = 0,
 ) -> SimpleScheduler:
     del model_path
+    if max_concurrency > 1 and max_batch_size > 1:
+        raise ValueError(
+            "Qwen3-TTS preprocessing concurrency and batching are mutually exclusive"
+        )
     return SimpleScheduler(
         preprocess_qwen3_tts_payload,
+        batch_compute_fn=(
+            preprocess_qwen3_tts_payloads if max_batch_size > 1 else None
+        ),
+        max_batch_size=max_batch_size,
+        max_batch_wait_ms=max_batch_wait_ms,
         max_concurrency=max_concurrency,
         abort_callback=cleanup_prepared_qwen3_tts_request,
     )
