@@ -19,6 +19,7 @@ from sglang_omni.models.qwen3_tts.request_builders import (
 from sglang_omni.models.qwen3_tts.streaming_vocoder import (
     DEFAULT_QWEN3_TTS_INITIAL_CHUNK_FRAMES,
     DEFAULT_QWEN3_TTS_LEFT_CONTEXT_FRAMES,
+    DEFAULT_QWEN3_TTS_STREAM_FOLLOWUP_STRIDE,
     DEFAULT_QWEN3_TTS_STREAM_STRIDE,
     Qwen3TTSStreamingVocoderScheduler,
 )
@@ -162,7 +163,7 @@ def create_vocoder_executor(
     max_batch_size: int = 8,
     max_batch_wait_ms: int = 2,
     stream_stride: int = DEFAULT_QWEN3_TTS_STREAM_STRIDE,
-    stream_followup_stride: int = DEFAULT_QWEN3_TTS_STREAM_STRIDE,
+    stream_followup_stride: int = DEFAULT_QWEN3_TTS_STREAM_FOLLOWUP_STRIDE,
     initial_chunk_frames: int = DEFAULT_QWEN3_TTS_INITIAL_CHUNK_FRAMES,
     stream_left_context_frames: int = DEFAULT_QWEN3_TTS_LEFT_CONTEXT_FRAMES,
 ) -> SimpleScheduler:

@@ -1004,8 +1004,9 @@ def test_qwen3_tts_vocoder_batches_decode_requests(
         max_batch_size=2,
         max_batch_wait_ms=3,
     )
-    assert scheduler.create_stream_state("request").initial_chunk_frames == 5
+    assert scheduler.create_stream_state("request").initial_chunk_frames == 1
     assert scheduler._stream_left_context_frames == 25
+    assert scheduler._stream_followup_stride == 64
     first = make_payload(inputs="first")
     first.data = Qwen3TTSState(
         audio_codes=torch.tensor([[1, 2], [3, 4]]),
@@ -1064,13 +1065,13 @@ class _FakeQwen3TTSTokenizer:
         return waveforms, self.get_output_sample_rate()
 
 
-def test_qwen3_tts_streaming_vocoder_buffers_five_initial_frames() -> None:
+def test_qwen3_tts_streaming_vocoder_buffers_one_initial_frame() -> None:
     scheduler = Qwen3TTSStreamingVocoderScheduler(
         _FakeQwen3TTSTokenizer(),
         device="cpu",
     )
 
-    assert scheduler.create_stream_state("request").initial_chunk_frames == 5
+    assert scheduler.create_stream_state("request").initial_chunk_frames == 1
 
 
 def _qwen3_tts_stream_item(
@@ -1105,29 +1106,24 @@ def test_qwen3_tts_streaming_vocoder_decodes_initial_chunk_early() -> None:
     scheduler._on_chunk(
         payload.request_id,
         _qwen3_tts_stream_item(
-            torch.ones((4, 2), dtype=torch.long),
+            torch.ones((1, 2), dtype=torch.long),
             chunk_id=0,
             ref_code_len=0,
         ),
     )
-    assert scheduler.outbox.qsize() == 0
-    scheduler._on_chunk(
-        payload.request_id,
-        _qwen3_tts_stream_item(torch.ones((1, 2), dtype=torch.long), chunk_id=1),
-    )
     assert scheduler.outbox.qsize() == 1
 
     first = scheduler.outbox.get_nowait()
-    assert len(first.data["audio_waveform"]) == 5 * 4 * 4
+    assert len(first.data["audio_waveform"]) == 1 * 4 * 4
 
     scheduler._on_chunk(
         payload.request_id,
-        _qwen3_tts_stream_item(torch.ones((15, 2), dtype=torch.long), chunk_id=2),
+        _qwen3_tts_stream_item(torch.ones((63, 2), dtype=torch.long), chunk_id=1),
     )
     assert scheduler.outbox.qsize() == 0
     scheduler._on_chunk(
         payload.request_id,
-        _qwen3_tts_stream_item(torch.ones((1, 2), dtype=torch.long), chunk_id=3),
+        _qwen3_tts_stream_item(torch.ones((1, 2), dtype=torch.long), chunk_id=2),
     )
     assert scheduler.outbox.qsize() == 1
     assert len(scheduler._decoder.decode_inputs) == 2
@@ -1179,6 +1175,7 @@ def test_qwen3_tts_stream_output_prepends_reference_once() -> None:
     first = stream_output_builder(payload.request_id, data, None)
     assert len(first) == 1
     assert first[0].data.tolist() == [[10, 11], [12, 13], [1, 2]]
+    assert first[0].data.device.type == "cpu"
     assert first[0].metadata["ref_code_len"] == 2
     assert first[0].metadata["num_quantizers"] == 2
 
@@ -1576,12 +1573,10 @@ def test_qwen3_tts_pipeline_parallelizes_preprocessing() -> None:
 
     config = Qwen3TTSPipelineConfig(model_path="model")
     preprocessing = next(
-        stage
-        for stage in config.stages
-        if stage.name == "preprocessing"
+        stage for stage in config.stages if stage.name == "preprocessing"
     )
 
-    assert preprocessing.factory_args["max_concurrency"] == 8
+    assert preprocessing.factory_args["max_concurrency"] == 4
 
 
 def test_qwen3_tts_preprocessing_abort_race_cleans_late_prepared_state(

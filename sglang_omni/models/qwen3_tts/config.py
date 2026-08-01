@@ -57,7 +57,7 @@ class Qwen3TTSPipelineConfig(PipelineConfig):
             name="preprocessing",
             process="pipeline",
             factory=f"{_PKG}.stages.create_preprocessing_executor",
-            factory_args={"max_concurrency": 8},
+            factory_args={"max_concurrency": 4},
             next="tts_engine",
         ),
         StageConfig(

@@ -20,7 +20,8 @@ from sglang_omni.scheduling.streaming_vocoder import (
 from sglang_omni.utils.audio_payload import audio_waveform_payload
 
 DEFAULT_QWEN3_TTS_STREAM_STRIDE = 16
-DEFAULT_QWEN3_TTS_INITIAL_CHUNK_FRAMES = 5
+DEFAULT_QWEN3_TTS_STREAM_FOLLOWUP_STRIDE = 64
+DEFAULT_QWEN3_TTS_INITIAL_CHUNK_FRAMES = 1
 DEFAULT_QWEN3_TTS_LEFT_CONTEXT_FRAMES = 25
 _QWEN3_TTS_CODEBOOK_SIZE = 2048
 
@@ -41,7 +42,7 @@ class _Qwen3TTSStreamState:
 class Qwen3TTSStreamingVocoderScheduler(
     StreamingVocoderBase[_Qwen3TTSStreamState, None]
 ):
-    """Decode Qwen3-TTS codec frames incrementally and batch final-only work."""
+    """Decode Qwen3-TTS codec frames on a priority CUDA stream."""
 
     def __init__(
         self,
@@ -49,7 +50,7 @@ class Qwen3TTSStreamingVocoderScheduler(
         *,
         device: str,
         stream_stride: int = DEFAULT_QWEN3_TTS_STREAM_STRIDE,
-        stream_followup_stride: int = DEFAULT_QWEN3_TTS_STREAM_STRIDE,
+        stream_followup_stride: int = DEFAULT_QWEN3_TTS_STREAM_FOLLOWUP_STRIDE,
         initial_chunk_frames: int = DEFAULT_QWEN3_TTS_INITIAL_CHUNK_FRAMES,
         stream_left_context_frames: int = DEFAULT_QWEN3_TTS_LEFT_CONTEXT_FRAMES,
         max_batch_size: int = 8,
@@ -70,6 +71,11 @@ class Qwen3TTSStreamingVocoderScheduler(
         self._stream_followup_stride = int(stream_followup_stride)
         self._default_initial_chunk_frames = int(initial_chunk_frames)
         self._stream_left_context_frames = int(stream_left_context_frames)
+        self._decode_stream = (
+            torch.cuda.Stream(device=self._device, priority=-1)
+            if self._device.type == "cuda"
+            else None
+        )
         sample_rate = int(tokenizer.get_output_sample_rate())
 
         super().__init__(
@@ -146,7 +152,7 @@ class Qwen3TTSStreamingVocoderScheduler(
         state: _Qwen3TTSStreamState,
         codes: torch.Tensor,
     ) -> torch.Tensor:
-        chunk = codes.detach().to(device=self._device, dtype=torch.long)
+        chunk = codes.detach().to(device="cpu", dtype=torch.long)
         if chunk.ndim == 1:
             chunk = chunk.unsqueeze(0)
         elif chunk.ndim != 2:
@@ -224,10 +230,16 @@ class Qwen3TTSStreamingVocoderScheduler(
         window_start = max(0, absolute_emitted - self._stream_left_context_frames)
         codes = torch.cat(state.code_chunks, dim=0)
         codes_window = codes[window_start : state.total_frames]
+        decoder_input = codes_window.transpose(0, 1).unsqueeze(0)
         with torch.inference_mode():
-            waveform = self._decoder.chunked_decode(
-                codes_window.transpose(0, 1).unsqueeze(0),
-            )
+            if self._decode_stream is None:
+                waveform = self._decoder.chunked_decode(decoder_input)
+            else:
+                with torch.cuda.stream(self._decode_stream):
+                    waveform = self._decoder.chunked_decode(
+                        decoder_input.to(self._device)
+                    )
+                torch.cuda.current_stream(self._device).wait_stream(self._decode_stream)
         if waveform.ndim == 3:
             waveform = waveform[0, 0]
         elif waveform.ndim == 2:

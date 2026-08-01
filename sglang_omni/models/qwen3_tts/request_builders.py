@@ -1139,6 +1139,8 @@ def make_qwen3_tts_scheduler_adapters(*, model: Any, wrapper: Any):
                 ]
             data.stream_ref_sent = True
 
+        codes = codes.detach().to(device="cpu", dtype=torch.long)
+
         return [
             OutgoingMessage(
                 request_id=request_id,
