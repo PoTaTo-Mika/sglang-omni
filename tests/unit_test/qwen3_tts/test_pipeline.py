@@ -1354,9 +1354,9 @@ def test_qwen3_tts_async_initial_batches_ready_requests() -> None:
             scheduler.abort(payload.request_id)
         scheduler.stop()
 
-    assert [
-        int(codes.shape[0]) for codes in tokenizer.model.decoder.decode_inputs
-    ] == [2]
+    assert [int(codes.shape[0]) for codes in tokenizer.model.decoder.decode_inputs] == [
+        2
+    ]
 
 
 def test_qwen3_tts_async_initial_flushes_before_result() -> None:

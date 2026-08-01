@@ -101,9 +101,7 @@ class Qwen3TTSStreamingVocoderScheduler(
         self._default_initial_chunk_frames = int(initial_chunk_frames)
         self._stream_left_context_frames = int(stream_left_context_frames)
         self._async_decode = (
-            self._device.type == "cuda"
-            if async_decode is None
-            else bool(async_decode)
+            self._device.type == "cuda" if async_decode is None else bool(async_decode)
         )
         if self._device.type == "cuda":
             least_priority, greatest_priority = torch.cuda.Stream.priority_range()
@@ -123,12 +121,12 @@ class Qwen3TTSStreamingVocoderScheduler(
         else:
             self._decode_stream = None
             self._followup_decode_stream = None
-        self._initial_queue: queue.Queue[
-            tuple[str, _Qwen3TTSStreamState] | None
-        ] = queue.Queue()
-        self._followup_queue: queue.Queue[
-            tuple[str, _Qwen3TTSStreamState] | None
-        ] = queue.Queue()
+        self._initial_queue: queue.Queue[tuple[str, _Qwen3TTSStreamState] | None] = (
+            queue.Queue()
+        )
+        self._followup_queue: queue.Queue[tuple[str, _Qwen3TTSStreamState] | None] = (
+            queue.Queue()
+        )
         self._async_stop = threading.Event()
         self._initial_worker: threading.Thread | None = None
         self._followup_worker: threading.Thread | None = None
@@ -351,9 +349,7 @@ class Qwen3TTSStreamingVocoderScheduler(
         window_start = max(0, absolute_emitted - self._stream_left_context_frames)
         window_end = state.ref_frames + generated_frames
         codes = torch.cat(state.code_chunks, dim=0)
-        decoder_input = (
-            codes[window_start:window_end].transpose(0, 1).unsqueeze(0)
-        )
+        decoder_input = codes[window_start:window_end].transpose(0, 1).unsqueeze(0)
         return _Qwen3TTSDecodePlan(
             decoder_input=decoder_input,
             absolute_emitted_frames=absolute_emitted,
@@ -523,9 +519,7 @@ class Qwen3TTSStreamingVocoderScheduler(
         self,
         batch: list[tuple[str, _Qwen3TTSStreamState]],
     ) -> None:
-        planned: list[
-            tuple[str, _Qwen3TTSStreamState, _Qwen3TTSDecodePlan]
-        ] = []
+        planned: list[tuple[str, _Qwen3TTSStreamState, _Qwen3TTSDecodePlan]] = []
         with self._state_lock:
             for request_id, state in batch:
                 if (
@@ -561,9 +555,7 @@ class Qwen3TTSStreamingVocoderScheduler(
 
     @staticmethod
     def _group_decode_plans(
-        planned: list[
-            tuple[str, _Qwen3TTSStreamState, _Qwen3TTSDecodePlan]
-        ],
+        planned: list[tuple[str, _Qwen3TTSStreamState, _Qwen3TTSDecodePlan]],
     ) -> list[list[tuple[str, _Qwen3TTSStreamState, _Qwen3TTSDecodePlan]]]:
         groups: dict[
             tuple[int, ...],
@@ -621,9 +613,7 @@ class Qwen3TTSStreamingVocoderScheduler(
         self,
         batch: list[tuple[str, _Qwen3TTSStreamState]],
     ) -> None:
-        planned: list[
-            tuple[str, _Qwen3TTSStreamState, _Qwen3TTSDecodePlan]
-        ] = []
+        planned: list[tuple[str, _Qwen3TTSStreamState, _Qwen3TTSDecodePlan]] = []
         with self._state_lock:
             for request_id, state in batch:
                 if self._stream_states.get(request_id) is not state:
@@ -632,8 +622,7 @@ class Qwen3TTSStreamingVocoderScheduler(
                     state,
                     is_final=state.final_pending,
                     max_generated_frames=(
-                        state.emitted_generated_frames
-                        + self._stream_followup_stride
+                        state.emitted_generated_frames + self._stream_followup_stride
                     ),
                 )
                 if plan is None:
@@ -715,8 +704,10 @@ class Qwen3TTSStreamingVocoderScheduler(
                 self._pending_done.add(request_id)
                 return
             state = self._get_or_create_stream_state(request_id)
-            if self._async_decode and state is not None and (
-                state.initial_pending or state.decoded_chunks
+            if (
+                self._async_decode
+                and state is not None
+                and (state.initial_pending or state.decoded_chunks)
             ):
                 state.final_pending = True
                 if not state.initial_pending:
