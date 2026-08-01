@@ -1058,6 +1058,46 @@ def test_qwen3_tts_custom_voice_rejects_invalid_speaker(
         )
 
 
+def test_qwen3_tts_speaker_mel_uses_cached_device_buffers() -> None:
+    from sglang_omni.models.qwen3_tts.sglang_model import Qwen3TTSTalker
+
+    captured: list[torch.Tensor] = []
+
+    class FakeSpeakerEncoder(torch.nn.Module):
+        def forward(self, mels: torch.Tensor) -> torch.Tensor:
+            captured.append(mels.detach().clone())
+            return mels.mean(dim=1)
+
+    talker = Qwen3TTSTalker.__new__(Qwen3TTSTalker)
+    torch.nn.Module.__init__(talker)
+    talker.model = SimpleNamespace(codec_embedding=torch.nn.Embedding(2, 128))
+    talker.speaker_encoder_sample_rate = 24000
+    talker.speaker_encoder = FakeSpeakerEncoder()
+    talker.register_buffer(
+        "_speaker_mel_basis",
+        torch.ones((128, 513), dtype=torch.float32),
+        persistent=False,
+    )
+    talker.register_buffer(
+        "_speaker_hann_window",
+        torch.hann_window(1024),
+        persistent=False,
+    )
+    audio = np.sin(np.linspace(0, 32, 4096, dtype=np.float32))
+
+    first = talker.extract_speaker_embedding(audio, 24000)
+    second = talker.extract_speaker_embedding(audio, 24000)
+
+    assert first.shape == (128,)
+    torch.testing.assert_close(first, second)
+    assert len(captured) == 2
+    assert captured[0].shape == (1, 16, 128)
+    assert (
+        talker._speaker_mel_basis.data_ptr()
+        == talker._buffers["_speaker_mel_basis"].data_ptr()
+    )
+
+
 def test_qwen3_tts_vocoder_batches_decode_requests(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
