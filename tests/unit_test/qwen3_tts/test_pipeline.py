@@ -666,6 +666,62 @@ def test_qwen3_tts_adhoc_voice_clone_prompt_uses_reference_service(
     assert calls == 3
 
 
+def test_qwen3_tts_reference_encode_uses_non_default_cuda_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered: list[object] = []
+    stream = object()
+
+    class StreamContext:
+        def __enter__(self):
+            entered.append(stream)
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    class FakeStream:
+        @staticmethod
+        def priority_range():
+            return 0, -1
+
+        def __new__(cls, *, device, priority):
+            return stream
+
+    monkeypatch.setattr(torch.cuda, "Stream", FakeStream)
+    monkeypatch.setattr(torch.cuda, "stream", lambda value: StreamContext())
+
+    class FakePrompt:
+        ref_text = "reference"
+
+    class FakeWrapper:
+        def create_voice_clone_prompt(self, **kwargs):
+            assert entered == [stream]
+            return [FakePrompt()]
+
+        def _prompt_items_to_voice_clone_prompt(self, prompt_items):
+            return {
+                "ref_code": [torch.ones((1, 2), dtype=torch.long)],
+                "ref_spk_embedding": [torch.ones(4)],
+                "icl_mode": [True],
+            }
+
+    hook = qwen3_request_builders._Qwen3TTSAdhocReferenceHook(
+        model=SimpleNamespace(device=torch.device("cuda")),
+        wrapper=FakeWrapper(),
+    )
+    item = hook.normalize_input(
+        qwen3_request_builders.Qwen3TTSState(
+            text="target",
+            ref_audio="data:audio/wav;base64,AAAA",
+            ref_text="reference",
+        )
+    )
+
+    hook.encode_one(item)
+
+    assert entered == [stream]
+
+
 def test_qwen3_tts_batches_adhoc_voice_clone_prompts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
