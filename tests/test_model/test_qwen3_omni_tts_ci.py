@@ -84,10 +84,10 @@ VC_UTMOS_MEAN_MIN = apply_mos_slack(VC_UTMOS_MEAN_REFERENCE)
 
 _VC_NON_STREAM_P95 = {
     16: {
-        "throughput_qps": 5.478,
-        "output_tok_per_req_s": 5.4,
-        "latency_mean_s": 2.724,
-        "rtf_mean": 0.9258,
+        "throughput_qps": 8.13,
+        "output_tok_per_req_s": 8.3,
+        "latency_mean_s": 1.77,
+        "rtf_mean": 0.5818,
     },
 }
 

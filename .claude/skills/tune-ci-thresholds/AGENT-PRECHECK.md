@@ -24,7 +24,14 @@ Run this checklist before every fresh session and after environment recovery.
 - Record `git rev-parse HEAD`.
 - Use a fresh `.tune-runs/<UTC>_<label>/` per calibration process unless
   explicitly resuming.
-- Resume only when `HEAD` matches the run plan.
+- Resume when `HEAD` matches the run plan, or when `run --resume` proves the
+  commits measurement-equivalent and says so. It prints either
+  `note: HEAD moved … no measured code differs` and continues, or an error
+  naming the file whose logic changed.
+- **Never discard observations because a gate refused.** A refusal says the
+  tool would not proceed, not that the data is wrong. Check what actually
+  changed (`git diff --name-only <plan-sha>..HEAD`) before spending GPU hours
+  on a re-run; hours of valid observations have been thrown away this way.
 - Regenerate `stages.yaml` after relevant test/config changes.
 
 ## 2. GPU ownership

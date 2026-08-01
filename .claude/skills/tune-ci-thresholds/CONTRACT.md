@@ -6,9 +6,34 @@ agent instructions are not a substitute for code gates.
 ## Session identity
 
 - A new request uses a new UTC-timestamped directory on current `HEAD`.
-- Resume is interruption recovery for the same directory and commit.
-- Every run artifact records the calibration commit.
-- A calibration never mixes artifacts from commits, schemas, or environments.
+- Resume is interruption recovery for the same directory, on the calibration
+  commit or a commit proven **measurement-equivalent** to it (below).
+- Every run artifact records the commit it was produced on.
+- A calibration never mixes artifacts from commits that could measure
+  differently, from different schemas, or from different environments.
+
+### Measurement-equivalent commits
+
+`HEAD` moving is not by itself a reason to discard observations. What matters
+is whether anything that can change a measured number moved. Two commits are
+measurement-equivalent when, for every file that differs:
+
+- it lives under `.claude/skills/` (calibration tooling, not measured code); or
+- it is a `.py` file whose AST is identical once every numeric literal is
+  blanked — i.e. only constants such as CI thresholds changed.
+
+Anything else — changed logic, a non-Python file, an added or removed file —
+is a real change and blocks reuse.
+
+Threshold constants decide whether an assertion passes; they do not affect what
+the benchmark measures. Refusing to reuse observations across such a commit
+throws away hours of valid GPU time and buys no integrity.
+
+`run --resume` performs this proof itself, prints the verdict, and records the
+accepted commit under `equivalent_commits` in `plan.json`. Provenance accepts a
+run artifact whose `git_sha` is the calibration commit or any commit recorded
+there. `merge-runs` is unaffected: its inputs must still share one calibration
+commit.
 
 ## Observation validity
 
@@ -18,7 +43,8 @@ A stage repeat is strict-valid only when:
 - every tracked metric is non-null;
 - sample `ok == total`;
 - `total == expected_samples` when configured;
-- the recorded commit matches the plan;
+- the recorded commit is the calibration commit or one recorded as
+  measurement-equivalent to it;
 - the round is not marked destructive (see below).
 
 Threshold assertion failures may still yield a valid observation when all
@@ -111,8 +137,10 @@ A degenerate sample is treated as `n >= _DESTRUCTIVE_FULL_RERUN_N`.
 
 ## Worst-of-N
 
-- Baseline N is 5; **effective N is recorded per stage** and may exceed it when
-  rounds were rejected and replenished.
+- Baseline N is `--repeats` (default 5); **effective N is recorded per stage**
+  and may exceed it when rounds were rejected and replenished. This is separate
+  from `_DESTRUCTIVE_MIN_OBS`, which is fixed at 5 and governs only whether the
+  detector will judge at all.
 - Every selected stage needs at least `repeats` clean observations.
 - Lower-bound metrics use the minimum; upper-bound metrics use the maximum,
   over the clean subset only.
@@ -179,8 +207,9 @@ speed stage:
 
 ## Required provenance
 
-The final artifact records commit, dirty state, venv, dependency hash, core
-versions, container identity when available, driver/GPU/topology, selected GPU
-group, relevant environment, required model/dataset IDs, attempt history, seed
-policy, and — for every rejected round — its raw values and the evidence that
-condemned it, so any exclusion can be re-derived.
+The final artifact records the calibration commit and any commit accepted as
+measurement-equivalent, dirty state, venv, dependency hash, core versions,
+container identity when available, driver/GPU/topology, selected GPU group,
+relevant environment, required model/dataset IDs, attempt history, seed policy,
+and — for every rejected round — its raw values and the evidence that condemned
+it, so any exclusion can be re-derived.
