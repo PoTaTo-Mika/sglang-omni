@@ -7,6 +7,7 @@ import hashlib
 import json
 import threading
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -589,8 +590,20 @@ class _Qwen3TTSAdhocReferenceHook(
     def __init__(self, *, model: Any, wrapper: Any) -> None:
         self._model = model
         self._wrapper = wrapper
+        self._stream_local = threading.local()
         self.model_revision = _qwen3_tts_model_revision(model, wrapper)
         self.encoder_config_hash = _qwen3_tts_encoder_config_hash(model, wrapper)
+
+    def _encode_context(self):
+        device = torch.device(self._model.device)
+        if device.type != "cuda":
+            return nullcontext()
+        stream = getattr(self._stream_local, "stream", None)
+        if stream is None:
+            least_priority, _ = torch.cuda.Stream.priority_range()
+            stream = torch.cuda.Stream(device=device, priority=least_priority)
+            self._stream_local.stream = stream
+        return torch.cuda.stream(stream)
 
     def normalize_input(self, raw_input: Any) -> _Qwen3TTSAdhocReferenceInput:
         if isinstance(raw_input, _Qwen3TTSAdhocReferenceInput):
@@ -619,7 +632,7 @@ class _Qwen3TTSAdhocReferenceHook(
     def encode_one(
         self, item: _Qwen3TTSAdhocReferenceInput
     ) -> tuple[dict[str, Any], str | None]:
-        with torch.no_grad():
+        with torch.no_grad(), self._encode_context():
             prompt_items = self._wrapper.create_voice_clone_prompt(
                 ref_audio=item.ref_audio,
                 ref_text=item.ref_text,

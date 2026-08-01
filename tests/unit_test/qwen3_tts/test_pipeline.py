@@ -666,6 +666,60 @@ def test_qwen3_tts_adhoc_voice_clone_prompt_uses_reference_service(
     assert calls == 3
 
 
+def test_qwen3_tts_reference_encode_uses_non_default_cuda_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered: list[object] = []
+    stream = object()
+
+    class StreamContext:
+        def __enter__(self):
+            entered.append(stream)
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    class FakeStream:
+        @staticmethod
+        def priority_range():
+            return 0, -1
+
+        def __new__(cls, *, device, priority):
+            return stream
+
+    monkeypatch.setattr(torch.cuda, "Stream", FakeStream)
+    monkeypatch.setattr(torch.cuda, "stream", lambda value: StreamContext())
+
+    class FakePrompt:
+        ref_text = "reference"
+
+    class FakeWrapper:
+        def create_voice_clone_prompt(self, **kwargs):
+            assert entered == [stream]
+            return [FakePrompt()]
+
+        def _prompt_items_to_voice_clone_prompt(self, prompt_items):
+            return {
+                "ref_code": [torch.ones((1, 2), dtype=torch.long)],
+                "ref_spk_embedding": [torch.ones(4)],
+                "icl_mode": [True],
+            }
+
+    hook = qwen3_request_builders._Qwen3TTSAdhocReferenceHook(
+        model=SimpleNamespace(device=torch.device("cuda")),
+        wrapper=FakeWrapper(),
+    )
+    item = qwen3_request_builders._Qwen3TTSAdhocReferenceInput(
+        ref_audio="data:audio/wav;base64,AAAA",
+        ref_text="reference",
+        x_vector_only_mode=False,
+    )
+
+    hook.encode_one(item)
+
+    assert entered == [stream]
+
+
 def test_qwen3_tts_uploaded_voice_x_vector_cache_omits_ref_code(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1005,9 +1059,9 @@ def test_qwen3_tts_vocoder_batches_decode_requests(
         max_batch_wait_ms=3,
     )
     assert scheduler.create_stream_state("request").initial_chunk_frames == 1
-    assert scheduler._stream_left_context_frames == 25
+    assert scheduler._stream_left_context_frames == 16
     assert scheduler._stream_followup_stride == 8
-    assert scheduler._stream_initial_followup_stride == 4
+    assert scheduler._stream_initial_followup_stride == 8
     assert scheduler._initial_max_batch_size == 32
     assert scheduler._initial_batch_wait_s == pytest.approx(0.002)
     assert scheduler._followup_max_batch_size == 8
@@ -1135,7 +1189,7 @@ def test_qwen3_tts_streaming_vocoder_decodes_initial_chunk_early() -> None:
     assert len(scheduler._decoder.decode_inputs) == 2
 
 
-def test_qwen3_tts_streaming_vocoder_bridges_to_steady_stride() -> None:
+def test_qwen3_tts_streaming_vocoder_uses_steady_followup_stride() -> None:
     scheduler = Qwen3TTSStreamingVocoderScheduler(
         _FakeQwen3TTSTokenizer(),
         device="cpu",
@@ -1152,13 +1206,13 @@ def test_qwen3_tts_streaming_vocoder_bridges_to_steady_stride() -> None:
         ),
     )
     state = scheduler._stream_states[payload.request_id]
-    assert state.next_decode_generated_frames == 5
+    assert state.next_decode_generated_frames == 9
 
     scheduler._on_chunk(
         payload.request_id,
-        _qwen3_tts_stream_item(torch.ones((4, 2), dtype=torch.long), chunk_id=1),
+        _qwen3_tts_stream_item(torch.ones((8, 2), dtype=torch.long), chunk_id=1),
     )
-    assert state.next_decode_generated_frames == 13
+    assert state.next_decode_generated_frames == 17
     assert len(scheduler._decoder.decode_inputs) == 2
 
 
