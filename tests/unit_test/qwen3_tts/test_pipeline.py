@@ -196,20 +196,20 @@ def install_fake_sglang(monkeypatch: pytest.MonkeyPatch) -> None:
     ]
     modules["sgl_kernel"].fused_qk_norm_rope = lambda *args, **kwargs: None
     modules["sglang.srt.managers.schedule_batch"].Req = FakeReq
-    modules[
-        "sglang.srt.managers.scheduler"
-    ].GenerationBatchResult = FakeGenerationBatchResult
-    modules[
-        "sglang.srt.layers.logits_processor"
-    ].LogitsProcessorOutput = FakeLogitsProcessorOutput
+    modules["sglang.srt.managers.scheduler"].GenerationBatchResult = (
+        FakeGenerationBatchResult
+    )
+    modules["sglang.srt.layers.logits_processor"].LogitsProcessorOutput = (
+        FakeLogitsProcessorOutput
+    )
     modules["sglang.srt.layers.sampler"].multinomial_with_seed = multinomial_with_seed
     modules["sglang.srt.layers.sampler"].sampler_calls = sampler_calls
-    modules[
-        "sglang.srt.model_loader.weight_utils"
-    ].default_weight_loader = default_weight_loader
-    modules[
-        "sglang.srt.sampling.sampling_batch_info"
-    ].SamplingBatchInfo = FakeSamplingBatchInfo
+    modules["sglang.srt.model_loader.weight_utils"].default_weight_loader = (
+        default_weight_loader
+    )
+    modules["sglang.srt.sampling.sampling_batch_info"].SamplingBatchInfo = (
+        FakeSamplingBatchInfo
+    )
     modules["sglang.srt.sampling.sampling_params"].SamplingParams = FakeSamplingParams
     modules["sglang.srt.utils"].add_prefix = add_prefix
     for name, module in modules.items():
@@ -2477,11 +2477,7 @@ def test_qwen3_tts_steady_decode_reports_cuda_graph_ready(
         forward_batch_info.ForwardBatch,
         "init_new",
         staticmethod(
-            lambda model_worker_batch,
-            model_runner,
-            *,
-            capture_hidden_mode=None,
-            return_hidden_states_before_norm: fake_forward_batch
+            lambda model_worker_batch, model_runner, *, capture_hidden_mode=None, return_hidden_states_before_norm: fake_forward_batch
         ),
     )
     monkeypatch.setattr(
