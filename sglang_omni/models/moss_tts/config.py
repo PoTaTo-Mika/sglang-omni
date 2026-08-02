@@ -48,6 +48,7 @@ class MossTTSPipelineConfig(PipelineConfig):
     ) -> dict[tuple[str, str], dict[str, float]]:
         return {
             ("tts_engine", "vocoder"): {
+                "preprocessing": 0.05,
                 "tts_engine": 0.85,
                 "vocoder": 0.10,
             }
@@ -59,6 +60,8 @@ class MossTTSPipelineConfig(PipelineConfig):
             name="preprocessing",
             process="pipeline",
             factory=f"{_PKG}.stages.create_preprocessing_executor",
+            factory_args={"dtype": "float32"},
+            gpu=0,
             next="tts_engine",
         ),
         StageConfig(
