@@ -9,13 +9,8 @@ from sglang.srt.utils import hf_transformers_utils
 from sglang_omni.model_runner import base as model_runner_base
 from sglang_omni.models.cosmos3 import bootstrap, request_builders
 from sglang_omni.models.cosmos3.bootstrap import resolve_transformer_weights_path
-from sglang_omni.scheduling import (
-    bootstrap as scheduling_bootstrap,
-)
-from sglang_omni.scheduling import (
-    omni_scheduler,
-    sglang_backend,
-)
+from sglang_omni.scheduling import bootstrap as scheduling_bootstrap
+from sglang_omni.scheduling import omni_scheduler, sglang_backend
 
 
 def test_resolves_nested_transformer_weights_directory(tmp_path) -> None:

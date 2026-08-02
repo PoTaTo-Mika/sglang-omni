@@ -15,11 +15,7 @@ from sglang_omni.models.cosmos3.request_builders import (
     make_text_scheduler_adapters,
     make_text_stream_output_builder,
 )
-from sglang_omni.proto import (
-    EXPLICIT_GENERATION_PARAMS_KEY,
-    OmniRequest,
-    StagePayload,
-)
+from sglang_omni.proto import EXPLICIT_GENERATION_PARAMS_KEY, OmniRequest, StagePayload
 
 
 class _FakeTokenizer:
