@@ -166,6 +166,7 @@ def create_vocoder_executor(
     initial_batch_wait_ms: int = 2,
     followup_max_batch_size: int = 8,
     followup_batch_wait_ms: int = 1,
+    initial_cuda_graph: bool = True,
 ) -> SimpleScheduler:
     if gpu_id is not None:
         device = f"cuda:{gpu_id}"
@@ -190,4 +191,5 @@ def create_vocoder_executor(
         initial_batch_wait_ms=initial_batch_wait_ms,
         followup_max_batch_size=followup_max_batch_size,
         followup_batch_wait_ms=followup_batch_wait_ms,
+        initial_cuda_graph=initial_cuda_graph,
     )
