@@ -228,11 +228,6 @@ class CommEngine:
         """
 
         if data_ref.kind is DataKind.STAGE_PAYLOAD:
-            if data_ref.layout is not DataLayout.PACKED_TENSORS:
-                raise ValueError(
-                    "stage_payload requires packed_tensors layout, got "
-                    f"{data_ref.layout.value}"
-                )
             return await self.read_payload(
                 relay=relay,
                 request_id=request_id,
@@ -422,17 +417,10 @@ class CommEngine:
                     f"{len(source_page_indices)} != "
                     f"{len(ready.destination_page_indices)}"
                 )
-            destination_ref = BackendRef.from_dict(ready.destination_ref)
-            if destination_ref.transport is not transport:
-                raise ValueError(
-                    "KV destination transport does not match the selected route"
-                )
             op = await kv_relay.put_kv_pages(
                 source_pool_id=source_pool_id,
                 source_page_indices=source_page_indices,
-                destination_ref=destination_ref.info,
-                destination_page_indices=ready.destination_page_indices,
-                receiver_id=to_stage,
+                destination_ref=ready.destination_ref,
             )
             data_ref = DataRef(
                 version=1,
@@ -534,10 +522,6 @@ class CommEngine:
             kv_relay = self._kv_relay(relay)
             kv_relay.register_kv_pool(pool)
             relay_info = kv_relay.prepare_kv_destination(destination.pool_id)
-            destination_ref = BackendRef.from_relay_info(
-                transport=self.router.inbound(message.from_stage),
-                relay_info=relay_info,
-            )
             self._inbound_kv[message.transfer_id] = _InboundKVTransfer(
                 request=message,
                 receiver=receiver,
@@ -551,7 +535,7 @@ class CommEngine:
                 success=True,
                 destination_pool_id=destination.pool_id,
                 destination_page_indices=destination.page_indices,
-                destination_ref=destination_ref.to_dict(),
+                destination_ref=relay_info,
             )
         except Exception as exc:
             with suppress(Exception):
@@ -565,12 +549,6 @@ class CommEngine:
         request_id: str,
         data_ref: DataRef,
     ) -> None:
-        if data_ref.kind is not DataKind.KV_PAGES:
-            raise ValueError(f"expected kv_pages, got {data_ref.kind.value}")
-        if data_ref.layout is not DataLayout.PAGED:
-            raise ValueError(f"expected paged layout, got {data_ref.layout.value}")
-        if data_ref.buffer.transport is not data_ref.transport:
-            raise ValueError("KV data_ref buffer transport does not match data_ref")
         state = self._inbound_kv.get(data_ref.object_id)
         if state is None:
             raise KeyError(f"unknown inbound KV transfer {data_ref.object_id!r}")

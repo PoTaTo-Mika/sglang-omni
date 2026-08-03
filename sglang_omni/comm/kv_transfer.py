@@ -106,14 +106,6 @@ class KVPageDestination:
     pool_id: str
     page_indices: tuple[int, ...]
 
-    def __post_init__(self) -> None:
-        if not self.pool_id:
-            raise ValueError("KV destination pool_id must not be empty")
-        if not self.page_indices:
-            raise ValueError("KV destination page_indices must not be empty")
-        if min(self.page_indices) < 0:
-            raise ValueError("KV destination page_indices must be non-negative")
-
 
 class KVReceiver(Protocol):
     """Request-scoped allocation lifecycle owned by the receiving stage.
@@ -158,8 +150,6 @@ class KVTransferRelay(Protocol):
         source_pool_id: str,
         source_page_indices: tuple[int, ...],
         destination_ref: dict[str, Any],
-        destination_page_indices: tuple[int, ...],
-        receiver_id: str,
     ) -> Any: ...
 
     async def get_kv_pages(
