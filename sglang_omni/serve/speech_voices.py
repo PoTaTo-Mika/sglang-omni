@@ -24,12 +24,12 @@ from sglang_omni.scheduling.speaker_cache import (
     get_speaker_artifact_cache,
 )
 from sglang_omni.serve.speech_errors import SpeechAPIError, bad_request, internal_error
+from sglang_omni.serve.speech_limits import MAX_VOICE_UPLOAD_BYTES
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_SPEAKER_SAMPLES_DIR = Path("~/.cache/sglang-omni/speakers").expanduser()
 DEFAULT_SPEAKER_MAX_UPLOADED = 1000
-MAX_VOICE_UPLOAD_BYTES = 10 * 1024 * 1024
 MIN_REFERENCE_AUDIO_SECONDS = 1.0
 MAX_REFERENCE_AUDIO_SECONDS = 30.0
 VOICE_SILENCE_THRESHOLD = 1e-5

@@ -6,11 +6,13 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, cast
 
 from fastapi import Request
 
 from sglang_omni_router.config import DEFAULT_CAPABILITIES, Capability
+from sglang_omni_router.worker import ServiceClass
 
 ROUTE_METADATA_JSON_LIMIT_BYTES = 1024 * 1024
 ROUTE_MODEL_HEADER = "x-sglang-omni-route-model"
@@ -48,6 +50,26 @@ class RouteMetadataError(ValueError):
     pass
 
 
+class RouteKind(str, Enum):
+    GENERATION = "generation"
+    SPEECH = "speech"
+    SPEECH_BATCH = "speech_batch"
+    VOICE_CONTROL = "voice_control"
+    TRANSCRIPTION = "transcription"
+
+
+def classify_route(path: str) -> RouteKind:
+    if path == "/v1/audio/speech":
+        return RouteKind.SPEECH
+    if path == "/v1/audio/speech/batch":
+        return RouteKind.SPEECH_BATCH
+    if path.startswith("/v1/audio/voices"):
+        return RouteKind.VOICE_CONTROL
+    if path == "/v1/audio/transcriptions":
+        return RouteKind.TRANSCRIPTION
+    return RouteKind.GENERATION
+
+
 @dataclass
 class RouteMetadata:
     request_id: str
@@ -56,6 +78,9 @@ class RouteMetadata:
     required_capabilities: set[Capability]
     body_exceeds_metadata_limit: bool
     route_capabilities_header_present: bool
+    route_kind: RouteKind
+    service_class: ServiceClass
+    voice_names: set[str]
 
 
 @dataclass
@@ -65,7 +90,11 @@ class LargeJsonMetadata:
     stream: bool | None = None
 
 
-def extract_route_metadata(request: Request, path: str, body: bytes) -> RouteMetadata:
+def extract_route_metadata(
+    request: Request,
+    route_kind: RouteKind,
+    body: bytes,
+) -> RouteMetadata:
     request_id = _request_id_from_request(request)
     route_model, route_model_header_present = _route_model_from_header(request)
     route_stream, route_stream_header_present = _route_stream_from_header(request)
@@ -88,7 +117,7 @@ def extract_route_metadata(request: Request, path: str, body: bytes) -> RouteMet
         model = _string_or_none(payload.get("model"))
         stream = payload.get("stream") is True
         required_capabilities = _required_capabilities(
-            path,
+            route_kind,
             payload,
             stream=stream,
             route_capabilities=set(),
@@ -109,7 +138,7 @@ def extract_route_metadata(request: Request, path: str, body: bytes) -> RouteMet
         model = large_json_metadata.model
         stream = large_json_metadata.stream is True
         required_capabilities = _required_capabilities(
-            path,
+            route_kind,
             payload,
             stream=stream,
             route_capabilities=route_capabilities,
@@ -131,7 +160,7 @@ def extract_route_metadata(request: Request, path: str, body: bytes) -> RouteMet
         model = route_model
         stream = route_stream
         required_capabilities = _required_capabilities(
-            path,
+            route_kind,
             payload,
             stream=stream,
             route_capabilities=route_capabilities,
@@ -144,6 +173,9 @@ def extract_route_metadata(request: Request, path: str, body: bytes) -> RouteMet
         required_capabilities=required_capabilities,
         body_exceeds_metadata_limit=body_exceeds_metadata_limit,
         route_capabilities_header_present=route_capabilities_header_present,
+        route_kind=route_kind,
+        service_class=_service_class_for_route(route_kind),
+        voice_names=_voice_names(route_kind, payload),
     )
 
 
@@ -414,15 +446,17 @@ class _JsonTopLevelScanner:
 
 
 def _required_capabilities(
-    path: str,
+    route_kind: RouteKind,
     payload: dict[str, Any] | None,
     *,
     stream: bool,
     route_capabilities: set[Capability],
 ) -> set[Capability]:
-    if path == "/v1/audio/speech":
+    if route_kind in {RouteKind.SPEECH, RouteKind.SPEECH_BATCH}:
         capabilities: set[Capability] = {"speech"}
-    elif path == "/v1/audio/transcriptions":
+    elif route_kind is RouteKind.VOICE_CONTROL:
+        capabilities = {"speech"}
+    elif route_kind is RouteKind.TRANSCRIPTION:
         capabilities = {"audio_input"}
     else:
         capabilities = {"chat"}
@@ -431,22 +465,83 @@ def _required_capabilities(
         capabilities.add("streaming")
     capabilities.update(route_capabilities)
     if payload is not None:
-        capabilities.update(_infer_payload_capabilities(path, payload))
+        capabilities.update(_infer_payload_capabilities(route_kind, payload))
     return capabilities
 
 
 def _infer_payload_capabilities(
-    path: str,
+    route_kind: RouteKind,
     payload: dict[str, Any],
 ) -> set[Capability]:
     capabilities: set[Capability] = set()
     capabilities.update(_infer_input_field_capabilities(payload))
-    if path == "/v1/audio/speech" and _speech_uses_reference_audio(payload):
+    if route_kind is RouteKind.SPEECH and _speech_uses_reference_audio(payload):
+        capabilities.add("audio_input")
+    if route_kind is RouteKind.SPEECH_BATCH and _batch_uses_reference_audio(payload):
         capabilities.add("audio_input")
     if _modalities_include_audio(payload) or _has_non_empty(payload.get("audio")):
         capabilities.add("audio_output")
     capabilities.update(_infer_message_part_capabilities(payload.get("messages")))
     return capabilities
+
+
+def _service_class_for_route(route_kind: RouteKind) -> ServiceClass:
+    if route_kind is RouteKind.SPEECH:
+        return "speech_http"
+    if route_kind is RouteKind.SPEECH_BATCH:
+        return "speech_batch"
+    if route_kind is RouteKind.VOICE_CONTROL:
+        return "voice_control"
+    if route_kind is RouteKind.TRANSCRIPTION:
+        return "transcription"
+    return "generation"
+
+
+def _voice_names(
+    route_kind: RouteKind,
+    payload: dict[str, Any] | None,
+) -> set[str]:
+    if payload is None or route_kind not in {
+        RouteKind.SPEECH,
+        RouteKind.SPEECH_BATCH,
+    }:
+        return set()
+
+    names: set[str] = set()
+    default_voice = _voice_name(payload)
+    if default_voice is not None:
+        names.add(default_voice)
+    if route_kind is RouteKind.SPEECH_BATCH:
+        items = payload.get("items")
+        if isinstance(items, list):
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                item_voice = _voice_name(item)
+                if item_voice is not None:
+                    names.add(item_voice)
+                elif default_voice is not None:
+                    names.add(default_voice)
+    return names
+
+
+def _voice_name(payload: dict[str, Any]) -> str | None:
+    value = payload.get("voice", payload.get("speaker"))
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    return normalized or None
+
+
+def _batch_uses_reference_audio(payload: dict[str, Any]) -> bool:
+    if _speech_uses_reference_audio(payload):
+        return True
+    items = payload.get("items")
+    if not isinstance(items, list):
+        return False
+    return any(
+        isinstance(item, dict) and _speech_uses_reference_audio(item) for item in items
+    )
 
 
 def _infer_input_field_capabilities(payload: dict[str, Any]) -> set[Capability]:
@@ -478,13 +573,15 @@ def _modalities_include_audio(payload: dict[str, Any]) -> bool:
 
 
 def _speech_uses_reference_audio(payload: dict[str, Any]) -> bool:
+    reference_fields = ("audio_path", "ref_audio", "audio", "data")
     if _has_non_empty(payload.get("ref_audio")):
         return True
     references = payload.get("references")
     if not isinstance(references, list):
         return False
     return any(
-        isinstance(reference, dict) and _has_non_empty(reference.get("audio_path"))
+        isinstance(reference, dict)
+        and any(_has_non_empty(reference.get(field)) for field in reference_fields)
         for reference in references
     )
 

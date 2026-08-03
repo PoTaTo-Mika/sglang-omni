@@ -8,20 +8,32 @@ import logging
 import time
 import weakref
 from collections.abc import Callable
+from email import policy
+from email.parser import BytesParser
 from http import HTTPStatus
+from urllib.parse import unquote
 
 import httpx
 from fastapi import Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from sglang_omni.serve.speech_errors import openai_error_payload
+from sglang_omni.serve.speech_limits import MAX_VOICE_UPLOAD_BODY_BYTES
 from sglang_omni_router.config import Capability, RouterConfig
 from sglang_omni_router.route_metadata import (
     ROUTE_HEADER_NAMES,
+    RouteKind,
     RouteMetadata,
     RouteMetadataError,
+    classify_route,
     extract_route_metadata,
 )
-from sglang_omni_router.selector import NoEligibleWorkerError, WorkerSelector
+from sglang_omni_router.selector import (
+    NoEligibleWorkerError,
+    WorkerSelector,
+    require_eligible_worker,
+)
+from sglang_omni_router.voice_routing import VoiceMutation, VoiceRoutingState
 from sglang_omni_router.worker import Worker
 
 logger = logging.getLogger(__name__)
@@ -231,10 +243,22 @@ class ProxyHandler:
         self._selector = selector
         self._client = client
         self._admission = AdmissionController(config.effective_max_inflight)
+        self._voice_mutation_lock = asyncio.Lock()
+        self._voice_routing = VoiceRoutingState(
+            workers=workers,
+            owner_url=config.voice_owner_worker_url,
+            client=client,
+            timeout_secs=config.health_check_timeout_secs,
+            retry_interval_secs=config.health_check_interval_secs,
+        )
 
     @property
     def admission(self) -> AdmissionController:
         return self._admission
+
+    @property
+    def voice_routing(self) -> VoiceRoutingState:
+        return self._voice_routing
 
     async def forward_model_request(self, request: Request, path: str) -> Response:
         # Note (Jiaxin Deng): reject before reading the body; past the bound
@@ -280,23 +304,26 @@ class ProxyHandler:
         path: str,
         release: _ReleaseOnce,
     ) -> Response:
+        route_kind = classify_route(path)
+        body_limit = self._config.max_payload_size
+        is_voice_upload = path == "/v1/audio/voices" and request.method == "POST"
+        if is_voice_upload:
+            body_limit = min(body_limit, MAX_VOICE_UPLOAD_BODY_BYTES)
         content_length = request.headers.get("content-length")
-        if content_length is not None and _exceeds_max_size(
-            content_length, self._config.max_payload_size
-        ):
+        if content_length is not None and _exceeds_max_size(content_length, body_limit):
             self._log_route_rejection(
                 request=request,
                 path=path,
                 status_code=413,
                 reason="payload_too_large",
             )
-            return JSONResponse(
-                status_code=413,
-                content={"error": {"message": "payload too large"}},
+            return _payload_too_large_response(
+                is_voice_upload=is_voice_upload,
+                max_size=body_limit,
             )
 
         try:
-            body = await _read_body_with_limit(request, self._config.max_payload_size)
+            body = await _read_body_with_limit(request, body_limit)
         except PayloadTooLargeError:
             self._log_route_rejection(
                 request=request,
@@ -304,13 +331,13 @@ class ProxyHandler:
                 status_code=413,
                 reason="payload_too_large",
             )
-            return JSONResponse(
-                status_code=413,
-                content={"error": {"message": "payload too large"}},
+            return _payload_too_large_response(
+                is_voice_upload=is_voice_upload,
+                max_size=body_limit,
             )
 
         try:
-            metadata = extract_route_metadata(request, path, body)
+            metadata = extract_route_metadata(request, route_kind, body)
         except RouteMetadataError as exc:
             self._log_route_rejection(
                 request=request,
@@ -340,12 +367,37 @@ class ProxyHandler:
             )
         metadata.required_capabilities.update(extra_capabilities)
 
-        try:
-            worker = self._selector.select(
-                self._workers,
-                required_capabilities=metadata.required_capabilities,
-                requested_model=metadata.model,
+        voice_mutation = self._voice_mutation(request, path, body)
+        if voice_mutation is None:
+            return await self._select_and_forward(
+                request,
+                path,
+                body,
+                metadata,
+                release,
             )
+        async with self._voice_mutation_lock:
+            return await self._select_and_forward(
+                request,
+                path,
+                body,
+                metadata,
+                release,
+                voice_mutation=voice_mutation,
+            )
+
+    async def _select_and_forward(
+        self,
+        request: Request,
+        path: str,
+        body: bytes,
+        metadata: RouteMetadata,
+        release: _ReleaseOnce,
+        *,
+        voice_mutation: VoiceMutation | None = None,
+    ) -> Response:
+        try:
+            worker = self._select_worker(metadata)
         except NoEligibleWorkerError:
             self._log_route_rejection(
                 request=request,
@@ -359,7 +411,41 @@ class ProxyHandler:
                 content={"error": {"message": "no eligible upstream"}},
             )
 
-        return await self._forward_relay(request, path, body, metadata, worker, release)
+        return await self._forward_relay(
+            request,
+            path,
+            body,
+            metadata,
+            worker,
+            release,
+            voice_mutation=voice_mutation,
+        )
+
+    def _select_worker(
+        self,
+        metadata: RouteMetadata,
+    ) -> Worker:
+        voice_control = metadata.route_kind is RouteKind.VOICE_CONTROL
+        uploaded_voice_request = metadata.route_kind in {
+            RouteKind.SPEECH,
+            RouteKind.SPEECH_BATCH,
+        } and self._voice_routing.requires_owner(
+            metadata.voice_names,
+            body_exceeds_metadata_limit=metadata.body_exceeds_metadata_limit,
+        )
+        if uploaded_voice_request:
+            metadata.required_capabilities.add("audio_input")
+        if voice_control or uploaded_voice_request:
+            return require_eligible_worker(
+                self._voice_routing.owner,
+                required_capabilities=metadata.required_capabilities,
+                requested_model=metadata.model,
+            )
+        return self._selector.select(
+            self._workers,
+            required_capabilities=metadata.required_capabilities,
+            requested_model=metadata.model,
+        )
 
     async def _forward_relay(
         self,
@@ -369,6 +455,7 @@ class ProxyHandler:
         metadata: RouteMetadata,
         worker: Worker,
         release: _ReleaseOnce,
+        voice_mutation: VoiceMutation | None = None,
     ) -> Response:
         # Note (Jiaxin Deng): stream through instead of buffering. A mid-stream
         # failure after a 2xx cannot become a 502; SSE (text/event-stream) bodies
@@ -386,7 +473,7 @@ class ProxyHandler:
             upstream = await self._client.send(upstream_request, stream=True)
         except httpx.HTTPError as exc:
             worker.decrement_active()
-            worker.record_routed_request()
+            worker.record_routed_request(service_class=metadata.service_class)
             self._record_worker_request_failure(
                 worker,
                 error=type(exc).__name__,
@@ -427,6 +514,8 @@ class ProxyHandler:
                 status_code=upstream.status_code,
                 error=f"status={upstream.status_code}",
             )
+        if voice_mutation is not None and 200 <= upstream.status_code < 300:
+            self._voice_routing.apply(voice_mutation)
 
         is_event_stream = (upstream.headers.get("content-type") or "").startswith(
             "text/event-stream"
@@ -434,7 +523,10 @@ class ProxyHandler:
 
         def record_completion(outcome: str) -> None:
             status_code = upstream.status_code if outcome == "completed" else None
-            worker.record_routed_request(status_code=status_code)
+            worker.record_routed_request(
+                status_code=status_code,
+                service_class=metadata.service_class,
+            )
             self._log_route_completion(
                 worker=worker,
                 path=path,
@@ -488,6 +580,22 @@ class ProxyHandler:
             media_type=media_type,
             cleanup=cleanup,
         )
+
+    def _voice_mutation(
+        self,
+        request: Request,
+        path: str,
+        body: bytes,
+    ) -> VoiceMutation | None:
+        if path == "/v1/audio/voices" and request.method == "POST":
+            name = _multipart_text_field(request, body, "name")
+            return None if name is None else VoiceMutation.create("upload", name)
+
+        prefix = "/v1/audio/voices/"
+        if path.startswith(prefix) and request.method == "DELETE":
+            name = unquote(path.removeprefix(prefix))
+            return VoiceMutation.create("delete", name)
+        return None
 
     def _diagnostic_headers(
         self,
@@ -600,11 +708,66 @@ def _request_id_from_headers(request: Request) -> str | None:
     )
 
 
+def _multipart_text_field(
+    request: Request,
+    body: bytes,
+    field_name: str,
+) -> str | None:
+    content_type = request.headers.get("content-type")
+    if not content_type or "multipart/form-data" not in content_type.lower():
+        return None
+    message = BytesParser(policy=policy.default).parsebytes(
+        (f"Content-Type: {content_type}\r\n" "MIME-Version: 1.0\r\n" "\r\n").encode(
+            "utf-8"
+        )
+        + body
+    )
+    if not message.is_multipart():
+        return None
+    for part in message.iter_parts():
+        if part.get_param("name", header="content-disposition") != field_name:
+            continue
+        payload = part.get_payload(decode=True)
+        if payload is None:
+            return None
+        charset = part.get_content_charset() or "utf-8"
+        try:
+            value = payload.decode(charset).strip()
+        except (LookupError, UnicodeDecodeError):
+            return None
+        return value or None
+    return None
+
+
+def _payload_too_large_response(
+    *,
+    is_voice_upload: bool,
+    max_size: int,
+) -> JSONResponse:
+    if is_voice_upload:
+        return JSONResponse(
+            status_code=413,
+            content=openai_error_payload(
+                f"request body must be at most {max_size} bytes",
+                error_type="RequestTooLargeError",
+                param="audio_sample",
+                code=413,
+            ),
+        )
+    return JSONResponse(
+        status_code=413,
+        content={"error": {"message": "payload too large"}},
+    )
+
+
 def _large_request_extra_capabilities_or_error(
     workers: list[Worker],
     metadata: RouteMetadata,
 ) -> tuple[set[Capability], str | None]:
-    if not metadata.body_exceeds_metadata_limit:
+    if (
+        metadata.route_kind is not RouteKind.GENERATION
+        or not metadata.body_exceeds_metadata_limit
+    ):
         return set(), None
 
     candidates = [

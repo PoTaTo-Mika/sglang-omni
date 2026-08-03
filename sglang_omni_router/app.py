@@ -8,10 +8,10 @@ import json
 import logging
 from contextlib import asynccontextmanager
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import ValidationError
@@ -25,10 +25,12 @@ from sglang_omni_router.config import (
     MIN_CONNECTIONS_PER_WORKER,
     RouterConfig,
     WorkerConfig,
+    can_own_uploaded_voices,
 )
 from sglang_omni_router.health import HealthChecker
 from sglang_omni_router.proxy import ProxyHandler, filter_request_headers
 from sglang_omni_router.selector import WorkerSelector
+from sglang_omni_router.websocket_proxy import TTSWebSocketProxy
 from sglang_omni_router.worker import (
     HEALTH_STATE_UNHEALTHY,
     HEALTH_STATE_UNKNOWN,
@@ -86,6 +88,13 @@ def create_app(
         selector=selector,
         client=client,
     )
+    websocket_proxy = TTSWebSocketProxy(
+        config=config,
+        workers=workers,
+        selector=selector,
+        admission=proxy.admission,
+        voice_routing=proxy.voice_routing,
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -95,12 +104,16 @@ def create_app(
         app.state.health_http_client = health_client
         app.state.health_checker = health_checker
         app.state.proxy = proxy
+        app.state.voice_routing = proxy.voice_routing
+        app.state.websocket_proxy = websocket_proxy
         app.state.admission_controller = proxy.admission
         app.state.admin_update_lock = asyncio.Lock()
         await health_checker.start()
+        await proxy.voice_routing.start()
         try:
             yield
         finally:
+            await proxy.voice_routing.stop()
             await health_checker.stop()
             if owns_health_client:
                 await health_client.aclose()
@@ -118,7 +131,14 @@ def create_app(
         allow_headers=["*"],
     )
 
-    register_routes(app, workers, proxy, config, admin_api_key=resolved_key)
+    register_routes(
+        app,
+        workers,
+        proxy,
+        websocket_proxy,
+        config,
+        admin_api_key=resolved_key,
+    )
     register_favicon(app)
     return app
 
@@ -127,6 +147,7 @@ def register_routes(
     app: FastAPI,
     workers: list[Worker],
     proxy: ProxyHandler,
+    websocket_proxy: TTSWebSocketProxy,
     config: RouterConfig,
     *,
     admin_api_key: str | None = None,
@@ -281,6 +302,14 @@ def register_routes(
             except ValidationError as exc:
                 return _error_response(400, str(exc))
 
+        if worker.url == proxy.voice_routing.owner_url and not can_own_uploaded_voices(
+            next_config.capabilities
+        ):
+            return _error_response(
+                409,
+                "voice owner worker must retain speech and audio_input capabilities",
+            )
+
         worker.replace_config(next_config)
 
         if requested_disabled is not None:
@@ -306,6 +335,8 @@ def register_routes(
         worker = _find_worker(workers, worker_id)
         if worker is None:
             return _error_response(404, "worker not found")
+        if worker.url == proxy.voice_routing.owner_url:
+            return _error_response(409, "voice owner worker cannot be deleted")
         workers.remove(worker)
         logger.info(
             f"worker_deleted worker={worker.display_id} url={worker.url} "
@@ -393,6 +424,27 @@ def register_routes(
     @app.post("/v1/audio/speech")
     async def audio_speech(request: Request) -> Response:
         return await proxy.forward_model_request(request, "/v1/audio/speech")
+
+    @app.post("/v1/audio/speech/batch")
+    async def audio_speech_batch(request: Request) -> Response:
+        return await proxy.forward_model_request(request, "/v1/audio/speech/batch")
+
+    @app.websocket("/v1/audio/speech/stream")
+    async def audio_speech_stream(websocket: WebSocket) -> None:
+        await websocket_proxy.forward(websocket)
+
+    @app.get("/v1/audio/voices")
+    async def audio_voices(request: Request) -> Response:
+        return await proxy.forward_model_request(request, "/v1/audio/voices")
+
+    @app.post("/v1/audio/voices")
+    async def upload_audio_voice(request: Request) -> Response:
+        return await proxy.forward_model_request(request, "/v1/audio/voices")
+
+    @app.delete("/v1/audio/voices/{name}")
+    async def delete_audio_voice(name: str, request: Request) -> Response:
+        path = f"/v1/audio/voices/{quote(name, safe='')}"
+        return await proxy.forward_model_request(request, path)
 
     @app.post("/v1/audio/transcriptions")
     async def audio_transcriptions(request: Request) -> Response:

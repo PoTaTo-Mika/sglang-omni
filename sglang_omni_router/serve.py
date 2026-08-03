@@ -155,6 +155,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--health-check-timeout-secs", type=int, default=5)
     parser.add_argument("--health-check-interval-secs", type=int, default=10)
     parser.add_argument("--health-check-endpoint", default="/health")
+    parser.add_argument(
+        "--voice-owner-worker-url",
+        default=None,
+        help=(
+            "Worker that owns uploaded-voice state. Defaults to the first "
+            "worker with speech and audio_input capabilities. Voice management "
+            "and requests using uploaded voices are pinned to this worker."
+        ),
+    )
     parser.add_argument("--log-level", default="info")
     parser.add_argument(
         "--strict-limits",
@@ -232,6 +241,7 @@ def build_config_from_args(
         health_check_timeout_secs=args.health_check_timeout_secs,
         health_check_interval_secs=args.health_check_interval_secs,
         health_check_endpoint=args.health_check_endpoint,
+        voice_owner_worker_url=args.voice_owner_worker_url,
     )
 
 
@@ -287,6 +297,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             f"health_check_endpoint={config.health_check_endpoint} | "
             f"health_check_interval_secs={config.health_check_interval_secs} | "
             f"health_check_timeout_secs={config.health_check_timeout_secs} | "
+            f"voice_owner_worker={config.resolved_voice_owner_worker_url} | "
             f"readiness_requires_routable_worker=true"
         )
         uvicorn.run(

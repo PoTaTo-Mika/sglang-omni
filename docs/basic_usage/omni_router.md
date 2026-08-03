@@ -195,6 +195,7 @@ The table below lists the router command-line arguments.
 | `--health-check-timeout-secs` | `5` | Timeout for one worker health-check request. |
 | `--health-check-interval-secs` | `10` | Interval between background worker health checks. |
 | `--health-check-endpoint` | `/health` | Worker endpoint used by background health checks. |
+| `--voice-owner-worker-url` | first worker with `speech` and `audio_input` | Worker that owns uploaded TTS voices. Voice management and synthesis requests that use uploaded voices stay on this worker. Without such an owner, built-in voices can still route to eligible speech workers, but voice management is unavailable. |
 | `--log-level` | `info` | Router and Uvicorn log level. |
 | `--strict-limits` | off | Fail startup instead of warning when the `nofile` soft limit is too low for the resolved upstream pool size (`max(--max-connections, --max-inflight)`). |
 
@@ -367,10 +368,30 @@ The router infers required capabilities from each request:
 - `audios`, `audio_inputs`, or audio message parts require `audio_input`
 - `videos`, `video`, or video message parts require `video_input`
 - `modalities: ["audio"]` or `audio` output fields require `audio_output`
-- `/v1/audio/speech` requires `speech`, plus `streaming` for streamed speech
+- `/v1/audio/speech` and `/v1/audio/speech/batch` require `speech`, plus
+  `streaming` for streamed speech
+- `/v1/audio/speech/stream` WebSocket sessions require `speech` and `streaming`
+- `/v1/audio/voices` management requests require `speech`
 
 Register narrower worker capabilities only when a worker cannot serve one of
 those request classes.
+
+Uploaded TTS voices are mutable worker-local state. The Router sends voice
+list, upload, and delete operations to `--voice-owner-worker-url`, and pins
+speech, batch, and WebSocket requests that name an uploaded voice to the same
+worker. It returns `503` if that owner is unavailable instead of silently
+routing the request to a worker without the voice. Built-in voices remain
+balanced by the configured routing policy. By default, the first worker with
+both `speech` and `audio_input` capabilities becomes the owner. Pools without
+such an owner can still route built-in TTS to eligible speech workers, but
+voice management returns `503`.
+The owner cannot be removed or have either required capability removed through
+the router's worker API while the router is running.
+
+Voice ownership assumes one router is the writer for the pool, clients perform
+voice mutations through that router, and the owner keeps its speaker directory
+across restarts. Multiple independent routers or direct mutations against a
+worker are not coordinated and are unsupported for uploaded voices.
 
 Large JSON requests are not fully parsed by the router. With a homogeneous pool
 of complete Omni V1 replicas, no extra headers are needed. With mixed models,
@@ -381,6 +402,10 @@ when the router cannot infer a single safe worker set:
 - `X-SGLang-Omni-Route-Capabilities`: comma-separated capabilities such as
   `image_input`, `audio_input`, `video_input`, `audio_output`, or `streaming`
 - `X-SGLang-Omni-Route-Stream`: `true` or `false` for large streaming requests
+
+Speech and speech-batch JSON bodies larger than 1 MiB are conservatively pinned
+to the voice owner because the router cannot fully inspect them to rule out an
+uploaded voice reference. Route-hint headers do not override voice ownership.
 
 These headers are router-only hints and are not forwarded to workers.
 

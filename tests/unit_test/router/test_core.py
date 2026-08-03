@@ -17,7 +17,11 @@ from sglang_omni_router.health import HealthChecker
 from sglang_omni_router.launcher import LocalLauncher, LocalLauncherConfig
 from sglang_omni_router.launcher.config import load_launcher_config
 from sglang_omni_router.launcher.utils import build_gpu_assignments
-from sglang_omni_router.selector import NoEligibleWorkerError, WorkerSelector
+from sglang_omni_router.selector import (
+    NoEligibleWorkerError,
+    WorkerSelector,
+    require_eligible_worker,
+)
 from sglang_omni_router.serve import (
     build_config_from_args,
     build_parser,
@@ -785,6 +789,54 @@ def test_selector_preserves_unannotated_homogeneous_pool_behavior() -> None:
         ).url
         == "http://127.0.0.1:8102"
     )
+
+
+def test_exact_worker_eligibility_does_not_advance_round_robin() -> None:
+    workers = build_workers(
+        [
+            WorkerConfig(url="http://127.0.0.1:8101"),
+            WorkerConfig(url="http://127.0.0.1:8102"),
+        ]
+    )
+    for worker in workers:
+        worker.state = "healthy"
+
+    selector = WorkerSelector("round_robin")
+    assert selector.select(workers, required_capabilities={"chat"}) is workers[0]
+    assert (
+        require_eligible_worker(
+            workers[0],
+            required_capabilities={"speech"},
+        )
+        is workers[0]
+    )
+    assert selector.select(workers, required_capabilities={"chat"}) is workers[1]
+
+
+def test_exact_worker_eligibility_applies_model_and_capability_contract() -> None:
+    worker = build_workers(
+        [
+            WorkerConfig(
+                url="http://127.0.0.1:8101",
+                model="model-a",
+                capabilities={"speech"},
+            )
+        ]
+    )[0]
+    worker.state = "healthy"
+
+    with pytest.raises(NoEligibleWorkerError):
+        require_eligible_worker(
+            worker,
+            required_capabilities={"speech", "audio_input"},
+            requested_model="model-a",
+        )
+    with pytest.raises(NoEligibleWorkerError):
+        require_eligible_worker(
+            worker,
+            required_capabilities={"speech"},
+            requested_model="model-b",
+        )
 
 
 def test_round_robin_recomputes_candidates_after_health_change() -> None:
