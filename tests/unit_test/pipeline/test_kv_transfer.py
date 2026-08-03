@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 import torch
 
-from sglang_omni.comm.data_ref import DataRef
+from sglang_omni.comm.data_ref import BackendRef, DataKind, DataLayout, DataRef
 from sglang_omni.comm.engine import CommEngine
 from sglang_omni.comm.kv_transfer import KVBufferRegion, KVPageDestination, KVPool
 from sglang_omni.comm.router import CommRouter
@@ -21,6 +21,8 @@ from sglang_omni.proto import (
     KVTransferPrepareMessage,
     KVTransferReadyMessage,
 )
+from tests.unit_test.fixtures.pipeline_fakes import RecordingStageControlPlane
+from tests.unit_test.pipeline.helpers import make_stage
 
 
 class _KVOp:
@@ -209,11 +211,12 @@ class _LinkedControlPlane:
             target.kv_transfer_ready(message)
         elif isinstance(message, DataReadyMessage):
             data_ref = DataRef.from_dict(message.data_ref or {})
-            await target.read_kv_pages(
+            result = await target.read_data(
                 relay=target.relay(data_ref.transport),
                 request_id=message.request_id,
                 data_ref=data_ref,
             )
+            assert result is None
             self.engines[message.from_stage].ack_transfer(
                 DataAckMessage(
                     request_id=message.request_id,
@@ -335,6 +338,77 @@ def test_kv_transfer_reserves_copies_commits_and_releases() -> None:
             KVTransferReadyMessage,
             DataReadyMessage,
         ]
+
+    asyncio.run(_run())
+
+
+def test_stage_uses_common_data_ready_path_for_kv_pages() -> None:
+    async def _run() -> None:
+        relay = _PagedRelay()
+        control_plane = RecordingStageControlPlane()
+        stage = make_stage(
+            name="destination",
+            endpoints={"source": "unused"},
+            relay=relay,
+            control_plane=control_plane,
+        )
+        source_tensor = torch.arange(16, dtype=torch.uint8).reshape(4, 4)
+        destination_tensor = torch.zeros_like(source_tensor)
+        source_pool = _pool("source_pool", source_tensor)
+        destination_pool = _pool("destination_pool", destination_tensor)
+        relay.register_kv_pool(source_pool)
+        stage._comm.register_kv_pool(destination_pool)
+        receiver = _Receiver((2,))
+        stage._comm.register_kv_receiver("destination_pool", receiver)
+        prepare = KVTransferPrepareMessage(
+            request_id="request",
+            transfer_id="transfer",
+            from_stage="source",
+            to_stage="destination",
+            source_pool_id="source_pool",
+            target_pool_id="destination_pool",
+            source_page_indices=(1,),
+            source_layout=source_pool.layout,
+        )
+        ready = stage._comm.prepare_kv_receive(prepare, relay=relay)
+        assert ready.success
+        destination_ref = BackendRef.from_dict(ready.destination_ref or {})
+        op = await relay.put_kv_pages(
+            source_pool_id="source_pool",
+            source_page_indices=(1,),
+            destination_ref=destination_ref.info,
+            destination_page_indices=ready.destination_page_indices,
+            request_id="request",
+            receiver_id="destination",
+        )
+        data_ref = DataRef(
+            version=1,
+            object_id="transfer",
+            kind=DataKind.KV_PAGES,
+            transport=destination_ref.transport,
+            layout=DataLayout.PAGED,
+            buffer=BackendRef.from_relay_info(
+                transport=destination_ref.transport,
+                relay_info=op.metadata,
+            ),
+        )
+
+        await stage._on_data_ready(
+            DataReadyMessage(
+                request_id="request",
+                from_stage="source",
+                to_stage="destination",
+                data_ref=data_ref.to_dict(),
+            )
+        )
+
+        assert torch.equal(destination_tensor[2], source_tensor[1])
+        assert receiver.committed == ["request"]
+        assert stage.scheduler.inbox.empty()
+        assert len(control_plane.sent_to_stage) == 1
+        _, _, ack = control_plane.sent_to_stage[0]
+        assert isinstance(ack, DataAckMessage)
+        assert ack.success
 
     asyncio.run(_run())
 
