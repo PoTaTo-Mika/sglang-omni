@@ -1012,13 +1012,7 @@ class CudaIpcRelay(Relay):
             },
         }
 
-    def prepare_kv_destination(
-        self,
-        pool_id: str,
-        *,
-        sender_id: str,
-    ) -> dict[str, Any]:
-        del sender_id
+    def prepare_kv_destination(self, pool_id: str) -> dict[str, Any]:
         pool = self._kv_pools.get(pool_id)
         if pool is None:
             raise KeyError(f"unknown cuda_ipc KV pool {pool_id!r}")
@@ -1050,7 +1044,6 @@ class CudaIpcRelay(Relay):
         source_page_indices: tuple[int, ...],
         destination_ref: dict[str, Any],
         destination_page_indices: tuple[int, ...],
-        request_id: str,
         receiver_id: str,
     ) -> _ReceiverAckOperation:
         pool = self._kv_pools.get(source_pool_id)
@@ -1059,42 +1052,22 @@ class CudaIpcRelay(Relay):
         pool.validate_page_indices(source_page_indices)
         if len(source_page_indices) != len(destination_page_indices):
             raise ValueError("source and destination KV page counts must match")
-        destination_meta = destination_ref.get("cuda_ipc_kv_destination")
-        if not isinstance(destination_meta, dict):
-            raise ValueError("destination is missing cuda_ipc_kv_destination metadata")
-        destination_buffers = destination_meta.get("buffers")
-        if not isinstance(destination_buffers, list):
-            raise TypeError("destination KV buffers must be list")
-        destination_registration_id = destination_meta.get("registration_id")
-        if (
-            not isinstance(destination_registration_id, str)
-            or not destination_registration_id
-        ):
-            raise TypeError("destination KV registration_id must be a non-empty str")
-        if destination_meta.get("page_size") != pool.page_size:
+        destination_meta = destination_ref["cuda_ipc_kv_destination"]
+        destination_buffers = destination_meta["buffers"]
+        destination_registration_id = destination_meta["registration_id"]
+        if destination_meta["page_size"] != pool.page_size:
             raise ValueError("source and destination KV page sizes do not match")
         if len(destination_buffers) != len(pool.buffers):
             raise ValueError("source and destination KV buffer counts do not match")
-        if not destination_page_indices:
-            raise ValueError("destination KV page indices must not be empty")
-        if any(
-            type(index) is not int or index < 0 for index in destination_page_indices
-        ):
-            raise TypeError(
-                "destination KV page indices must contain non-negative ints"
-            )
         for source, destination in zip(pool.buffers, destination_buffers, strict=True):
             if (
-                destination.get("name") != source.name
-                or destination.get("bytes_per_page") != source.bytes_per_page
+                destination["name"] != source.name
+                or destination["bytes_per_page"] != source.bytes_per_page
             ):
                 raise ValueError(
                     "source and destination KV buffer layouts do not match"
                 )
-            destination_page_count = destination.get("page_count")
-            if type(destination_page_count) is not int or destination_page_count <= max(
-                destination_page_indices
-            ):
+            if destination["page_count"] <= max(destination_page_indices):
                 raise ValueError("destination KV page index exceeds buffer capacity")
 
         device = pool.device
@@ -1114,7 +1087,6 @@ class CudaIpcRelay(Relay):
         }
         relay_info["cuda_ipc_kv"] = dict(relay_info["cuda_ipc_kv"])
         relay_info["cuda_ipc_kv"]["ready_event"] = ready_event.ipc_handle()
-        relay_info["request_id"] = request_id
         return _ReceiverAckOperation(
             relay_info,
             held_references=(
@@ -1138,13 +1110,9 @@ class CudaIpcRelay(Relay):
         destination.validate_page_indices(destination_page_indices)
         if len(source_page_indices) != len(destination_page_indices):
             raise ValueError("source and destination KV page counts must match")
-        source_meta = metadata.get("cuda_ipc_kv")
-        if not isinstance(source_meta, dict):
-            raise ValueError("source is missing cuda_ipc_kv metadata")
-        raw_buffers = source_meta.get("buffers")
-        if not isinstance(raw_buffers, list):
-            raise TypeError("source KV buffers must be list")
-        if source_meta.get("page_size") != destination.page_size:
+        source_meta = metadata["cuda_ipc_kv"]
+        raw_buffers = source_meta["buffers"]
+        if source_meta["page_size"] != destination.page_size:
             raise ValueError("source and destination KV page sizes do not match")
         if len(raw_buffers) != len(destination.buffers):
             raise ValueError("source and destination KV buffer counts do not match")
@@ -1166,12 +1134,8 @@ class CudaIpcRelay(Relay):
                     f"cuda:{source_device_id}"
                 )
             _ensure_peer_access(source_device_id, destination_device_id)
-        source_engine_id = metadata.get("engine_id")
-        if not isinstance(source_engine_id, str) or not source_engine_id:
-            raise TypeError("source KV engine_id must be a non-empty str")
-        source_registration_id = source_meta.get("registration_id")
-        if not isinstance(source_registration_id, str) or not source_registration_id:
-            raise TypeError("source KV registration_id must be a non-empty str")
+        source_engine_id = metadata["engine_id"]
+        source_registration_id = source_meta["registration_id"]
         remote_pool_key = (source_engine_id, source_registration_id)
         source_buffers = self._remote_kv_pools.get(remote_pool_key)
         if source_buffers is None:
@@ -1179,33 +1143,23 @@ class CudaIpcRelay(Relay):
             for source_buffer, destination_buffer in zip(
                 raw_buffers, destination.buffers, strict=True
             ):
-                if source_buffer.get("name") != destination_buffer.name:
+                if source_buffer["name"] != destination_buffer.name:
                     raise ValueError("source and destination KV buffer names differ")
-                if (
-                    source_buffer.get("bytes_per_page")
-                    != destination_buffer.bytes_per_page
-                ):
+                if source_buffer["bytes_per_page"] != destination_buffer.bytes_per_page:
                     raise ValueError("source and destination KV page byte sizes differ")
-                source_page_count = source_buffer.get("page_count")
-                if type(source_page_count) is not int or source_page_count <= max(
-                    source_page_indices
-                ):
+                if source_buffer["page_count"] <= max(source_page_indices):
                     raise ValueError("source KV page index exceeds buffer capacity")
-                storage = source_buffer.get("storage")
-                if not isinstance(storage, dict):
-                    raise TypeError("source KV storage metadata must be dict")
                 imported.append(
-                    _load_cuda_storage_handle(storage, device=destination_device)
+                    _load_cuda_storage_handle(
+                        source_buffer["storage"], device=destination_device
+                    )
                 )
             source_buffers = tuple(imported)
             self._remote_kv_pools[remote_pool_key] = source_buffers
 
-        ready_handle = source_meta.get("ready_event")
-        if not isinstance(ready_handle, bytes):
-            raise TypeError("source KV ready_event must be bytes")
         ready_event = torch.cuda.Event.from_ipc_handle(
             destination_device,
-            ready_handle,
+            source_meta["ready_event"],
         )
         source_indices = torch.tensor(
             source_page_indices,
