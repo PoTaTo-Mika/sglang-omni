@@ -6,7 +6,7 @@ import asyncio
 import logging
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, cast
 from uuid import uuid4
 
 import msgspec
@@ -50,14 +50,6 @@ class _InboundKVTransfer:
     destination: KVPageDestination
     copy_started: bool = False
     abort_error: BaseException | None = None
-
-
-@dataclass
-class _KVReadyWaiter:
-    request_id: str
-    from_stage: str
-    to_stage: str
-    future: asyncio.Future[KVTransferReadyMessage]
 
 
 class _PendingTransfer(msgspec.Struct):
@@ -121,7 +113,7 @@ class CommEngine:
         self._pending: dict[str, _PendingTransfer] = {}
         self._kv_pools: dict[str, KVPool] = {}
         self._kv_receivers: dict[str, KVReceiver] = {}
-        self._kv_ready: dict[str, _KVReadyWaiter] = {}
+        self._kv_ready: dict[str, asyncio.Future[KVTransferReadyMessage]] = {}
         self._outbound_kv_requests: dict[str, str] = {}
         self._inbound_kv: dict[str, _InboundKVTransfer] = {}
         self._task_done_callback = task_done_callback
@@ -240,7 +232,9 @@ class CommEngine:
                 data_ref=data_ref,
             )
             return None
-        raise ValueError(f"unsupported non-stream data kind {data_ref.kind.value!r}")
+        raise NotImplementedError(
+            f"unsupported non-stream data kind {data_ref.kind.value!r}"
+        )
 
     async def send_stream_chunk(
         self,
@@ -298,15 +292,9 @@ class CommEngine:
         return await stage_io.read_stream_chunk(relay, data_ref)
 
     def register_kv_pool(self, pool: KVPool) -> None:
-        existing = self._kv_pools.get(pool.pool_id)
-        if existing is not None and existing is not pool:
-            raise ValueError(f"KV pool {pool.pool_id!r} is already registered")
         self._kv_pools[pool.pool_id] = pool
 
     def register_kv_receiver(self, pool_id: str, receiver: KVReceiver) -> None:
-        existing = self._kv_receivers.get(pool_id)
-        if existing is not None and existing is not receiver:
-            raise ValueError(f"KV receiver {pool_id!r} is already registered")
         self._kv_receivers[pool_id] = receiver
 
     async def send_kv_pages(
@@ -369,19 +357,12 @@ class CommEngine:
             raise RuntimeError(f"duplicate KV transfer {transfer_id!r}")
 
         transport = self.router.outbound(to_stage)
-        if transport is TransportKind.LOCAL_OBJECT:
-            raise ValueError("KV page transfer requires a physical transport")
         relay = self.relay(transport)
         kv_relay = self._kv_relay(relay)
         kv_relay.register_kv_pool(pool)
 
         ready_future = asyncio.get_running_loop().create_future()
-        self._kv_ready[transfer_id] = _KVReadyWaiter(
-            request_id=request_id,
-            from_stage=from_stage,
-            to_stage=to_stage,
-            future=ready_future,
-        )
+        self._kv_ready[transfer_id] = ready_future
         self._outbound_kv_requests[transfer_id] = request_id
         object_id: str | None = None
         try:
@@ -406,17 +387,6 @@ class CommEngine:
             )
             if not ready.success:
                 raise RuntimeError(ready.error)
-            if ready.destination_pool_id != target_pool_id:
-                raise ValueError(
-                    "KV destination pool does not match the requested target: "
-                    f"{ready.destination_pool_id!r} != {target_pool_id!r}"
-                )
-            if len(ready.destination_page_indices) != len(source_page_indices):
-                raise ValueError(
-                    "source and destination KV page counts must match: "
-                    f"{len(source_page_indices)} != "
-                    f"{len(ready.destination_page_indices)}"
-                )
             op = await kv_relay.put_kv_pages(
                 source_pool_id=source_pool_id,
                 source_page_indices=source_page_indices,
@@ -461,23 +431,12 @@ class CommEngine:
             self._outbound_kv_requests.pop(transfer_id, None)
 
     def kv_transfer_ready(self, message: KVTransferReadyMessage) -> None:
-        if message.to_stage != self.router.stage_name:
-            raise ValueError(
-                f"KV transfer ready for {message.to_stage!r} delivered to "
-                f"{self.router.stage_name!r}"
-            )
-        waiter = self._kv_ready.get(message.transfer_id)
-        if waiter is None:
+        future = self._kv_ready.get(message.transfer_id)
+        if future is None:
             logger.debug("Ignoring stale KV transfer ready for %s", message.transfer_id)
             return
-        if message.request_id != waiter.request_id:
-            raise ValueError("KV transfer ready request_id does not match prepare")
-        if message.from_stage != waiter.to_stage:
-            raise ValueError("KV transfer ready source stage does not match target")
-        if message.to_stage != waiter.from_stage:
-            raise ValueError("KV transfer ready target stage does not match source")
-        if not waiter.future.done():
-            waiter.future.set_result(message)
+        if not future.done():
+            future.set_result(message)
 
     def prepare_kv_receive(
         self,
@@ -485,11 +444,6 @@ class CommEngine:
         *,
         relay: Relay,
     ) -> KVTransferReadyMessage:
-        if message.to_stage != self.router.stage_name:
-            raise ValueError(
-                f"KV transfer prepare for {message.to_stage!r} delivered to "
-                f"{self.router.stage_name!r}"
-            )
         if message.transfer_id in self._inbound_kv:
             raise RuntimeError(f"duplicate inbound KV transfer {message.transfer_id!r}")
         receiver = self._kv_receivers.get(message.target_pool_id)
@@ -502,11 +456,6 @@ class CommEngine:
         destination: KVPageDestination | None = None
         try:
             destination = receiver.reserve(message)
-            if destination.pool_id != message.target_pool_id:
-                raise ValueError(
-                    "KV receiver reserved a different pool: "
-                    f"{destination.pool_id!r} != {message.target_pool_id!r}"
-                )
             if len(destination.page_indices) != len(message.source_page_indices):
                 raise ValueError(
                     "KV receiver must reserve one destination page per source page"
@@ -552,10 +501,6 @@ class CommEngine:
         state = self._inbound_kv.get(data_ref.object_id)
         if state is None:
             raise KeyError(f"unknown inbound KV transfer {data_ref.object_id!r}")
-        if data_ref.transport is not self.router.inbound(state.request.from_stage):
-            raise ValueError("KV data_ref transport does not match the prepared route")
-        if request_id != state.request.request_id:
-            raise ValueError("KV transfer request_id does not match prepare")
 
         try:
             state.copy_started = True
@@ -583,11 +528,7 @@ class CommEngine:
 
     @staticmethod
     def _kv_relay(relay: Relay) -> KVTransferRelay:
-        if not isinstance(relay, KVTransferRelay):
-            raise TypeError(
-                f"{type(relay).__name__} does not support paged KV transfer"
-            )
-        return relay
+        return cast(KVTransferRelay, relay)
 
     @staticmethod
     def _kv_ready_failure(
@@ -619,9 +560,9 @@ class CommEngine:
         ):
             if outbound_request_id != request_id:
                 continue
-            waiter = self._kv_ready.get(transfer_id)
-            if waiter is not None and not waiter.future.done():
-                waiter.future.set_exception(error)
+            future = self._kv_ready.get(transfer_id)
+            if future is not None and not future.done():
+                future.set_exception(error)
             self._fail_pending(transfer_id, error)
         self.router.cleanup(request_id)
 
@@ -638,9 +579,9 @@ class CommEngine:
             with suppress(Exception):
                 state.receiver.abort(state.request, state.destination, close_error)
         self._inbound_kv.clear()
-        for waiter in self._kv_ready.values():
-            if not waiter.future.done():
-                waiter.future.set_exception(close_error)
+        for future in self._kv_ready.values():
+            if not future.done():
+                future.set_exception(close_error)
         self._kv_ready.clear()
         self._outbound_kv_requests.clear()
         self.router.close()

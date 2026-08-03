@@ -952,19 +952,12 @@ class CudaIpcRelay(Relay):
         )
 
     def register_kv_pool(self, pool: KVPool) -> None:
-        if pool.device.type != "cuda":
-            raise ValueError(
-                f"cuda_ipc KV pool must use CUDA storage, got {pool.device}"
-            )
         expected_device = torch.device(self.device)
         if pool.device != expected_device:
             raise ValueError(
                 f"KV pool {pool.pool_id!r} is on {pool.device}, but relay uses "
                 f"{expected_device}"
             )
-        existing = self._kv_pools.get(pool.pool_id)
-        if existing is not None and existing is not pool:
-            raise ValueError(f"cuda_ipc KV pool {pool.pool_id!r} already exists")
         self._kv_pools[pool.pool_id] = pool
         self._kv_pool_registration_ids.setdefault(
             pool.pool_id,

@@ -75,35 +75,8 @@ class KVTransferReadyMessage:
     destination_ref: dict[str, Any] | None = None
     error: str | None = None
 
-    def __post_init__(self) -> None:
-        if self.success:
-            if self.destination_ref is None:
-                raise ValueError(
-                    "successful KV transfer ready requires destination_ref"
-                )
-            if self.error is not None:
-                raise ValueError("successful KV transfer ready cannot carry error")
-        else:
-            if not self.error:
-                raise ValueError("failed KV transfer ready requires error")
-            if self.destination_pool_id is not None:
-                raise ValueError("failed KV transfer ready cannot carry destination")
-            if self.destination_page_indices:
-                raise ValueError("failed KV transfer ready cannot carry page indices")
-            if self.destination_ref is not None:
-                raise ValueError(
-                    "failed KV transfer ready cannot carry destination_ref"
-                )
-
     def to_dict(self) -> dict[str, Any]:
-        value = {"type": "kv_transfer_ready", **msgspec.to_builtins(self)}
-        if self.success:
-            value.pop("error")
-        else:
-            value.pop("destination_pool_id")
-            value.pop("destination_page_indices")
-            value.pop("destination_ref")
-        return value
+        return {"type": "kv_transfer_ready", **msgspec.to_builtins(self)}
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "KVTransferReadyMessage":
