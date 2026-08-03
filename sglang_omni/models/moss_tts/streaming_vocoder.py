@@ -61,8 +61,10 @@ class MossStreamingVocoderScheduler(StreamingVocoderBase[_MossStreamState, None]
     ) -> None:
         if stream_stride <= 0 or stream_followup_stride <= 0:
             raise ValueError("stream strides must be > 0")
-        if stream_overlap_tokens < 0 or stream_holdback_tokens < 0:
-            raise ValueError("stream overlap and holdback must be >= 0")
+        if stream_overlap_tokens <= 0:
+            raise ValueError("stream overlap must be > 0")
+        if stream_holdback_tokens < 0:
+            raise ValueError("stream holdback must be >= 0")
 
         self._vocoder = vocoder
         self._audio_tokenizer = vocoder._audio_tokenizer

@@ -6,6 +6,7 @@ import queue
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from sglang_omni.models.moss_tts.payload_types import MossTTSState
@@ -116,6 +117,11 @@ def _drain(scheduler: MossStreamingVocoderScheduler) -> list:
             messages.append(scheduler.outbox.get_nowait())
         except queue.Empty:
             return messages
+
+
+def test_zero_overlap_is_rejected() -> None:
+    with pytest.raises(ValueError, match="stream overlap must be > 0"):
+        _make_scheduler(stream_overlap_tokens=0)
 
 
 def test_stream_builder_emits_prefix_and_only_new_audio_rows() -> None:
