@@ -279,9 +279,6 @@ def match_metric(name, nested):
         return "latency_mean_s"
     if "LATENCY_P50" in name:
         return "latency_p50_s"
-    # Advisory p95 gates (warn-only) must be routed to a distinct metric key
-    # so discover never collapses them with the hard-gate LATENCY_P95_S_REF
-    # for the same stage/workload.
     if "LATENCY_P95" in name and "ADVISORY" in name:
         return "latency_p95_advisory_s"
     if "LATENCY_P95" in name:
