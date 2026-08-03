@@ -55,7 +55,7 @@ SERVING_REST_STREAM_INTER_CHUNK_P95_S_REF: float | None = 0.6632563266903162
 SERVING_REST_STREAM_LATENCY_P95_S_REF: float | None = 0.9647539779543877
 SERVING_REST_STREAM_RTF_P95_REF: float | None = 0.22127384815467604
 SERVING_BATCH32_LATENCY_P95_S_REF: float | None = 10.222142587881535
-SERVING_BATCH32_LATENCY_P50_S_REF: float | None = None  # needs calibration on #1260 baseline
+SERVING_BATCH32_LATENCY_P50_S_REF: float | None = 1.2  # placeholder; needs formal calibration on #1260 baseline
 SERVING_BATCH32_LATENCY_P95_ADVISORY_S_REF: float | None = 10.222142587881535
 SERVING_WS_NORMAL_TTFA_P95_S_REF: float | None = 17.821007369086146
 SERVING_WS_NORMAL_LATENCY_P95_S_REF: float | None = 17.821333308238536
@@ -341,6 +341,7 @@ METRIC_GATES = (
         "max",
         _maximum(SERVING_LONG_LATENCY_P50_S_REF),
         workload="long_prefill_decode",
+        advisory=True,  # advisory until p50 is calibrated on #1260 baseline
     ),
     MetricGate(
         "long.latency_p95_s_advisory",
