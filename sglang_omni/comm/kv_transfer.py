@@ -19,19 +19,6 @@ class KVBufferRegion:
     tensor: torch.Tensor
     bytes_per_page: int
 
-    def __post_init__(self) -> None:
-        if not self.name:
-            raise ValueError("KV buffer region name must not be empty")
-        if not self.tensor.is_contiguous():
-            raise ValueError(f"KV buffer region {self.name!r} must be contiguous")
-        if self.bytes_per_page <= 0:
-            raise ValueError("KV buffer bytes_per_page must be positive")
-        if self.tensor.numel() * self.tensor.element_size() % self.bytes_per_page:
-            raise ValueError(
-                f"KV buffer region {self.name!r} byte length must be divisible "
-                "by bytes_per_page"
-            )
-
     @property
     def page_count(self) -> int:
         return (
@@ -52,17 +39,6 @@ class KVPool:
     buffers: tuple[KVBufferRegion, ...]
 
     def __post_init__(self) -> None:
-        if not self.pool_id:
-            raise ValueError("KV pool_id must not be empty")
-        if not self.layout_id:
-            raise ValueError("KV pool layout_id must not be empty")
-        if self.page_size <= 0:
-            raise ValueError("KV pool page_size must be positive")
-        if not self.buffers:
-            raise ValueError("KV pool requires at least one buffer")
-        names = [buffer.name for buffer in self.buffers]
-        if len(set(names)) != len(names):
-            raise ValueError("KV pool buffer names must be unique")
         devices = {buffer.tensor.device for buffer in self.buffers}
         if len(devices) != 1:
             raise ValueError("all KV pool buffers must live on the same device")
@@ -86,8 +62,6 @@ class KVPool:
         )
 
     def validate_page_indices(self, page_indices: tuple[int, ...]) -> None:
-        if not page_indices:
-            raise ValueError("KV page indices must not be empty")
         if min(page_indices) < 0:
             raise ValueError("KV page indices must be non-negative")
         max_page_index = max(page_indices)
