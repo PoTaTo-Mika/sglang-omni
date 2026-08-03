@@ -44,13 +44,7 @@ _DIRECT_CUDA_IPC_STREAM_INLINE_BYTES_LIMIT = 64 * 1024
 
 
 def relay_device(relay: Relay) -> str:
-    device = relay.device
-    if not isinstance(device, str):
-        raise TypeError(
-            f"{type(relay).__name__}.device must be str, got "
-            f"{type(device).__name__}"
-        )
-    return device
+    return relay.device
 
 
 def extract_tensors(obj: Any, path: str = "") -> tuple[Any, dict[str, torch.Tensor]]:
@@ -136,16 +130,9 @@ def payload_has_cuda_tensor(payload: Any) -> bool:
 
 
 def serialize_direct_cuda_ipc_payload(payload: StagePayload) -> dict[str, Any]:
-    if not isinstance(payload, StagePayload):
-        raise TypeError(
-            f"direct CUDA IPC payload requires StagePayload, got "
-            f"{type(payload).__name__}"
-        )
     if _contains_cuda_tensor(payload.request) or _contains_cpu_tensor(payload.request):
         raise ValueError("direct CUDA IPC payload does not support request tensors")
     data_without_tensors, tensors = extract_cuda_tensors(payload.data)
-    if not tensors:
-        raise ValueError("direct CUDA IPC payload requires at least one CUDA tensor")
     header = StagePayload(
         request_id=payload.request_id,
         request=payload.request,
@@ -170,60 +157,10 @@ def is_direct_cuda_ipc_payload_ref(value: Any) -> bool:
 
 
 def deserialize_direct_cuda_ipc_payload(data_ref: dict[str, Any]) -> StagePayload:
-    if data_ref.get("_type") != _DIRECT_CUDA_IPC_PAYLOAD_TYPE:
-        raise ValueError("data_ref is not a direct CUDA IPC payload")
-    if data_ref.get("version") != 1:
-        raise ValueError(
-            f"unsupported direct CUDA IPC payload version {data_ref.get('version')!r}"
-        )
-    header_bytes = data_ref.get("header")
-    if not isinstance(header_bytes, bytes):
-        raise TypeError(
-            "direct CUDA IPC payload header must be bytes, got "
-            f"{type(header_bytes).__name__}"
-        )
-    header = pickle.loads(header_bytes)
-    if not isinstance(header, StagePayload):
-        raise TypeError(
-            "direct CUDA IPC payload header must decode to StagePayload, got "
-            f"{type(header).__name__}"
-        )
-    raw_tensors = data_ref.get("tensors")
-    if not isinstance(raw_tensors, list):
-        raise TypeError(
-            "direct CUDA IPC payload tensors must be list, got "
-            f"{type(raw_tensors).__name__}"
-        )
-    tensors: dict[str, torch.Tensor] = {}
-    for item in raw_tensors:
-        if not isinstance(item, dict):
-            raise TypeError(
-                "direct CUDA IPC payload tensor entry must be dict, got "
-                f"{type(item).__name__}"
-            )
-        path = item.get("path")
-        if not isinstance(path, str):
-            raise TypeError(
-                "direct CUDA IPC payload tensor path must be str, got "
-                f"{type(path).__name__}"
-            )
-        tensor_bytes = item.get("tensor_bytes")
-        if not isinstance(tensor_bytes, bytes):
-            raise TypeError(
-                "direct CUDA IPC payload tensor_bytes must be bytes, got "
-                f"{type(tensor_bytes).__name__}"
-            )
-        tensor = pickle.loads(tensor_bytes)
-        if not isinstance(tensor, torch.Tensor):
-            raise TypeError(
-                "direct CUDA IPC payload tensor entry must decode to Tensor, got "
-                f"{type(tensor).__name__}"
-            )
-        if not tensor.is_cuda:
-            raise ValueError("direct CUDA IPC payload tensor decoded as non-CUDA")
-        if path in tensors:
-            raise ValueError(f"duplicate direct CUDA IPC tensor path {path!r}")
-        tensors[path] = tensor
+    header = pickle.loads(data_ref["header"])
+    tensors = {
+        item["path"]: pickle.loads(item["tensor_bytes"]) for item in data_ref["tensors"]
+    }
     return StagePayload(
         request_id=header.request_id,
         request=header.request,
@@ -257,34 +194,11 @@ def is_direct_cuda_ipc_stream_chunk_ref(value: Any) -> bool:
 def deserialize_direct_cuda_ipc_stream_chunk(
     data_ref: dict[str, Any],
 ) -> tuple[Any, dict[str, Any] | None]:
-    if data_ref.get("_type") != _DIRECT_CUDA_IPC_STREAM_CHUNK_TYPE:
-        raise ValueError("data_ref is not a direct CUDA IPC stream chunk")
-    if data_ref.get("version") != 1:
-        raise ValueError(
-            f"unsupported direct CUDA IPC version {data_ref.get('version')!r}"
-        )
-    tensor_bytes = data_ref.get("tensor_bytes")
-    if not isinstance(tensor_bytes, bytes):
-        raise TypeError(
-            "direct CUDA IPC data_ref tensor_bytes must be bytes, got "
-            f"{type(tensor_bytes).__name__}"
-        )
-    data = pickle.loads(tensor_bytes)
+    data = pickle.loads(data_ref["tensor_bytes"])
     raw_metadata = data_ref.get("metadata")
     if raw_metadata is None:
         return data, None
-    if not isinstance(raw_metadata, dict):
-        raise TypeError(
-            "direct CUDA IPC metadata must be dict, got "
-            f"{type(raw_metadata).__name__}"
-        )
-    metadata = deserialize_direct_ipc_metadata(raw_metadata)
-    if not isinstance(metadata, dict):
-        raise TypeError(
-            "direct CUDA IPC decoded metadata must be dict, got "
-            f"{type(metadata).__name__}"
-        )
-    return data, metadata
+    return data, deserialize_direct_ipc_metadata(raw_metadata)
 
 
 async def write_payload(
@@ -329,10 +243,6 @@ async def read_payload(
     request_id: str,
     data_ref: DataRef,
 ) -> StagePayload:
-    if data_ref.kind is not DataKind.STAGE_PAYLOAD:
-        raise ValueError(f"expected stage_payload, got {data_ref.kind.value}")
-    if data_ref.header is None:
-        raise ValueError("stage_payload data_ref is missing header")
     header = pickle.loads(base64.b64decode(data_ref.header))
     transfer_buf = await _read_transfer_buffer(relay, request_id, data_ref)
     tensors = {
@@ -363,10 +273,6 @@ async def write_tensor(
     from_stage: str | None = None,
     to_stage: str | None = None,
 ) -> tuple[DataRef, Any]:
-    if not isinstance(tensor, torch.Tensor):
-        raise TypeError(
-            f"write_tensor requires torch.Tensor, got {type(tensor).__name__}"
-        )
     packed = tensor.contiguous().view(torch.uint8).reshape(-1)
     target_device = torch.device(relay_device(relay))
     if packed.device != target_device:
@@ -404,14 +310,6 @@ async def read_tensor(
     relay: Relay,
     data_ref: DataRef,
 ) -> torch.Tensor:
-    if data_ref.layout is not DataLayout.RAW_TENSOR:
-        raise ValueError(f"expected raw_tensor layout, got {data_ref.layout.value}")
-    if data_ref.shape is None:
-        raise ValueError("raw tensor data_ref is missing shape")
-    if data_ref.dtype is None:
-        raise ValueError("raw tensor data_ref is missing dtype")
-    if data_ref.offset is None:
-        raise ValueError("raw tensor data_ref is missing offset")
     transfer_buf = await _read_transfer_buffer(relay, data_ref.object_id, data_ref)
     return (
         transfer_buf[data_ref.offset :]
@@ -704,15 +602,11 @@ def _serialize_direct_ipc_metadata_value(value: Any) -> Any:
 def deserialize_direct_ipc_metadata(value: Any) -> Any:
     if isinstance(value, dict):
         if set(value) == {"_ipc_tensor"}:
-            tensor_bytes = value["_ipc_tensor"]
-            if not isinstance(tensor_bytes, bytes):
-                raise TypeError("_ipc_tensor metadata must be bytes")
-            return pickle.loads(tensor_bytes)
+            return pickle.loads(value["_ipc_tensor"])
         if set(value) == {"_ipc_tuple"}:
-            items = value["_ipc_tuple"]
-            if not isinstance(items, list):
-                raise TypeError("_ipc_tuple metadata must be list")
-            return tuple(deserialize_direct_ipc_metadata(item) for item in items)
+            return tuple(
+                deserialize_direct_ipc_metadata(item) for item in value["_ipc_tuple"]
+            )
         return {
             key: deserialize_direct_ipc_metadata(item) for key, item in value.items()
         }

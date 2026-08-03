@@ -3,6 +3,7 @@
 
 import asyncio
 import logging
+from typing import cast
 
 import msgpack
 import zmq
@@ -201,9 +202,7 @@ class SubSocket:
         if self._socket is None:
             raise RuntimeError("Socket not connected")
         data = await self._socket.recv()
-        msg = deserialize_message(data)
-        if not isinstance(msg, AbortMessage):
-            raise ValueError(f"Expected AbortMessage, got {type(msg)}")
+        msg = cast(AbortMessage, deserialize_message(data))
         logger.debug("SUB received %s", type(msg).__name__)
         return msg
 
@@ -279,23 +278,18 @@ class StageControlPlane:
         """Receive work from previous stage or coordinator."""
         if self._recv_socket is None:
             raise RuntimeError("Control plane not started")
-        msg = await self._recv_socket.recv()
-        if isinstance(
-            msg,
-            (
-                DataReadyMessage,
-                DataAckMessage,
-                KVTransferPrepareMessage,
-                KVTransferReadyMessage,
-                SubmitMessage,
-                ShutdownMessage,
-                ProfilerStartMessage,
-                ProfilerStopMessage,
-                AdminMessage,
-            ),
-        ):
-            return msg
-        raise ValueError(f"Unexpected message type: {type(msg)}")
+        return cast(
+            AdminMessage
+            | DataAckMessage
+            | DataReadyMessage
+            | KVTransferPrepareMessage
+            | KVTransferReadyMessage
+            | SubmitMessage
+            | ShutdownMessage
+            | ProfilerStartMessage
+            | ProfilerStopMessage,
+            await self._recv_socket.recv(),
+        )
 
     async def send_to_stage(
         self,
@@ -407,12 +401,9 @@ class CoordinatorControlPlane:
         """Receive completion or stream event from a stage."""
         if self._completion_socket is None:
             raise RuntimeError("Control plane not started")
-        msg = await self._completion_socket.recv()
-        if isinstance(msg, (CompleteMessage, StreamMessage, AdminResultMessage)):
-            return msg
-        raise ValueError(
-            "Expected CompleteMessage, StreamMessage, or AdminResultMessage, "
-            f"got {type(msg)}"
+        return cast(
+            CompleteMessage | StreamMessage | AdminResultMessage,
+            await self._completion_socket.recv(),
         )
 
     async def send_admin(

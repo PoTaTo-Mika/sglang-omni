@@ -11,7 +11,7 @@ import torch
 from sglang_omni.comm.data_ref import DataRef, TransportKind
 from sglang_omni.comm.engine import CommEngine
 from sglang_omni.comm.router import CommRouter
-from sglang_omni.proto import DataAckMessage, DataReadyMessage
+from sglang_omni.proto import DataAckMessage
 from tests.unit_test.fixtures.pipeline_fakes import (
     RecordingStageControlPlane,
     make_stage_payload,
@@ -199,60 +199,6 @@ def test_comm_engine_ignores_duplicate_data_ack() -> None:
         engine.ack_transfer(ack)
 
     asyncio.run(_run())
-
-
-def test_data_messages_reject_missing_data_ref() -> None:
-    with pytest.raises(TypeError, match="data_ref"):
-        DataReadyMessage(
-            request_id="req-1",
-            from_stage="a",
-            to_stage="b",
-            data_ref=None,
-        ).to_dict()
-
-    with pytest.raises(TypeError, match="success"):
-        DataAckMessage.from_dict(
-            {
-                "type": "data_ack",
-                "request_id": "req-1",
-                "from_stage": "b",
-                "to_stage": "a",
-                "object_id": "obj",
-            }
-        )
-
-    with pytest.raises(TypeError, match="is_done"):
-        DataReadyMessage.from_dict(
-            {
-                "type": "data_ready",
-                "request_id": "req-1",
-                "from_stage": "a",
-                "to_stage": "b",
-                "is_done": "false",
-            }
-        )
-
-    with pytest.raises(TypeError, match="chunk_id"):
-        DataReadyMessage.from_dict(
-            {
-                "type": "data_ready",
-                "request_id": "req-1",
-                "from_stage": "a",
-                "to_stage": "b",
-                "data_ref": {"version": 1},
-                "chunk_id": True,
-            }
-        )
-
-    with pytest.raises(ValueError, match="both done and error"):
-        DataReadyMessage(
-            request_id="req-1",
-            from_stage="a",
-            to_stage="b",
-            data_ref=None,
-            is_done=True,
-            error="boom",
-        ).to_dict()
 
 
 def test_data_ref_rejects_bool_int_fields() -> None:

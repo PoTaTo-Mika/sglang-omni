@@ -81,11 +81,6 @@ class CommRouter:
         return TransportKind.SHM
 
     def outbound_stream(self, target: str, data: torch.Tensor) -> TransportKind:
-        if not isinstance(data, torch.Tensor):
-            raise TypeError(
-                "relay-backed stream chunks must be torch.Tensor, got "
-                f"{type(data).__name__}"
-            )
         if target in self.remote_stage_names:
             return TransportKind.MOONCAKE
         if not data.is_cuda:
@@ -115,21 +110,10 @@ class CommRouter:
             self._relays[kind] = relay
         return relay
 
-    def relay_for(self, target: str) -> tuple[TransportKind, Relay]:
-        kind = self.outbound(target)
-        if kind is TransportKind.LOCAL_OBJECT:
-            raise ValueError(
-                f"same-process target {target!r} has no relay transport; "
-                "use local-object dispatch"
-            )
-        return kind, self.relay(kind)
-
     def relay_for_payload(
         self, target: str, payload: Any
     ) -> tuple[TransportKind, Relay]:
         kind = self.outbound_payload(target, payload)
-        if kind is TransportKind.LOCAL_OBJECT:
-            raise ValueError("local_object has no relay")
         return kind, self.relay(kind)
 
     def outbound_payload(self, target: str, payload: Any) -> TransportKind:
@@ -148,11 +132,6 @@ class CommRouter:
         self, target: str, data: torch.Tensor
     ) -> tuple[TransportKind, Relay]:
         kind = self.outbound_stream(target, data)
-        if kind is TransportKind.LOCAL_OBJECT:
-            raise ValueError(
-                f"same-process stream target {target!r} has no relay transport; "
-                "use local-object dispatch"
-            )
         return kind, self.relay(kind)
 
     def inbound_relay(self, from_stage: str) -> Relay:

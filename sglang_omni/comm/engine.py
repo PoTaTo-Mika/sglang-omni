@@ -161,10 +161,6 @@ class CommEngine:
         to_stage: str,
         target_endpoint: str,
     ) -> DataRef:
-        if not isinstance(payload, StagePayload):
-            raise TypeError(
-                f"send_payload expects StagePayload, got {type(payload).__name__}"
-            )
         queue = self._send_queue_for(to_stage)
         loop = asyncio.get_running_loop()
         ready: asyncio.Future[DataRef] = loop.create_future()
@@ -596,10 +592,6 @@ class CommEngine:
         self.router.close()
 
     def ack_transfer(self, ack: DataAckMessage) -> None:
-        if ack.to_stage != self.router.stage_name:
-            raise ValueError(
-                f"data_ack for {ack.to_stage!r} delivered to {self.router.stage_name!r}"
-            )
         pending = self._pending.get(ack.object_id)
         if pending is None:
             logger.debug(
@@ -613,11 +605,8 @@ class CommEngine:
             if not pending.ack.done():
                 pending.ack.set_result(None)
             return
-        error = ack.error
-        if error is None:
-            raise ValueError("failed data_ack is missing error")
         if not pending.ack.done():
-            pending.ack.set_exception(RuntimeError(error))
+            pending.ack.set_exception(RuntimeError(ack.error))
 
     def _send_queue_for(
         self, queue_key: str

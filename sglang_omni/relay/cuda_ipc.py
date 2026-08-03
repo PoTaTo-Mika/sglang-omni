@@ -173,8 +173,6 @@ def _load_cuda_storage_handle(
 
 
 def _slots_for_size(size: int, slot_size: int) -> int:
-    if size < 0:
-        raise ValueError("cuda_ipc transfer size must be non-negative")
     return max(1, (size + slot_size - 1) // slot_size)
 
 
@@ -414,10 +412,6 @@ class CudaIpcGetOperation(RelayOperation):
 
 class _ContiguousSlotAllocator:
     def __init__(self, *, slot_count: int, slot_size: int) -> None:
-        if slot_count <= 0:
-            raise ValueError("slot_count must be positive")
-        if slot_size <= 0:
-            raise ValueError("slot_size must be positive")
         self.slot_count = slot_count
         self.slot_size = slot_size
         self._free = [True] * slot_count
@@ -429,14 +423,6 @@ class _ContiguousSlotAllocator:
     async def acquire_async(
         self, num_slots: int, *, capture_layout: bool = False
     ) -> _SlotAllocation:
-        if num_slots <= 0:
-            raise ValueError("num_slots must be positive")
-        if num_slots > self.slot_count:
-            raise ValueError(
-                f"allocation requires {num_slots} slots, but pool has "
-                f"{self.slot_count}"
-            )
-
         wait_rounds = 0
         last_failed_free_slots = 0
         last_failed_largest_free_run = 0
@@ -471,13 +457,7 @@ class _ContiguousSlotAllocator:
             await self._changed.wait()
 
     def release(self, offset: int, num_slots: int) -> None:
-        if num_slots <= 0:
-            raise ValueError("num_slots must be positive")
-        if offset % self.slot_size != 0:
-            raise ValueError("offset must be slot aligned")
         slot_index = offset // self.slot_size
-        if slot_index < 0 or slot_index + num_slots > self.slot_count:
-            raise ValueError("slot range is outside the pool")
         for index in range(slot_index, slot_index + num_slots):
             if self._free[index]:
                 raise RuntimeError("cuda_ipc slot released twice")

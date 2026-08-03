@@ -1247,13 +1247,6 @@ def test_direct_cuda_ipc_payload_allows_large_ordinary_header(monkeypatch) -> No
     assert ref["tensors"] == [{"path": "gpu", "tensor_bytes": b"cuda-handle"}]
 
 
-def test_direct_cuda_ipc_payload_rejects_cpu_only_payloads() -> None:
-    payload = make_stage_payload(data={"x": torch.ones(1)})
-
-    with pytest.raises(ValueError, match="at least one CUDA tensor"):
-        stage_io.serialize_direct_cuda_ipc_payload(payload)
-
-
 def test_direct_cuda_ipc_payload_rejects_request_tensors() -> None:
     payload = make_stage_payload(data={"x": "ok"}, inputs={"tensor": torch.ones(1)})
 

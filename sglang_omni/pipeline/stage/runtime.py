@@ -694,8 +694,6 @@ class Stage:
         await self._send_failure(request_id, str(error))
 
     def _data_ref_from_message(self, msg: DataReadyMessage) -> DataRef:
-        if msg.data_ref is None:
-            raise ValueError("data_ready message is missing transfer data_ref")
         return DataRef.from_dict(msg.data_ref)
 
     async def _send_data_ack(
@@ -768,8 +766,6 @@ class Stage:
             imported = stage_io.deserialize_direct_cuda_ipc_stream_chunk(msg.data_ref)
             del imported
             return
-        if msg.chunk_id is None:
-            raise ValueError("stream chunk discard requires chunk_id")
         data_ref = self._data_ref_from_message(msg)
         relay = self._comm.relay(data_ref.transport)
         try:
