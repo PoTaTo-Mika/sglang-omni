@@ -35,10 +35,7 @@ class _PagedRelay(FakeRelay):
         del pool
 
     def prepare_kv_destination(self, pool_id: str) -> dict[str, Any]:
-        return {
-            "transfer_info": {"size": 1},
-            "fake_kv": {"pool_id": pool_id},
-        }
+        return {"fake_kv": {"pool_id": pool_id}}
 
     async def put_kv_pages(
         self,
@@ -46,10 +43,8 @@ class _PagedRelay(FakeRelay):
         source_pool_id: str,
         source_page_indices: tuple[int, ...],
         destination_ref: dict[str, Any],
-        destination_page_indices: tuple[int, ...],
-        receiver_id: str,
     ) -> FakeOp:
-        del source_pool_id, destination_ref, destination_page_indices, receiver_id
+        del source_pool_id, destination_ref
         op = FakeOp(
             {
                 "transfer_info": {"size": len(source_page_indices)},

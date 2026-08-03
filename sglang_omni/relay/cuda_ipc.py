@@ -975,40 +975,24 @@ class CudaIpcRelay(Relay):
         self,
         pool_id: str,
         *,
-        receiver_id: str,
+        destination_registration_id: str,
     ) -> dict[str, Any]:
         pool = self._kv_pools.get(pool_id)
         if pool is None:
             raise KeyError(f"unknown cuda_ipc KV pool {pool_id!r}")
-        cache_key = (pool_id, receiver_id)
+        cache_key = (pool_id, destination_registration_id)
         storage_handles = self._kv_pool_storage_handles.get(cache_key)
         if storage_handles is None:
             storage_handles = tuple(
                 _dump_cuda_storage_handle(buffer.byte_view()) for buffer in pool.buffers
             )
             self._kv_pool_storage_handles[cache_key] = storage_handles
-        total_bytes = sum(
-            buffer.bytes_per_page * buffer.page_count for buffer in pool.buffers
-        )
         return {
             "engine_id": self.engine_id,
-            "transfer_info": {"size": total_bytes},
             "cuda_ipc_kv": {
-                "pool_id": pool_id,
                 "registration_id": self._kv_pool_registration_ids[pool_id],
                 "device_id": self.device_id,
-                "page_size": pool.page_size,
-                "buffers": [
-                    {
-                        "name": buffer.name,
-                        "bytes_per_page": buffer.bytes_per_page,
-                        "page_count": buffer.page_count,
-                        "storage": storage,
-                    }
-                    for buffer, storage in zip(
-                        pool.buffers, storage_handles, strict=True
-                    )
-                ],
+                "storages": list(storage_handles),
             },
         }
 
@@ -1016,24 +1000,9 @@ class CudaIpcRelay(Relay):
         pool = self._kv_pools.get(pool_id)
         if pool is None:
             raise KeyError(f"unknown cuda_ipc KV pool {pool_id!r}")
-        total_bytes = sum(
-            buffer.bytes_per_page * buffer.page_count for buffer in pool.buffers
-        )
         return {
-            "engine_id": self.engine_id,
-            "transfer_info": {"size": total_bytes},
             "cuda_ipc_kv_destination": {
-                "pool_id": pool_id,
                 "registration_id": self._kv_pool_registration_ids[pool_id],
-                "page_size": pool.page_size,
-                "buffers": [
-                    {
-                        "name": buffer.name,
-                        "bytes_per_page": buffer.bytes_per_page,
-                        "page_count": buffer.page_count,
-                    }
-                    for buffer in pool.buffers
-                ],
             },
         }
 
@@ -1043,32 +1012,13 @@ class CudaIpcRelay(Relay):
         source_pool_id: str,
         source_page_indices: tuple[int, ...],
         destination_ref: dict[str, Any],
-        destination_page_indices: tuple[int, ...],
-        receiver_id: str,
     ) -> _ReceiverAckOperation:
         pool = self._kv_pools.get(source_pool_id)
         if pool is None:
             raise KeyError(f"unknown cuda_ipc KV pool {source_pool_id!r}")
-        pool.validate_page_indices(source_page_indices)
-        if len(source_page_indices) != len(destination_page_indices):
-            raise ValueError("source and destination KV page counts must match")
-        destination_meta = destination_ref["cuda_ipc_kv_destination"]
-        destination_buffers = destination_meta["buffers"]
-        destination_registration_id = destination_meta["registration_id"]
-        if destination_meta["page_size"] != pool.page_size:
-            raise ValueError("source and destination KV page sizes do not match")
-        if len(destination_buffers) != len(pool.buffers):
-            raise ValueError("source and destination KV buffer counts do not match")
-        for source, destination in zip(pool.buffers, destination_buffers, strict=True):
-            if (
-                destination["name"] != source.name
-                or destination["bytes_per_page"] != source.bytes_per_page
-            ):
-                raise ValueError(
-                    "source and destination KV buffer layouts do not match"
-                )
-            if destination["page_count"] <= max(destination_page_indices):
-                raise ValueError("destination KV page index exceeds buffer capacity")
+        destination_registration_id = destination_ref["cuda_ipc_kv_destination"][
+            "registration_id"
+        ]
 
         device = pool.device
         stream = torch.cuda.current_stream(device)
@@ -1077,7 +1027,7 @@ class CudaIpcRelay(Relay):
             ready_event.record(stream)
         relay_info = self._export_kv_source_pool(
             source_pool_id,
-            receiver_id=f"{receiver_id}:{destination_registration_id}",
+            destination_registration_id=destination_registration_id,
         )
         relay_info["transfer_info"] = {
             "size": sum(
@@ -1107,15 +1057,7 @@ class CudaIpcRelay(Relay):
         destination = self._kv_pools.get(destination_pool_id)
         if destination is None:
             raise KeyError(f"unknown cuda_ipc KV pool {destination_pool_id!r}")
-        destination.validate_page_indices(destination_page_indices)
-        if len(source_page_indices) != len(destination_page_indices):
-            raise ValueError("source and destination KV page counts must match")
         source_meta = metadata["cuda_ipc_kv"]
-        raw_buffers = source_meta["buffers"]
-        if source_meta["page_size"] != destination.page_size:
-            raise ValueError("source and destination KV page sizes do not match")
-        if len(raw_buffers) != len(destination.buffers):
-            raise ValueError("source and destination KV buffer counts do not match")
 
         destination_device = destination.device
         source_device_id = int(source_meta["device_id"])
@@ -1139,22 +1081,10 @@ class CudaIpcRelay(Relay):
         remote_pool_key = (source_engine_id, source_registration_id)
         source_buffers = self._remote_kv_pools.get(remote_pool_key)
         if source_buffers is None:
-            imported: list[torch.Tensor] = []
-            for source_buffer, destination_buffer in zip(
-                raw_buffers, destination.buffers, strict=True
-            ):
-                if source_buffer["name"] != destination_buffer.name:
-                    raise ValueError("source and destination KV buffer names differ")
-                if source_buffer["bytes_per_page"] != destination_buffer.bytes_per_page:
-                    raise ValueError("source and destination KV page byte sizes differ")
-                if source_buffer["page_count"] <= max(source_page_indices):
-                    raise ValueError("source KV page index exceeds buffer capacity")
-                imported.append(
-                    _load_cuda_storage_handle(
-                        source_buffer["storage"], device=destination_device
-                    )
-                )
-            source_buffers = tuple(imported)
+            source_buffers = tuple(
+                _load_cuda_storage_handle(storage, device=destination_device)
+                for storage in source_meta["storages"]
+            )
             self._remote_kv_pools[remote_pool_key] = source_buffers
 
         ready_event = torch.cuda.Event.from_ipc_handle(
