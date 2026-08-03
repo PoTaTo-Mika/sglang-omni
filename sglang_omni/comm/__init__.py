@@ -17,7 +17,6 @@ from sglang_omni.comm.kv_transfer import (
     KVPageLease,
     KVPool,
     KVReceiver,
-    KVTransferRelay,
 )
 from sglang_omni.comm.router import CommRouter
 
@@ -29,7 +28,6 @@ __all__ = [
     "KVPageLease",
     "KVPool",
     "KVReceiver",
-    "KVTransferRelay",
     "CommRouter",
     "MetadataTensorRef",
     "TensorMeta",

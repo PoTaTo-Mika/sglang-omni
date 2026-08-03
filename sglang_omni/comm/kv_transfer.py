@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Protocol, runtime_checkable
+from typing import Protocol
 
 import torch
 
@@ -108,30 +108,3 @@ class KVPageLease(Protocol):
     """Pins source pages until the receiver acknowledges the transfer."""
 
     def release(self) -> None: ...
-
-
-@runtime_checkable
-class KVTransferRelay(Protocol):
-    """Optional paged-transfer capability implemented by a physical relay."""
-
-    def register_kv_pool(self, pool: KVPool) -> None: ...
-
-    def prepare_kv_destination(self, pool_id: str) -> dict[str, Any]: ...
-
-    async def put_kv_pages(
-        self,
-        *,
-        source_pool_id: str,
-        source_page_indices: tuple[int, ...],
-        destination_ref: dict[str, Any],
-    ) -> Any: ...
-
-    async def get_kv_pages(
-        self,
-        metadata: dict[str, Any],
-        *,
-        destination_pool_id: str,
-        source_page_indices: tuple[int, ...],
-        destination_page_indices: tuple[int, ...],
-        request_id: str,
-    ) -> Any: ...

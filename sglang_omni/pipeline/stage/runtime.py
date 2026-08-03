@@ -483,8 +483,7 @@ class Stage:
                 error=f"request {msg.request_id!r} was aborted",
             )
         else:
-            relay = self._comm.inbound_relay(msg.from_stage)
-            ready = self._comm.prepare_kv_receive(msg, relay=relay)
+            ready = self._comm.prepare_kv_receive(msg)
         await self.control_plane.send_to_stage(msg.from_stage, endpoint, ready)
 
     async def receive_local_payload(

@@ -6,7 +6,7 @@ import asyncio
 import logging
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Any, Callable, cast
+from typing import Any, Callable
 from uuid import uuid4
 
 import msgspec
@@ -25,7 +25,6 @@ from sglang_omni.comm.kv_transfer import (
     KVPageLease,
     KVPool,
     KVReceiver,
-    KVTransferRelay,
 )
 from sglang_omni.comm.router import CommRouter
 from sglang_omni.profiler.comm_trace import elapsed_ms as _comm_elapsed_ms
@@ -357,9 +356,13 @@ class CommEngine:
             raise RuntimeError(f"duplicate KV transfer {transfer_id!r}")
 
         transport = self.router.outbound(to_stage)
+        if transport is not TransportKind.CUDA_IPC:
+            raise NotImplementedError(
+                "paged KV transfer currently supports only cuda_ipc; topology "
+                f"selected {transport.value}"
+            )
         relay = self.relay(transport)
-        kv_relay = self._kv_relay(relay)
-        kv_relay.register_kv_pool(pool)
+        relay.register_kv_pool(pool)
 
         ready_future = asyncio.get_running_loop().create_future()
         self._kv_ready[transfer_id] = ready_future
@@ -387,7 +390,7 @@ class CommEngine:
             )
             if not ready.success:
                 raise RuntimeError(ready.error)
-            op = await kv_relay.put_kv_pages(
+            op = await relay.put_kv_pages(
                 source_pool_id=source_pool_id,
                 source_page_indices=source_page_indices,
                 destination_ref=ready.destination_ref,
@@ -441,11 +444,17 @@ class CommEngine:
     def prepare_kv_receive(
         self,
         message: KVTransferPrepareMessage,
-        *,
-        relay: Relay,
     ) -> KVTransferReadyMessage:
         if message.transfer_id in self._inbound_kv:
             raise RuntimeError(f"duplicate inbound KV transfer {message.transfer_id!r}")
+        transport = self.router.inbound(message.from_stage)
+        if transport is not TransportKind.CUDA_IPC:
+            return self._kv_ready_failure(
+                message,
+                "paged KV transfer currently supports only cuda_ipc; topology "
+                f"selected {transport.value}",
+            )
+        relay = self.relay(transport)
         receiver = self._kv_receivers.get(message.target_pool_id)
         if receiver is None:
             return self._kv_ready_failure(
@@ -468,9 +477,8 @@ class CommEngine:
             pool.validate_page_indices(destination.page_indices)
             if not message.source_layout.compatible_with(pool.layout):
                 raise ValueError("source and destination KV pool layouts do not match")
-            kv_relay = self._kv_relay(relay)
-            kv_relay.register_kv_pool(pool)
-            relay_info = kv_relay.prepare_kv_destination(destination.pool_id)
+            relay.register_kv_pool(pool)
+            relay_info = relay.prepare_kv_destination(destination.pool_id)
             self._inbound_kv[message.transfer_id] = _InboundKVTransfer(
                 request=message,
                 receiver=receiver,
@@ -498,13 +506,18 @@ class CommEngine:
         request_id: str,
         data_ref: DataRef,
     ) -> None:
+        if data_ref.transport is not TransportKind.CUDA_IPC:
+            raise NotImplementedError(
+                "paged KV transfer currently supports only cuda_ipc; data_ref "
+                f"uses {data_ref.transport.value}"
+            )
         state = self._inbound_kv.get(data_ref.object_id)
         if state is None:
             raise KeyError(f"unknown inbound KV transfer {data_ref.object_id!r}")
 
         try:
             state.copy_started = True
-            op = await self._kv_relay(relay).get_kv_pages(
+            op = await relay.get_kv_pages(
                 data_ref.buffer.info,
                 destination_pool_id=state.destination.pool_id,
                 source_page_indices=state.request.source_page_indices,
@@ -525,10 +538,6 @@ class CommEngine:
             raise
         finally:
             self._inbound_kv.pop(data_ref.object_id, None)
-
-    @staticmethod
-    def _kv_relay(relay: Relay) -> KVTransferRelay:
-        return cast(KVTransferRelay, relay)
 
     @staticmethod
     def _kv_ready_failure(

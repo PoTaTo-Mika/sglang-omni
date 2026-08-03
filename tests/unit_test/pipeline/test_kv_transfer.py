@@ -141,9 +141,9 @@ def _engine(stage_name: str, relay: _PagedRelay) -> CommEngine:
     return CommEngine(
         CommRouter(
             stage_name=stage_name,
-            gpu_id=None,
+            gpu_id=0,
             same_process_targets=set(),
-            gpu_stage_names=set(),
+            gpu_stage_names={"source", "destination"},
             injected_relay=relay,
             comm_config={"ack_timeout_s": 1.0},
         )
@@ -157,6 +157,8 @@ def _linked_pair() -> tuple[_PagedRelay, CommEngine, Any, _LinkedControlPlane]:
     destination = make_stage(
         name="destination",
         endpoints={"source": "unused"},
+        gpu_id=0,
+        gpu_stage_names={"source", "destination"},
         relay=relay,
         control_plane=control_plane,
     )
@@ -210,6 +212,35 @@ def test_kv_control_messages_round_trip() -> None:
 
     for message in messages:
         assert deserialize_message(serialize_message(message)) == message
+
+
+def test_kv_transfer_requires_cuda_ipc_topology() -> None:
+    async def _run() -> None:
+        relay = _PagedRelay()
+        source = CommEngine(
+            CommRouter(
+                stage_name="source",
+                gpu_id=None,
+                same_process_targets=set(),
+                gpu_stage_names=set(),
+                injected_relay=relay,
+            )
+        )
+        source.register_kv_pool(_pool("source_pool"))
+
+        with pytest.raises(NotImplementedError, match="only cuda_ipc"):
+            await source.send_kv_pages(
+                control_plane=_LinkedControlPlane(),
+                request_id="request",
+                source_pool_id="source_pool",
+                source_page_indices=(0,),
+                target_pool_id="destination_pool",
+                from_stage="source",
+                to_stage="destination",
+                target_endpoint="unused",
+            )
+
+    asyncio.run(_run())
 
 
 def test_kv_transfer_uses_common_data_ready_lifecycle() -> None:
@@ -306,7 +337,7 @@ def test_kv_cleanup_aborts_reserved_destination() -> None:
         source_layout=destination_pool.layout,
     )
 
-    assert destination.prepare_kv_receive(prepare, relay=relay).success
+    assert destination.prepare_kv_receive(prepare).success
     destination.cleanup("request")
 
     assert receiver.aborted == ["request"]
