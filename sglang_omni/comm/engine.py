@@ -5,21 +5,59 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import suppress
+from dataclasses import dataclass
 from typing import Any, Callable
+from uuid import uuid4
 
 import msgspec
 import torch
 
 from sglang_omni.comm import stage_io
-from sglang_omni.comm.data_ref import DataRef, TransportKind
+from sglang_omni.comm.data_ref import (
+    BackendRef,
+    DataKind,
+    DataLayout,
+    DataRef,
+    TransportKind,
+)
+from sglang_omni.comm.kv_transfer import (
+    KVPageDestination,
+    KVPageLease,
+    KVPool,
+    KVReceiver,
+    KVTransferRelay,
+)
 from sglang_omni.comm.router import CommRouter
 from sglang_omni.profiler.comm_trace import elapsed_ms as _comm_elapsed_ms
 from sglang_omni.profiler.comm_trace import emit as _comm_trace
 from sglang_omni.profiler.comm_trace import now_ns as _comm_now_ns
-from sglang_omni.proto import DataAckMessage, DataReadyMessage, StagePayload
+from sglang_omni.proto import (
+    DataAckMessage,
+    DataReadyMessage,
+    KVTransferPrepareMessage,
+    KVTransferReadyMessage,
+    StagePayload,
+)
 from sglang_omni.relay.base import Relay
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _InboundKVTransfer:
+    request: KVTransferPrepareMessage
+    receiver: KVReceiver
+    destination: KVPageDestination
+    copy_started: bool = False
+    abort_error: BaseException | None = None
+
+
+@dataclass
+class _KVReadyWaiter:
+    request_id: str
+    from_stage: str
+    to_stage: str
+    future: asyncio.Future[KVTransferReadyMessage]
 
 
 class _PendingTransfer(msgspec.Struct):
@@ -81,6 +119,11 @@ class CommEngine:
         ] = {}
         self._send_workers: dict[str, asyncio.Task] = {}
         self._pending: dict[str, _PendingTransfer] = {}
+        self._kv_pools: dict[str, KVPool] = {}
+        self._kv_receivers: dict[str, KVReceiver] = {}
+        self._kv_ready: dict[str, _KVReadyWaiter] = {}
+        self._outbound_kv_requests: dict[str, str] = {}
+        self._inbound_kv: dict[str, _InboundKVTransfer] = {}
         self._task_done_callback = task_done_callback
         self._closed = False
 
@@ -225,7 +268,358 @@ class CommEngine:
     ) -> tuple[torch.Tensor, dict[str, Any] | None]:
         return await stage_io.read_stream_chunk(relay, data_ref)
 
+    def register_kv_pool(self, pool: KVPool) -> None:
+        existing = self._kv_pools.get(pool.pool_id)
+        if existing is not None and existing is not pool:
+            raise ValueError(f"KV pool {pool.pool_id!r} is already registered")
+        self._kv_pools[pool.pool_id] = pool
+
+    def register_kv_receiver(self, pool_id: str, receiver: KVReceiver) -> None:
+        if not isinstance(pool_id, str) or not pool_id:
+            raise TypeError("KV receiver pool_id must be a non-empty str")
+        existing = self._kv_receivers.get(pool_id)
+        if existing is not None and existing is not receiver:
+            raise ValueError(f"KV receiver {pool_id!r} is already registered")
+        self._kv_receivers[pool_id] = receiver
+
+    async def send_kv_pages(
+        self,
+        *,
+        control_plane: Any,
+        request_id: str,
+        source_pool_id: str,
+        source_page_indices: tuple[int, ...],
+        target_pool_id: str,
+        from_stage: str,
+        to_stage: str,
+        target_endpoint: str,
+        metadata: dict[str, Any] | None = None,
+        transfer_id: str | None = None,
+        lease: KVPageLease | None = None,
+    ) -> DataRef:
+        """Reserve remote pages, transfer directly, and wait for receiver ACK."""
+
+        try:
+            return await self._send_kv_pages_impl(
+                control_plane=control_plane,
+                request_id=request_id,
+                source_pool_id=source_pool_id,
+                source_page_indices=source_page_indices,
+                target_pool_id=target_pool_id,
+                from_stage=from_stage,
+                to_stage=to_stage,
+                target_endpoint=target_endpoint,
+                metadata=metadata,
+                transfer_id=transfer_id,
+            )
+        finally:
+            if lease is not None:
+                lease.release()
+
+    async def _send_kv_pages_impl(
+        self,
+        *,
+        control_plane: Any,
+        request_id: str,
+        source_pool_id: str,
+        source_page_indices: tuple[int, ...],
+        target_pool_id: str,
+        from_stage: str,
+        to_stage: str,
+        target_endpoint: str,
+        metadata: dict[str, Any] | None,
+        transfer_id: str | None,
+    ) -> DataRef:
+
+        pool = self._kv_pools.get(source_pool_id)
+        if pool is None:
+            raise KeyError(f"unknown source KV pool {source_pool_id!r}")
+        pool.validate_page_indices(source_page_indices)
+        transfer_id = transfer_id or (
+            f"{request_id}:kv_pages:{from_stage}:{to_stage}:{uuid4().hex}"
+        )
+        if transfer_id in self._kv_ready or transfer_id in self._pending:
+            raise RuntimeError(f"duplicate KV transfer {transfer_id!r}")
+
+        transport = self.router.outbound(to_stage)
+        if transport is TransportKind.LOCAL_OBJECT:
+            raise ValueError("KV page transfer requires a physical transport")
+        relay = self.relay(transport)
+        kv_relay = self._kv_relay(relay)
+        kv_relay.register_kv_pool(pool)
+
+        ready_future = asyncio.get_running_loop().create_future()
+        self._kv_ready[transfer_id] = _KVReadyWaiter(
+            request_id=request_id,
+            from_stage=from_stage,
+            to_stage=to_stage,
+            future=ready_future,
+        )
+        self._outbound_kv_requests[transfer_id] = request_id
+        object_id: str | None = None
+        try:
+            await control_plane.send_to_stage(
+                to_stage,
+                target_endpoint,
+                KVTransferPrepareMessage(
+                    request_id=request_id,
+                    transfer_id=transfer_id,
+                    from_stage=from_stage,
+                    to_stage=to_stage,
+                    source_pool_id=source_pool_id,
+                    target_pool_id=target_pool_id,
+                    source_page_indices=source_page_indices,
+                    source_layout=pool.layout,
+                    metadata=dict(metadata or {}),
+                ),
+            )
+            ready = await asyncio.wait_for(
+                ready_future,
+                timeout=self._ack_timeout_s,
+            )
+            if not ready.success:
+                raise RuntimeError(ready.error or "KV destination reservation failed")
+            if ready.destination_pool_id != target_pool_id:
+                raise ValueError(
+                    "KV destination pool does not match the requested target: "
+                    f"{ready.destination_pool_id!r} != {target_pool_id!r}"
+                )
+            if len(ready.destination_page_indices) != len(source_page_indices):
+                raise ValueError(
+                    "source and destination KV page counts must match: "
+                    f"{len(source_page_indices)} != "
+                    f"{len(ready.destination_page_indices)}"
+                )
+            destination_ref = BackendRef.from_dict(ready.destination_ref or {})
+            if destination_ref.transport is not transport:
+                raise ValueError(
+                    "KV destination transport does not match the selected route"
+                )
+            op = await kv_relay.put_kv_pages(
+                source_pool_id=source_pool_id,
+                source_page_indices=source_page_indices,
+                destination_ref=destination_ref.info,
+                destination_page_indices=ready.destination_page_indices,
+                request_id=request_id,
+                receiver_id=to_stage,
+            )
+            data_ref = DataRef(
+                version=1,
+                object_id=transfer_id,
+                kind=DataKind.KV_PAGES,
+                transport=transport,
+                layout=DataLayout.PAGED,
+                buffer=BackendRef.from_relay_info(
+                    transport=transport,
+                    relay_info=op.metadata,
+                ),
+            )
+            object_id = data_ref.object_id
+            self._register_pending(object_id, [op])
+            pending_task = self._arm_pending(object_id)
+            await control_plane.send_to_stage(
+                to_stage,
+                target_endpoint,
+                DataReadyMessage(
+                    request_id=request_id,
+                    from_stage=from_stage,
+                    to_stage=to_stage,
+                    data_ref=data_ref.to_dict(),
+                ),
+            )
+            await pending_task
+            return data_ref
+        except asyncio.CancelledError:
+            if object_id is not None:
+                self._fail_pending(
+                    object_id,
+                    RuntimeError(f"KV transfer {transfer_id!r} was cancelled"),
+                )
+            raise
+        except Exception as exc:
+            if object_id is not None:
+                self._fail_pending(object_id, exc)
+            raise
+        finally:
+            self._kv_ready.pop(transfer_id, None)
+            self._outbound_kv_requests.pop(transfer_id, None)
+
+    def kv_transfer_ready(self, message: KVTransferReadyMessage) -> None:
+        if message.to_stage != self.router.stage_name:
+            raise ValueError(
+                f"KV transfer ready for {message.to_stage!r} delivered to "
+                f"{self.router.stage_name!r}"
+            )
+        waiter = self._kv_ready.get(message.transfer_id)
+        if waiter is None:
+            logger.debug("Ignoring stale KV transfer ready for %s", message.transfer_id)
+            return
+        if message.request_id != waiter.request_id:
+            raise ValueError("KV transfer ready request_id does not match prepare")
+        if message.from_stage != waiter.to_stage:
+            raise ValueError("KV transfer ready source stage does not match target")
+        if message.to_stage != waiter.from_stage:
+            raise ValueError("KV transfer ready target stage does not match source")
+        if not waiter.future.done():
+            waiter.future.set_result(message)
+
+    def prepare_kv_receive(
+        self,
+        message: KVTransferPrepareMessage,
+        *,
+        relay: Relay,
+    ) -> KVTransferReadyMessage:
+        if message.to_stage != self.router.stage_name:
+            raise ValueError(
+                f"KV transfer prepare for {message.to_stage!r} delivered to "
+                f"{self.router.stage_name!r}"
+            )
+        if message.transfer_id in self._inbound_kv:
+            raise RuntimeError(f"duplicate inbound KV transfer {message.transfer_id!r}")
+        receiver = self._kv_receivers.get(message.target_pool_id)
+        if receiver is None:
+            return self._kv_ready_failure(
+                message,
+                f"unknown target KV pool {message.target_pool_id!r}",
+            )
+
+        destination: KVPageDestination | None = None
+        try:
+            destination = receiver.reserve(message)
+            if destination.pool_id != message.target_pool_id:
+                raise ValueError(
+                    "KV receiver reserved a different pool: "
+                    f"{destination.pool_id!r} != {message.target_pool_id!r}"
+                )
+            if len(destination.page_indices) != len(message.source_page_indices):
+                raise ValueError(
+                    "KV receiver must reserve one destination page per source page"
+                )
+            pool = self._kv_pools.get(destination.pool_id)
+            if pool is None:
+                raise KeyError(
+                    f"destination KV pool {destination.pool_id!r} is not registered"
+                )
+            pool.validate_page_indices(destination.page_indices)
+            if not message.source_layout.compatible_with(pool.layout):
+                raise ValueError("source and destination KV pool layouts do not match")
+            kv_relay = self._kv_relay(relay)
+            kv_relay.register_kv_pool(pool)
+            relay_info = kv_relay.prepare_kv_destination(
+                destination.pool_id,
+                sender_id=message.from_stage,
+            )
+            destination_ref = BackendRef.from_relay_info(
+                transport=self.router.inbound(message.from_stage),
+                relay_info=relay_info,
+            )
+            self._inbound_kv[message.transfer_id] = _InboundKVTransfer(
+                request=message,
+                receiver=receiver,
+                destination=destination,
+            )
+            return KVTransferReadyMessage(
+                request_id=message.request_id,
+                transfer_id=message.transfer_id,
+                from_stage=message.to_stage,
+                to_stage=message.from_stage,
+                success=True,
+                destination_pool_id=destination.pool_id,
+                destination_page_indices=destination.page_indices,
+                destination_ref=destination_ref.to_dict(),
+            )
+        except Exception as exc:
+            with suppress(Exception):
+                receiver.abort(message, destination, exc)
+            return self._kv_ready_failure(message, str(exc) or type(exc).__name__)
+
+    async def read_kv_pages(
+        self,
+        *,
+        relay: Relay,
+        request_id: str,
+        data_ref: DataRef,
+    ) -> None:
+        if data_ref.kind is not DataKind.KV_PAGES:
+            raise ValueError(f"expected kv_pages, got {data_ref.kind.value}")
+        if data_ref.layout is not DataLayout.PAGED:
+            raise ValueError(f"expected paged layout, got {data_ref.layout.value}")
+        if data_ref.buffer.transport is not data_ref.transport:
+            raise ValueError("KV data_ref buffer transport does not match data_ref")
+        state = self._inbound_kv.get(data_ref.object_id)
+        if state is None:
+            raise KeyError(f"unknown inbound KV transfer {data_ref.object_id!r}")
+        if data_ref.transport is not self.router.inbound(state.request.from_stage):
+            raise ValueError("KV data_ref transport does not match the prepared route")
+        if request_id != state.request.request_id:
+            raise ValueError("KV transfer request_id does not match prepare")
+
+        try:
+            state.copy_started = True
+            op = await self._kv_relay(relay).get_kv_pages(
+                data_ref.buffer.info,
+                destination_pool_id=state.destination.pool_id,
+                source_page_indices=state.request.source_page_indices,
+                destination_page_indices=state.destination.page_indices,
+                request_id=request_id,
+            )
+            await op.wait_for_completion(timeout=self._ack_timeout_s)
+            if state.abort_error is not None:
+                raise state.abort_error
+            state.receiver.commit(state.request, state.destination)
+        except asyncio.CancelledError as exc:
+            with suppress(Exception):
+                state.receiver.abort(state.request, state.destination, exc)
+            raise
+        except Exception as exc:
+            with suppress(Exception):
+                state.receiver.abort(state.request, state.destination, exc)
+            raise
+        finally:
+            self._inbound_kv.pop(data_ref.object_id, None)
+
+    @staticmethod
+    def _kv_relay(relay: Relay) -> KVTransferRelay:
+        if not isinstance(relay, KVTransferRelay):
+            raise TypeError(
+                f"{type(relay).__name__} does not support paged KV transfer"
+            )
+        return relay
+
+    @staticmethod
+    def _kv_ready_failure(
+        message: KVTransferPrepareMessage,
+        error: str,
+    ) -> KVTransferReadyMessage:
+        return KVTransferReadyMessage(
+            request_id=message.request_id,
+            transfer_id=message.transfer_id,
+            from_stage=message.to_stage,
+            to_stage=message.from_stage,
+            success=False,
+            error=error,
+        )
+
     def cleanup(self, request_id: str) -> None:
+        error = RuntimeError(f"KV transfer request {request_id!r} was cleaned up")
+        for transfer_id, state in list(self._inbound_kv.items()):
+            if state.request.request_id != request_id:
+                continue
+            if state.copy_started:
+                state.abort_error = error
+                continue
+            with suppress(Exception):
+                state.receiver.abort(state.request, state.destination, error)
+            self._inbound_kv.pop(transfer_id, None)
+        for transfer_id, outbound_request_id in list(
+            self._outbound_kv_requests.items()
+        ):
+            if outbound_request_id != request_id:
+                continue
+            waiter = self._kv_ready.get(transfer_id)
+            if waiter is not None and not waiter.future.done():
+                waiter.future.set_exception(error)
+            self._fail_pending(transfer_id, error)
         self.router.cleanup(request_id)
 
     def close(self) -> None:
@@ -236,6 +630,16 @@ class CommEngine:
         self._send_queues.clear()
         for object_id in list(self._pending):
             self._fail_pending(object_id, RuntimeError("comm engine closed"))
+        close_error = RuntimeError("comm engine closed")
+        for state in self._inbound_kv.values():
+            with suppress(Exception):
+                state.receiver.abort(state.request, state.destination, close_error)
+        self._inbound_kv.clear()
+        for waiter in self._kv_ready.values():
+            if not waiter.future.done():
+                waiter.future.set_exception(close_error)
+        self._kv_ready.clear()
+        self._outbound_kv_requests.clear()
         self.router.close()
 
     def ack_transfer(self, ack: DataAckMessage) -> None:
@@ -406,11 +810,12 @@ class CommEngine:
             ack=asyncio.get_running_loop().create_future(),
         )
 
-    def _arm_pending(self, object_id: str) -> None:
+    def _arm_pending(self, object_id: str) -> asyncio.Task:
         pending = self._pending[object_id]
         assert pending.task is None
         pending.task = asyncio.create_task(self._watch_pending(object_id, pending))
         self._track_task(pending.task, f"comm ack {object_id}")
+        return pending.task
 
     async def _watch_pending(self, object_id: str, pending: _PendingTransfer) -> None:
         try:
