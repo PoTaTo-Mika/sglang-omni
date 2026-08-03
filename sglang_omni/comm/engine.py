@@ -213,6 +213,40 @@ class CommEngine:
     ) -> StagePayload:
         return await stage_io.read_payload(relay, request_id, data_ref)
 
+    async def read_data(
+        self,
+        *,
+        relay: Relay,
+        request_id: str,
+        data_ref: DataRef,
+    ) -> StagePayload | None:
+        """Read one non-stream ``DataReady`` object.
+
+        Payload data is returned to the Stage input handler. Paged KV data is
+        installed into its pre-reserved destination and therefore has no value
+        to route through the input handler.
+        """
+
+        if data_ref.kind is DataKind.STAGE_PAYLOAD:
+            if data_ref.layout is not DataLayout.PACKED_TENSORS:
+                raise ValueError(
+                    "stage_payload requires packed_tensors layout, got "
+                    f"{data_ref.layout.value}"
+                )
+            return await self.read_payload(
+                relay=relay,
+                request_id=request_id,
+                data_ref=data_ref,
+            )
+        if data_ref.kind is DataKind.KV_PAGES:
+            await self._read_kv_pages(
+                relay=relay,
+                request_id=request_id,
+                data_ref=data_ref,
+            )
+            return None
+        raise ValueError(f"unsupported non-stream data kind {data_ref.kind.value!r}")
+
     async def send_stream_chunk(
         self,
         *,
@@ -415,17 +449,14 @@ class CommEngine:
                 ),
             )
             object_id = data_ref.object_id
-            self._register_pending(object_id, [op])
-            pending_task = self._arm_pending(object_id)
-            await control_plane.send_to_stage(
-                to_stage,
-                target_endpoint,
-                DataReadyMessage(
-                    request_id=request_id,
-                    from_stage=from_stage,
-                    to_stage=to_stage,
-                    data_ref=data_ref.to_dict(),
-                ),
+            pending_task = await self._publish_data_ready(
+                control_plane=control_plane,
+                request_id=request_id,
+                from_stage=from_stage,
+                to_stage=to_stage,
+                target_endpoint=target_endpoint,
+                data_ref=data_ref,
+                ops=[op],
             )
             await pending_task
             return data_ref
@@ -533,7 +564,7 @@ class CommEngine:
                 receiver.abort(message, destination, exc)
             return self._kv_ready_failure(message, str(exc) or type(exc).__name__)
 
-    async def read_kv_pages(
+    async def _read_kv_pages(
         self,
         *,
         relay: Relay,
@@ -715,20 +746,17 @@ class CommEngine:
             )
             write_ms = _comm_elapsed_ms(write_start)
             object_id = data_ref.object_id
-            self._register_pending(object_id, [op])
             control_start = _comm_now_ns()
-            await job.control_plane.send_to_stage(
-                job.to_stage,
-                job.target_endpoint,
-                DataReadyMessage(
-                    request_id=job.request_id,
-                    from_stage=job.from_stage,
-                    to_stage=job.to_stage,
-                    data_ref=data_ref.to_dict(),
-                ),
+            await self._publish_data_ready(
+                control_plane=job.control_plane,
+                request_id=job.request_id,
+                from_stage=job.from_stage,
+                to_stage=job.to_stage,
+                target_endpoint=job.target_endpoint,
+                data_ref=data_ref,
+                ops=[op],
             )
             control_ms = _comm_elapsed_ms(control_start)
-            self._arm_pending(object_id)
             _comm_trace(
                 "comm_payload_send",
                 request_id=job.request_id,
@@ -767,21 +795,18 @@ class CommEngine:
             )
             write_ms = _comm_elapsed_ms(write_start)
             object_id = data_ref.object_id
-            self._register_pending(object_id, ops)
             control_start = _comm_now_ns()
-            await job.control_plane.send_to_stage(
-                job.target_stage,
-                job.target_endpoint,
-                DataReadyMessage(
-                    request_id=job.request_id,
-                    from_stage=job.from_stage,
-                    to_stage=job.target_stage,
-                    data_ref=data_ref.to_dict(),
-                    chunk_id=job.chunk_id,
-                ),
+            await self._publish_data_ready(
+                control_plane=job.control_plane,
+                request_id=job.request_id,
+                from_stage=job.from_stage,
+                to_stage=job.target_stage,
+                target_endpoint=job.target_endpoint,
+                data_ref=data_ref,
+                ops=ops,
+                chunk_id=job.chunk_id,
             )
             control_ms = _comm_elapsed_ms(control_start)
-            self._arm_pending(object_id)
             _comm_trace(
                 "comm_stream_send",
                 request_id=job.request_id,
@@ -801,6 +826,39 @@ class CommEngine:
                 self._fail_pending(object_id, exc)
             if not job.ready.done():
                 job.ready.set_exception(exc)
+
+    async def _publish_data_ready(
+        self,
+        *,
+        control_plane: Any,
+        request_id: str,
+        from_stage: str,
+        to_stage: str,
+        target_endpoint: str,
+        data_ref: DataRef,
+        ops: list[Any],
+        chunk_id: int | None = None,
+    ) -> asyncio.Task:
+        """Publish a relay object and arm its existing ACK lifecycle."""
+
+        object_id = data_ref.object_id
+        self._register_pending(object_id, ops)
+        try:
+            await control_plane.send_to_stage(
+                to_stage,
+                target_endpoint,
+                DataReadyMessage(
+                    request_id=request_id,
+                    from_stage=from_stage,
+                    to_stage=to_stage,
+                    data_ref=data_ref.to_dict(),
+                    chunk_id=chunk_id,
+                ),
+            )
+        except BaseException as exc:
+            self._fail_pending(object_id, exc)
+            raise
+        return self._arm_pending(object_id)
 
     def _register_pending(self, object_id: str, ops: list[Any]) -> None:
         if object_id in self._pending:
