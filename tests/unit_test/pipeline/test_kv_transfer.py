@@ -34,8 +34,7 @@ class _PagedRelay(FakeRelay):
     def register_kv_pool(self, pool: KVPool) -> None:
         del pool
 
-    def prepare_kv_destination(self, pool_id: str, *, sender_id: str) -> dict[str, Any]:
-        del sender_id
+    def prepare_kv_destination(self, pool_id: str) -> dict[str, Any]:
         return {
             "transfer_info": {"size": 1},
             "fake_kv": {"pool_id": pool_id},
@@ -48,7 +47,6 @@ class _PagedRelay(FakeRelay):
         source_page_indices: tuple[int, ...],
         destination_ref: dict[str, Any],
         destination_page_indices: tuple[int, ...],
-        request_id: str,
         receiver_id: str,
     ) -> FakeOp:
         del source_pool_id, destination_ref, destination_page_indices, receiver_id
@@ -56,7 +54,7 @@ class _PagedRelay(FakeRelay):
             {
                 "transfer_info": {"size": len(source_page_indices)},
                 "fake_kv": True,
-                "key": request_id,
+                "key": "kv-put",
             },
             self.log,
         )
@@ -248,7 +246,7 @@ def test_kv_transfer_uses_common_data_ready_lifecycle() -> None:
         assert destination.scheduler.inbox.empty()
         lease.release.assert_called_once_with()
         assert relay.put_ops[0].waited
-        assert ("op_ack", "request") in relay.log.events
+        assert ("op_ack", "kv-put") in relay.log.events
         assert [type(message) for message in control_plane.messages] == [
             KVTransferPrepareMessage,
             KVTransferReadyMessage,

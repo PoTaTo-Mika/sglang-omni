@@ -20,14 +20,12 @@ class KVBufferRegion:
     bytes_per_page: int
 
     def __post_init__(self) -> None:
-        if not isinstance(self.name, str) or not self.name:
-            raise TypeError("KV buffer region name must be a non-empty str")
-        if not isinstance(self.tensor, torch.Tensor):
-            raise TypeError("KV buffer region tensor must be torch.Tensor")
+        if not self.name:
+            raise ValueError("KV buffer region name must not be empty")
         if not self.tensor.is_contiguous():
             raise ValueError(f"KV buffer region {self.name!r} must be contiguous")
-        if type(self.bytes_per_page) is not int or self.bytes_per_page <= 0:
-            raise TypeError("KV buffer bytes_per_page must be a positive int")
+        if self.bytes_per_page <= 0:
+            raise ValueError("KV buffer bytes_per_page must be positive")
         if self.tensor.numel() * self.tensor.element_size() % self.bytes_per_page:
             raise ValueError(
                 f"KV buffer region {self.name!r} byte length must be divisible "
@@ -54,12 +52,12 @@ class KVPool:
     buffers: tuple[KVBufferRegion, ...]
 
     def __post_init__(self) -> None:
-        if not isinstance(self.pool_id, str) or not self.pool_id:
-            raise TypeError("KV pool_id must be a non-empty str")
-        if not isinstance(self.layout_id, str) or not self.layout_id:
-            raise TypeError("KV pool layout_id must be a non-empty str")
-        if type(self.page_size) is not int or self.page_size <= 0:
-            raise TypeError("KV pool page_size must be a positive int")
+        if not self.pool_id:
+            raise ValueError("KV pool_id must not be empty")
+        if not self.layout_id:
+            raise ValueError("KV pool layout_id must not be empty")
+        if self.page_size <= 0:
+            raise ValueError("KV pool page_size must be positive")
         if not self.buffers:
             raise ValueError("KV pool requires at least one buffer")
         names = [buffer.name for buffer in self.buffers]
@@ -90,12 +88,13 @@ class KVPool:
     def validate_page_indices(self, page_indices: tuple[int, ...]) -> None:
         if not page_indices:
             raise ValueError("KV page indices must not be empty")
-        if any(type(index) is not int or index < 0 for index in page_indices):
-            raise TypeError("KV page indices must contain non-negative ints")
+        if min(page_indices) < 0:
+            raise ValueError("KV page indices must be non-negative")
+        max_page_index = max(page_indices)
         for buffer in self.buffers:
-            if max(page_indices) >= buffer.page_count:
+            if max_page_index >= buffer.page_count:
                 raise ValueError(
-                    f"KV page index {max(page_indices)} exceeds buffer "
+                    f"KV page index {max_page_index} exceeds buffer "
                     f"{buffer.name!r} capacity {buffer.page_count}"
                 )
 
@@ -108,14 +107,12 @@ class KVPageDestination:
     page_indices: tuple[int, ...]
 
     def __post_init__(self) -> None:
-        if not isinstance(self.pool_id, str) or not self.pool_id:
-            raise TypeError("KV destination pool_id must be a non-empty str")
+        if not self.pool_id:
+            raise ValueError("KV destination pool_id must not be empty")
         if not self.page_indices:
             raise ValueError("KV destination page_indices must not be empty")
-        if any(type(index) is not int or index < 0 for index in self.page_indices):
-            raise TypeError(
-                "KV destination page_indices must contain non-negative ints"
-            )
+        if min(self.page_indices) < 0:
+            raise ValueError("KV destination page_indices must be non-negative")
 
 
 class KVReceiver(Protocol):
@@ -153,12 +150,7 @@ class KVTransferRelay(Protocol):
 
     def register_kv_pool(self, pool: KVPool) -> None: ...
 
-    def prepare_kv_destination(
-        self,
-        pool_id: str,
-        *,
-        sender_id: str,
-    ) -> dict[str, Any]: ...
+    def prepare_kv_destination(self, pool_id: str) -> dict[str, Any]: ...
 
     async def put_kv_pages(
         self,
@@ -167,7 +159,6 @@ class KVTransferRelay(Protocol):
         source_page_indices: tuple[int, ...],
         destination_ref: dict[str, Any],
         destination_page_indices: tuple[int, ...],
-        request_id: str,
         receiver_id: str,
     ) -> Any: ...
 

@@ -309,8 +309,6 @@ class CommEngine:
         self._kv_pools[pool.pool_id] = pool
 
     def register_kv_receiver(self, pool_id: str, receiver: KVReceiver) -> None:
-        if not isinstance(pool_id, str) or not pool_id:
-            raise TypeError("KV receiver pool_id must be a non-empty str")
         existing = self._kv_receivers.get(pool_id)
         if existing is not None and existing is not receiver:
             raise ValueError(f"KV receiver {pool_id!r} is already registered")
@@ -412,7 +410,7 @@ class CommEngine:
                 timeout=self._ack_timeout_s,
             )
             if not ready.success:
-                raise RuntimeError(ready.error or "KV destination reservation failed")
+                raise RuntimeError(ready.error)
             if ready.destination_pool_id != target_pool_id:
                 raise ValueError(
                     "KV destination pool does not match the requested target: "
@@ -424,7 +422,7 @@ class CommEngine:
                     f"{len(source_page_indices)} != "
                     f"{len(ready.destination_page_indices)}"
                 )
-            destination_ref = BackendRef.from_dict(ready.destination_ref or {})
+            destination_ref = BackendRef.from_dict(ready.destination_ref)
             if destination_ref.transport is not transport:
                 raise ValueError(
                     "KV destination transport does not match the selected route"
@@ -434,7 +432,6 @@ class CommEngine:
                 source_page_indices=source_page_indices,
                 destination_ref=destination_ref.info,
                 destination_page_indices=ready.destination_page_indices,
-                request_id=request_id,
                 receiver_id=to_stage,
             )
             data_ref = DataRef(
@@ -536,10 +533,7 @@ class CommEngine:
                 raise ValueError("source and destination KV pool layouts do not match")
             kv_relay = self._kv_relay(relay)
             kv_relay.register_kv_pool(pool)
-            relay_info = kv_relay.prepare_kv_destination(
-                destination.pool_id,
-                sender_id=message.from_stage,
-            )
+            relay_info = kv_relay.prepare_kv_destination(destination.pool_id)
             destination_ref = BackendRef.from_relay_info(
                 transport=self.router.inbound(message.from_stage),
                 relay_info=relay_info,

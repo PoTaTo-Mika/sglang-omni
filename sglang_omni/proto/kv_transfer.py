@@ -32,12 +32,8 @@ class KVPoolLayout:
     def __post_init__(self) -> None:
         _require_str(self.layout_id, "layout_id")
         _require_positive_int(self.page_size, "page_size")
-        if not isinstance(self.buffers, tuple):
-            raise TypeError("buffers must be tuple[KVBufferSpec, ...]")
         if not self.buffers:
             raise ValueError("KV pool layout requires at least one buffer")
-        if any(not isinstance(buffer, KVBufferSpec) for buffer in self.buffers):
-            raise TypeError("buffers must contain KVBufferSpec values")
         names = [buffer.name for buffer in self.buffers]
         if len(set(names)) != len(names):
             raise ValueError("KV pool layout buffer names must be unique")
@@ -80,10 +76,6 @@ class KVTransferPrepareMessage:
         _require_str(self.source_pool_id, "source_pool_id")
         _require_str(self.target_pool_id, "target_pool_id")
         _validate_page_indices(self.source_page_indices, "source_page_indices")
-        if not isinstance(self.source_layout, KVPoolLayout):
-            raise TypeError("source_layout must be KVPoolLayout")
-        if not isinstance(self.metadata, dict):
-            raise TypeError("metadata must be dict")
 
     def to_dict(self) -> dict[str, Any]:
         return {"type": "kv_transfer_prepare", **msgspec.to_builtins(self)}
@@ -114,16 +106,15 @@ class KVTransferReadyMessage:
             from_stage=self.from_stage,
             to_stage=self.to_stage,
         )
-        if not isinstance(self.success, bool):
-            raise TypeError("success must be bool")
         if self.success:
             _require_str(self.destination_pool_id, "destination_pool_id")
             _validate_page_indices(
                 self.destination_page_indices, "destination_page_indices"
             )
             if self.destination_ref is None:
-                raise TypeError("successful KV transfer ready requires destination_ref")
-            _require_dict(self.destination_ref, "destination_ref")
+                raise ValueError(
+                    "successful KV transfer ready requires destination_ref"
+                )
             if self.error is not None:
                 raise ValueError("successful KV transfer ready cannot carry error")
         else:
@@ -161,28 +152,18 @@ def _validate_common_message_fields(
     _require_str(to_stage, "to_stage")
 
 
-def _require_str(value: Any, name: str) -> str:
-    if not isinstance(value, str) or value == "":
-        raise TypeError(f"{name} must be a non-empty str")
-    return value
+def _require_str(value: str | None, name: str) -> None:
+    if not value:
+        raise ValueError(f"{name} must not be empty")
 
 
-def _require_positive_int(value: Any, name: str) -> int:
-    if type(value) is not int or value <= 0:
-        raise TypeError(f"{name} must be a positive int")
-    return value
-
-
-def _require_dict(value: Any, name: str) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        raise TypeError(f"{name} must be dict")
-    return value
+def _require_positive_int(value: int, name: str) -> None:
+    if value <= 0:
+        raise ValueError(f"{name} must be positive")
 
 
 def _validate_page_indices(indices: tuple[int, ...], name: str) -> None:
-    if not isinstance(indices, tuple):
-        raise TypeError(f"{name} must be tuple[int, ...]")
     if not indices:
         raise ValueError(f"{name} must not be empty")
-    if any(type(index) is not int or index < 0 for index in indices):
-        raise TypeError(f"{name} must contain non-negative ints")
+    if min(indices) < 0:
+        raise ValueError(f"{name} must be non-negative")
