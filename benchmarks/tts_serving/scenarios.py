@@ -7,17 +7,17 @@ import base64
 import hashlib
 import json
 import random
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
-from benchmarks.tts_serving.spec import BenchmarkSpec, LoadStage
+from benchmarks.tts_serving.spec import BenchmarkSpec, LoadStage, SpecError
 from benchmarks.tts_serving.voice_upload_fixtures import (
     VOICE_UPLOAD_FIXTURE_SIZES,
     VOICE_UPLOAD_WAV_FIXTURE_SIZE,
     get_wav_upload_fixture,
 )
 
-SCENARIO_SCHEMA_VERSION = 3
+SCENARIO_SCHEMA_VERSION = 4
 
 MULTILINGUAL_TEXTS = (
     ("Auto", "This sentence lets the model auto-detect the target language."),
@@ -237,6 +237,8 @@ class Scenario:
     upload_size_bytes: int = 0
     script: list[dict[str, Any]] = field(default_factory=list)
     planned_metadata: dict[str, Any] = field(default_factory=dict)
+    t_offset_s: float | None = None
+    collision_epoch_s: float | None = None
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)
@@ -339,6 +341,12 @@ def _build_stage_scenarios(spec: BenchmarkSpec, stage: LoadStage) -> list[Scenar
     rng = random.Random(f"{spec.seed}:{stage.id}")
     endpoint_set = set(stage.enabled_endpoints or spec.params.enabled_endpoints)
     required_scenarios = _required_stage_scenarios(spec, stage, endpoint_set)
+    if stage.mode == "scheduled":
+        return _build_scheduled_stage_scenarios(
+            spec,
+            stage,
+            required_scenarios,
+        )
     if _stage_voice_speaker_cap_count(spec, stage):
         return required_scenarios
     scenarios = list(required_scenarios)
@@ -353,6 +361,128 @@ def _build_stage_scenarios(spec: BenchmarkSpec, stage: LoadStage) -> list[Scenar
             )
         )
     return scenarios
+
+
+def _build_scheduled_stage_scenarios(
+    spec: BenchmarkSpec,
+    stage: LoadStage,
+    required_scenarios: list[Scenario],
+) -> list[Scenario]:
+    assert stage.coverage_schedule is not None
+    scheduled_workloads = {schedule.workload for schedule in stage.workload_schedules}
+    required_by_workload = {
+        workload: [
+            scenario for scenario in required_scenarios if scenario.workload == workload
+        ]
+        for workload in scheduled_workloads
+    }
+    coverage_scenarios = [
+        scenario
+        for scenario in required_scenarios
+        if scenario.workload not in scheduled_workloads
+    ]
+
+    resolved: list[tuple[float, int, int, Scenario]] = []
+    next_index = len(required_scenarios)
+    for source_rank, schedule in enumerate(stage.workload_schedules):
+        events = sorted(
+            (
+                *(
+                    (offset, True, index)
+                    for index, offset in enumerate(schedule.collision_offsets_s)
+                ),
+                *(
+                    (offset, False, index)
+                    for index, offset in enumerate(schedule.background_offsets_s)
+                ),
+            ),
+            key=lambda item: (item[0], not item[1], item[2]),
+        )
+        required = required_by_workload[schedule.workload]
+        if len(required) > len(events):
+            raise SpecError(
+                f"scheduled workload {schedule.workload!r} has "
+                f"{len(required)} required scenarios but only {len(events)} offsets"
+            )
+        for source_index, (offset, collision, _) in enumerate(events):
+            if source_index < len(required):
+                scenario = required[source_index]
+            else:
+                scenario = _scheduled_workload_scenario(
+                    schedule.workload,
+                    next_index,
+                    spec,
+                    stage,
+                )
+                next_index += 1
+            resolved.append(
+                (
+                    offset,
+                    source_rank,
+                    source_index,
+                    replace(
+                        scenario,
+                        t_offset_s=offset,
+                        collision_epoch_s=offset if collision else None,
+                    ),
+                )
+            )
+
+    coverage_offsets = _coverage_offsets(
+        stage.coverage_schedule.start_s,
+        stage.coverage_schedule.end_s,
+        len(coverage_scenarios),
+    )
+    coverage_rank = len(stage.workload_schedules)
+    for source_index, (scenario, offset) in enumerate(
+        zip(coverage_scenarios, coverage_offsets, strict=True)
+    ):
+        resolved.append(
+            (
+                offset,
+                coverage_rank,
+                source_index,
+                replace(scenario, t_offset_s=offset),
+            )
+        )
+
+    resolved.sort(key=lambda item: item[:3])
+    return [scenario for _, _, _, scenario in resolved]
+
+
+def _coverage_offsets(start_s: float, end_s: float, count: int) -> list[float]:
+    if count == 0:
+        return []
+    if count == 1:
+        return [(start_s + end_s) / 2.0]
+    step = (end_s - start_s) / (count - 1)
+    return [start_s + index * step for index in range(count)]
+
+
+def _scheduled_workload_scenario(
+    workload: str,
+    index: int,
+    spec: BenchmarkSpec,
+    stage: LoadStage,
+) -> Scenario:
+    if workload == "speech_normal":
+        return _speech_baseline(
+            index,
+            spec,
+            stage,
+            random.Random(f"{spec.seed}:{stage.id}:{index}:scheduled"),
+        )
+    if workload == "rest_stream":
+        return _speech_raw_pcm_stream(index, spec, stage)
+    if workload == "batch_32_all_valid":
+        return _batch_request(index, spec, stage, batch_size=32)
+    if workload == "long_prefill_decode":
+        return _speech_long_prefill_decode(index, spec, stage)
+    if workload == "ws_normal":
+        return _websocket_normal(index, spec, stage)
+    if workload == "ws_stream_audio":
+        return _websocket_stream_audio(index, spec, stage)
+    raise ValueError(f"unsupported scheduled workload: {workload}")
 
 
 def _required_stage_scenarios(

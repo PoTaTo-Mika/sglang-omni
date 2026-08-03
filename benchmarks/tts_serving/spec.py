@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import re
+from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -15,9 +16,17 @@ from urllib.parse import urlparse
 VALID_TEST_TYPES = {"engine", "e2e", "external"}
 DEFAULT_PROFILE = "stress"
 VALID_PROFILES = {DEFAULT_PROFILE}
-VALID_LOAD_MODES = {"closed_loop", "open_loop", "ramp", "burst", "soak"}
+VALID_LOAD_MODES = {"closed_loop", "open_loop", "ramp", "burst", "soak", "scheduled"}
 VALID_ARRIVAL_DISTRIBUTIONS = {"deterministic", "poisson"}
 DEFAULT_ENDPOINTS = ("speech", "speech_stream", "voices", "batch", "websocket")
+SCHEDULED_WORKLOAD_ENDPOINTS = {
+    "speech_normal": "speech",
+    "rest_stream": "speech_stream",
+    "batch_32_all_valid": "batch",
+    "long_prefill_decode": "speech",
+    "ws_normal": "websocket",
+    "ws_stream_audio": "websocket",
+}
 DEFAULT_SPEAKER_MAX_UPLOADED = 1000
 DEFAULT_SEED = 0
 SAFE_STAGE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
@@ -77,6 +86,14 @@ LOAD_STAGE_KEYS = {
     "voice_cache_pressure_voice_count",
     "voice_speaker_cap_count",
     "speaker_max_uploaded",
+    "coverage_schedule",
+    "workload_schedules",
+}
+SCHEDULE_KEYS = {"start_s", "end_s"}
+WORKLOAD_SCHEDULE_KEYS = {
+    "workload",
+    "background_offsets_s",
+    "collision_offsets_s",
 }
 
 
@@ -104,6 +121,86 @@ class AuthSpec:
 
 
 @dataclass(frozen=True)
+class CoverageSchedule:
+    start_s: float
+    end_s: float
+
+    @classmethod
+    def from_obj(cls, obj: Any) -> CoverageSchedule:
+        if not isinstance(obj, dict):
+            raise SpecError("params.load_stages[].coverage_schedule must be an object")
+        _reject_unknown_keys(
+            obj,
+            SCHEDULE_KEYS,
+            "params.load_stages[].coverage_schedule",
+        )
+        start_s = _finite_nonnegative_float(
+            obj.get("start_s"),
+            "params.load_stages[].coverage_schedule.start_s",
+        )
+        end_s = _finite_nonnegative_float(
+            obj.get("end_s"),
+            "params.load_stages[].coverage_schedule.end_s",
+        )
+        if end_s < start_s:
+            raise SpecError(
+                "params.load_stages[].coverage_schedule.end_s must be >= start_s"
+            )
+        return cls(start_s=start_s, end_s=end_s)
+
+
+@dataclass(frozen=True)
+class WorkloadSchedule:
+    workload: str
+    background_offsets_s: tuple[float, ...]
+    collision_offsets_s: tuple[float, ...]
+
+    @classmethod
+    def from_obj(cls, obj: Any) -> WorkloadSchedule:
+        if not isinstance(obj, dict):
+            raise SpecError(
+                "params.load_stages[].workload_schedules entries must be objects"
+            )
+        _reject_unknown_keys(
+            obj,
+            WORKLOAD_SCHEDULE_KEYS,
+            "params.load_stages[].workload_schedules[]",
+        )
+        workload = _required_str_at(
+            obj,
+            "workload",
+            "params.load_stages[].workload_schedules[].workload",
+        )
+        if workload not in SCHEDULED_WORKLOAD_ENDPOINTS:
+            raise SpecError(
+                "unknown params.load_stages[].workload_schedules[].workload: "
+                f"{workload}"
+            )
+        background = _offsets(
+            obj.get("background_offsets_s"),
+            "params.load_stages[].workload_schedules[].background_offsets_s",
+        )
+        collisions = _offsets(
+            obj.get("collision_offsets_s"),
+            "params.load_stages[].workload_schedules[].collision_offsets_s",
+        )
+        if not background and not collisions:
+            raise SpecError(
+                "params.load_stages[].workload_schedules[] must contain at "
+                "least one offset"
+            )
+        return cls(
+            workload=workload,
+            background_offsets_s=background,
+            collision_offsets_s=collisions,
+        )
+
+    @property
+    def request_count(self) -> int:
+        return len(self.background_offsets_s) + len(self.collision_offsets_s)
+
+
+@dataclass(frozen=True)
 class LoadStage:
     id: str
     mode: str
@@ -117,6 +214,8 @@ class LoadStage:
     voice_cache_pressure_voice_count: int = 0
     voice_speaker_cap_count: int = 0
     speaker_max_uploaded: int | None = None
+    coverage_schedule: CoverageSchedule | None = None
+    workload_schedules: tuple[WorkloadSchedule, ...] = field(default_factory=tuple)
 
     @classmethod
     def from_obj(cls, obj: Any, *, index: int) -> LoadStage:
@@ -135,12 +234,56 @@ class LoadStage:
                 "and duration_s for soak stages"
             )
 
-        request_count = _positive_int(
-            obj,
-            "request_count",
-            _positive_int(obj, "total_requests", 100, path="params.load_stages[]"),
-            path="params.load_stages[]",
-        )
+        if mode == "scheduled":
+            if "max_concurrency" not in obj:
+                raise SpecError("scheduled stages require an explicit max_concurrency")
+            conflicting = sorted(
+                set(obj)
+                & {
+                    "request_count",
+                    "total_requests",
+                    "request_rate",
+                    "start_request_rate",
+                    "duration_s",
+                    "arrival_distribution",
+                    "concurrency",
+                }
+            )
+            if conflicting:
+                raise SpecError(
+                    "scheduled stages derive arrivals from workload_schedules; "
+                    f"remove fields: {conflicting}"
+                )
+            coverage_schedule = CoverageSchedule.from_obj(obj.get("coverage_schedule"))
+            workload_schedules = _workload_schedules(obj.get("workload_schedules"))
+            latest_workload_offset = max(
+                offset
+                for schedule in workload_schedules
+                for offset in (
+                    *schedule.background_offsets_s,
+                    *schedule.collision_offsets_s,
+                )
+            )
+            if latest_workload_offset > coverage_schedule.end_s:
+                raise SpecError(
+                    "scheduled workload offsets must not exceed "
+                    "coverage_schedule.end_s"
+                )
+            request_count = sum(item.request_count for item in workload_schedules)
+        else:
+            coverage_schedule = None
+            workload_schedules = ()
+            request_count = _positive_int(
+                obj,
+                "request_count",
+                _positive_int(
+                    obj,
+                    "total_requests",
+                    100,
+                    path="params.load_stages[]",
+                ),
+                path="params.load_stages[]",
+            )
         max_concurrency = _positive_int(
             obj,
             "max_concurrency",
@@ -206,6 +349,8 @@ class LoadStage:
             voice_cache_pressure_voice_count=voice_cache_pressure_voice_count,
             voice_speaker_cap_count=voice_speaker_cap_count,
             speaker_max_uploaded=speaker_max_uploaded,
+            coverage_schedule=coverage_schedule,
+            workload_schedules=workload_schedules,
         )
 
     def to_json(self) -> dict[str, Any]:
@@ -228,6 +373,19 @@ class LoadStage:
             "voice_cache_pressure_voice_count": self.voice_cache_pressure_voice_count,
             "voice_speaker_cap_count": self.voice_speaker_cap_count,
             "speaker_max_uploaded": self.speaker_max_uploaded,
+            "coverage_schedule": (
+                asdict(self.coverage_schedule)
+                if self.coverage_schedule is not None
+                else None
+            ),
+            "workload_schedules": [
+                {
+                    "workload": schedule.workload,
+                    "background_offsets_s": list(schedule.background_offsets_s),
+                    "collision_offsets_s": list(schedule.collision_offsets_s),
+                }
+                for schedule in self.workload_schedules
+            ],
         }
 
 
@@ -298,6 +456,10 @@ class BenchmarkParams:
             load_stages,
             default_enabled_endpoints=enabled,
             default_voice_speaker_cap_count=voice_speaker_cap_count,
+        )
+        _validate_scheduled_stage_endpoints(
+            load_stages,
+            default_enabled_endpoints=enabled,
         )
 
         return cls(
@@ -428,6 +590,13 @@ def _required_str(obj: dict[str, Any], key: str) -> str:
     return value
 
 
+def _required_str_at(obj: dict[str, Any], key: str, path: str) -> str:
+    value = obj.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise SpecError(f"{path} must be a non-empty string")
+    return value.strip()
+
+
 def _reject_unknown_keys(obj: dict[str, Any], allowed: set[str], path: str) -> None:
     unknown = sorted(set(obj) - allowed)
     if unknown:
@@ -537,6 +706,60 @@ def _optional_positive_float(value: Any, key: str) -> float | None:
     return float(value)
 
 
+def _finite_nonnegative_float(value: Any, path: str) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        raise SpecError(f"{path} must be a finite non-negative number")
+    return float(value)
+
+
+def _offsets(value: Any, path: str) -> tuple[float, ...]:
+    if not isinstance(value, list):
+        raise SpecError(f"{path} must be a list")
+    offsets = tuple(_finite_nonnegative_float(item, f"{path}[]") for item in value)
+    if any(current < previous for previous, current in zip(offsets, offsets[1:])):
+        raise SpecError(f"{path} must be nondecreasing")
+    return offsets
+
+
+def _workload_schedules(value: Any) -> tuple[WorkloadSchedule, ...]:
+    if not isinstance(value, list) or not value:
+        raise SpecError("scheduled stages require a non-empty workload_schedules list")
+    schedules = tuple(WorkloadSchedule.from_obj(item) for item in value)
+    workloads = [schedule.workload for schedule in schedules]
+    duplicates = sorted(
+        workload for workload in set(workloads) if workloads.count(workload) > 1
+    )
+    if duplicates:
+        raise SpecError(f"duplicate scheduled workloads: {duplicates}")
+    missing = sorted(set(SCHEDULED_WORKLOAD_ENDPOINTS) - set(workloads))
+    if missing:
+        raise SpecError(f"scheduled stage is missing workloads: {missing}")
+
+    collision_workloads: dict[float, set[str]] = defaultdict(set)
+    for schedule in schedules:
+        for offset in schedule.collision_offsets_s:
+            collision_workloads[offset].add(schedule.workload)
+    if not collision_workloads:
+        raise SpecError("scheduled stages require at least one collision offset")
+    scheduled_workloads = set(workloads)
+    invalid = {
+        offset: sorted(scheduled_workloads - workloads_at_offset)
+        for offset, workloads_at_offset in collision_workloads.items()
+        if workloads_at_offset != scheduled_workloads
+    }
+    if invalid:
+        raise SpecError(
+            "collision offsets must be shared by every scheduled workload; "
+            f"missing workloads by offset: {invalid}"
+        )
+    return schedules
+
+
 def _concurrency_levels(value: Any) -> tuple[int, ...] | None:
     if value is None:
         return None
@@ -642,6 +865,27 @@ def _validate_voice_speaker_cap_stages(
             "stage with enabled_endpoints ['voices']; prefer stage-level "
             "voice_speaker_cap_count when multiple voices stages exist"
         )
+
+
+def _validate_scheduled_stage_endpoints(
+    stages: tuple[LoadStage, ...],
+    *,
+    default_enabled_endpoints: tuple[str, ...],
+) -> None:
+    for stage in stages:
+        if stage.mode != "scheduled":
+            continue
+        enabled = set(stage.enabled_endpoints or default_enabled_endpoints)
+        unavailable = sorted(
+            schedule.workload
+            for schedule in stage.workload_schedules
+            if SCHEDULED_WORKLOAD_ENDPOINTS[schedule.workload] not in enabled
+        )
+        if unavailable:
+            raise SpecError(
+                f"scheduled stage {stage.id!r} enables no endpoint for workloads: "
+                f"{unavailable}"
+            )
 
 
 def _effective_voice_speaker_cap_count(
