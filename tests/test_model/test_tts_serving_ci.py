@@ -54,7 +54,6 @@ SERVING_REST_STREAM_TTFA_P95_S_REF: float | None = 0.3016385301016271
 SERVING_REST_STREAM_INTER_CHUNK_P95_S_REF: float | None = 0.6632563266903162
 SERVING_REST_STREAM_LATENCY_P95_S_REF: float | None = 0.9647539779543877
 SERVING_REST_STREAM_RTF_P95_REF: float | None = 0.22127384815467604
-SERVING_BATCH32_LATENCY_P95_S_REF: float | None = 10.222142587881535
 SERVING_BATCH32_LATENCY_P50_S_REF: float | None = (
     1.2  # placeholder; needs formal calibration on #1260 baseline
 )
@@ -73,7 +72,6 @@ SERVING_LONG_LATENCY_P95_S_REF: float | None = 28.912055992987007
 SERVING_LONG_LATENCY_P50_S_REF: float | None = (
     None  # needs calibration on #1260 baseline
 )
-SERVING_LONG_LATENCY_P95_ADVISORY_S_REF: float | None = 28.912055992987007
 SERVING_LONG_AUDIO_DURATION_MIN_S_REF: float | None = 3.48
 SERVING_LONG_OUTPUT_TOK_PER_REQ_S_REF: float | None = 123.20174934932271
 SERVING_LONG_BASELINE_LATENCY_MAX_S_REF: float | None = 11.957396121229976
@@ -348,14 +346,13 @@ METRIC_GATES = (
         advisory=True,  # advisory until p50 is calibrated on #1260 baseline
     ),
     MetricGate(
-        "long.latency_p95_s_advisory",
+        "long.latency_p95_s_max",
         "workload",
         "latency_s",
         "p95",
         "max",
-        _maximum(SERVING_LONG_LATENCY_P95_ADVISORY_S_REF),
+        _maximum(SERVING_LONG_LATENCY_P95_S_REF),
         workload="long_prefill_decode",
-        advisory=True,
     ),
     MetricGate(
         "long.audio_duration_s_min",

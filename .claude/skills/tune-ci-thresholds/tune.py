@@ -4057,15 +4057,28 @@ def _read_concurrency(text):
 
 
 def _read_bare_value(text, symbol):
+    # Single-line form: SYMBOL: float | None = 1.2
     m = re.search(
         rf"^{re.escape(symbol)}(?:\s*:\s*[^=]+)?\s*=\s*"
         r"(None|[+-]?\d+(?:\.\d+)?)\s*$",
         text,
         re.M,
     )
-    if not m or m.group(1) == "None":
-        return None
-    return float(m.group(1))
+    if m:
+        return None if m.group(1) == "None" else float(m.group(1))
+    # Black-wrapped parenthesized form:
+    #   SYMBOL: float | None = (
+    #       1.2  # optional comment
+    #   )
+    m = re.search(
+        rf"^{re.escape(symbol)}(?:\s*:\s*[^=]+)?\s*=\s*\(\s*\n"
+        r"\s*([+-]?\d+(?:\.\d+)?)",
+        text,
+        re.M,
+    )
+    if m:
+        return float(m.group(1))
+    return None
 
 
 def _read_nested_value(text, symbol, conc, subkey):
