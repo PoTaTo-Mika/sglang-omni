@@ -16,7 +16,6 @@ from sglang_omni.models.moss_tts.payload_types import (
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.pipeline_state import build_usage
 from sglang_omni.scheduling.streaming_vocoder import (
-    INITIAL_CODEC_CHUNK_FRAMES_PARAM,
     StreamingVocoderBase,
     resolve_initial_codec_chunk_frames,
 )

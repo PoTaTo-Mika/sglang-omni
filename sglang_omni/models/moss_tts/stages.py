@@ -31,9 +31,7 @@ from sglang_omni.models.moss_tts.request_builders import (
     preprocess_moss_tts_payload,
     set_moss_tts_preprocessing_context,
 )
-from sglang_omni.models.moss_tts.streaming_vocoder import (
-    MossStreamingVocoderScheduler,
-)
+from sglang_omni.models.moss_tts.streaming_vocoder import MossStreamingVocoderScheduler
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.pipeline_state import build_usage
 from sglang_omni.scheduling.pipeline_state import load_state as _load_pipeline_state

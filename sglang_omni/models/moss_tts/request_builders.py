@@ -23,9 +23,7 @@ from sglang_omni.proto import StagePayload
 from sglang_omni.sampling.seed import derive_sampling_seed, new_random_sampling_seed
 from sglang_omni.scheduling.messages import OutgoingMessage
 from sglang_omni.scheduling.prepared_request_queue import PreparedRequestQueue
-from sglang_omni.scheduling.streaming_vocoder import (
-    INITIAL_CODEC_CHUNK_FRAMES_PARAM,
-)
+from sglang_omni.scheduling.streaming_vocoder import INITIAL_CODEC_CHUNK_FRAMES_PARAM
 from sglang_omni.scheduling.types import ARRequestData
 from sglang_omni.utils.audio_payload import audio_data_uri_from_reference
 

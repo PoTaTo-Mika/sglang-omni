@@ -14,9 +14,7 @@ from sglang_omni.models.moss_tts.request_builders import (
     make_moss_tts_stream_output_builder,
 )
 from sglang_omni.models.moss_tts.stages import _MossTTSVocoder
-from sglang_omni.models.moss_tts.streaming_vocoder import (
-    MossStreamingVocoderScheduler,
-)
+from sglang_omni.models.moss_tts.streaming_vocoder import MossStreamingVocoderScheduler
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.scheduling.types import RequestOutput
