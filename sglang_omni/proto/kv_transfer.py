@@ -6,7 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from sglang_omni.proto.utils import dataclass_from_wire, dataclass_to_wire
+import msgspec
 
 
 @dataclass(frozen=True)
@@ -86,11 +86,11 @@ class KVTransferPrepareMessage:
             raise TypeError("metadata must be dict")
 
     def to_dict(self) -> dict[str, Any]:
-        return dataclass_to_wire(self, message_type="kv_transfer_prepare")
+        return {"type": "kv_transfer_prepare", **msgspec.to_builtins(self)}
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "KVTransferPrepareMessage":
-        return dataclass_from_wire(value, cls, message_type="kv_transfer_prepare")
+        return msgspec.convert(value, type=cls, strict=True)
 
 
 @dataclass(frozen=True)
@@ -138,7 +138,7 @@ class KVTransferReadyMessage:
                 )
 
     def to_dict(self) -> dict[str, Any]:
-        value = dataclass_to_wire(self, message_type="kv_transfer_ready")
+        value = {"type": "kv_transfer_ready", **msgspec.to_builtins(self)}
         if self.success:
             value.pop("error")
         else:
@@ -149,7 +149,7 @@ class KVTransferReadyMessage:
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "KVTransferReadyMessage":
-        return dataclass_from_wire(value, cls, message_type="kv_transfer_ready")
+        return msgspec.convert(value, type=cls, strict=True)
 
 
 def _validate_common_message_fields(
