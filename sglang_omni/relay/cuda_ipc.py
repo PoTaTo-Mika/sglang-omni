@@ -12,6 +12,7 @@ from typing import Any, Callable, NamedTuple
 import torch
 from torch.multiprocessing.reductions import rebuild_cuda_tensor
 
+from sglang_omni.comm.kv_transfer import KVPool
 from sglang_omni.profiler.comm_trace import elapsed_ms as _comm_elapsed_ms
 from sglang_omni.profiler.comm_trace import emit as _comm_trace
 from sglang_omni.profiler.comm_trace import enabled as _comm_trace_enabled
@@ -110,6 +111,7 @@ def _dump_cuda_storage_handle(tensor: torch.Tensor) -> dict[str, Any]:
         "event_handle": event_handle,
         "event_sync_required": bool(event_sync_required),
         "numel": int(tensor.numel()),
+        "tensor_offset": int(tensor.storage_offset()),
     }
 
 
@@ -123,7 +125,7 @@ def _load_cuda_storage_handle(
         torch.Tensor,
         (int(storage_meta["numel"]),),
         (1,),
-        0,
+        int(storage_meta.get("tensor_offset", 0)),
         torch.UntypedStorage,
         torch.uint8,
         device_index,
@@ -369,6 +371,102 @@ class CudaIpcGetOperation(RelayOperation):
         _comm_trace("cuda_ipc_get_wait_copy", **trace_fields)
 
 
+class CudaIpcKVPutOperation(RelayOperation):
+    """Pins exported KV storage until the receiver acknowledges its copy."""
+
+    def __init__(
+        self,
+        metadata: dict[str, Any],
+        *,
+        ready_event: torch.cuda.Event,
+        source_buffers: tuple[torch.Tensor, ...],
+    ) -> None:
+        self._metadata = metadata
+        self._ready_event: torch.cuda.Event | None = ready_event
+        self._source_buffers: tuple[torch.Tensor, ...] = source_buffers
+        self._receiver_done = asyncio.get_running_loop().create_future()
+        self._completed = False
+
+    @property
+    def metadata(self) -> dict[str, Any]:
+        return self._metadata
+
+    async def wait_for_completion(self, timeout: float = 30.0) -> None:
+        if self._completed:
+            return
+        try:
+            await asyncio.wait_for(self._receiver_done, timeout=timeout)
+        finally:
+            self._completed = True
+            self._ready_event = None
+            self._source_buffers = ()
+
+    def mark_receiver_done(self) -> None:
+        if not self._receiver_done.done():
+            self._receiver_done.set_result(None)
+
+    def mark_receiver_failed(self, exc: BaseException) -> None:
+        if not self._receiver_done.done():
+            self._receiver_done.set_exception(exc)
+
+
+class CudaIpcKVGetOperation(RelayOperation):
+    """Receiver-side completion for direct source-page to destination-page copy."""
+
+    def __init__(
+        self,
+        event: torch.cuda.Event,
+        *,
+        ready_event: torch.cuda.Event,
+        source_buffers: tuple[torch.Tensor, ...],
+        index_buffers: tuple[torch.Tensor, torch.Tensor],
+        device_index: int,
+        wait_executor: ThreadPoolExecutor,
+    ) -> None:
+        self._event = event
+        self._ready_event: torch.cuda.Event | None = ready_event
+        self._source_buffers: tuple[torch.Tensor, ...] = source_buffers
+        self._index_buffers: tuple[torch.Tensor, torch.Tensor] = index_buffers
+        self._device_index = device_index
+        self._wait_executor = wait_executor
+        self._completed = False
+
+    @property
+    def metadata(self) -> None:
+        return None
+
+    async def wait_for_completion(self, timeout: float = 30.0) -> None:
+        if self._completed:
+            return
+        if self._event.query():
+            self._release_references()
+            return
+
+        loop = asyncio.get_running_loop()
+        wait_future = loop.run_in_executor(
+            self._wait_executor,
+            _synchronize_cuda_event,
+            self._event,
+            self._device_index,
+        )
+        try:
+            await asyncio.wait_for(asyncio.shield(wait_future), timeout=timeout)
+        except (asyncio.CancelledError, TimeoutError):
+            # A launched page-copy kernel cannot be cancelled. Keep both pools
+            # and the index tensors alive until it stops touching them, then
+            # propagate the original cancellation/timeout to the request.
+            await asyncio.shield(wait_future)
+            self._release_references()
+            raise
+        self._release_references()
+
+    def _release_references(self) -> None:
+        self._completed = True
+        self._ready_event = None
+        self._source_buffers = ()
+        self._index_buffers = ()
+
+
 class _ContiguousSlotAllocator:
     def __init__(self, *, slot_count: int, slot_size: int) -> None:
         if slot_count <= 0:
@@ -534,6 +632,12 @@ class CudaIpcRelay(Relay):
         self._allocator: _ContiguousSlotAllocator | None = None
 
         self._remote_pools: dict[str, torch.Tensor] = {}
+        self._kv_pools: dict[str, KVPool] = {}
+        self._kv_pool_registration_ids: dict[str, str] = {}
+        self._kv_pool_storage_handles: dict[
+            tuple[str, str], tuple[dict[str, Any], ...]
+        ] = {}
+        self._remote_kv_pools: dict[tuple[str, str], tuple[torch.Tensor, ...]] = {}
         self._failed_error: BaseException | None = None
         self._failed_event = asyncio.Event()
         self._wait_executor = ThreadPoolExecutor(
@@ -902,11 +1006,304 @@ class CudaIpcRelay(Relay):
             done_event=done_event,
         )
 
+    def register_kv_pool(self, pool: KVPool) -> None:
+        if pool.device.type != "cuda":
+            raise ValueError(
+                f"cuda_ipc KV pool must use CUDA storage, got {pool.device}"
+            )
+        expected_device = torch.device(self.device)
+        if pool.device != expected_device:
+            raise ValueError(
+                f"KV pool {pool.pool_id!r} is on {pool.device}, but relay uses "
+                f"{expected_device}"
+            )
+        existing = self._kv_pools.get(pool.pool_id)
+        if existing is not None and existing is not pool:
+            raise ValueError(f"cuda_ipc KV pool {pool.pool_id!r} already exists")
+        self._kv_pools[pool.pool_id] = pool
+        self._kv_pool_registration_ids.setdefault(
+            pool.pool_id,
+            f"{self.engine_id}:{os.getpid()}:{uuid.uuid4().hex}",
+        )
+
+    def _export_kv_source_pool(
+        self,
+        pool_id: str,
+        *,
+        receiver_id: str,
+    ) -> dict[str, Any]:
+        pool = self._kv_pools.get(pool_id)
+        if pool is None:
+            raise KeyError(f"unknown cuda_ipc KV pool {pool_id!r}")
+        cache_key = (pool_id, receiver_id)
+        storage_handles = self._kv_pool_storage_handles.get(cache_key)
+        if storage_handles is None:
+            storage_handles = tuple(
+                _dump_cuda_storage_handle(buffer.byte_view()) for buffer in pool.buffers
+            )
+            self._kv_pool_storage_handles[cache_key] = storage_handles
+        total_bytes = sum(
+            buffer.bytes_per_page * buffer.page_count for buffer in pool.buffers
+        )
+        return {
+            "engine_id": self.engine_id,
+            "transfer_info": {"size": total_bytes},
+            "cuda_ipc_kv": {
+                "pool_id": pool_id,
+                "registration_id": self._kv_pool_registration_ids[pool_id],
+                "device_id": self.device_id,
+                "page_size": pool.page_size,
+                "buffers": [
+                    {
+                        "name": buffer.name,
+                        "bytes_per_page": buffer.bytes_per_page,
+                        "page_count": buffer.page_count,
+                        "storage": storage,
+                    }
+                    for buffer, storage in zip(
+                        pool.buffers, storage_handles, strict=True
+                    )
+                ],
+            },
+        }
+
+    def prepare_kv_destination(
+        self,
+        pool_id: str,
+        *,
+        sender_id: str,
+    ) -> dict[str, Any]:
+        del sender_id
+        pool = self._kv_pools.get(pool_id)
+        if pool is None:
+            raise KeyError(f"unknown cuda_ipc KV pool {pool_id!r}")
+        total_bytes = sum(
+            buffer.bytes_per_page * buffer.page_count for buffer in pool.buffers
+        )
+        return {
+            "engine_id": self.engine_id,
+            "transfer_info": {"size": total_bytes},
+            "cuda_ipc_kv_destination": {
+                "pool_id": pool_id,
+                "registration_id": self._kv_pool_registration_ids[pool_id],
+                "page_size": pool.page_size,
+                "buffers": [
+                    {
+                        "name": buffer.name,
+                        "bytes_per_page": buffer.bytes_per_page,
+                        "page_count": buffer.page_count,
+                    }
+                    for buffer in pool.buffers
+                ],
+            },
+        }
+
+    async def put_kv_pages(
+        self,
+        *,
+        source_pool_id: str,
+        source_page_indices: tuple[int, ...],
+        destination_ref: dict[str, Any],
+        destination_page_indices: tuple[int, ...],
+        request_id: str,
+        receiver_id: str,
+    ) -> CudaIpcKVPutOperation:
+        pool = self._kv_pools.get(source_pool_id)
+        if pool is None:
+            raise KeyError(f"unknown cuda_ipc KV pool {source_pool_id!r}")
+        pool.validate_page_indices(source_page_indices)
+        if len(source_page_indices) != len(destination_page_indices):
+            raise ValueError("source and destination KV page counts must match")
+        destination_meta = destination_ref.get("cuda_ipc_kv_destination")
+        if not isinstance(destination_meta, dict):
+            raise ValueError("destination is missing cuda_ipc_kv_destination metadata")
+        destination_buffers = destination_meta.get("buffers")
+        if not isinstance(destination_buffers, list):
+            raise TypeError("destination KV buffers must be list")
+        destination_registration_id = destination_meta.get("registration_id")
+        if (
+            not isinstance(destination_registration_id, str)
+            or not destination_registration_id
+        ):
+            raise TypeError("destination KV registration_id must be a non-empty str")
+        if destination_meta.get("page_size") != pool.page_size:
+            raise ValueError("source and destination KV page sizes do not match")
+        if len(destination_buffers) != len(pool.buffers):
+            raise ValueError("source and destination KV buffer counts do not match")
+        if not destination_page_indices:
+            raise ValueError("destination KV page indices must not be empty")
+        if any(
+            type(index) is not int or index < 0 for index in destination_page_indices
+        ):
+            raise TypeError(
+                "destination KV page indices must contain non-negative ints"
+            )
+        for source, destination in zip(pool.buffers, destination_buffers, strict=True):
+            if (
+                destination.get("name") != source.name
+                or destination.get("bytes_per_page") != source.bytes_per_page
+            ):
+                raise ValueError(
+                    "source and destination KV buffer layouts do not match"
+                )
+            destination_page_count = destination.get("page_count")
+            if type(destination_page_count) is not int or destination_page_count <= max(
+                destination_page_indices
+            ):
+                raise ValueError("destination KV page index exceeds buffer capacity")
+
+        device = pool.device
+        stream = torch.cuda.current_stream(device)
+        ready_event = torch.cuda.Event(interprocess=True)
+        with torch.cuda.device(device), torch.cuda.stream(stream):
+            ready_event.record(stream)
+        relay_info = self._export_kv_source_pool(
+            source_pool_id,
+            receiver_id=f"{receiver_id}:{destination_registration_id}",
+        )
+        relay_info["transfer_info"] = {
+            "size": sum(
+                buffer.bytes_per_page * len(source_page_indices)
+                for buffer in pool.buffers
+            )
+        }
+        relay_info["cuda_ipc_kv"] = dict(relay_info["cuda_ipc_kv"])
+        relay_info["cuda_ipc_kv"]["ready_event"] = ready_event.ipc_handle()
+        relay_info["request_id"] = request_id
+        return CudaIpcKVPutOperation(
+            relay_info,
+            ready_event=ready_event,
+            source_buffers=tuple(buffer.byte_view() for buffer in pool.buffers),
+        )
+
+    async def get_kv_pages(
+        self,
+        metadata: dict[str, Any],
+        *,
+        destination_pool_id: str,
+        source_page_indices: tuple[int, ...],
+        destination_page_indices: tuple[int, ...],
+        request_id: str,
+    ) -> CudaIpcKVGetOperation:
+        del request_id
+        destination = self._kv_pools.get(destination_pool_id)
+        if destination is None:
+            raise KeyError(f"unknown cuda_ipc KV pool {destination_pool_id!r}")
+        destination.validate_page_indices(destination_page_indices)
+        if len(source_page_indices) != len(destination_page_indices):
+            raise ValueError("source and destination KV page counts must match")
+        source_meta = metadata.get("cuda_ipc_kv")
+        if not isinstance(source_meta, dict):
+            raise ValueError("source is missing cuda_ipc_kv metadata")
+        raw_buffers = source_meta.get("buffers")
+        if not isinstance(raw_buffers, list):
+            raise TypeError("source KV buffers must be list")
+        if source_meta.get("page_size") != destination.page_size:
+            raise ValueError("source and destination KV page sizes do not match")
+        if len(raw_buffers) != len(destination.buffers):
+            raise ValueError("source and destination KV buffer counts do not match")
+
+        destination_device = destination.device
+        source_device_id = int(source_meta["device_id"])
+        destination_device_id = int(destination_device.index or 0)
+        if 0 <= source_device_id < torch.cuda.device_count():
+            if (
+                source_device_id != destination_device_id
+                and not torch.cuda.can_device_access_peer(
+                    destination_device_id,
+                    source_device_id,
+                )
+            ):
+                raise RuntimeError(
+                    "direct CUDA-IPC KV transfer requires GPU peer access; "
+                    f"cuda:{destination_device_id} cannot access "
+                    f"cuda:{source_device_id}"
+                )
+            _ensure_peer_access(source_device_id, destination_device_id)
+        source_engine_id = metadata.get("engine_id")
+        if not isinstance(source_engine_id, str) or not source_engine_id:
+            raise TypeError("source KV engine_id must be a non-empty str")
+        source_registration_id = source_meta.get("registration_id")
+        if not isinstance(source_registration_id, str) or not source_registration_id:
+            raise TypeError("source KV registration_id must be a non-empty str")
+        remote_pool_key = (source_engine_id, source_registration_id)
+        source_buffers = self._remote_kv_pools.get(remote_pool_key)
+        if source_buffers is None:
+            imported: list[torch.Tensor] = []
+            for source_buffer, destination_buffer in zip(
+                raw_buffers, destination.buffers, strict=True
+            ):
+                if source_buffer.get("name") != destination_buffer.name:
+                    raise ValueError("source and destination KV buffer names differ")
+                if (
+                    source_buffer.get("bytes_per_page")
+                    != destination_buffer.bytes_per_page
+                ):
+                    raise ValueError("source and destination KV page byte sizes differ")
+                source_page_count = source_buffer.get("page_count")
+                if type(source_page_count) is not int or source_page_count <= max(
+                    source_page_indices
+                ):
+                    raise ValueError("source KV page index exceeds buffer capacity")
+                storage = source_buffer.get("storage")
+                if not isinstance(storage, dict):
+                    raise TypeError("source KV storage metadata must be dict")
+                imported.append(
+                    _load_cuda_storage_handle(storage, device=destination_device)
+                )
+            source_buffers = tuple(imported)
+            self._remote_kv_pools[remote_pool_key] = source_buffers
+
+        ready_handle = source_meta.get("ready_event")
+        if not isinstance(ready_handle, bytes):
+            raise TypeError("source KV ready_event must be bytes")
+        ready_event = torch.cuda.Event.from_ipc_handle(
+            destination_device,
+            ready_handle,
+        )
+        source_indices = torch.tensor(
+            source_page_indices,
+            dtype=torch.int64,
+            device=destination_device,
+        )
+        destination_indices = torch.tensor(
+            destination_page_indices,
+            dtype=torch.int64,
+            device=destination_device,
+        )
+        stream = torch.cuda.current_stream(destination_device)
+        with torch.cuda.device(destination_device), torch.cuda.stream(stream):
+            stream.wait_event(ready_event)
+            from sgl_kernel import transfer_kv_per_layer_mla
+
+            for source, target in zip(source_buffers, destination.buffers, strict=True):
+                transfer_kv_per_layer_mla(
+                    src=source,
+                    dst=target.byte_view(),
+                    src_indices=source_indices,
+                    dst_indices=destination_indices,
+                    item_size=target.bytes_per_page,
+                )
+        done_event = torch.cuda.Event()
+        done_event.record(stream)
+        return CudaIpcKVGetOperation(
+            done_event,
+            ready_event=ready_event,
+            source_buffers=source_buffers,
+            index_buffers=(source_indices, destination_indices),
+            device_index=destination_device_id,
+            wait_executor=self._wait_executor,
+        )
+
     def cleanup(self, request_id: str) -> None:
         pass
 
     def close(self) -> None:
         self._remote_pools.clear()
+        self._remote_kv_pools.clear()
+        self._kv_pool_storage_handles.clear()
+        self._kv_pool_registration_ids.clear()
+        self._kv_pools.clear()
         self._pool_storage_handles.clear()
         self._pool_tensor = None
         self._allocator = None

@@ -20,7 +20,7 @@ from typing import Any, Awaitable, Callable, Literal
 import torch
 
 from sglang_omni.comm import stage_io
-from sglang_omni.comm.data_ref import DataRef
+from sglang_omni.comm.data_ref import DataKind, DataRef
 from sglang_omni.comm.engine import CommEngine
 from sglang_omni.comm.router import CommRouter
 from sglang_omni.pipeline.stage.input import DirectInput, InputHandler
@@ -37,6 +37,8 @@ from sglang_omni.proto import (
     CompleteMessage,
     DataAckMessage,
     DataReadyMessage,
+    KVTransferPrepareMessage,
+    KVTransferReadyMessage,
     ProfilerStartMessage,
     ProfilerStopMessage,
     ShutdownMessage,
@@ -324,6 +326,10 @@ class Stage:
             await self._on_submit(msg)
         elif isinstance(msg, DataAckMessage):
             self._comm.ack_transfer(msg)
+        elif isinstance(msg, KVTransferReadyMessage):
+            self._comm.kv_transfer_ready(msg)
+        elif isinstance(msg, KVTransferPrepareMessage):
+            await self._on_kv_transfer_prepare(msg)
         elif isinstance(msg, DataReadyMessage):
             self._schedule_receive_task(msg)
         elif isinstance(msg, ProfilerStartMessage):
@@ -344,8 +350,19 @@ class Stage:
             handler = self._on_stream_chunk
             label = f"stream chunk {msg.request_id}:{msg.from_stage}:{msg.chunk_id}"
         else:
-            handler = self._on_data_ready
-            label = f"payload {msg.request_id}:{msg.from_stage}"
+            if stage_io.is_direct_cuda_ipc_payload_ref(msg.data_ref):
+                handler = self._on_data_ready
+                label = f"payload {msg.request_id}:{msg.from_stage}"
+            else:
+                raw_kind = (
+                    msg.data_ref.get("kind") if isinstance(msg.data_ref, dict) else None
+                )
+                if raw_kind == DataKind.KV_PAGES.value:
+                    handler = self._on_kv_pages_ready
+                    label = f"KV pages {msg.request_id}:{msg.from_stage}"
+                else:
+                    handler = self._on_data_ready
+                    label = f"payload {msg.request_id}:{msg.from_stage}"
 
         lane = (msg.request_id, msg.from_stage)
         predecessor = self._receive_lane_tails.get(lane)
@@ -458,6 +475,72 @@ class Stage:
 
         await self._wait_for_receive_predecessor(predecessor)
         await self._receive_payload_from_stage(request_id, msg.from_stage, payload)
+
+    async def _on_kv_transfer_prepare(
+        self,
+        msg: KVTransferPrepareMessage,
+    ) -> None:
+        endpoint = self.endpoints.get(msg.from_stage)
+        if endpoint is None:
+            raise RuntimeError(
+                f"Stage {self.name}: no endpoint configured for KV ready target "
+                f"{msg.from_stage!r}"
+            )
+        if msg.request_id in self._aborted:
+            ready = KVTransferReadyMessage(
+                request_id=msg.request_id,
+                transfer_id=msg.transfer_id,
+                from_stage=self.name,
+                to_stage=msg.from_stage,
+                success=False,
+                error=f"request {msg.request_id!r} was aborted",
+            )
+        else:
+            relay = self._comm.inbound_relay(msg.from_stage)
+            ready = self._comm.prepare_kv_receive(msg, relay=relay)
+        await self.control_plane.send_to_stage(msg.from_stage, endpoint, ready)
+
+    async def _on_kv_pages_ready(
+        self,
+        msg: DataReadyMessage,
+        predecessor: asyncio.Future[None] | None = None,
+    ) -> None:
+        data_ref = self._data_ref_from_message(msg)
+        relay = self._comm.relay(data_ref.transport)
+        if msg.request_id in self._aborted:
+            error = RuntimeError(f"request {msg.request_id!r} was aborted")
+            self._comm.cleanup(msg.request_id)
+            await self._send_data_ack(
+                msg,
+                data_ref,
+                success=False,
+                error=_error_text(error),
+            )
+            return
+        try:
+            await self._comm.read_kv_pages(
+                relay=relay,
+                request_id=msg.request_id,
+                data_ref=data_ref,
+            )
+        except Exception as exc:
+            logger.exception(
+                "Stage %s: KV page transfer failed for %s",
+                self.name,
+                msg.request_id,
+            )
+            self._comm.cleanup(msg.request_id)
+            await self._send_data_ack(
+                msg,
+                data_ref,
+                success=False,
+                error=_error_text(exc),
+            )
+            await self._wait_for_receive_predecessor(predecessor)
+            await self._send_failure(msg.request_id, f"KV transfer failed: {exc}")
+            return
+        await self._send_data_ack(msg, data_ref, success=True)
+        await self._wait_for_receive_predecessor(predecessor)
 
     async def receive_local_payload(
         self,
