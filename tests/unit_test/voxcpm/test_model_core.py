@@ -33,7 +33,10 @@ def test_state_pool_isolates_and_recycles_request_rows():
         stop_flag=torch.ones(1, dtype=torch.long),
     )
     assert pool.feedback[second].count_nonzero() == 0
-    assert pool.steps.tolist() == [1, 0]
+    assert pool.steps.tolist() == [1, 0, 0]
+    assert pool.padding_row == 2
+    assert pool.row_for("first") != pool.padding_row
+    assert pool.row_for("second") != pool.padding_row
 
     pool.reset("first")
     recycled = pool.acquire("third")

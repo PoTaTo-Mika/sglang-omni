@@ -101,6 +101,7 @@ Supported Models
    :caption: Benchmarks
 
    benchmarks/relay.md
+   benchmarks/voxcpm2_vllm_comparison.md
 
 
 .. toctree::

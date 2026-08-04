@@ -14,6 +14,10 @@ import torch
 from sglang_omni.models.voxcpm_common.payload_types import VoxCPMState
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.pipeline_state import build_usage
+from sglang_omni.utils.audio_payload import audio_waveform_payload
+
+_MAX_AUDIO_TEXT_RATIO = 6
+_MAX_AUDIO_TEXT_SLACK = 10
 
 try:
     from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
@@ -38,9 +42,6 @@ except ModuleNotFoundError as error:
         decode_input_embeds: list[torch.Tensor] = field(default_factory=list)
         stage_payload: Any = None
         pending_feedback_queue: Any = field(default_factory=collections.deque)
-
-
-from sglang_omni.utils.audio_payload import audio_waveform_payload
 
 
 def _config_value(config: Any, name: str, default: Any = None) -> Any:
@@ -240,6 +241,16 @@ def validate_prompt_length(
         )
 
 
+def cap_generation_length(target_token_count: int, max_new_tokens: int) -> int:
+    """Apply the official VoxCPM text-relative generation safety bound."""
+    if target_token_count < 1:
+        raise ValueError("VoxCPM target_token_count must be positive")
+    return min(
+        int(max_new_tokens),
+        target_token_count * _MAX_AUDIO_TEXT_RATIO + _MAX_AUDIO_TEXT_SLACK,
+    )
+
+
 def make_voxcpm_scheduler_adapters(
     *,
     model: Any,
@@ -289,7 +300,11 @@ def make_voxcpm_scheduler_adapters(
 
         stop_id = int(getattr(tokenizer, "eos_token_id", None) or 2)
         continue_id = int(_config_value(config, "audio_start_token", 101))
-        max_new_tokens = int(kwargs["max_new_tokens"])
+        max_new_tokens = cap_generation_length(
+            len(tokenizer.encode(state.target_text)),
+            int(kwargs["max_new_tokens"]),
+        )
+        kwargs["max_new_tokens"] = max_new_tokens
         max_model_len = int(_config_value(config, "max_position_embeddings", 32768))
         validate_prompt_length(int(input_ids.shape[0]), max_new_tokens, max_model_len)
         sampling = SamplingParams(

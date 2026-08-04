@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import logging
 import math
 from typing import Any, Literal
 
@@ -12,6 +13,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang_omni.models.voxcpm_common.state_pool import VoxCPMRequestStatePool
+
+logger = logging.getLogger(__name__)
 
 try:
     from sglang_omni.vendor.sglang.layers import (
@@ -177,7 +180,11 @@ class MiniCPMLongRoPE(nn.Module):
     def forward(
         self, positions: torch.Tensor, query: torch.Tensor, key: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if positions.numel() and int(positions.max()) >= self.max_position:
+        if (
+            positions.device.type == "cpu"
+            and positions.numel()
+            and int(positions.max()) >= self.max_position
+        ):
             raise ValueError("position exceeds configured LongRoPE cache")
         cos = self.cos_cached[positions].unsqueeze(1)
         sin = self.sin_cached[positions].unsqueeze(1)
@@ -902,6 +909,40 @@ class VoxCPMCore(nn.Module):
         return torch.cumsum(lengths.to(device=device, dtype=torch.long), dim=0) - 1
 
     @torch.no_grad()
+    def _run_diffusion(
+        self,
+        hidden_states: torch.Tensor,
+        cond: torch.Tensor,
+        *,
+        temperature: torch.Tensor,
+        cfg_value: torch.Tensor,
+        z_noise: torch.Tensor,
+        inference_timesteps: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if hidden_states.ndim != 2 or hidden_states.shape[1] != 2 * self.hidden_size:
+            raise ValueError("hidden_states must be [batch, 2 * hidden_size]")
+        lm_hidden, residual_hidden = hidden_states.chunk(2, dim=-1)
+        mu_left = self.lm_to_dit_proj(lm_hidden)
+        mu_right = self.res_to_dit_proj(residual_hidden)
+        mu = (
+            mu_left + mu_right
+            if self.version == "v1"
+            else torch.cat((mu_left, mu_right), dim=-1)
+        )
+        decoded = self.feat_decoder(
+            mu,
+            cond,
+            temperature.to(mu),
+            cfg_value.to(mu),
+            z_noise.to(mu),
+            inference_timesteps=inference_timesteps,
+        )
+        latents = decoded.transpose(1, 2)
+        stop_flag = self.stop_head(self.stop_actn(self.stop_proj(lm_hidden))).argmax(-1)
+        feedback = self.enc_to_lm_proj(self.feat_encoder(latents))
+        return latents, stop_flag, feedback
+
+    @torch.no_grad()
     def generate_batch(
         self,
         hidden_states: torch.Tensor,
@@ -916,59 +957,71 @@ class VoxCPMCore(nn.Module):
         rows = rows.to(self.state_pool.feedback.device, torch.long).reshape(-1)
         if hidden_states.shape != (rows.numel(), 2 * self.hidden_size):
             raise ValueError("hidden_states must be [batch, 2 * hidden_size]")
-        lm_hidden, residual_hidden = hidden_states.chunk(2, dim=-1)
-        mu_left = self.lm_to_dit_proj(lm_hidden)
-        mu_right = self.res_to_dit_proj(residual_hidden)
-        mu = (
-            mu_left + mu_right
-            if self.version == "v1"
-            else torch.cat((mu_left, mu_right), dim=-1)
-        )
         temperature = (
             self.state_pool.temperature.index_select(0, rows)
             if temperature is None
-            else temperature.to(mu)
+            else temperature.to(hidden_states)
         )
         cfg_value = (
             self.state_pool.cfg_value.index_select(0, rows)
             if cfg_value is None
-            else cfg_value.to(mu)
+            else cfg_value.to(hidden_states)
         )
         cond = self.state_pool.latents.index_select(0, rows).transpose(1, 2)
-        if inference_timesteps is None:
-            decoded = self.feat_decoder(mu, cond, temperature, cfg_value, z_noise)
-        else:
-            step_counts = inference_timesteps.to(
-                device=mu.device, dtype=torch.long
-            ).reshape(-1)
-            if step_counts.numel() != rows.numel() or bool((step_counts < 1).any()):
-                raise ValueError(
-                    "inference_timesteps must be positive and match row count"
-                )
-            decoded = torch.empty(
+        noise = (
+            torch.randn(
                 rows.numel(),
                 self.feat_dim,
                 self.patch_size,
-                device=mu.device,
-                dtype=mu.dtype,
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
             )
-            for step_count in torch.unique(step_counts).tolist():
-                indices = (step_counts == int(step_count)).nonzero(as_tuple=True)[0]
-                group_noise = (
-                    None if z_noise is None else z_noise.index_select(0, indices)
-                )
-                group = self.feat_decoder(
-                    mu.index_select(0, indices),
-                    cond.index_select(0, indices),
-                    temperature.index_select(0, indices),
-                    cfg_value.index_select(0, indices),
-                    group_noise,
-                    inference_timesteps=int(step_count),
-                )
-                decoded.index_copy_(0, indices, group)
-        latents = decoded.transpose(1, 2)
-        stop_flag = self.stop_head(self.stop_actn(self.stop_proj(lm_hidden))).argmax(-1)
-        feedback = self.enc_to_lm_proj(self.feat_encoder(latents))
+            if z_noise is None
+            else z_noise
+        )
+        step_counts = (
+            torch.full(
+                (rows.numel(),),
+                self.feat_decoder.inference_timesteps,
+                device=hidden_states.device,
+                dtype=torch.long,
+            )
+            if inference_timesteps is None
+            else inference_timesteps.to(
+                device=hidden_states.device, dtype=torch.long
+            ).reshape(-1)
+        )
+        if step_counts.numel() != rows.numel() or bool((step_counts < 1).any()):
+            raise ValueError("inference_timesteps must be positive and match row count")
+        latents = torch.empty(
+            rows.numel(),
+            self.patch_size,
+            self.feat_dim,
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        stop_flag = torch.empty(
+            rows.numel(), device=hidden_states.device, dtype=torch.long
+        )
+        feedback = torch.empty(
+            rows.numel(),
+            self.hidden_size,
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        for step_count in torch.unique(step_counts).tolist():
+            indices = (step_counts == int(step_count)).nonzero(as_tuple=True)[0]
+            group_latents, group_stop, group_feedback = self._run_diffusion(
+                hidden_states.index_select(0, indices),
+                cond.index_select(0, indices),
+                temperature=temperature.index_select(0, indices),
+                cfg_value=cfg_value.index_select(0, indices),
+                z_noise=noise.index_select(0, indices),
+                inference_timesteps=int(step_count),
+            )
+            latents.index_copy_(0, indices, group_latents)
+            stop_flag.index_copy_(0, indices, group_stop)
+            feedback.index_copy_(0, indices, group_feedback)
         self.state_pool.update(
             rows, feedback=feedback, latents=latents, stop_flag=stop_flag
         )
@@ -976,6 +1029,130 @@ class VoxCPMCore(nn.Module):
         if decode_vae:
             output["vae_chunk"] = self.decode_vae_chunks(latents, rows)
         return output
+
+    @torch.no_grad()
+    def init_diffusion_graphs(self, batch_sizes: list[int]) -> None:
+        if self.state_pool.feedback.device.type != "cuda":
+            return
+        buckets = sorted({int(bs) for bs in batch_sizes if int(bs) > 0})
+        if not buckets:
+            return
+        device = self.state_pool.feedback.device
+        dtype = self.state_pool.feedback.dtype
+        steps = int(self.feat_decoder.inference_timesteps)
+        self._diffusion_graphs: dict[int, tuple[Any, ...]] = {}
+        graph_pool = None
+        for bucket in reversed(buckets):
+            inputs = {
+                "hidden_states": torch.zeros(
+                    bucket, 2 * self.hidden_size, device=device, dtype=dtype
+                ),
+                "cond": torch.zeros(
+                    bucket,
+                    self.feat_dim,
+                    self.patch_size,
+                    device=device,
+                    dtype=dtype,
+                ),
+                "temperature": torch.ones(bucket, device=device, dtype=dtype),
+                "cfg_value": torch.ones(bucket, device=device, dtype=dtype),
+                "z_noise": torch.zeros(
+                    bucket,
+                    self.feat_dim,
+                    self.patch_size,
+                    device=device,
+                    dtype=dtype,
+                ),
+            }
+            output_buffers = (
+                torch.empty(
+                    bucket,
+                    self.patch_size,
+                    self.feat_dim,
+                    device=device,
+                    dtype=dtype,
+                ),
+                torch.empty(bucket, device=device, dtype=torch.long),
+                torch.empty(bucket, self.hidden_size, device=device, dtype=dtype),
+            )
+            warmup_stream = torch.cuda.Stream()
+            warmup_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(warmup_stream):
+                for _ in range(2):
+                    self._run_diffusion(
+                        **inputs,
+                        inference_timesteps=steps,
+                    )
+            torch.cuda.current_stream().wait_stream(warmup_stream)
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, pool=graph_pool):
+                generated = self._run_diffusion(
+                    **inputs,
+                    inference_timesteps=steps,
+                )
+                for output_buffer, output in zip(output_buffers, generated):
+                    output_buffer.copy_(output)
+            if graph_pool is None:
+                graph_pool = graph.pool()
+            self._diffusion_graphs[bucket] = (graph, inputs, *output_buffers)
+        self._diffusion_graph_pool = graph_pool
+        logger.info(
+            "VoxCPM diffusion CUDA graphs captured for bs=%s steps=%d",
+            buckets,
+            steps,
+        )
+
+    @property
+    def diffusion_graph_max_bs(self) -> int:
+        graphs = getattr(self, "_diffusion_graphs", None)
+        return max(graphs) if graphs else 0
+
+    @torch.no_grad()
+    def generate_batch_graphed(
+        self,
+        hidden_states: torch.Tensor,
+        rows: torch.Tensor,
+        *,
+        temperature: torch.Tensor,
+        cfg_value: torch.Tensor,
+        z_noise: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        batch_size = rows.numel()
+        graphs = getattr(self, "_diffusion_graphs", None)
+        if not graphs or batch_size > max(graphs):
+            return self.generate_batch(
+                hidden_states,
+                rows,
+                temperature=temperature,
+                cfg_value=cfg_value,
+                z_noise=z_noise,
+            )
+        bucket = min(bs for bs in graphs if bs >= batch_size)
+        graph, inputs, latents, stop_flag, feedback = graphs[bucket]
+        cond = self.state_pool.latents.index_select(0, rows).transpose(1, 2)
+        for name, value, pad_value in (
+            ("hidden_states", hidden_states, 0),
+            ("cond", cond, 0),
+            ("temperature", temperature, 1),
+            ("cfg_value", cfg_value, 1),
+            ("z_noise", z_noise, 0),
+        ):
+            buffer = inputs[name]
+            buffer[:batch_size].copy_(value)
+            if batch_size < bucket:
+                buffer[batch_size:].fill_(pad_value)
+        graph.replay()
+        active_latents = latents[:batch_size]
+        active_stop = stop_flag[:batch_size]
+        active_feedback = feedback[:batch_size]
+        self.state_pool.update(
+            rows,
+            feedback=active_feedback,
+            latents=active_latents,
+            stop_flag=active_stop,
+        )
+        return {"latents": active_latents, "stop_flag": active_stop}
 
     def attach_vae(self, vae: nn.Module) -> None:
         self.vae = vae

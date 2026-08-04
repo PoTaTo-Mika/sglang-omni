@@ -25,15 +25,20 @@ class VoxCPMRequestStatePool:
         if min(capacity, hidden_size, patch_size, feat_dim) <= 0:
             raise ValueError("all VoxCPM state-pool dimensions must be positive")
         self.capacity = capacity
-        self.feedback = torch.zeros(capacity, hidden_size, device=device, dtype=dtype)
-        self.latents = torch.zeros(
-            capacity, patch_size, feat_dim, device=device, dtype=dtype
+        self.num_rows = capacity + 1
+        self.padding_row = capacity
+        self.feedback = torch.zeros(
+            self.num_rows, hidden_size, device=device, dtype=dtype
         )
-        self.temperature = torch.ones(capacity, device=device, dtype=dtype)
-        self.cfg_value = torch.ones(capacity, device=device, dtype=dtype)
-        self.stop_flag = torch.zeros(capacity, device=device, dtype=torch.long)
-        self.steps = torch.zeros(capacity, device=device, dtype=torch.long)
-        self.seeds = torch.full((capacity,), -1, device=device, dtype=torch.long)
+        self.latents = torch.zeros(
+            self.num_rows, patch_size, feat_dim, device=device, dtype=dtype
+        )
+        self.temperature = torch.ones(self.num_rows, device=device, dtype=dtype)
+        self.cfg_value = torch.ones(self.num_rows, device=device, dtype=dtype)
+        self.stop_flag = torch.zeros(self.num_rows, device=device, dtype=torch.long)
+        self.done = torch.zeros(self.num_rows, device=device, dtype=torch.bool)
+        self.steps = torch.zeros(self.num_rows, device=device, dtype=torch.long)
+        self.seeds = torch.full((self.num_rows,), -1, device=device, dtype=torch.long)
         self._rid_to_row: dict[str, int] = {}
         self._free = list(range(capacity - 1, -1, -1))
         self._lock = threading.RLock()
@@ -135,8 +140,13 @@ class VoxCPMRequestStatePool:
     def _check_rows(self, rows: torch.Tensor) -> None:
         if rows.ndim != 1:
             raise ValueError("rows must be one-dimensional")
-        if rows.numel() and (
-            int(rows.min().item()) < 0 or int(rows.max().item()) >= self.capacity
+        # GPU row tensors are produced by the scheduler/model runner. Avoid
+        # value-dependent host reads here: .item() is illegal while SGLang is
+        # capturing the decode CUDA graph.
+        if (
+            rows.device.type == "cpu"
+            and rows.numel()
+            and (int(rows.min().item()) < 0 or int(rows.max().item()) >= self.num_rows)
         ):
             raise IndexError("VoxCPM state-pool row is out of range")
 
@@ -146,5 +156,6 @@ class VoxCPMRequestStatePool:
         self.temperature.index_fill_(0, rows, 1)
         self.cfg_value.index_fill_(0, rows, 1)
         self.stop_flag.index_fill_(0, rows, 0)
+        self.done.index_fill_(0, rows, False)
         self.steps.index_fill_(0, rows, 0)
         self.seeds.index_fill_(0, rows, -1)

@@ -32,6 +32,12 @@ uv pip install --no-deps qwen-tts==0.1.1
 | VoxCPM 1.0 / 1.5 | `examples/configs/voxcpm1.yaml`, `examples/configs/voxcpm.yaml` | Text-only synthesis or continuation cloning; `ref_text` is optional when `ref_audio` is supplied |
 | VoxCPM2 | `examples/configs/voxcpm2.yaml` | Text-only synthesis, isolated cloning with `ref_audio`, or continuation with `ref_audio` + `ref_text`; outputs 48 kHz audio |
 
+VoxCPM enables AR and fixed-step CFM CUDA graphs by default. Requests that
+override `inference_timesteps` use the eager CFM fallback. Experimental VAE
+Snake compilation (`SGLANG_VOXCPM_ENABLE_VAE_COMPILE=1`) and one-step async
+decode (`SGLANG_VOXCPM_ENABLE_ASYNC_DECODE=1`) are opt-in because they can
+change numerical output or reduce throughput on some GPUs.
+
 ## Launch the Server
 
 The reference-audio examples below fetch clips from Hugging Face, so the

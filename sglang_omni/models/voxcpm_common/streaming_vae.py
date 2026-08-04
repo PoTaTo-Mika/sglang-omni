@@ -127,14 +127,18 @@ class BatchedStreamingVAEDecoder:
         ) -> torch.Tensor:
             if self._stream_ids is None:
                 return type(_module).forward(_module, x)
+            stream_ids = self._ids(x.shape[0])
             contexts = []
-            for index, rid in enumerate(self._ids(x.shape[0])):
+            for rid in stream_ids:
                 state = _states.get(rid)
                 if state is None:
                     state = x.new_zeros((x.shape[1], _padding))
                 contexts.append(state)
-                _states[rid] = torch.cat((state, x[index]), -1)[:, -_padding:].detach()
-            return nn.Conv1d.forward(_module, torch.cat((torch.stack(contexts), x), -1))
+            combined = torch.cat((torch.stack(contexts), x), -1)
+            next_states = combined[..., -_padding:].detach()
+            for index, rid in enumerate(stream_ids):
+                _states[rid] = next_states[index]
+            return nn.Conv1d.forward(_module, combined)
 
         module.forward = forward  # type: ignore[method-assign]
 
@@ -153,16 +157,18 @@ class BatchedStreamingVAEDecoder:
         ) -> torch.Tensor:
             if self._stream_ids is None:
                 return type(_module).forward(_module, x)
+            stream_ids = self._ids(x.shape[0])
             contexts = []
-            for index, rid in enumerate(self._ids(x.shape[0])):
+            for rid in stream_ids:
                 state = _states.get(rid)
                 if state is None:
                     state = x.new_zeros((x.shape[1], _context))
                 contexts.append(state)
-                _states[rid] = torch.cat((state, x[index]), -1)[:, -_context:].detach()
-            output = nn.ConvTranspose1d.forward(
-                _module, torch.cat((torch.stack(contexts), x), -1)
-            )
+            combined = torch.cat((torch.stack(contexts), x), -1)
+            next_states = combined[..., -_context:].detach()
+            for index, rid in enumerate(stream_ids):
+                _states[rid] = next_states[index]
+            output = nn.ConvTranspose1d.forward(_module, combined)
             left = _context * _module.stride[0]
             return output[..., left:-_trim] if _trim else output[..., left:]
 

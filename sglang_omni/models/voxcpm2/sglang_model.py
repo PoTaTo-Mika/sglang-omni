@@ -122,6 +122,21 @@ class VoxCPM2SGLangModel(nn.Module):
     ) -> dict[str, torch.Tensor]:
         return self.model.generate_batch(hidden_states, rows, **kwargs)
 
+    def init_diffusion_graphs(self, batch_sizes: list[int]) -> None:
+        self.model.init_diffusion_graphs(batch_sizes)
+
+    @property
+    def diffusion_graph_max_bs(self) -> int:
+        return self.model.diffusion_graph_max_bs
+
+    def generate_batch_graphed(
+        self,
+        hidden_states: torch.Tensor,
+        rows: torch.Tensor,
+        **kwargs: Any,
+    ) -> dict[str, torch.Tensor]:
+        return self.model.generate_batch_graphed(hidden_states, rows, **kwargs)
+
     def attach_vae(self, vae: nn.Module) -> None:
         self.model.attach_vae(vae)
 

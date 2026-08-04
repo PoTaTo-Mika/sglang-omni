@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import math
+import os
 from typing import Any
 
 import torch
@@ -67,12 +68,25 @@ def _snake(x: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
     return x.reshape(shape)
 
 
+_compiled_snake = (
+    torch.compile(
+        _snake,
+        dynamic=True,
+        mode="max-autotune-no-cudagraphs",
+    )
+    if os.environ.get("SGLANG_VOXCPM_ENABLE_VAE_COMPILE") == "1"
+    else None
+)
+
+
 class Snake1d(nn.Module):
     def __init__(self, channels: int) -> None:
         super().__init__()
         self.alpha = nn.Parameter(torch.ones(1, channels, 1))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.device.type == "cuda" and _compiled_snake is not None:
+            return _compiled_snake(x, self.alpha)
         return _snake(x, self.alpha)
 
 
@@ -314,15 +328,17 @@ class CausalDecoder(nn.Module):
             self.default_sr_idx = len(sr_boundaries)
             self.sr_cond_model = nn.ModuleList(
                 [
-                    SampleRateConditionLayer(
-                        layer.input_channels,
-                        buckets,
-                        cond_type=cond_type,
-                        cond_dim=cond_dim,
-                        out_layer=cond_out_layer,
+                    (
+                        SampleRateConditionLayer(
+                            layer.input_channels,
+                            buckets,
+                            cond_type=cond_type,
+                            cond_dim=cond_dim,
+                            out_layer=cond_out_layer,
+                        )
+                        if isinstance(layer, CausalDecoderBlock)
+                        else None
                     )
-                    if isinstance(layer, CausalDecoderBlock)
-                    else None
                     for layer in layers
                 ]
             )

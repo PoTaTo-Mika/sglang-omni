@@ -91,7 +91,7 @@ class VoxCPMEngineBuilder(TtsEngineBuilder):
         defaults = {
             "max_running_requests": 8,
             "dtype": dtype,
-            "disable_cuda_graph": True,
+            "disable_cuda_graph": False,
             "disable_overlap_schedule": True,
             "disable_radix_cache": True,
             "enable_torch_compile": False,
@@ -126,7 +126,6 @@ class VoxCPMEngineBuilder(TtsEngineBuilder):
         overrides["disable_radix_cache"] = True
         overrides["chunked_prefill_size"] = 0
         overrides["disable_overlap_schedule"] = True
-        overrides["disable_cuda_graph"] = True
         overrides["enable_torch_compile"] = False
         overrides["tp_size"] = 1
 
@@ -155,9 +154,32 @@ class VoxCPMEngineBuilder(TtsEngineBuilder):
         # The causal vocoder is numerically sensitive and official weights are fp32.
         self.vae.to(device=device, dtype=__import__("torch").float32).eval()
         model.load_audiovae(self.vae, checkpoint_dir, strict=True)
+        if device.startswith("cuda"):
+            torch = __import__("torch")
+            with torch.inference_mode():
+                self.vae.decode(
+                    torch.zeros(
+                        1,
+                        int(self.vae.latent_dim),
+                        int(model.model.patch_size),
+                        device=device,
+                        dtype=torch.float32,
+                    )
+                )
+            torch.cuda.synchronize()
 
     def get_model_buffer_bs(self, model: Any) -> int | None:
         return int(model.model.state_pool.capacity)
+
+    def post_cuda_graph_setup(self, model: Any, server_args: Any) -> None:
+        if os.environ.get("SGLANG_VOXCPM_DISABLE_DIFFUSION_GRAPH") == "1":
+            return
+        requested = list(server_args.cuda_graph_bs)
+        max_bs = max(requested)
+        diffusion_buckets = [
+            bs for bs in requested if bs <= 8 or bs % 16 == 0 or bs == max_bs
+        ]
+        model.init_diffusion_graphs(diffusion_buckets)
 
     def make_model_runner(self, model_worker: Any, output_proc: Any) -> Any:
         from sglang_omni.models.voxcpm_common.model_runner import VoxCPMModelRunner
@@ -182,6 +204,14 @@ class VoxCPMEngineBuilder(TtsEngineBuilder):
 
     def make_abort_callback(self) -> Any:
         return self._runner.reset_request
+
+    def extra_scheduler_kwargs(self) -> dict[str, Any]:
+        return {
+            "enable_async_decode": (
+                os.environ.get("SGLANG_VOXCPM_ENABLE_ASYNC_DECODE") == "1"
+            ),
+            "async_decode_min_batch_size": 16,
+        }
 
     def post_scheduler_setup(self, scheduler: Any, model_runner: Any) -> None:
         model_runner.set_stream_outbox(scheduler.outbox)
