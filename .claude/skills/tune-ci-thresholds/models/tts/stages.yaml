@@ -538,7 +538,7 @@ tts_serving_closed16_speed:
   extra_env: {}
   context_vars: []
   variant: "closed16"
-  test_file_sha256: ac22137e5cd8af36c4a934ce499fb7911fd2763c6b7279dbe269dc3ffc27cd1e
+  test_file_sha256: 0717355034889e62bae69daec014d91868eb4088b08bc94c97a76c53339902ec
   last_discovered_at: 2026-08-03T02:04:22Z
   observation_validity:
     json_file: "tts-serving-ci0/benchmark_validation.json"
@@ -581,7 +581,7 @@ tts_serving_ramp_speed:
   extra_env: {}
   context_vars: []
   variant: "ramp"
-  test_file_sha256: ac22137e5cd8af36c4a934ce499fb7911fd2763c6b7279dbe269dc3ffc27cd1e
+  test_file_sha256: 0717355034889e62bae69daec014d91868eb4088b08bc94c97a76c53339902ec
   last_discovered_at: 2026-08-03T02:04:22Z
   observation_validity:
     json_file: "tts-serving-ci0/benchmark_validation.json"
@@ -624,7 +624,7 @@ tts_serving_soak_speed:
   extra_env: {}
   context_vars: []
   variant: "soak"
-  test_file_sha256: ac22137e5cd8af36c4a934ce499fb7911fd2763c6b7279dbe269dc3ffc27cd1e
+  test_file_sha256: 0717355034889e62bae69daec014d91868eb4088b08bc94c97a76c53339902ec
   last_discovered_at: 2026-08-03T02:04:22Z
   observation_validity:
     json_file: "tts-serving-ci0/benchmark_validation.json"
@@ -657,7 +657,7 @@ tts_serving_speech_normal_speed:
   extra_env: {}
   context_vars: []
   variant: "speech_normal"
-  test_file_sha256: ac22137e5cd8af36c4a934ce499fb7911fd2763c6b7279dbe269dc3ffc27cd1e
+  test_file_sha256: 0717355034889e62bae69daec014d91868eb4088b08bc94c97a76c53339902ec
   last_discovered_at: 2026-08-03T02:04:22Z
   observation_validity:
     json_file: "tts-serving-ci0/benchmark_validation.json"
@@ -700,7 +700,7 @@ tts_serving_rest_stream_speed:
   extra_env: {}
   context_vars: []
   variant: "rest_stream"
-  test_file_sha256: ac22137e5cd8af36c4a934ce499fb7911fd2763c6b7279dbe269dc3ffc27cd1e
+  test_file_sha256: 0717355034889e62bae69daec014d91868eb4088b08bc94c97a76c53339902ec
   last_discovered_at: 2026-08-03T02:04:22Z
   observation_validity:
     json_file: "tts-serving-ci0/benchmark_validation.json"
@@ -763,7 +763,7 @@ tts_serving_batch32_speed:
   extra_env: {}
   context_vars: []
   variant: "batch32"
-  test_file_sha256: ac22137e5cd8af36c4a934ce499fb7911fd2763c6b7279dbe269dc3ffc27cd1e
+  test_file_sha256: 0717355034889e62bae69daec014d91868eb4088b08bc94c97a76c53339902ec
   last_discovered_at: 2026-08-03T02:04:22Z
   observation_validity:
     json_file: "tts-serving-ci0/benchmark_validation.json"
@@ -806,7 +806,7 @@ tts_serving_ws_normal_speed:
   extra_env: {}
   context_vars: []
   variant: "ws_normal"
-  test_file_sha256: ac22137e5cd8af36c4a934ce499fb7911fd2763c6b7279dbe269dc3ffc27cd1e
+  test_file_sha256: 0717355034889e62bae69daec014d91868eb4088b08bc94c97a76c53339902ec
   last_discovered_at: 2026-08-03T02:04:22Z
   observation_validity:
     json_file: "tts-serving-ci0/benchmark_validation.json"
@@ -849,7 +849,7 @@ tts_serving_ws_stream_speed:
   extra_env: {}
   context_vars: []
   variant: "ws_stream"
-  test_file_sha256: ac22137e5cd8af36c4a934ce499fb7911fd2763c6b7279dbe269dc3ffc27cd1e
+  test_file_sha256: 0717355034889e62bae69daec014d91868eb4088b08bc94c97a76c53339902ec
   last_discovered_at: 2026-08-03T02:04:22Z
   observation_validity:
     json_file: "tts-serving-ci0/benchmark_validation.json"
@@ -912,7 +912,7 @@ tts_serving_mixed_burst_speed:
   extra_env: {}
   context_vars: []
   variant: "mixed_burst"
-  test_file_sha256: ac22137e5cd8af36c4a934ce499fb7911fd2763c6b7279dbe269dc3ffc27cd1e
+  test_file_sha256: 0717355034889e62bae69daec014d91868eb4088b08bc94c97a76c53339902ec
   last_discovered_at: 2026-08-03T02:04:22Z
   observation_validity:
     json_file: "tts-serving-ci0/benchmark_validation.json"
@@ -955,7 +955,7 @@ tts_serving_long_speed:
   extra_env: {}
   context_vars: []
   variant: "long"
-  test_file_sha256: ac22137e5cd8af36c4a934ce499fb7911fd2763c6b7279dbe269dc3ffc27cd1e
+  test_file_sha256: 0717355034889e62bae69daec014d91868eb4088b08bc94c97a76c53339902ec
   last_discovered_at: 2026-08-03T02:04:22Z
   observation_validity:
     json_file: "tts-serving-ci0/benchmark_validation.json"
@@ -1038,7 +1038,7 @@ tts_serving_long_baseline_speed:
   extra_env: {}
   context_vars: []
   variant: "long_baseline"
-  test_file_sha256: ac22137e5cd8af36c4a934ce499fb7911fd2763c6b7279dbe269dc3ffc27cd1e
+  test_file_sha256: 0717355034889e62bae69daec014d91868eb4088b08bc94c97a76c53339902ec
   last_discovered_at: 2026-08-03T02:04:22Z
   observation_validity:
     json_file: "tts-serving-ci0/benchmark_validation.json"
