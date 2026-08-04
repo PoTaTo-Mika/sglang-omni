@@ -10,6 +10,7 @@ import pytest
 import torch
 
 import sglang_omni.preprocessing.transcription as transcription
+from sglang_omni.models.moss_transcribe_diarize import request_builders
 from sglang_omni.models.moss_transcribe_diarize.request_builders import (
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_K,
