@@ -827,9 +827,7 @@ def test_qwen3_tts_preprocess_payload_batches_reference_codes_across_requests(
         except BaseException as exc:  # noqa: BLE001 - surfaced via assertion
             errors.append(exc)
 
-    threads = [
-        threading.Thread(target=preprocess, args=(index,)) for index in range(2)
-    ]
+    threads = [threading.Thread(target=preprocess, args=(index,)) for index in range(2)]
     try:
         for thread in threads:
             thread.start()

@@ -677,8 +677,7 @@ class _Qwen3TTSRefCodeBatcher:
         cuda_devices = {
             outcome.device
             for outcome in outcomes.values()
-            if not isinstance(outcome, Exception)
-            and getattr(outcome, "is_cuda", False)
+            if not isinstance(outcome, Exception) and getattr(outcome, "is_cuda", False)
         }
         for device in cuda_devices:
             torch.cuda.current_stream(device).synchronize()
