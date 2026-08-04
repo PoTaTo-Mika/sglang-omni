@@ -115,10 +115,19 @@ def _compile_qwen3_tts_backbone(model: Any) -> None:
     ]
 
 
-def create_preprocessing_executor(model_path: str) -> SimpleScheduler:
+def create_preprocessing_executor(
+    model_path: str,
+    *,
+    max_concurrency: int = 8,
+) -> SimpleScheduler:
     del model_path
+    # note (luojiaxuan): preprocessing must admit several requests at once. A
+    # serial executor keeps at most one reference-code request in flight, so
+    # the speech-tokenizer batcher would only ever see batches of one; the
+    # default matches the batcher's max_batch_size.
     return SimpleScheduler(
         preprocess_qwen3_tts_payload,
+        max_concurrency=max_concurrency,
         abort_callback=cleanup_prepared_qwen3_tts_request,
     )
 

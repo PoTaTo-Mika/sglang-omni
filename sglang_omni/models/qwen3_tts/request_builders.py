@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import hashlib
 import json
 import queue
@@ -578,17 +579,40 @@ class _Qwen3TTSAdhocReferenceInput:
     x_vector_only_mode: bool
 
 
+def _new_cuda_encode_stream(device: Any) -> torch.cuda.Stream | None:
+    if device is None or not torch.cuda.is_available():
+        return None
+    try:
+        resolved = torch.device(device)
+    except (TypeError, ValueError, RuntimeError):
+        return None
+    if resolved.type != "cuda":
+        return None
+    return torch.cuda.Stream(device=resolved)
+
+
+def _record_ref_code_consumer_stream(ref_code: Any) -> Any:
+    # note (luojiaxuan): reference codes may be allocated on the batcher's
+    # private stream; register the consumer stream with the caching allocator
+    # so a later batch cannot recycle the block while reads are still queued.
+    if isinstance(ref_code, torch.Tensor) and ref_code.is_cuda:
+        ref_code.record_stream(torch.cuda.current_stream(ref_code.device))
+    return ref_code
+
+
 class _Qwen3TTSRefCodeBatcher:
     def __init__(
         self,
         speech_tokenizer: Any,
         *,
+        device: Any | None = None,
         max_batch_size: int = 8,
         max_batch_wait_ms: float = 2.0,
     ) -> None:
         self._speech_tokenizer = speech_tokenizer
         self._max_batch_size = max(int(max_batch_size), 1)
         self._max_batch_wait_s = max(float(max_batch_wait_ms), 0.0) / 1000.0
+        self._encode_stream = _new_cuda_encode_stream(device)
         self._queue: queue.Queue[object] = queue.Queue()
         self._thread = threading.Thread(
             target=self._run,
@@ -602,7 +626,9 @@ class _Qwen3TTSRefCodeBatcher:
         self._thread.join(timeout=5.0)
 
     def encode(self, waveform: Any, sample_rate: int) -> torch.Tensor:
-        return self.submit(waveform, sample_rate).result(timeout=130.0)
+        return _record_ref_code_consumer_stream(
+            self.submit(waveform, sample_rate).result(timeout=130.0)
+        )
 
     def submit(
         self, waveform: Any, sample_rate: int
@@ -634,6 +660,29 @@ class _Qwen3TTSRefCodeBatcher:
             batch.append(queued)
         return batch, shutdown
 
+    def _synchronize_outcomes(
+        self, outcomes: dict[int, torch.Tensor | Exception]
+    ) -> None:
+        # note (luojiaxuan): resolve futures only after the encode kernels
+        # finish so consumer threads may use the codes on any stream. With a
+        # dedicated stream, waiting on its event leaves the default stream —
+        # where speaker-embedding kernels run concurrently — untouched; the
+        # fallback keeps the historical current-stream synchronize for
+        # tokenizers whose device could not be resolved up front.
+        if self._encode_stream is not None:
+            handoff = torch.cuda.Event()
+            handoff.record(self._encode_stream)
+            handoff.synchronize()
+            return
+        cuda_devices = {
+            outcome.device
+            for outcome in outcomes.values()
+            if not isinstance(outcome, Exception)
+            and getattr(outcome, "is_cuda", False)
+        }
+        for device in cuda_devices:
+            torch.cuda.current_stream(device).synchronize()
+
     def _run(self) -> None:
         while True:
             raw_batch, shutdown = self._drain()
@@ -646,7 +695,12 @@ class _Qwen3TTSRefCodeBatcher:
             for index, (waveform, sample_rate, _) in enumerate(batch):
                 groups.setdefault(sample_rate, []).append((index, waveform))
             outcomes: dict[int, torch.Tensor | Exception] = {}
-            with torch.inference_mode():
+            encode_stream_ctx = (
+                torch.cuda.stream(self._encode_stream)
+                if self._encode_stream is not None
+                else contextlib.nullcontext()
+            )
+            with torch.inference_mode(), encode_stream_ctx:
                 for sample_rate, group in groups.items():
                     waveforms = [waveform for _, waveform in group]
                     try:
@@ -671,14 +725,7 @@ class _Qwen3TTSRefCodeBatcher:
                     else:
                         for (index, _), code in zip(group, encoded, strict=True):
                             outcomes[index] = code
-            cuda_devices = {
-                outcome.device
-                for outcome in outcomes.values()
-                if not isinstance(outcome, Exception)
-                and getattr(outcome, "is_cuda", False)
-            }
-            for device in cuda_devices:
-                torch.cuda.current_stream(device).synchronize()
+            self._synchronize_outcomes(outcomes)
             for index, (_, _, future) in enumerate(batch):
                 outcome = outcomes[index]
                 if isinstance(outcome, Exception):
@@ -703,7 +750,13 @@ class _Qwen3TTSAdhocReferenceHook(
     def __init__(self, *, model: Any, wrapper: Any) -> None:
         self._model = model
         self._wrapper = wrapper
-        self._ref_code_batcher = _Qwen3TTSRefCodeBatcher(model.speech_tokenizer)
+        # note (luojiaxuan): the engine builder loads the speech tokenizer on
+        # the same device as the talker model, so model.device selects the
+        # dedicated reference-code encode stream for that device.
+        self._ref_code_batcher = _Qwen3TTSRefCodeBatcher(
+            model.speech_tokenizer,
+            device=getattr(model, "device", None),
+        )
         self.model_revision = _qwen3_tts_model_revision(model, wrapper)
         self.encoder_config_hash = _qwen3_tts_encoder_config_hash(model, wrapper)
 
@@ -761,7 +814,9 @@ class _Qwen3TTSAdhocReferenceHook(
                 audio=speaker_waveform,
                 sr=speaker_sample_rate,
             )
-            ref_code = ref_code_future.result(timeout=130.0)
+            ref_code = _record_ref_code_consumer_stream(
+                ref_code_future.result(timeout=130.0)
+            )
         voice_clone_prompt = {
             "ref_code": [None if item.x_vector_only_mode else ref_code],
             "ref_spk_embedding": [speaker_embedding],
