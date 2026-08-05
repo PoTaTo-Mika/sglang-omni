@@ -121,7 +121,9 @@ def create_asr_executor(
         context_length=8192,
         **overrides,
     )
-    validate_generation_batch_policy(model_name="MiMo-V2.5-ASR", server_args=server_args)
+    validate_generation_batch_policy(
+        model_name="MiMo-V2.5-ASR", server_args=server_args
+    )
     (
         _,
         (

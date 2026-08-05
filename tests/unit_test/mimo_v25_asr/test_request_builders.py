@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import torch
 import pytest
+import torch
 from sglang.srt.managers.schedule_batch import Modality
 
 from sglang_omni.models.mimo_v25_asr.prompt import CHINESE_TAG, EMPTY

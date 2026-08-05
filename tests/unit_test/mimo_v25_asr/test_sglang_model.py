@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import torch
+from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 
 from sglang_omni.models.mimo_v25_asr.sglang_model import (
     MiMoInputPatchEncoder,
@@ -10,7 +11,6 @@ from sglang_omni.models.mimo_v25_asr.sglang_model import (
     is_output_only_weight,
     parse_channel_values,
 )
-from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 
 
 def _tiny_config() -> Qwen2Config:
