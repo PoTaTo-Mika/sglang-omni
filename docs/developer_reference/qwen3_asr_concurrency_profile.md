@@ -174,10 +174,13 @@ Dominant costs, in order:
 
 ## Environment
 
-Fingerprints (git SHA, dependency freeze hash, driver, GPU, cached model
-revision) are embedded in each result JSON produced by `--fingerprint`; raw
-per-request records and profiler event JSONL live beside the result files on
-the measurement host.
+Fingerprints are embedded in each result JSON produced by
+`--fingerprint`: a client block (git SHA, dependency freeze hash, driver,
+GPU, cached model revision — describing the benchmark process) and a server
+block (what the target server reports about itself). In the runs above,
+client and server shared one host and checkout, so the client git state also
+identifies the server code. Raw per-request records and profiler event JSONL
+live beside the result files on the measurement host.
 
 Summary for the runs above: NVIDIA H100 80GB HBM3, driver 580.126.20,
 torch 2.11.0+cu130, sglang 0.5.16, transformers 5.12.1, model snapshot

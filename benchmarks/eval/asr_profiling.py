@@ -179,6 +179,8 @@ class UtilizationSampler:
             try:
                 sample["load_avg_1m"] = os.getloadavg()[0]
             except OSError:
+                # note (luojiaxuan): load average is optional telemetry and
+                # unavailable on some platforms (e.g. Windows); skip silently.
                 pass
             gpu = _query_gpu_utilization(self.gpu_ids)
             if gpu:
@@ -244,12 +246,38 @@ _FINGERPRINT_ENV_KEYS = (
 )
 
 
+def collect_server_identity(base_url: str) -> dict:
+    """Best-effort identity of the serving process under test.
+
+    The client-side fingerprint describes the benchmark process; the server
+    may run different code. This records what the server itself reports
+    (currently its /v1/models listing) alongside the target URL.
+    """
+    identity: dict[str, Any] = {"url": base_url.rstrip("/")}
+    try:
+        response = requests.get(
+            f"{base_url.rstrip('/')}/v1/models",
+            timeout=10,
+            proxies=_NO_PROXIES,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        identity["models"] = [
+            entry.get("id") for entry in payload.get("data", []) if entry.get("id")
+        ]
+    except (requests.RequestException, ValueError):
+        identity["models"] = None
+    return identity
+
+
 def collect_environment_fingerprint(model_path: str | None = None) -> dict:
-    """Capture code, dependency, and hardware identity for a benchmark run.
+    """Capture code, dependency, and hardware identity of the client process.
 
     Every field is best-effort: a missing tool (git outside a checkout,
     nvidia-smi on CPU hosts) yields None rather than an exception, so the
-    fingerprint never blocks a run.
+    fingerprint never blocks a run. This describes the benchmark client;
+    pair it with :func:`collect_server_identity` for the server side (they
+    coincide only when client and server share one host and checkout).
     """
     pip_freeze = _run_command([sys.executable, "-m", "pip", "freeze"])
     fingerprint: dict[str, Any] = {

@@ -13,6 +13,7 @@ from benchmarks.eval.asr_profiling import (
     UtilizationSampler,
     build_stage_breakdown,
     collect_environment_fingerprint,
+    collect_server_identity,
     start_request_profile,
     stop_request_profile,
 )
@@ -169,3 +170,33 @@ def test_aggregate_and_table_surface_latency_median() -> None:
     # raising for both plain and profiled aggregates.
     aggregate["profile"] = None
     _print_table([aggregate])
+
+
+def test_server_identity_reports_models_best_effort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _ModelsResponse:
+        def raise_for_status(self) -> None:
+            pass
+
+        def json(self) -> dict:
+            return {"data": [{"id": "Qwen/Qwen3-ASR-1.7B"}]}
+
+    monkeypatch.setattr(
+        asr_profiling.requests,
+        "get",
+        lambda url, *, timeout, proxies: _ModelsResponse(),
+    )
+    identity = collect_server_identity("http://127.0.0.1:8000/")
+    assert identity == {
+        "url": "http://127.0.0.1:8000",
+        "models": ["Qwen/Qwen3-ASR-1.7B"],
+    }
+
+    def _down(url, *, timeout, proxies):
+        raise asr_profiling.requests.ConnectionError("down")
+
+    monkeypatch.setattr(asr_profiling.requests, "get", _down)
+    identity = collect_server_identity("http://127.0.0.1:8000")
+    assert identity["url"] == "http://127.0.0.1:8000"
+    assert identity["models"] is None

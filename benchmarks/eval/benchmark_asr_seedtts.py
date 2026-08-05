@@ -99,6 +99,7 @@ from benchmarks.eval.asr_profiling import (
     UtilizationSampler,
     build_stage_breakdown,
     collect_environment_fingerprint,
+    collect_server_identity,
     start_request_profile,
     stop_request_profile,
 )
@@ -505,7 +506,13 @@ async def _run_profiled_pass(args, samples, concurrency: int) -> dict | None:
             started.append(url)
     except requests.RequestException as exc:
         for url in started:
-            stop_request_profile(url)
+            try:
+                stop_request_profile(url, run_id)
+            except requests.RequestException as stop_exc:
+                print(
+                    f"[conc={concurrency}] failed to stop profiling on "
+                    f"{url}: {stop_exc}"
+                )
         print(f"[conc={concurrency}] profiling unavailable, skipping: {exc}")
         return None
     try:
@@ -513,9 +520,14 @@ async def _run_profiled_pass(args, samples, concurrency: int) -> dict | None:
     finally:
         for url in started:
             try:
-                stop_request_profile(url)
-            except requests.RequestException:
-                pass
+                stop_request_profile(url, run_id)
+            except requests.RequestException as stop_exc:
+                # The pass metrics remain valid; profiling just keeps
+                # recording on that worker until the next explicit stop.
+                print(
+                    f"[conc={concurrency}] failed to stop profiling on "
+                    f"{url}: {stop_exc}"
+                )
     report = build_stage_breakdown(event_dir)
     return {
         "run_id": run_id,
@@ -607,9 +619,12 @@ def main() -> None:
         "results": aggregates,
     }
     if args.fingerprint:
-        payload["environment_fingerprint"] = collect_environment_fingerprint(
-            args.model_path
-        )
+        # The client fingerprint equals the server's only when both share one
+        # host and checkout; the server block records what the server reports.
+        payload["environment_fingerprint"] = {
+            "client": collect_environment_fingerprint(args.model_path),
+            "server": collect_server_identity(f"http://{args.host}:{args.port}"),
+        }
     output_path = os.path.abspath(args.output)
     with open(output_path, "w") as handle:
         json.dump(payload, handle, indent=2)
