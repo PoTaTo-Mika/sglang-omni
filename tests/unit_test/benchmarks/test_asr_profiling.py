@@ -83,7 +83,7 @@ def test_build_stage_breakdown_pairs_queue_and_decode_intervals(tmp_path) -> Non
 
     assert "timelines" not in report
     assert report["request_count"] == 1
-    by_interval = {row["interval_name"]: row for row in report["stage_breakdown"]}
+    by_interval = {row["interval"]: row for row in report["stage_breakdown"]}
     build = by_interval["scheduler_request_build_start->scheduler_request_build_end"]
     assert build["avg_ms"] == pytest.approx(5.0)
     queue = by_interval["scheduler_queue_enter->scheduler_prefill_start"]
