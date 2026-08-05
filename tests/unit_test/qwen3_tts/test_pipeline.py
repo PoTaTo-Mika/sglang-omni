@@ -817,14 +817,14 @@ def test_qwen3_tts_preprocess_payload_batches_reference_codes_across_requests(
             data={},
         )
 
-    errors: list[BaseException] = []
+    errors: list[Exception] = []
 
     def preprocess(index: int) -> None:
         try:
             qwen3_request_builders.preprocess_qwen3_tts_payload(
                 make_distinct_payload(index)
             )
-        except BaseException as exc:  # noqa: BLE001 - surfaced via assertion
+        except Exception as exc:
             errors.append(exc)
 
     threads = [threading.Thread(target=preprocess, args=(index,)) for index in range(2)]
