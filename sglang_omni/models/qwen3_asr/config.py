@@ -34,7 +34,7 @@ class Qwen3ASRPipelineConfig(PipelineConfig):
                 "device": "cuda:0",
                 "max_running_requests": 32,
                 "max_new_tokens": 128,
-                "request_build_max_workers": 2,
+                "request_build_max_workers": 8,
                 "request_build_max_pending": 16,
                 "enable_pre_lm_encoder": True,
                 "pre_lm_cache_max_entries": 4096,
