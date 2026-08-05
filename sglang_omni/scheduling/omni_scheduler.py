@@ -1341,6 +1341,13 @@ class OmniScheduler:
         prefill — for streaming and non-streaming requests alike. The
         metadata carries the realized batch size (issue #1324 Q-PR2).
         """
+        # note (luojiaxuan): steady-state decode reaches here after every
+        # step. _prefill_end_done only ever holds rids present in
+        # _prefill_start_done and both are discarded together, so equal sizes
+        # mean every started request already emitted -- skip before building
+        # metadata or scanning the batch.
+        if len(self._prefill_end_done) == len(self._prefill_start_done):
+            return
         metadata = {
             "batch_size": len(batch.reqs),
             "is_extend_in_batch": bool(batch.is_extend_in_batch),
