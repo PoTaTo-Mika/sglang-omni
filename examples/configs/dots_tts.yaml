@@ -1,0 +1,39 @@
+config_cls: DotsTtsPipelineConfig
+model_path: /data/chenyang/models/dots.tts-mf
+name: dots-tts-mf
+stages:
+  - name: preprocessing
+    process: pipeline
+    factory: sglang_omni.models.dots_tts.stages.create_preprocessing_executor
+    next: reference_encode
+
+  - name: reference_encode
+    process: pipeline
+    factory: sglang_omni.models.dots_tts.stages.create_reference_encode_executor
+    factory_args:
+      max_sequence_length: 2048
+      max_concurrency: 1
+    gpu: 0
+    next: tts_engine
+
+  - name: tts_engine
+    process: pipeline
+    factory: sglang_omni.models.dots_tts.stages.create_tts_engine_executor
+    factory_args:
+      dtype: bfloat16
+      ode_method: euler
+      eos_threshold: 0.8
+      max_sequence_length: 2048
+      optimize: false
+    gpu: 0
+    next: audio_decode
+
+  - name: audio_decode
+    process: pipeline
+    factory: sglang_omni.models.dots_tts.stages.create_audio_decode_executor
+    factory_args:
+      dtype: bfloat16
+      max_batch_size: 1
+      max_batch_wait_ms: 0
+    gpu: 0
+    terminal: true
