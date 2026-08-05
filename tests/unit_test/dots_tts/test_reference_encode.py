@@ -16,13 +16,15 @@ from sglang_omni.models.dots_tts.prompt_builder import (
     prompt_audio_patch_count,
 )
 from sglang_omni.models.dots_tts.reference_encode import (
-    DotsTtsReferenceAudioHook,
+    DotsTtsPromptFeatureHook,
     DotsTtsReferenceEncoder,
 )
 from sglang_omni.proto import OmniRequest, StagePayload
 
 SAMPLE_RATE = 48000
-SAMPLES_PER_PATCH = 4 * 1920
+PATCH_SIZE = 4
+LATENT_DIM = 128
+SAMPLES_PER_PATCH = PATCH_SIZE * 960
 
 
 class _FakeTokenizer:
@@ -46,6 +48,21 @@ class _FakeTokenizer:
         return "".join(chr(token_id) for token_id in token_ids if token_id < 90000)
 
 
+class _FakeVocoderInference:
+    """Returns a deterministic AudioVAE posterior for the padded waveform."""
+
+    def extract_latents(self, waveform: torch.Tensor) -> torch.Tensor:
+        frames = int(waveform.shape[-1]) // (SAMPLES_PER_PATCH // PATCH_SIZE)
+        mean = torch.full((1, LATENT_DIM, frames), 0.25)
+        log_std = torch.full((1, LATENT_DIM, frames), -10.0)
+        return torch.cat([mean, log_std], dim=1)
+
+
+def _fake_speaker_encoder(waveform: torch.Tensor) -> torch.Tensor:
+    del waveform
+    return torch.ones((1, 512))
+
+
 def _write_wav(path: Path, samples: bytes) -> Path:
     with wave.open(str(path), "wb") as handle:
         handle.setnchannels(1)
@@ -63,19 +80,32 @@ def _make_payload(state: DotsTtsState) -> StagePayload:
     )
 
 
+def _make_hook(model_identity: str = "dots.tts-mf") -> DotsTtsPromptFeatureHook:
+    return DotsTtsPromptFeatureHook(
+        model_identity=model_identity,
+        vocoder_inference=_FakeVocoderInference(),
+        speaker_encoder=_fake_speaker_encoder,
+        sample_rate=SAMPLE_RATE,
+        samples_per_patch=SAMPLES_PER_PATCH,
+        device=torch.device("cpu"),
+    )
+
+
 def _make_encoder(tmp_path: Path) -> DotsTtsReferenceEncoder:
     return DotsTtsReferenceEncoder(
         tokenizer=_FakeTokenizer(),
+        vocoder_inference=_FakeVocoderInference(),
+        speaker_encoder=_fake_speaker_encoder,
         sample_rate=SAMPLE_RATE,
+        patch_size=PATCH_SIZE,
         samples_per_patch=SAMPLES_PER_PATCH,
         model_identity=str(tmp_path),
+        device=torch.device("cpu"),
     )
 
 
 def test_cache_key_differs_for_same_size_different_content(tmp_path: Path) -> None:
-    hook = DotsTtsReferenceAudioHook(
-        model_identity="dots.tts-mf", sample_rate=SAMPLE_RATE
-    )
+    hook = _make_hook()
     first = _write_wav(tmp_path / "a.wav", b"\x01\x00" * 24000)
     second = _write_wav(tmp_path / "b.wav", b"\x02\x00" * 24000)
 
@@ -85,15 +115,13 @@ def test_cache_key_differs_for_same_size_different_content(tmp_path: Path) -> No
 
 
 def test_cache_key_is_none_for_missing_reference(tmp_path: Path) -> None:
-    hook = DotsTtsReferenceAudioHook(
-        model_identity="dots.tts-mf", sample_rate=SAMPLE_RATE
-    )
+    hook = _make_hook()
 
     assert hook.input_key(str(tmp_path / "missing.wav")) is None
     assert hook.cache_key(str(tmp_path / "missing.wav")) is None
 
 
-def test_encode_payload_attaches_prompt_audio_and_schedule(
+def test_encode_payload_attaches_prompt_conditioning_and_schedule(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     reference = _write_wav(tmp_path / "ref.wav", b"\x01\x00" * 24000)
@@ -114,7 +142,11 @@ def test_encode_payload_attaches_prompt_audio_and_schedule(
     stored = _make_encoder(tmp_path).encode_payload(payload)
     state = DotsTtsState.from_dict(stored.data)
 
-    assert state.prompt_audio.shape == (1, SAMPLES_PER_PATCH * 3)
+    # The AR loop regenerates the final prompt patch, so conditioning stops one
+    # patch short of the reference audio.
+    assert state.prompt_patch_count == 2
+    assert state.prompt_latent.shape == (1, 2 * PATCH_SIZE, LATENT_DIM)
+    assert state.spk_emb.shape == (1, 512)
     assert state.generation_schedule_ids is not None
     assert state.generation_schedule_ids.count(90002) == 16
     assert state.prompt_tokens == len(state.generation_schedule_ids)
@@ -148,6 +180,35 @@ def test_encode_payload_requires_reference_audio(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="requires reference audio"):
         _make_encoder(tmp_path).encode_payload(payload)
+
+
+def test_seeded_requests_reuse_the_cached_posterior(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reference = _write_wav(tmp_path / "ref.wav", b"\x01\x00" * 24000)
+    monkeypatch.setattr(
+        "sglang_omni.models.dots_tts.reference_encode.load_reference_waveform",
+        lambda path, *, target_sample_rate: torch.zeros(
+            (1, SAMPLES_PER_PATCH * 3), dtype=torch.float32
+        ),
+    )
+    encoder = _make_encoder(tmp_path)
+
+    def encode(seed: int) -> torch.Tensor:
+        payload = _make_payload(
+            DotsTtsState(
+                text="target",
+                prompt_text="reference",
+                ref_audio_path=str(reference),
+                max_audio_patches=16,
+                seed=seed,
+            )
+        )
+        return DotsTtsState.from_dict(
+            encoder.encode_payload(payload).data
+        ).prompt_latent
+
+    assert torch.equal(encode(7), encode(7))
 
 
 def test_prompt_text_gets_the_training_continuation_boundary() -> None:

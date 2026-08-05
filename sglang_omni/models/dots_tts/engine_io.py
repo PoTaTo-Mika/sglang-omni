@@ -102,18 +102,36 @@ def make_dots_tts_scheduler_adapters(
     model: Any,
     special_tokens: DotsTtsSpecialTokens,
     reset_request: Callable[[str], None],
+    num_steps: int,
+    max_audio_patches: int,
 ):
     """Build StagePayload <-> SGLang request adapters for dots.tts."""
 
     vocab_size = int(model.llm_config.vocab_size)
     latent_patch_size = int(model.latent_patch_size)
     latent_dim = int(model.latent_dim)
+    num_steps = int(num_steps)
+    max_audio_patches = int(max_audio_patches)
 
     def request_builder(payload: StagePayload) -> DotsTtsSGLangRequestData:
         from sglang.srt.managers.schedule_batch import Req
         from sglang.srt.sampling.sampling_params import SamplingParams
 
         state = load_dots_tts_state(payload)
+        # note (chenyang): the MeanFlow tail batches one shared ODE grid across
+        # the running batch, and the DiT KV pools are sized once at startup, so
+        # both knobs are engine-wide rather than per request.
+        if int(state.num_steps) != num_steps:
+            raise ValueError(
+                "dots.tts num_steps is fixed by the tts_engine stage: "
+                f"requested={int(state.num_steps)} engine={num_steps}"
+            )
+        if int(state.max_audio_patches) > max_audio_patches:
+            raise ValueError(
+                "dots.tts max_audio_patches exceeds the tts_engine capacity: "
+                f"requested={int(state.max_audio_patches)} "
+                f"engine={max_audio_patches}"
+            )
         schedule_ids = [
             int(token_id) for token_id in (state.generation_schedule_ids or [])
         ]

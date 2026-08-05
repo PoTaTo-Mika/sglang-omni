@@ -18,13 +18,24 @@ stages:
 
   - name: tts_engine
     process: pipeline
-    factory: sglang_omni.models.dots_tts.stages.create_tts_engine_executor
+    factory: sglang_omni.models.dots_tts.stages.create_sglang_tts_engine_executor
     factory_args:
       dtype: bfloat16
-      ode_method: euler
+      context_length: 2048
+      num_steps: 4
       eos_threshold: 0.8
-      max_sequence_length: 2048
-      optimize: false
+      max_audio_patches: 500
+      server_args_overrides:
+        chunked_prefill_size: 0
+        disable_cuda_graph: true
+        disable_overlap_schedule: true
+        disable_radix_cache: true
+        enable_torch_compile: false
+        max_prefill_tokens: 2048
+        max_running_requests: 8
+        mem_fraction_static: 0.35
+        sampling_backend: pytorch
+        trust_remote_code: false
     gpu: 0
     next: audio_decode
 
@@ -32,7 +43,6 @@ stages:
     process: pipeline
     factory: sglang_omni.models.dots_tts.stages.create_audio_decode_executor
     factory_args:
-      dtype: bfloat16
       max_batch_size: 1
       max_batch_wait_ms: 0
     gpu: 0

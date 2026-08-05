@@ -35,7 +35,7 @@ def _stages() -> list[StageConfig]:
         StageConfig(
             name=TTS_ENGINE_STAGE,
             process="pipeline",
-            factory=f"{_PKG}.stages.create_tts_engine_executor",
+            factory=f"{_PKG}.stages.create_sglang_tts_engine_executor",
             factory_args={"dtype": "bfloat16"},
             gpu=0,
             next=AUDIO_DECODE_STAGE,
@@ -44,7 +44,6 @@ def _stages() -> list[StageConfig]:
             name=AUDIO_DECODE_STAGE,
             process="pipeline",
             factory=f"{_PKG}.stages.create_audio_decode_executor",
-            factory_args={"dtype": "bfloat16"},
             gpu=0,
             terminal=True,
         ),

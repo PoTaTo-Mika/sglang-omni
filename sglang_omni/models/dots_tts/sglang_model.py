@@ -4,13 +4,11 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
 import torch
 import torch.nn as nn
-from einops import rearrange
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -21,14 +19,10 @@ from sglang.srt.utils import add_prefix
 from sglang_omni.models.dots_tts.components.backbone.dit import DiT
 from sglang_omni.models.dots_tts.components.backbone.dit_inference import (
     DiTInferenceContext,
-    DiTSolver,
-    DiTSolverState,
 )
 from sglang_omni.models.dots_tts.components.backbone.encoder import VAESemanticEncoder
-from sglang_omni.models.dots_tts.components.backbone.encoder_inference import (
-    SemanticEncoderInference,
-)
 from sglang_omni.models.dots_tts.hf_config import DOTS_TTS_LATENT_STATS_FILENAME
+from sglang_omni.models.dots_tts.tail import DotsTtsAcousticTail, DotsTtsTailSpec
 from sglang_omni.models.dots_tts.weight_loading import (
     AR_BACKBONE_PREFIX,
     OWNER_AR_BACKBONE,
@@ -50,36 +44,13 @@ _QWEN2_STACKED_PARAMS = (
 )
 
 
-@dataclass
-class DotsTtsTailInputs:
-    """One acoustic tail step for a single request."""
-
-    fm_sequence: torch.Tensor
-    fm_cfg_sequence: torch.Tensor | None
-    fm_seq_len: int
-    g_cond: torch.Tensor
-    dit_state: DiTSolverState
-    patch_encoder_state: Any
-    num_steps: int
-    guidance_scale: float
-    ode_method: str
-
-
-@dataclass
-class DotsTtsTailOutputs:
-    """Normalized latent patch plus the backbone input it feeds back."""
-
-    latent_patch: torch.Tensor
-    feedback_embedding: torch.Tensor
-    patch_encoder_state: Any
-
-
 class DotsTTSSGLangModel(nn.Module):
     """dots.tts AR backbone on SGLang with the MeanFlow acoustic tail attached.
 
     ``forward`` owns the Qwen2 hidden-state path that SGLang schedules and
-    caches. Latent sampling, the patch-encoder feedback, and the EOS head run
-    per request in ``run_tail_step`` after that forward returns.
+    caches. Latent sampling, the patch-encoder feedback, and the EOS head run in
+    :class:`DotsTtsAcousticTail`, batched across the whole running batch once
+    that forward returns.
     """
 
     def __init__(
@@ -107,12 +78,12 @@ class DotsTTSSGLangModel(nn.Module):
         self.fm_hidden_size = int(model_config.DiT.hidden_size)
         self.fm_sigma = float(model_config.fm_sigma)
         meanflow = model_config.meanflow
-        self.is_meanflow = bool(meanflow is not None and meanflow.enabled)
-        dit_mode = (
-            "meanflow"
-            if self.is_meanflow and meanflow.use_duration_embedding
-            else "flow_matching"
-        )
+        if meanflow is None or not meanflow.enabled:
+            raise ValueError(
+                "dots.tts serving currently supports MeanFlow checkpoints only; "
+                "this checkpoint has meanflow disabled"
+            )
+        self.use_duration_embedding = bool(meanflow.use_duration_embedding)
 
         self.patch_encoder = VAESemanticEncoder(
             in_dim=self.latent_dim,
@@ -123,7 +94,7 @@ class DotsTTSSGLangModel(nn.Module):
             in_dim=self.fm_hidden_size,
             out_dim=self.latent_dim,
             transformer_config=model_config.DiT,
-            mode=dit_mode,
+            mode="meanflow" if self.use_duration_embedding else "flow_matching",
         )
         self.hidden_proj = nn.Linear(self.hidden_size, self.fm_hidden_size)
         self.latent_proj = nn.Linear(self.latent_dim, self.fm_hidden_size)
@@ -153,13 +124,6 @@ class DotsTTSSGLangModel(nn.Module):
             persistent=False,
         )
         self.register_buffer(
-            "null_g_cond",
-            torch.zeros(
-                (1, self.fm_hidden_size), dtype=weight.dtype, device=weight.device
-            ),
-            persistent=False,
-        )
-        self.register_buffer(
             "latent_mean",
             torch.zeros(self.latent_dim, dtype=torch.float32, device=weight.device),
             persistent=False,
@@ -169,8 +133,7 @@ class DotsTTSSGLangModel(nn.Module):
             torch.ones(self.latent_dim, dtype=torch.float32, device=weight.device),
             persistent=False,
         )
-        self._dit_solver: DiTSolver | None = None
-        self._patch_encoder_inference: SemanticEncoderInference | None = None
+        self._tail: DotsTtsAcousticTail | None = None
 
     @staticmethod
     def _resolve_max_batch_size() -> int:
@@ -180,17 +143,19 @@ class DotsTTSSGLangModel(nn.Module):
             return 1
         return max(1, int(server_args.max_running_requests))
 
-    @property
-    def fm_unit_len(self) -> int:
-        return self.hidden_patch_size + self.latent_patch_size
-
     # ------------------------------------------------------------------
     # Post-load wiring
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def init_tail(self, checkpoint_dir: str) -> None:
-        """Fuse the tail modules and load latent statistics after weight load.
+    def init_tail(
+        self,
+        checkpoint_dir: str,
+        *,
+        nfe: int,
+        max_audio_patches: int,
+    ) -> None:
+        """Fuse the tail modules and allocate their pools after weight load.
 
         Both the fused adaLN DiT and the fused QKV patch encoder copy trained
         weights into new parameters, so this must run once weights are in.
@@ -200,26 +165,34 @@ class DotsTTSSGLangModel(nn.Module):
         )
         self.latent_mean.copy_(mean.to(self.latent_mean.device))
         self.latent_std.copy_(std.to(self.latent_std.device))
-        self._patch_encoder_inference = SemanticEncoderInference(self.patch_encoder)
-        self._dit_solver = DiTSolver(
-            DiTInferenceContext.from_core(self),
-            optimize=False,
-            bucket_resolver=int,
-            meanflow=self.is_meanflow,
-        )
-        logger.info(
-            "dots.tts acoustic tail ready: mode=%s latent_patch_size=%s",
-            "meanflow" if self.is_meanflow else "flow_matching",
-            self.latent_patch_size,
+
+        weight = self._decode_input_embedding.weight
+        self._tail = DotsTtsAcousticTail(
+            dit_context=DiTInferenceContext.from_core(self),
+            patch_encoder=self.patch_encoder,
+            spec=DotsTtsTailSpec(
+                nfe=int(nfe),
+                # note (chenyang): one spare patch so a request that runs its
+                # whole decode budget cannot land exactly on the cache edge.
+                patch_capacity=int(max_audio_patches) + 1,
+                num_slots=int(self._decode_input_embedding.num_embeddings),
+                hidden_patch_size=self.hidden_patch_size,
+                latent_patch_size=self.latent_patch_size,
+                latent_dim=self.latent_dim,
+                fm_hidden_size=self.fm_hidden_size,
+            ),
+            device=weight.device,
+            dtype=weight.dtype,
         )
 
-    def _require_tail(self) -> tuple[DiTSolver, SemanticEncoderInference]:
-        if self._dit_solver is None or self._patch_encoder_inference is None:
+    @property
+    def tail(self) -> DotsTtsAcousticTail:
+        if self._tail is None:
             raise RuntimeError(
                 "dots.tts acoustic tail is not initialized; call init_tail() "
                 "after the checkpoint is loaded"
             )
-        return self._dit_solver, self._patch_encoder_inference
+        return self._tail
 
     # ------------------------------------------------------------------
     # Latent statistics and conditioning
@@ -235,7 +208,9 @@ class DotsTTSSGLangModel(nn.Module):
             latents.dtype
         )
 
-    def _patch_encoder_input(self, latents: torch.Tensor, *, normalized: bool):
+    def patch_encoder_input(
+        self, latents: torch.Tensor, *, normalized: bool
+    ) -> torch.Tensor:
         if self.patch_encoder.expects_normalized_input:
             return latents if normalized else self.normalize_latents(latents)
         return self.denormalize_latents(latents) if normalized else latents
@@ -244,85 +219,67 @@ class DotsTTSSGLangModel(nn.Module):
     def speaker_condition(
         self, speaker_embedding: torch.Tensor, speaker_scale: float
     ) -> torch.Tensor:
+        """Flow-space speaker conditioning ``g_cond`` for one request."""
         dtype = self._decode_input_embedding.weight.dtype
         scaled = speaker_embedding.to(dtype=dtype) * float(speaker_scale)
         return self.xvec_proj(scaled)
 
     @torch.no_grad()
-    def encode_prompt_patches(
-        self, prompt_latents: torch.Tensor, state: Any | None
-    ) -> tuple[torch.Tensor, Any]:
-        """Backbone embeddings for the prompt audio spans, warming the encoder."""
-        _solver, patch_encoder = self._require_tail()
-        encoder_input = self._patch_encoder_input(prompt_latents, normalized=False)
-        return patch_encoder.prefill_with_state(
-            encoder_input,
-            state,
-            optimize=False,
-            dtype=self._decode_input_embedding.weight.dtype,
+    def meanflow_modulations(self, g_cond: torch.Tensor, *, nfe: int) -> torch.Tensor:
+        """Per-ODE-step fused AdaLN modulations for one request's ``g_cond``.
+
+        The MeanFlow time grid is fixed for a given ``nfe`` and ``g_cond`` is
+        constant across a generation, so the whole schedule is precomputed once
+        per request instead of per decode step.
+        """
+        dit = self.tail.dit
+        nfe = int(nfe)
+        grid = torch.linspace(
+            0.0, 1.0, nfe + 1, device=g_cond.device, dtype=g_cond.dtype
+        )
+        times = grid[:-1]
+        durations = grid[1:] - times
+        condition = dit.time_embedder(times)
+        if dit.duration_embedder is not None:
+            condition = condition + dit.duration_embedder(durations)
+        return dit.fused_adaln(condition + g_cond.reshape(1, -1))
+
+    @torch.no_grad()
+    def prompt_flow_rows(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        prompt_latents: torch.Tensor,
+    ) -> torch.Tensor:
+        """Projected flow history for one request's prompt audio spans.
+
+        ``hidden_states`` is ``[patches, hidden_size]``: the backbone hidden at
+        the token before the first audio span followed by the hidden at every
+        prompt span but the last. ``prompt_latents`` is the raw (unnormalized)
+        prompt latent sequence ``[patches * latent_patch_size, latent_dim]``.
+        Rows interleave one projected hidden with one projected latent patch,
+        matching the DiT's ``unit_len`` layout.
+        """
+        patches = int(hidden_states.size(0))
+        hidden_rows = self.hidden_proj(hidden_states).unsqueeze(1)
+        latent_rows = self.latent_proj(
+            self.normalize_latents(
+                prompt_latents.reshape(patches, self.latent_patch_size, self.latent_dim)
+            )
+        )
+        return torch.cat([hidden_rows, latent_rows], dim=1).reshape(
+            -1, self.fm_hidden_size
         )
 
     @torch.no_grad()
-    def project_hidden(self, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """FM-space rows for backbone hidden states and their CFG null branch.
-
-        ``hidden`` is ``[rows, hidden_size]``; MeanFlow never reads the null
-        branch, so it is only materialized for the flow-matching solver.
-        """
-        projected = self.hidden_proj(hidden)
-        if self.is_meanflow:
-            return projected, projected
-        return projected, self.hidden_proj(torch.zeros_like(hidden))
-
-    @torch.no_grad()
-    def project_latent(self, latent_patch: torch.Tensor) -> torch.Tensor:
-        return self.latent_proj(latent_patch)
+    def project_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Flow-space rows for backbone hidden states ``[rows, hidden_size]``."""
+        return self.hidden_proj(hidden)
 
     @torch.no_grad()
     def stop_probability(self, hidden: torch.Tensor) -> torch.Tensor:
         """EOS probability per row for ``hidden`` shaped ``[rows, hidden_size]``."""
         return self.eos_proj(hidden).softmax(dim=-1)[:, 1]
-
-    def fm_capacity(self, max_audio_patch_count: int) -> int:
-        # note (chenyang): every audio patch contributes one hidden row plus
-        # latent_patch_size latent rows, and the prefill seeds one extra hidden
-        # row ahead of the first prompt patch.
-        return int(max_audio_patch_count) * self.fm_unit_len + 1
-
-    # ------------------------------------------------------------------
-    # Acoustic tail
-    # ------------------------------------------------------------------
-
-    @torch.no_grad()
-    def run_tail_step(self, inputs: DotsTtsTailInputs) -> DotsTtsTailOutputs:
-        solver, patch_encoder = self._require_tail()
-        latent_patch = solver.decode_next(
-            inputs.dit_state,
-            sequence=inputs.fm_sequence,
-            cfg_sequence=inputs.fm_cfg_sequence,
-            fm_seq_len=int(inputs.fm_seq_len),
-            null_g_cond=self.null_g_cond,
-            g_cond=inputs.g_cond,
-            nfe=int(inputs.num_steps),
-            ode_method=inputs.ode_method,
-            guidance_scale=float(inputs.guidance_scale),
-        )
-        feedback_embedding, patch_encoder_state = patch_encoder.decode_patch_with_state(
-            self._patch_encoder_input(latent_patch, normalized=True),
-            inputs.patch_encoder_state,
-            optimize=False,
-            dtype=inputs.fm_sequence.dtype,
-        )
-        return DotsTtsTailOutputs(
-            latent_patch=latent_patch,
-            feedback_embedding=feedback_embedding.reshape(-1),
-            patch_encoder_state=patch_encoder_state,
-        )
-
-    @staticmethod
-    def split_latent_patches(latents: torch.Tensor, patch_size: int) -> torch.Tensor:
-        """Reshape ``[1, frames, dim]`` latents into ``[1, patches, p, dim]``."""
-        return rearrange(latents, "b (s p) d -> b s p d", p=int(patch_size))
 
     # ------------------------------------------------------------------
     # Backbone
@@ -365,7 +322,7 @@ class DotsTTSSGLangModel(nn.Module):
             input_embeds=input_embeds,
         )
         # note (chenyang): prefill returns every position because the tail
-        # rebuilds its FM sequence from the prompt audio spans, not just the
+        # rebuilds its flow sequence from the prompt audio spans, not just the
         # last token. Sizing the dummy logits by request keeps the scheduler's
         # per-row bookkeeping intact.
         row_count = (
@@ -432,7 +389,5 @@ EntryClass = DotsTTSSGLangModel
 
 __all__ = [
     "DotsTTSSGLangModel",
-    "DotsTtsTailInputs",
-    "DotsTtsTailOutputs",
     "EntryClass",
 ]
