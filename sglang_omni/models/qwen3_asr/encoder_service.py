@@ -363,6 +363,12 @@ class Qwen3ASRPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.T
                     "Qwen3-ASR pre-LM encode item is missing its audio token count"
                 )
             token_counts.append(expected)
+        # note (luojiaxuan): get_audio_feature feeds the tower one packed
+        # frame stream (per-item lengths via feature_lens), so
+        # last_hidden_state comes back as [1, total_tokens, hidden]; drop the
+        # unit batch dim before the row-count check splits per item.
+        if embedding.dim() == 3 and embedding.shape[0] == 1:
+            embedding = embedding.squeeze(0)
         if (
             embedding.dim() != 2
             or embedding.shape[0] != sum(token_counts)

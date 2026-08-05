@@ -43,6 +43,7 @@ class _StubModel(torch.nn.Module):
         self.fail = False
         self.fail_oom = False
         self.fail_multi_item = False
+        self.packed_3d_output = True
         self.encode_gate: threading.Event | None = None
         self.row_offset = 0
         self.encode_delay_s = 0.0
@@ -68,7 +69,12 @@ class _StubModel(torch.nn.Module):
             rows = _expected_audio_tokens(item) + self.row_offset
             fill = float((getattr(item, "hash", None) or 0) % 97 + 1)
             parts.append(torch.full((rows, _HIDDEN_SIZE), fill, dtype=self.dtype))
-        return torch.cat(parts, dim=0)
+        packed = torch.cat(parts, dim=0)
+        if self.packed_3d_output:
+            # Mirrors the real audio tower: one packed frame stream in, so
+            # last_hidden_state is [1, total_tokens, hidden].
+            return packed.unsqueeze(0)
+        return packed
 
 
 def _make_service(
@@ -553,3 +559,14 @@ def test_build_cache_namespace_is_stable_and_scoped() -> None:
         marker="other",
     )
     assert namespace != build_cache_namespace(changed_config, **base)
+
+
+def test_flat_2d_encoder_output_is_also_accepted() -> None:
+    model = _StubModel()
+    model.packed_3d_output = False
+    service = _make_service(model)
+    item = _item(8, 3)
+
+    service.encode_item(item)
+
+    assert item.precomputed_embeddings.shape == (3, _HIDDEN_SIZE)
