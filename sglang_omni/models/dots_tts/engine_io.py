@@ -73,9 +73,7 @@ def split_prefill_schedule(
     if audio_span_token_id not in schedule_ids:
         raise ValueError("dots.tts generation schedule has no audio spans")
     prompt_span_start = schedule_ids.index(audio_span_token_id)
-    total_spans = sum(
-        1 for token_id in schedule_ids if token_id == audio_span_token_id
-    )
+    total_spans = sum(1 for token_id in schedule_ids if token_id == audio_span_token_id)
     if prompt_span_start == 0:
         raise ValueError(
             "dots.tts generation schedule must start with text before audio spans"
@@ -116,7 +114,9 @@ def make_dots_tts_scheduler_adapters(
         from sglang.srt.sampling.sampling_params import SamplingParams
 
         state = load_dots_tts_state(payload)
-        schedule_ids = [int(token_id) for token_id in (state.generation_schedule_ids or [])]
+        schedule_ids = [
+            int(token_id) for token_id in (state.generation_schedule_ids or [])
+        ]
         if not schedule_ids:
             raise ValueError(
                 "dots.tts tts_engine requires a generation schedule from "

@@ -227,9 +227,9 @@ def _build_generate_inputs(
         "generation_schedule": torch.tensor(
             schedule_ids, dtype=torch.long, device=device
         ).unsqueeze(0),
-        "prompt_audio": prompt_audio.to(
-            device=device, dtype=torch.float32
-        ).reshape(1, -1),
+        "prompt_audio": prompt_audio.to(device=device, dtype=torch.float32).reshape(
+            1, -1
+        ),
         "prompt_text": state.prompt_text,
         "text": state.text,
     }

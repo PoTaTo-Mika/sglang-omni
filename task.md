@@ -2,7 +2,7 @@
 
 ## 仓库与路径
 
-- 工作区：`/data/chenyang/sglang-omni`
+- 工作区：`/data/chenyang/sglang-omni` 在 `dots-tts` branch 下。
 - 权重：`/data/chenyang/models/dots.tts-mf`
   - HF architecture：`DotsTTSForConditionalGeneration`
   - 文件：`config.json`、`llm_config.json`（Qwen2）、`model.safetensors`、

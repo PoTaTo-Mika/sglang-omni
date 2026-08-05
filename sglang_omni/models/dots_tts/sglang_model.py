@@ -32,7 +32,6 @@ from sglang_omni.models.dots_tts.hf_config import DOTS_TTS_LATENT_STATS_FILENAME
 from sglang_omni.models.dots_tts.weight_loading import (
     AR_BACKBONE_PREFIX,
     OWNER_AR_BACKBONE,
-    OWNER_TTS_TAIL,
     DotsTtsWeightReport,
     assert_dots_tts_weight_coverage,
     classify_dots_tts_weight,
@@ -333,9 +332,7 @@ class DotsTTSSGLangModel(nn.Module):
         return self.model.get_input_embeddings()
 
     @torch.no_grad()
-    def stage_decode_feedback(
-        self, feedback_embeddings: torch.Tensor
-    ) -> torch.Tensor:
+    def stage_decode_feedback(self, feedback_embeddings: torch.Tensor) -> torch.Tensor:
         batch_size = int(feedback_embeddings.shape[0])
         weight = self._decode_input_embedding.weight
         weight[:batch_size].copy_(
@@ -401,9 +398,7 @@ class DotsTTSSGLangModel(nn.Module):
             loaded_names.add(target)
             report.add_loaded(owner)
 
-        report.missing = sorted(
-            set(params_dict) - loaded_names - _RUNTIME_PARAM_NAMES
-        )
+        report.missing = sorted(set(params_dict) - loaded_names - _RUNTIME_PARAM_NAMES)
         assert_dots_tts_weight_coverage(report)
         logger.info("%s", report.summary())
 

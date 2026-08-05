@@ -29,10 +29,7 @@ from sglang_omni.models.dots_tts.components.backbone.llm_inference import (
     LLMInference,
     LLMInferenceState,
 )
-from sglang_omni.models.dots_tts.components.core import (
-    DotsTtsCore,
-    DotsTtsForwardOutput,
-)
+from sglang_omni.models.dots_tts.components.core import DotsTtsCore
 from sglang_omni.models.dots_tts.components.model_config import ModelConfig
 from sglang_omni.models.dots_tts.components.speaker.encoder import (
     SpeakerXVectorFeatures,
