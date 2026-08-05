@@ -50,7 +50,7 @@ def create_sglang_qwen3_asr_executor(
     pre_lm_cache_max_entries: int = 4096,
     pre_lm_cache_size_bytes: int = 2 * 1024**3,
     pre_lm_max_batch_size: int = 8,
-    pre_lm_max_batch_wait_ms: int = 4,
+    pre_lm_max_batch_wait_ms: int = 0,
     server_args_overrides: dict[str, Any] | None = None,
 ):
     if pre_lm_max_batch_size < 1:

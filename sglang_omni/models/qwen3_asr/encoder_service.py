@@ -115,7 +115,7 @@ class Qwen3ASRPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.T
         cache_max_entries: int = _CACHE_MAX_ENTRIES,
         cache_max_bytes: int = _CACHE_MAX_BYTES,
         max_batch_size: int = 8,
-        max_batch_wait_ms: int = 4,
+        max_batch_wait_ms: int = 0,
     ) -> None:
         self._model = model
         reference = next(model.audio_tower.parameters())
@@ -313,6 +313,11 @@ class Qwen3ASRPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.T
     def _drain_batch(
         self,
     ) -> tuple[list[QueueEntry[Any]], bool]:
+        # note (luojiaxuan): the default window is 0 (greedy drain): items
+        # that queued while the previous batch encoded are taken instantly,
+        # so batches still form under load, and an idle-arrival request never
+        # pays a batching wait -- at concurrency 1 a window is pure latency
+        # (same reasoning as the MOSS-TD encoder service).
         first = self._queue.get()
         if first is _SHUTDOWN:
             return [], True
