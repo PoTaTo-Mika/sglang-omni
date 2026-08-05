@@ -293,9 +293,7 @@ def _cached_hf_revision(model_path: str) -> str | None:
     hf_home = os.environ.get("HF_HOME") or os.path.join(
         os.path.expanduser("~"), ".cache", "huggingface"
     )
-    repo_dir = os.path.join(
-        hf_home, "hub", "models--" + model_path.replace("/", "--")
-    )
+    repo_dir = os.path.join(hf_home, "hub", "models--" + model_path.replace("/", "--"))
     ref_main = os.path.join(repo_dir, "refs", "main")
     try:
         with open(ref_main, encoding="utf-8") as handle:
