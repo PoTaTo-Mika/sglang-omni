@@ -59,6 +59,7 @@ def test_build_stage_breakdown_pairs_queue_and_decode_intervals(tmp_path) -> Non
         ("scheduler_request_build_end", base_ns + 5_000_000),
         ("scheduler_queue_enter", base_ns + 6_000_000),
         ("scheduler_prefill_start", base_ns + 30_000_000),
+        ("scheduler_prefill_end", base_ns + 60_000_000),
         ("scheduler_first_emit", base_ns + 80_000_000),
         ("stage_complete", base_ns + 200_000_000),
     ]
@@ -88,6 +89,10 @@ def test_build_stage_breakdown_pairs_queue_and_decode_intervals(tmp_path) -> Non
     assert build["avg_ms"] == pytest.approx(5.0)
     queue = by_interval["scheduler_queue_enter->scheduler_prefill_start"]
     assert queue["avg_ms"] == pytest.approx(24.0)
+    prefill = by_interval["scheduler_prefill_start->scheduler_prefill_end"]
+    assert prefill["avg_ms"] == pytest.approx(30.0)
+    decode_tail = by_interval["scheduler_prefill_end->stage_complete"]
+    assert decode_tail["avg_ms"] == pytest.approx(140.0)
     decode = by_interval["scheduler_first_emit->stage_complete"]
     assert decode["avg_ms"] == pytest.approx(120.0)
 
