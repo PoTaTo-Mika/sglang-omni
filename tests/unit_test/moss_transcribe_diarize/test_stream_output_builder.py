@@ -85,7 +85,7 @@ def test_silent_when_not_streaming():
     rd = _make_req_data(stream=False)
 
     assert builder("req-1", rd, _make_req_output(1)) == []
-    assert not hasattr(rd.req, "_moss_stream_pending_ids")
+    assert not hasattr(rd.req, "_asr_token_text_stream")
 
 
 def test_silent_during_chunked_prefill():
@@ -186,8 +186,8 @@ def test_per_request_state_is_isolated():
     assert [m.data["text"] for m in out1] == ["A"]
     assert [m.data["text"] for m in out2] == ["B"]
     assert [m.data["text"] for m in out1b] == ["B"]
-    assert rd1.req._moss_stream_pending_ids == []
-    assert rd2.req._moss_stream_pending_ids == []
+    assert rd1.req._asr_token_text_stream.pending_ids == []
+    assert rd2.req._asr_token_text_stream.pending_ids == []
 
 
 def _interval_builder(vocab: dict[int, bytes], interval_s: float):
