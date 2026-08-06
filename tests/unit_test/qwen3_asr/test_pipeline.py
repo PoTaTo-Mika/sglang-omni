@@ -5,6 +5,8 @@ from __future__ import annotations
 import inspect
 from types import SimpleNamespace
 
+import pytest
+
 import sglang_omni.models.qwen3_asr.engine_builder as qwen3_asr_builder
 import sglang_omni.models.qwen3_asr.stages as qwen3_asr_stages
 import sglang_omni.scheduling.bootstrap as bootstrap
@@ -27,9 +29,14 @@ def test_qwen3_asr_config_uses_batched_stage_with_32_running_requests() -> None:
     assert config.stages[0].factory.endswith("create_sglang_qwen3_asr_executor")
     assert config.stages[0].factory_args["device"] == "cuda:0"
     assert config.stages[0].factory_args["max_running_requests"] == 32
-    assert config.stages[0].factory_args["request_build_max_workers"] == 2
-    assert config.stages[0].factory_args["request_build_max_pending"] == 16
+    assert config.stages[0].factory_args["request_build_max_workers"] == 8
+    assert config.stages[0].factory_args["request_build_max_pending"] == 32
     assert "request_build_max_backlog" not in config.stages[0].factory_args
+    assert config.stages[0].factory_args["enable_pre_lm_encoder"] is True
+    assert config.stages[0].factory_args["pre_lm_cache_max_entries"] == 4096
+    assert config.stages[0].factory_args["pre_lm_cache_size_bytes"] == 2 * 1024**3
+    assert config.stages[0].factory_args["pre_lm_max_batch_size"] == 8
+    assert config.stages[0].factory_args["pre_lm_max_batch_wait_ms"] == 0
     assert (
         PIPELINE_CONFIG_REGISTRY.get_config("Qwen3ASRForConditionalGeneration")
         is Qwen3ASRPipelineConfig
@@ -40,9 +47,39 @@ def test_qwen3_asr_stage_default_allows_32_running_requests() -> None:
     signature = inspect.signature(create_sglang_qwen3_asr_executor)
 
     assert signature.parameters["max_running_requests"].default == 32
-    assert signature.parameters["request_build_max_workers"].default == 2
-    assert signature.parameters["request_build_max_pending"].default == 16
+    assert signature.parameters["request_build_max_workers"].default == 8
+    assert signature.parameters["request_build_max_pending"].default == 32
     assert "request_build_max_backlog" not in signature.parameters
+
+
+def test_qwen3_asr_stage_default_enables_pre_lm_encoder() -> None:
+    signature = inspect.signature(create_sglang_qwen3_asr_executor)
+
+    assert signature.parameters["enable_pre_lm_encoder"].default is True
+    assert signature.parameters["pre_lm_cache_max_entries"].default == 4096
+    assert signature.parameters["pre_lm_cache_size_bytes"].default == 2 * 1024**3
+    assert signature.parameters["pre_lm_max_batch_size"].default == 8
+    assert signature.parameters["pre_lm_max_batch_wait_ms"].default == 0
+
+
+@pytest.mark.parametrize(
+    ("batch_size", "wait_ms", "match"),
+    [
+        (0, 4, "pre_lm_max_batch_size"),
+        (-1, 4, "pre_lm_max_batch_size"),
+        (8, -1, "pre_lm_max_batch_wait_ms"),
+    ],
+)
+def test_qwen3_asr_stage_rejects_invalid_pre_lm_batch_knobs(
+    batch_size: int, wait_ms: int, match: str
+) -> None:
+    # Validation runs before any model/tokenizer load.
+    with pytest.raises(ValueError, match=match):
+        create_sglang_qwen3_asr_executor(
+            "dummy",
+            pre_lm_max_batch_size=batch_size,
+            pre_lm_max_batch_wait_ms=wait_ms,
+        )
 
 
 def test_qwen3_asr_stage_default_uses_auto_static_kv_budget() -> None:
@@ -89,6 +126,17 @@ def test_qwen3_asr_threads_explicit_cuda_graph_bs(monkeypatch) -> None:
         lambda gpu_id: None,
     )
     monkeypatch.setattr(qwen3_asr_builder, "init_mm_embedding_cache", lambda size: None)
+    fake_encoder_service = SimpleNamespace(close=lambda: None)
+    monkeypatch.setattr(
+        qwen3_asr_builder,
+        "Qwen3ASRPreLMEncoderService",
+        lambda *args, **kwargs: fake_encoder_service,
+    )
+    monkeypatch.setattr(
+        qwen3_asr_builder,
+        "build_cache_namespace",
+        lambda *args, **kwargs: "testns",
+    )
     monkeypatch.setattr(
         request_builders,
         "make_qwen3_asr_scheduler_adapters",
@@ -152,3 +200,4 @@ def test_qwen3_asr_threads_explicit_cuda_graph_bs(monkeypatch) -> None:
     assert build_kwargs["cuda_graph_bs"] == [1, 2, 4, 8, 12, 16, 24, 32]
     assert scheduler.enable_async_decode is False
     assert scheduler.async_decode_min_batch_size == 4
+    assert scheduler.shutdown_callback is fake_encoder_service.close
