@@ -15,8 +15,12 @@ from sglang_omni.scheduling.engine_factory import TtsEngineBuilder
 logger = logging.getLogger(__name__)
 
 _DTYPE_BYTES = 2
-# Headroom inside the SGLang share for its own activations and bookkeeping.
-_SGLANG_SLACK_BYTES = 2 * 2**30
+# Headroom kept inside the stage share on top of the acoustic tail pools, for
+# the tail's transient activations and allocator fragmentation.
+_TAIL_HEADROOM_BYTES = 2 * 2**30
+# Floor headroom the SGLang sub-share must still leave beyond weights and the
+# backbone KV the running batch can actually pin: CUDA context plus activations.
+_SGLANG_SLACK_BYTES = 4 * 2**30
 _DEFAULT_STAGE_SHARE = 0.84
 
 
@@ -104,38 +108,76 @@ class DotsTtsEngineBuilder(TtsEngineBuilder):
             for path in (Path(checkpoint_dir) / DOTS_TTS_MODEL_FILENAME,)
         )
 
-    def _sglang_mem_fraction(self) -> float:
-        """Share of the card SGLang may take for weights plus backbone KV.
+    def _stage_share(self) -> float:
+        return self.total_gpu_memory_fraction or _DEFAULT_STAGE_SHARE
 
-        note (chenyang): higgs and ming hand their whole stage fraction to
-        ``mem_fraction_static`` because weights and KV are all their SGLang
-        stage allocates. dots has a second consumer in the same stage — the
-        acoustic tail pools, which SGLang knows nothing about — so the stage's
-        declared share is split here and the remainder is checked against the
-        pools in :meth:`setup_model`.
-        """
-        kv_bytes = (
-            self.max_running_requests * self.context_length * self._kv_bytes_per_token
+    def _min_kv_tokens(self) -> int:
+        """Backbone KV the running batch can pin at once."""
+        return self.max_running_requests * self.context_length
+
+    def _tail_pool_bytes(self) -> int:
+        from sglang_omni.models.dots_tts.tail import tail_pool_bytes_per_slot
+
+        config = self._model_config
+        per_slot = tail_pool_bytes_per_slot(
+            nfe=self.num_steps,
+            patch_capacity=self.max_audio_patches + 1,
+            unit_len=1 + int(config.patch_size),
+            dit_layers=int(config.DiT.num_layers),
+            dit_heads=int(config.DiT.num_heads),
+            dit_head_dim=int(config.DiT.hidden_size) // int(config.DiT.num_heads),
+            encoder_layers=int(config.PatchEncoder.num_layers),
+            encoder_heads=int(config.PatchEncoder.num_heads),
+            encoder_head_dim=(
+                int(config.PatchEncoder.hidden_size)
+                // int(config.PatchEncoder.num_heads)
+            ),
+            encoder_block=int(config.patch_size) // 2,
         )
-        needed = self._weight_bytes + kv_bytes + _SGLANG_SLACK_BYTES
-        fraction = needed / float(_total_gpu_bytes(self.gpu_id))
-        stage_share = self.total_gpu_memory_fraction or _DEFAULT_STAGE_SHARE
-        if fraction >= stage_share:
+        return per_slot * self.max_running_requests
+
+    def _sglang_gpu_fraction(self) -> float:
+        """Share of the card SGLang may hold: the stage share minus the pools.
+
+        note (chenyang): higgs hands its whole stage fraction to SGLang because
+        weights and KV are all its SGLang stage allocates. dots has a second
+        consumer in the same stage — the acoustic tail pools, which SGLang
+        knows nothing about — so the pools are carved out first and everything
+        else in the declared share goes to SGLang. The stage still commits its
+        full budget up front and holds it flat for the whole run; the backbone
+        KV pool is simply larger than the running batch can pin, which is the
+        normal SGLang trade.
+
+        This drives both ``mem_fraction_static`` and the stage budget handed to
+        ``SGLangKVCacheConfigurator``, which sizes KV as
+        ``total * fraction - process_used`` and ignores ``mem_fraction_static``
+        entirely.
+        """
+        total = float(_total_gpu_bytes(self.gpu_id))
+        stage_share = self._stage_share()
+        fraction = (
+            stage_share - (self._tail_pool_bytes() + _TAIL_HEADROOM_BYTES) / total
+        )
+        floor = (
+            self._weight_bytes
+            + self._min_kv_tokens() * self._kv_bytes_per_token
+            + _SGLANG_SLACK_BYTES
+        ) / total
+        if fraction < floor:
             raise ValueError(
-                "dots.tts tts_engine needs "
-                f"{fraction:.2f} of the card for weights + backbone KV alone, "
-                f"which does not fit the declared stage share {stage_share:.2f}"
+                "dots.tts acoustic tail pools do not leave SGLang enough of the "
+                f"declared stage share {stage_share:.2f}: pools take "
+                f"{self._tail_pool_bytes() / 2**30:.1f} GiB, leaving "
+                f"{fraction:.3f} of the card where weights plus "
+                f"{self._min_kv_tokens()} KV tokens need {floor:.3f}. Lower "
+                "max_running_requests or max_audio_patches, or raise the "
+                "stage's total_gpu_memory_fraction."
             )
         return round(fraction, 3)
 
     def generation_defaults(self, *, dtype: str) -> dict[str, Any]:
-        # note (chenyang): the backbone only needs max_running_requests *
-        # context_length tokens of KV (a few hundred MB), while the acoustic
-        # tail pools are allocated after SGLang's and need the rest of the card.
-        # Without this cap SGLang's auto budget takes ~60 GB of KV it will never
-        # use and the tail pools only just fit.
         return {
-            "mem_fraction_static": self._sglang_mem_fraction(),
+            "mem_fraction_static": self._sglang_gpu_fraction(),
             "max_running_requests": self.max_running_requests,
             "dtype": dtype,
             "disable_cuda_graph": True,
@@ -165,7 +207,7 @@ class DotsTtsEngineBuilder(TtsEngineBuilder):
                 self.max_running_requests,
             )
             self.max_running_requests = int(requested)
-            overrides["mem_fraction_static"] = self._sglang_mem_fraction()
+            overrides["mem_fraction_static"] = self._sglang_gpu_fraction()
 
         if "disable_radix_cache" in overrides and not _coerce_bool(
             overrides["disable_radix_cache"],
@@ -190,7 +232,10 @@ class DotsTtsEngineBuilder(TtsEngineBuilder):
             raise ValueError("dots.tts torch.compile is not currently supported")
 
     def infra_kwargs(self) -> dict[str, Any]:
-        return {"total_gpu_memory_fraction": self.total_gpu_memory_fraction}
+        # note (chenyang): always the SGLang sub-share, never the stage share,
+        # and never None — otherwise the KV pool size would depend on whether
+        # the pipeline happened to declare a stage budget.
+        return {"total_gpu_memory_fraction": self._sglang_gpu_fraction()}
 
     def setup_model(
         self,
@@ -229,50 +274,27 @@ class DotsTtsEngineBuilder(TtsEngineBuilder):
         )
 
     def _check_stage_budget(self, gpu_id: int) -> None:
-        """Fail fast when the tail pools do not fit the declared stage share."""
-        from sglang_omni.models.dots_tts.tail import tail_pool_bytes_per_slot
-
-        config = self._model_config
-        per_slot = tail_pool_bytes_per_slot(
-            nfe=self.num_steps,
-            patch_capacity=self.max_audio_patches + 1,
-            unit_len=1 + int(config.patch_size),
-            dit_layers=int(config.DiT.num_layers),
-            dit_heads=int(config.DiT.num_heads),
-            dit_head_dim=int(config.DiT.hidden_size) // int(config.DiT.num_heads),
-            encoder_layers=int(config.PatchEncoder.num_layers),
-            encoder_heads=int(config.PatchEncoder.num_heads),
-            encoder_head_dim=(
-                int(config.PatchEncoder.hidden_size)
-                // int(config.PatchEncoder.num_heads)
-            ),
-            encoder_block=int(config.patch_size) // 2,
-        )
+        """Report the committed split and fail if the card overshot it."""
         total = _total_gpu_bytes(gpu_id)
-        stage_share = self.total_gpu_memory_fraction or _DEFAULT_STAGE_SHARE
-        sglang_bytes = int(self._sglang_mem_fraction() * total)
-        pool_budget = int(stage_share * total) - sglang_bytes
-        needed = per_slot * self.max_running_requests
+        stage_share = self._stage_share()
+        pools = self._tail_pool_bytes()
+        sglang_bytes = int(self._sglang_gpu_fraction() * total)
+        held = int(torch.cuda.memory_reserved(int(gpu_id)))
         gib = 2**30
-        if needed > pool_budget:
-            affordable = max(0, pool_budget // per_slot)
-            raise ValueError(
-                "dots.tts acoustic tail pools do not fit the declared stage "
-                f"share: max_running_requests={self.max_running_requests} needs "
-                f"{needed / gib:.1f} GiB but only {pool_budget / gib:.1f} GiB is "
-                f"left after SGLang's {sglang_bytes / gib:.1f} GiB. Lower "
-                f"max_running_requests to {affordable}, lower max_audio_patches, "
-                "or raise the stage's total_gpu_memory_fraction."
+        if held > stage_share * total:
+            raise RuntimeError(
+                "dots.tts tts_engine holds "
+                f"{held / gib:.1f} GiB, past its declared stage share "
+                f"{stage_share:.2f} ({stage_share * total / gib:.1f} GiB)"
             )
         logger.info(
             "dots.tts stage budget: share=%.2f (%.1f GiB) sglang=%.1f GiB "
-            "tail_pools=%.1f GiB/%.1f GiB slack=%.1f GiB",
+            "tail_pools=%.1f GiB held=%.1f GiB",
             stage_share,
             stage_share * total / gib,
             sglang_bytes / gib,
-            needed / gib,
-            pool_budget / gib,
-            (pool_budget - needed) / gib,
+            pools / gib,
+            held / gib,
         )
 
     def get_model_buffer_bs(self, model: Any) -> int | None:
