@@ -437,9 +437,12 @@ def make_moss_transcribe_diarize_stream_output_builder(
             "modality": "text",
             "token_id": token_id,
         },
+        pending_ids_attr="_moss_stream_pending_ids",
+        last_emit_attr="_moss_stream_last_emit_t",
         eos_token_id=resolved_eos,
         min_emit_interval_s=min_emit_interval_s,
         allow_terminal_flush=False,
+        emit_trailing_replacement_on_terminal=False,
     )
 
 

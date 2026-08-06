@@ -81,7 +81,7 @@ def test_silent_when_not_streaming_and_does_not_create_state() -> None:
     rd = _make_req_data(stream=False)
 
     assert builder("req-1", rd, _make_req_output(1)) == []
-    assert not hasattr(rd.req, "_asr_token_text_stream")
+    assert not hasattr(rd.req, "_fun_asr_stream_pending_ids")
 
 
 def test_silent_during_chunked_prefill_then_emits_after_prefill() -> None:
@@ -145,8 +145,8 @@ def test_per_request_state_is_isolated() -> None:
     assert [m.data["text"] for m in out1] == ["A"]
     assert [m.data["text"] for m in out2] == ["B"]
     assert [m.data["text"] for m in out1b] == ["B"]
-    assert rd1.req._asr_token_text_stream.pending_ids == []
-    assert rd2.req._asr_token_text_stream.pending_ids == []
+    assert rd1.req._fun_asr_stream_pending_ids == []
+    assert rd2.req._fun_asr_stream_pending_ids == []
 
 
 def test_utf8_partial_token_is_held_until_complete() -> None:

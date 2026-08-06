@@ -14,22 +14,17 @@ BuildMessageDataFn = Callable[[str], Any]
 BuildMessageMetadataFn = Callable[[int | None], dict[str, Any] | None]
 
 
-def _stream_state(req: Any) -> SimpleNamespace:
-    state = getattr(req, "_asr_token_text_stream", None)
-    if state is None:
-        state = SimpleNamespace(pending_ids=[], last_emit_t=0.0)
-        req._asr_token_text_stream = state
-    return state
-
-
 def make_token_text_stream_output_builder(
     *,
     decode_fn: DecodeFn,
     build_message_data: BuildMessageDataFn,
     build_message_metadata: BuildMessageMetadataFn,
+    pending_ids_attr: str,
+    last_emit_attr: str,
     eos_token_id: int | None,
     min_emit_interval_s: float = 0.0,
     allow_terminal_flush: bool = False,
+    emit_trailing_replacement_on_terminal: bool = False,
 ) -> Callable[[str, Any, Any], list[OutgoingMessage]]:
     def _build_stream_output(
         request_id: str, req_data: Any, req_output: Any
@@ -61,8 +56,11 @@ def make_token_text_stream_output_builder(
         elif not is_terminal:
             return []
 
-        state = _stream_state(req)
-        pending = state.pending_ids
+        try:
+            pending = getattr(req, pending_ids_attr)
+        except AttributeError:
+            pending = []
+            setattr(req, pending_ids_attr, pending)
 
         is_eos = (
             token_id is not None
@@ -75,7 +73,10 @@ def make_token_text_stream_output_builder(
             return []
 
         now = time.perf_counter()
-        last_emit = state.last_emit_t
+        try:
+            last_emit = float(getattr(req, last_emit_attr))
+        except AttributeError:
+            last_emit = 0.0
 
         # note (guozhihao): last_emit==0 → first delta immediate; EOS/terminal always flush.
         if (
@@ -88,13 +89,17 @@ def make_token_text_stream_output_builder(
             return []
 
         delta = decode_fn(pending)
-        if delta.endswith("\ufffd") and not is_terminal:
+        # note (guozhihao): trailing U+FFFD hold is independent of terminal flush so a
+        # follow-up can enable MOSS flush without also emitting incomplete UTF-8.
+        if delta.endswith("\ufffd") and not (
+            is_terminal and emit_trailing_replacement_on_terminal
+        ):
             return []
         pending.clear()
         if not delta:
             return []
 
-        state.last_emit_t = now
+        setattr(req, last_emit_attr, now)
 
         return [
             OutgoingMessage(
