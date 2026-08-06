@@ -16,9 +16,9 @@ from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
 
-from sglang_omni.models.dots_tts.components.backbone.dit import DiT
-from sglang_omni.models.dots_tts.components.backbone.dit_inference import (
-    DiTInferenceContext,
+from sglang_omni.models.dots_tts.components.backbone.dit import (
+    DiT,
+    fuse_dit_for_inference,
 )
 from sglang_omni.models.dots_tts.components.backbone.encoder import VAESemanticEncoder
 from sglang_omni.models.dots_tts.hf_config import DOTS_TTS_LATENT_STATS_FILENAME
@@ -71,19 +71,16 @@ class DotsTTSSGLangModel(nn.Module):
         self.hidden_size = int(self.llm_config.hidden_size)
 
         model_config = config.dots_model_config()
-        self.model_config = model_config
         self.latent_dim = int(model_config.latent_dim)
         self.latent_patch_size = int(model_config.patch_size)
         self.hidden_patch_size = 1
         self.fm_hidden_size = int(model_config.DiT.hidden_size)
-        self.fm_sigma = float(model_config.fm_sigma)
         meanflow = model_config.meanflow
         if meanflow is None or not meanflow.enabled:
             raise ValueError(
                 "dots.tts serving currently supports MeanFlow checkpoints only; "
                 "this checkpoint has meanflow disabled"
             )
-        self.use_duration_embedding = bool(meanflow.use_duration_embedding)
 
         self.patch_encoder = VAESemanticEncoder(
             in_dim=self.latent_dim,
@@ -94,7 +91,7 @@ class DotsTTSSGLangModel(nn.Module):
             in_dim=self.fm_hidden_size,
             out_dim=self.latent_dim,
             transformer_config=model_config.DiT,
-            mode="meanflow" if self.use_duration_embedding else "flow_matching",
+            mode="meanflow" if meanflow.use_duration_embedding else "flow_matching",
         )
         self.hidden_proj = nn.Linear(self.hidden_size, self.fm_hidden_size)
         self.latent_proj = nn.Linear(self.latent_dim, self.fm_hidden_size)
@@ -168,7 +165,8 @@ class DotsTTSSGLangModel(nn.Module):
 
         weight = self._decode_input_embedding.weight
         self._tail = DotsTtsAcousticTail(
-            dit_context=DiTInferenceContext.from_core(self),
+            dit=fuse_dit_for_inference(self),
+            coordinate_proj=self.coordinate_proj,
             patch_encoder=self.patch_encoder,
             spec=DotsTtsTailSpec(
                 nfe=int(nfe),
@@ -232,17 +230,12 @@ class DotsTTSSGLangModel(nn.Module):
         constant across a generation, so the whole schedule is precomputed once
         per request instead of per decode step.
         """
-        dit = self.tail.dit
-        nfe = int(nfe)
         grid = torch.linspace(
-            0.0, 1.0, nfe + 1, device=g_cond.device, dtype=g_cond.dtype
+            0.0, 1.0, int(nfe) + 1, device=g_cond.device, dtype=g_cond.dtype
         )
-        times = grid[:-1]
-        durations = grid[1:] - times
-        condition = dit.time_embedder(times)
-        if dit.duration_embedder is not None:
-            condition = condition + dit.duration_embedder(durations)
-        return dit.fused_adaln(condition + g_cond.reshape(1, -1))
+        return self.tail.dit.build_mods(
+            grid[:-1], duration=grid[1:] - grid[:-1], g_cond=g_cond.reshape(1, -1)
+        )
 
     @torch.no_grad()
     def prompt_flow_rows(

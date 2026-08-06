@@ -37,21 +37,6 @@ def normalize_prompt_text(prompt_text: str | None) -> str:
     return f"{stripped}\n"
 
 
-def prompt_audio_patch_count(
-    *, prompt_sample_count: int, samples_per_patch: int
-) -> int:
-    """Audio spans the prompt waveform occupies in the generation schedule."""
-    if samples_per_patch <= 0:
-        raise ValueError(
-            f"dots.tts samples_per_patch must be positive, got {samples_per_patch}"
-        )
-    if prompt_sample_count <= 0:
-        raise ValueError(
-            f"dots.tts prompt audio must be non-empty, got {prompt_sample_count} samples"
-        )
-    return (int(prompt_sample_count) + samples_per_patch - 1) // samples_per_patch
-
-
 def build_dots_tts_schedule_ids(
     *,
     tokenizer: Any,
@@ -68,18 +53,16 @@ def build_dots_tts_schedule_ids(
     if not target_text:
         raise ValueError("dots.tts requires non-empty target text")
 
-    schedule = build_generation_schedule(
+    return build_generation_schedule(
         text=f"{normalize_prompt_text(prompt_text)}{target_text}",
         tokenizer=tokenizer,
         template=DEFAULT_TRAIN_TEMPLATE,
         max_audio_tokens=int(max_audio_patches),
     )
-    return [int(token_id) for token_id in schedule["schedule_ids"]]
 
 
 __all__ = [
     "DOTS_TTS_MAX_SEQUENCE_LENGTH",
     "build_dots_tts_schedule_ids",
     "normalize_prompt_text",
-    "prompt_audio_patch_count",
 ]

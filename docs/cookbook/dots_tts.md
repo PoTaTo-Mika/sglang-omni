@@ -130,8 +130,8 @@ Measured on one H100 80GB (`max_running_requests=8`, `num_steps=4`,
 
 | Metric | Value |
 |---|---|
-| Generation wall clock | 358 s (3.04 req/s), 0 failures |
-| Corpus WER (Qwen3-ASR-1.7B) | **1.10%** |
+| Generation wall clock | 365 s (2.98 req/s), 0 failures |
+| Corpus WER (Qwen3-ASR-1.7B) | **1.11%** |
 | Samples above 50% WER | 0 |
 
 ## Known limitations

@@ -5,14 +5,13 @@ SGLang owns the Qwen2 AR backbone; every step of that backbone additionally
 needs one MeanFlow DiT sample plus one patch-encoder step per request. Both are
 small transformers with their own KV state, so running them one request at a
 time would make the engine launch-bound. This module keeps that state in
-slot-indexed pools sized once for ``num_slots x patch_capacity`` and runs
-both networks over the whole running batch in a single call per decode step.
+slot-indexed pools sized once for ``num_slots x patch_capacity`` and runs both
+networks over the whole running batch in a single call per decode step.
 
-The recurrence mirrors ``DotsTtsCore``'s streaming decode: the DiT reads a flow
-sequence that interleaves one projected backbone hidden row with
-``latent_patch_size`` projected latent rows per audio patch. Everything older
-than the last complete unit lives in the DiT KV cache, so only a
-``unit_len + hidden_patch_size`` row window has to be kept verbatim.
+The flow sequence the DiT reads interleaves one projected backbone hidden row
+with ``latent_patch_size`` projected latent rows per audio patch. Everything
+older than the last complete unit lives in the DiT KV cache, so a slot only
+keeps a ``unit_len + hidden_patch_size`` row window verbatim.
 """
 
 from __future__ import annotations
@@ -25,16 +24,10 @@ import torch
 import torch.nn as nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from sglang_omni.models.dots_tts.components.backbone.dit_inference import (
-    DiTInferenceContext,
-    KvPrefillStep,
-    NextPatchStep,
-)
-from sglang_omni.models.dots_tts.components.backbone.encoder_inference import (
+from sglang_omni.models.dots_tts.components.backbone.encoder import (
     SemanticEncoderDecodeStep,
 )
 from sglang_omni.models.dots_tts.components.backbone.inference_utils import (
-    build_rotary_cos_sin,
     fuse_qkv_projection,
     project_attention,
 )
@@ -74,14 +67,10 @@ class DotsTtsTailSpec:
         return self.unit_len + self.hidden_patch_size
 
     @property
-    def fm_capacity(self) -> int:
-        # note (chenyang): one hidden row plus latent_patch_size latent rows per
-        # audio patch, and the first patch is preceded by a bare hidden row.
-        return self.patch_capacity * self.unit_len + self.hidden_patch_size
-
-    @property
     def dit_cache_tokens(self) -> int:
-        return self.fm_capacity - self.window_len + self.unit_len
+        # One hidden row plus latent_patch_size latent rows per audio patch; the
+        # cache never has to hold the trailing window.
+        return self.patch_capacity * self.unit_len
 
 
 def batched_causal_update_mask(
@@ -91,11 +80,11 @@ def batched_causal_update_mask(
     prev_len: int,
     current_len: int,
 ) -> torch.Tensor:
-    """``build_causal_update_mask`` with a per-row valid prefix length.
+    """Attention mask for a fresh query block appended after a per-row cache.
 
-    Returns ``[rows, 1, prev_len + current_len, capacity_tokens + q_len]``: the
-    fresh query block attends causally inside ``prev_len`` and fully across the
-    tail, plus every cached key below that row's ``valid_persistent``.
+    Returns ``[rows, 1, prev_len + current_len, capacity_tokens + q_len]``. Keys
+    below a row's ``valid_persistent`` are always visible; inside the fresh block
+    the first ``prev_len`` queries stay causal and the rest see the whole block.
     """
     q_len = int(prev_len) + int(current_len)
     device = valid_persistent.device
@@ -110,16 +99,12 @@ def batched_causal_update_mask(
     return (past | tail.unsqueeze(0)).unsqueeze(1)
 
 
-def batched_rotary_cos_sin(
-    rotary: Any,
-    *,
-    start_pos: torch.Tensor,
-    seq_len: int,
+def rotary_cos_sin(
+    rotary: Any, *, start_pos: torch.Tensor, seq_len: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Rotary cos/sin for ``[rows, seq_len]`` positions starting per row."""
     offsets = torch.arange(int(seq_len), device=start_pos.device, dtype=torch.float32)
-    positions = start_pos.reshape(-1, 1).to(torch.float32) + offsets
-    embedding = rotary(positions)
+    embedding = rotary(start_pos.reshape(-1, 1).to(torch.float32) + offsets)
     return embedding.cos(), embedding.sin()
 
 
@@ -129,7 +114,8 @@ class DotsTtsAcousticTail:
     def __init__(
         self,
         *,
-        dit_context: DiTInferenceContext,
+        dit: nn.Module,
+        coordinate_proj: nn.Module,
         patch_encoder: nn.Module,
         spec: DotsTtsTailSpec,
         device: torch.device,
@@ -138,20 +124,19 @@ class DotsTtsAcousticTail:
         self.spec = spec
         self.device = device
         self.dtype = dtype
-
-        self.dit = dit_context.dit
-        self._next_patch_step = NextPatchStep(dit_context, attn_backend="sdpa").eval()
-        self._kv_prefill_step = KvPrefillStep(dit_context).eval()
+        self.dit = dit
+        self._coordinate_proj = coordinate_proj
 
         self._encoder = patch_encoder
         for layer in patch_encoder.encoder.layers:
             fuse_qkv_projection(layer.attn)
         self._encoder_step = SemanticEncoderDecodeStep(patch_encoder).eval()
 
-        dit_attn = self.dit.blocks[0].attn
-        self._dit_layers = len(self.dit.blocks)
+        dit_attn = dit.blocks[0].attn
+        self._dit_layers = len(dit.blocks)
         self._dit_rotary = dit_attn.rotary
-        self._mods_width = int(self.dit.fused_adaln[-1].out_features)
+        self._dit_heads = int(dit_attn.num_heads)
+        self._dit_head_dim = int(dit_attn.head_dim)
 
         encoder_attn = patch_encoder.encoder.layers[0].attn
         self._encoder_layers = len(patch_encoder.encoder.layers)
@@ -160,14 +145,17 @@ class DotsTtsAcousticTail:
         self._encoder_heads = int(encoder_attn.num_heads)
         self._encoder_head_dim = int(encoder_attn.head_dim)
 
+        # note (chenyang): the MeanFlow modulations differ per ODE step, so the
+        # cached keys/values of the same flow prefix do too and the DiT pool
+        # needs one cache per step.
         self._dit_k = torch.zeros(
             (
                 spec.nfe,
                 self._dit_layers,
                 spec.num_slots,
-                int(dit_attn.num_heads),
+                self._dit_heads,
                 spec.dit_cache_tokens,
-                int(dit_attn.head_dim),
+                self._dit_head_dim,
             ),
             device=device,
             dtype=dtype,
@@ -200,12 +188,12 @@ class DotsTtsAcousticTail:
             dtype=dtype,
         )
         self._all_mods = torch.zeros(
-            (spec.nfe, spec.num_slots, self._mods_width),
+            (spec.nfe, spec.num_slots, int(dit.fused_adaln[-1].out_features)),
             device=device,
             dtype=dtype,
         )
         self._times = torch.linspace(0.0, 1.0, spec.nfe + 1, device=device, dtype=dtype)
-        self._layer_index = torch.arange(self._dit_layers, device=device)
+        self._dit_layer_index = torch.arange(self._dit_layers, device=device)
         self._encoder_layer_index = torch.arange(self._encoder_layers, device=device)
 
         self._fm_seq_len = [0] * spec.num_slots
@@ -276,25 +264,22 @@ class DotsTtsAcousticTail:
         patch-encoder KV cache so decode steps continue the same sequence.
         """
         encoder = self._encoder
-        step_inputs = encoder.in_proj(encoder._downsample(prompt_latents))
-        tokens = int(step_inputs.size(1))
+        x = encoder.in_proj(encoder._downsample(prompt_latents))
+        tokens = int(x.size(1))
         if tokens > int(self._encoder_k.size(3)):
             raise ValueError(
                 "dots.tts prompt audio exceeds the patch-encoder cache: "
                 f"tokens={tokens} capacity={int(self._encoder_k.size(3))}"
             )
 
-        rotary_cos = rotary_sin = None
+        rotary = None
         if self._encoder_rotary is not None:
-            rotary_cos, rotary_sin = build_rotary_cos_sin(
-                self._encoder_rotary,
-                start_pos=0,
-                seq_len=tokens,
-                device=prompt_latents.device,
-                batched=True,
-            )
+            positions = torch.arange(
+                tokens, device=prompt_latents.device, dtype=torch.float32
+            ).reshape(1, tokens)
+            embedding = self._encoder_rotary(positions)
+            rotary = (embedding.cos(), embedding.sin())
 
-        x = step_inputs
         with sdpa_kernel(_TAIL_SDPA_BACKENDS):
             for layer_idx, layer in enumerate(encoder.encoder.layers):
                 attn_out, key, value = project_attention(
@@ -302,8 +287,8 @@ class DotsTtsAcousticTail:
                     layer.attn_norm(x),
                     num_heads=self._encoder_heads,
                     head_dim=self._encoder_head_dim,
-                    rotary_cos=rotary_cos,
-                    rotary_sin=rotary_sin,
+                    rotary_cos=None if rotary is None else rotary[0],
+                    rotary_sin=None if rotary is None else rotary[1],
                     is_causal=True,
                     dropout_p=0.0,
                 )
@@ -321,18 +306,13 @@ class DotsTtsAcousticTail:
 
     @torch.no_grad()
     def seed_fm_history(
-        self,
-        slot: int,
-        *,
-        fm_rows: torch.Tensor,
-        all_mods: torch.Tensor,
+        self, slot: int, *, fm_rows: torch.Tensor, all_mods: torch.Tensor
     ) -> None:
         """Install one request's prompt flow sequence and its AdaLN modulations.
 
         ``fm_rows`` is ``[unit_len * patches, fm_hidden_size]``: the projected
-        prompt history without the trailing hidden row, which the first tail
-        step appends. Everything but the last unit is folded into the DiT KV
-        cache right away.
+        prompt history without the trailing hidden row, which the first tail step
+        appends. Everything but the last unit is folded into the DiT KV cache.
         """
         spec = self.spec
         total = int(fm_rows.size(0))
@@ -341,13 +321,13 @@ class DotsTtsAcousticTail:
                 "dots.tts prompt flow history must be unit-aligned and non-empty: "
                 f"rows={total} unit_len={spec.unit_len}"
             )
-        if total + spec.hidden_patch_size > spec.fm_capacity:
+        persistent = total - spec.unit_len
+        if persistent + spec.unit_len > spec.dit_cache_tokens:
             raise ValueError(
                 "dots.tts prompt flow history exceeds the tail capacity: "
-                f"rows={total} fm_capacity={spec.fm_capacity}"
+                f"rows={total} cache_tokens={spec.dit_cache_tokens}"
             )
 
-        persistent = total - spec.unit_len
         self._all_mods[:, slot].copy_(all_mods)
         self._window[slot, : spec.unit_len].copy_(fm_rows[persistent:])
         self._window[slot, spec.unit_len :].zero_()
@@ -355,24 +335,43 @@ class DotsTtsAcousticTail:
         if persistent == 0:
             return
 
-        rotary_cos, rotary_sin = build_rotary_cos_sin(
-            self._dit_rotary,
-            start_pos=0,
-            seq_len=persistent,
-            device=fm_rows.device,
-            batched=True,
-        )
+        positions = torch.arange(
+            persistent, device=fm_rows.device, dtype=torch.float32
+        ).reshape(1, persistent)
+        embedding = self._dit_rotary(positions)
+        cos, sin = embedding.cos(), embedding.sin()
         prefix = fm_rows[:persistent].unsqueeze(0)
         with sdpa_kernel(_TAIL_SDPA_BACKENDS):
             for ode_idx in range(spec.nfe):
-                new_k, new_v = self._kv_prefill_step(
-                    prefix,
+                keys: list[torch.Tensor] = []
+                values: list[torch.Tensor] = []
+
+                def collect(_layer_idx, block, attn_in, keys=keys, values=values):
+                    out, key, value = project_attention(
+                        block.attn,
+                        attn_in,
+                        num_heads=self._dit_heads,
+                        head_dim=self._dit_head_dim,
+                        rotary_cos=cos,
+                        rotary_sin=sin,
+                        is_causal=True,
+                        dropout_p=0.0,
+                    )
+                    keys.append(key)
+                    values.append(value)
+                    return out
+
+                self.dit.run_modulated_blocks(
+                    x=prefix,
                     all_mods=all_mods[ode_idx : ode_idx + 1],
-                    rotary_cos=rotary_cos,
-                    rotary_sin=rotary_sin,
+                    attention=collect,
                 )
-                self._dit_k[ode_idx, :, slot, :, :persistent].copy_(new_k[:, 0])
-                self._dit_v[ode_idx, :, slot, :, :persistent].copy_(new_v[:, 0])
+                self._dit_k[ode_idx, :, slot, :, :persistent].copy_(
+                    torch.stack(keys)[:, 0]
+                )
+                self._dit_v[ode_idx, :, slot, :, :persistent].copy_(
+                    torch.stack(values)[:, 0]
+                )
 
     # ------------------------------------------------------------------
     # Decode
@@ -411,14 +410,13 @@ class DotsTtsAcousticTail:
                 "dots.tts flow history exceeded the DiT cache: "
                 f"persistent={capacity} capacity={spec.dit_cache_tokens}"
             )
-        persistent_index = torch.tensor(
-            persistent, device=self.device, dtype=torch.long
-        )
 
         latent = self._run_meanflow(
             slots=slots,
             slot_index=slot_index,
-            persistent_index=persistent_index,
+            persistent_index=torch.tensor(
+                persistent, device=self.device, dtype=torch.long
+            ),
             capacity=capacity,
         )
 
@@ -440,48 +438,76 @@ class DotsTtsAcousticTail:
         capacity: int,
     ) -> torch.Tensor:
         spec = self.spec
-        rows = int(slot_index.numel())
-        prev_unit = self._window[slot_index, : spec.unit_len]
-        current_hidden = self._window[slot_index, spec.unit_len :]
+        rows = len(slots)
+        unit = spec.unit_len
+        prev_unit = self._window[slot_index, :unit]
+        current_hidden = self._window[slot_index, unit:]
+        latent_slice = slice(
+            unit + spec.hidden_patch_size,
+            unit + spec.hidden_patch_size + spec.latent_patch_size,
+        )
         sdpa_mask = batched_causal_update_mask(
             capacity_tokens=capacity,
             valid_persistent=persistent_index,
-            prev_len=spec.unit_len,
-            current_len=spec.unit_len,
+            prev_len=unit,
+            current_len=unit,
         )
-        rotary_cos, rotary_sin = batched_rotary_cos_sin(
-            self._dit_rotary,
-            start_pos=persistent_index,
-            seq_len=2 * spec.unit_len,
+        cos, sin = rotary_cos_sin(
+            self._dit_rotary, start_pos=persistent_index, seq_len=2 * unit
         )
         mods = self._all_mods.index_select(1, slot_index)
-        token_index = persistent_index.reshape(1, rows, 1) + torch.arange(
-            spec.unit_len, device=self.device
-        ).reshape(1, 1, spec.unit_len)
-        layer_index = self._layer_index.reshape(self._dit_layers, 1, 1)
-        batch_index = slot_index.reshape(1, rows, 1)
 
         # note (chenyang): every ODE step reads only cache rows below its own
         # valid prefix and writes rows above it, so one gather up front is
-        # equivalent to gathering inside the loop and costs one kernel instead
-        # of two per step.
+        # equivalent to gathering inside the loop and costs one kernel per step
+        # instead of two.
         cache_k = self._dit_k[:, :, :, :, :capacity].index_select(2, slot_index)
         cache_v = self._dit_v[:, :, :, :, :capacity].index_select(2, slot_index)
+        token_index = persistent_index.reshape(1, rows, 1) + torch.arange(
+            unit, device=self.device
+        ).reshape(1, 1, unit)
+        layer_index = self._dit_layer_index.reshape(self._dit_layers, 1, 1)
+        batch_index = slot_index.reshape(1, rows, 1)
 
         latent = self._sample_noise(slots)
+        new_k = torch.empty(
+            self._dit_layers,
+            rows,
+            self._dit_heads,
+            unit,
+            self._dit_head_dim,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        new_v = torch.empty_like(new_k)
         with sdpa_kernel(_TAIL_SDPA_BACKENDS):
             for ode_idx in range(spec.nfe):
-                velocity, new_k, new_v = self._next_patch_step(
-                    latent,
-                    prev_unit=prev_unit,
-                    current_hidden=current_hidden,
-                    all_mods=mods[ode_idx],
-                    cache_k=cache_k[ode_idx],
-                    cache_v=cache_v[ode_idx],
-                    rotary_cos=rotary_cos,
-                    rotary_sin=rotary_sin,
-                    sdpa_mask=sdpa_mask,
+                step_k, step_v = cache_k[ode_idx], cache_v[ode_idx]
+
+                def cached_attention(layer_idx, block, attn_in, k=step_k, v=step_v):
+                    out, key, value = project_attention(
+                        block.attn,
+                        attn_in,
+                        num_heads=self._dit_heads,
+                        head_dim=self._dit_head_dim,
+                        rotary_cos=cos,
+                        rotary_sin=sin,
+                        key_prefix=k[layer_idx],
+                        value_prefix=v[layer_idx],
+                        attn_mask=sdpa_mask,
+                        dropout_p=0.0,
+                    )
+                    new_k[layer_idx].copy_(key[:, :, :unit, :])
+                    new_v[layer_idx].copy_(value[:, :, :unit, :])
+                    return out
+
+                x = torch.cat(
+                    [prev_unit, current_hidden, self._coordinate_proj(latent)], dim=1
                 )
+                x, final_mod = self.dit.run_modulated_blocks(
+                    x=x, all_mods=mods[ode_idx], attention=cached_attention
+                )
+                velocity = self.dit.apply_final_layer(x[:, latent_slice], final_mod)
                 duration = (self._times[ode_idx + 1] - self._times[ode_idx]).expand(
                     rows
                 )
@@ -497,16 +523,15 @@ class DotsTtsAcousticTail:
     def _sample_noise(self, slots: list[int]) -> torch.Tensor:
         spec = self.spec
         generators = [self._generators[slot] for slot in slots]
+        shape = (spec.latent_patch_size, spec.latent_dim)
         if all(generator is None for generator in generators):
             return torch.randn(
-                (len(slots), spec.latent_patch_size, spec.latent_dim),
-                device=self.device,
-                dtype=self.dtype,
+                (len(slots), *shape), device=self.device, dtype=self.dtype
             )
         return torch.cat(
             [
                 torch.randn(
-                    (1, spec.latent_patch_size, spec.latent_dim),
+                    (1, *shape),
                     generator=generator,
                     device=self.device,
                     dtype=self.dtype,
@@ -541,28 +566,22 @@ class DotsTtsAcousticTail:
         )
         if self._encoder_rotary is None:
             empty = torch.empty((0,), device=self.device)
-            rotary_cos, rotary_sin = empty, empty
+            cos, sin = empty, empty
         else:
-            rotary_cos, rotary_sin = batched_rotary_cos_sin(
-                self._encoder_rotary,
-                start_pos=start_index,
-                seq_len=block,
+            cos, sin = rotary_cos_sin(
+                self._encoder_rotary, start_pos=start_index, seq_len=block
             )
 
         cache_k = self._encoder_k[:, :, :, :capacity].index_select(1, slot_index)
         cache_v = self._encoder_v[:, :, :, :capacity].index_select(1, slot_index)
-        layer_caches = tuple(
-            (cache_k[layer_idx], cache_v[layer_idx])
-            for layer_idx in range(self._encoder_layers)
-        )
         with sdpa_kernel(_TAIL_SDPA_BACKENDS):
             embedding, conv_tail, new_k, new_v = self._encoder_step(
                 latent_patches.to(dtype=self.dtype),
                 self._encoder_conv_tail.index_select(0, slot_index),
-                layer_caches,
+                tuple(zip(cache_k, cache_v, strict=True)),
                 sdpa_mask,
-                rotary_cos,
-                rotary_sin,
+                cos,
+                sin,
             )
 
         token_index = start_index.reshape(1, rows, 1) + torch.arange(
@@ -586,5 +605,4 @@ __all__ = [
     "DotsTtsAcousticTail",
     "DotsTtsTailSpec",
     "batched_causal_update_mask",
-    "batched_rotary_cos_sin",
 ]

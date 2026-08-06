@@ -1,24 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 """Contracts for the batched dots.tts acoustic tail.
 
-The engine replaces the upstream per-request streaming solver with a batched,
-KV-cached one, so the tests that matter are equivalence checks against the
-reference full-recompute DiT path and against the single-row mask builder.
+The tail is a batched, KV-cached rewrite of a per-request full-recompute solver,
+so the tests that matter are equivalence checks: against an independent
+full-recompute MeanFlow sample, and against the mask definition spelled out
+element by element.
 """
 
 from __future__ import annotations
 
 import torch
 
-from sglang_omni.models.dots_tts.components.backbone.dit import DiT
-from sglang_omni.models.dots_tts.components.backbone.dit_inference import (
-    DiTInferenceContext,
-    EagerDiTRunner,
+from sglang_omni.models.dots_tts.components.backbone.dit import (
+    DiT,
+    fuse_dit_for_inference,
 )
 from sglang_omni.models.dots_tts.components.backbone.encoder import VAESemanticEncoder
-from sglang_omni.models.dots_tts.components.backbone.inference_utils import (
-    build_causal_update_mask,
-)
 from sglang_omni.models.dots_tts.components.model_config import (
     _DiTConfig,
     _EncoderConfig,
@@ -36,7 +33,7 @@ NFE = 2
 
 
 class _TailModelStub(torch.nn.Module):
-    """The subset of the serving model ``DiTInferenceContext`` reads."""
+    """The subset of the serving model the tail reads."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -58,9 +55,23 @@ class _TailModelStub(torch.nn.Module):
             ),
             mode="meanflow",
         )
+        _randomize(self.velocity_field_predictor)
         self.coordinate_proj = torch.nn.Linear(LATENT_DIM, FM_HIDDEN)
         self.latent_proj = torch.nn.Linear(LATENT_DIM, FM_HIDDEN)
-        self.config = type("_Cfg", (), {"fm_sigma": 0.0})()
+
+
+def _randomize(module: torch.nn.Module) -> torch.nn.Module:
+    """Give every parameter a non-trivial value.
+
+    ``DiT.initialize_weights`` zeroes the output layer and the adaLN modulations
+    so training starts from an identity flow. Left that way the sampled velocity
+    is identically zero and every solver trivially agrees, so the equivalence
+    tests below would pass without exercising any of the cached math.
+    """
+    with torch.no_grad():
+        for parameter in module.parameters():
+            parameter.normal_(0.0, 0.2)
+    return module
 
 
 def _patch_encoder() -> VAESemanticEncoder:
@@ -79,19 +90,71 @@ def _patch_encoder() -> VAESemanticEncoder:
 
 def _meanflow_modulations(dit: torch.nn.Module, g_cond: torch.Tensor) -> torch.Tensor:
     grid = torch.linspace(0.0, 1.0, NFE + 1, dtype=g_cond.dtype)
-    times, durations = grid[:-1], grid[1:] - grid[:-1]
-    condition = dit.time_embedder(times)
-    if dit.duration_embedder is not None:
-        condition = condition + dit.duration_embedder(durations)
-    return dit.fused_adaln(condition + g_cond.reshape(1, -1))
+    return dit.build_mods(
+        grid[:-1], duration=grid[1:] - grid[:-1], g_cond=g_cond.reshape(1, -1)
+    )
+
+
+def _reference_meanflow(
+    dit: torch.nn.Module,
+    coordinate_proj: torch.nn.Module,
+    *,
+    sequence: torch.Tensor,
+    fm_seq_len: int,
+    g_cond: torch.Tensor,
+) -> torch.Tensor:
+    """Full-recompute MeanFlow sample: no KV cache, no per-row padding.
+
+    Independent oracle for :meth:`DotsTtsAcousticTail.sample_patches` — it runs
+    the uncached ``FusedAdaLNDiT.forward`` over the whole flow prefix on every
+    ODE step, which is what the cached batched path must reproduce.
+    """
+    total = fm_seq_len + PATCH_SIZE
+    x_base = sequence.new_zeros(1, total, FM_HIDDEN)
+    x_base[:, :fm_seq_len] = sequence[:, :fm_seq_len]
+
+    attn_mask = torch.zeros((1, total, total), dtype=torch.bool)
+    block_start = fm_seq_len - 1
+    if block_start > 0:
+        attn_mask[:, :block_start, :block_start] = (
+            torch.ones(block_start, block_start, dtype=torch.bool).triu(1).logical_not()
+        )
+    attn_mask[:, block_start:fm_seq_len, :fm_seq_len] = True
+    attn_mask[:, block_start:fm_seq_len, fm_seq_len:] = True
+    attn_mask[:, fm_seq_len:, :] = True
+
+    pos_ids = torch.zeros((1, total), dtype=torch.float32)
+    pos_ids[:, :fm_seq_len] = torch.arange(fm_seq_len, dtype=torch.float32)
+    pos_ids[:, fm_seq_len:] = torch.arange(
+        fm_seq_len, fm_seq_len + PATCH_SIZE, dtype=torch.float32
+    )
+
+    z = torch.randn(1, PATCH_SIZE, LATENT_DIM, dtype=sequence.dtype)
+    times = torch.linspace(0.0, 1.0, NFE + 1, dtype=sequence.dtype)
+    for step in range(NFE):
+        x = x_base.clone()
+        x[:, fm_seq_len:] = coordinate_proj(z)
+        t = times[step].expand(1)
+        dt = (times[step + 1] - times[step]).expand(1)
+        velocity = dit(
+            x=x,
+            timesteps=t,
+            duration=dt,
+            attn_mask=attn_mask,
+            pos_ids=pos_ids,
+            g_cond=g_cond,
+        )[:, fm_seq_len:]
+        z = (z + velocity * dt.view(-1, 1, 1)).clone()
+    return z
 
 
 def _build_tail(
     model: _TailModelStub, *, num_slots: int, patch_capacity: int
 ) -> DotsTtsAcousticTail:
     return DotsTtsAcousticTail(
-        dit_context=DiTInferenceContext.from_core(model),
-        patch_encoder=_patch_encoder(),
+        dit=fuse_dit_for_inference(model),
+        coordinate_proj=model.coordinate_proj,
+        patch_encoder=_randomize(_patch_encoder()),
         spec=DotsTtsTailSpec(
             nfe=NFE,
             patch_capacity=patch_capacity,
@@ -106,45 +169,47 @@ def _build_tail(
     )
 
 
-def test_batched_mask_matches_the_single_row_builder() -> None:
+def test_batched_mask_matches_the_per_row_definition() -> None:
+    capacity, prev_len, current_len = 8, 3, 3
     valid = torch.tensor([0, 3, 7])
     batched = batched_causal_update_mask(
-        capacity_tokens=8,
+        capacity_tokens=capacity,
         valid_persistent=valid,
-        prev_len=3,
-        current_len=3,
+        prev_len=prev_len,
+        current_len=current_len,
     )
 
-    assert batched.shape == (3, 1, 6, 14)
+    q_len = prev_len + current_len
+    assert batched.shape == (len(valid), 1, q_len, capacity + q_len)
     for row, valid_persistent in enumerate(valid.tolist()):
-        reference = build_causal_update_mask(
-            capacity_tokens=8,
-            valid_persistent_tokens=valid_persistent,
-            prev_len=3,
-            current_len=3,
-            device=torch.device("cpu"),
-        )
-        assert torch.equal(batched[row : row + 1], reference)
+        for q in range(q_len):
+            for kv in range(capacity + q_len):
+                tail_idx = kv - capacity
+                if tail_idx < 0:
+                    expected = kv < valid_persistent
+                elif q < prev_len:
+                    expected = tail_idx < prev_len and tail_idx <= q
+                else:
+                    expected = True
+                assert bool(batched[row, 0, q, kv]) is expected
 
 
 def test_kv_cached_tail_matches_the_full_recompute_solver() -> None:
     torch.manual_seed(1234)
     model = _TailModelStub().eval()
-    patch_capacity = 8
-    tail = _build_tail(model, num_slots=1, patch_capacity=patch_capacity)
-    context = DiTInferenceContext.from_core(model)
-    eager = EagerDiTRunner(context=context)
+    tail = _build_tail(model, num_slots=1, patch_capacity=8)
+    dit = tail.dit
     unit = tail.spec.unit_len
 
     prompt_patches = 3
     g_cond = torch.randn(1, FM_HIDDEN)
-    all_mods = _meanflow_modulations(context.dit, g_cond)
+    all_mods = _meanflow_modulations(dit, g_cond)
     fm_rows = torch.randn(prompt_patches * unit, FM_HIDDEN)
 
     slot = tail.acquire_slot()
     tail.seed_fm_history(slot, fm_rows=fm_rows, all_mods=all_mods)
 
-    reference_sequence = torch.zeros(1, tail.spec.fm_capacity, FM_HIDDEN)
+    reference_sequence = torch.zeros(1, tail.spec.dit_cache_tokens + unit, FM_HIDDEN)
     reference_sequence[0, : fm_rows.size(0)] = fm_rows
     reference_len = fm_rows.size(0)
 
@@ -154,12 +219,12 @@ def test_kv_cached_tail_matches_the_full_recompute_solver() -> None:
         reference_len += 1
 
         torch.manual_seed(step)
-        expected = eager.decode_next(
+        expected = _reference_meanflow(
+            dit,
+            model.coordinate_proj,
             sequence=reference_sequence,
             fm_seq_len=reference_len,
             g_cond=g_cond,
-            nfe=NFE,
-            meanflow=True,
         )
 
         torch.manual_seed(step)
@@ -169,6 +234,11 @@ def test_kv_cached_tail_matches_the_full_recompute_solver() -> None:
             latent_proj=model.latent_proj,
         )
 
+        torch.manual_seed(step)
+        untouched_noise = torch.randn(1, PATCH_SIZE, LATENT_DIM)
+        assert not torch.allclose(
+            expected, untouched_noise
+        ), "the DiT left the noise unchanged, so this comparison is vacuous"
         torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-4)
         latent_rows = model.latent_proj(expected)[0]
         reference_sequence[0, reference_len : reference_len + PATCH_SIZE] = latent_rows
@@ -184,7 +254,7 @@ def test_slots_stay_independent_when_batched_together() -> None:
     unit = solo.spec.unit_len
 
     g_cond = torch.randn(1, FM_HIDDEN)
-    all_mods = _meanflow_modulations(DiTInferenceContext.from_core(model).dit, g_cond)
+    all_mods = _meanflow_modulations(solo.dit, g_cond)
     # A second slot with a longer history so the batch has to pad and mask.
     fm_rows = torch.randn(2 * unit, FM_HIDDEN)
     other_rows = torch.randn(4 * unit, FM_HIDDEN)

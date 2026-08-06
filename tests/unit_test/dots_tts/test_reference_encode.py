@@ -11,10 +11,7 @@ import pytest
 import torch
 
 from sglang_omni.models.dots_tts.payload_types import DotsTtsState
-from sglang_omni.models.dots_tts.prompt_builder import (
-    normalize_prompt_text,
-    prompt_audio_patch_count,
-)
+from sglang_omni.models.dots_tts.prompt_builder import normalize_prompt_text
 from sglang_omni.models.dots_tts.reference_encode import (
     DotsTtsPromptFeatureHook,
     DotsTtsReferenceEncoder,
@@ -215,9 +212,3 @@ def test_prompt_text_gets_the_training_continuation_boundary() -> None:
     assert normalize_prompt_text("  reference  ") == "reference\n"
     assert normalize_prompt_text("   ") == ""
     assert normalize_prompt_text(None) == ""
-
-
-def test_prompt_audio_patch_count_rounds_up() -> None:
-    assert prompt_audio_patch_count(prompt_sample_count=1, samples_per_patch=100) == 1
-    assert prompt_audio_patch_count(prompt_sample_count=100, samples_per_patch=100) == 1
-    assert prompt_audio_patch_count(prompt_sample_count=101, samples_per_patch=100) == 2

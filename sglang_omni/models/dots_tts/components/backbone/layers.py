@@ -1,36 +1,7 @@
-import os
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-from torch.nn.attention.flex_attention import create_block_mask, flex_attention
-
-
-def _block_mask_flex_attention(q, k, v, block_mask):
-    backend = os.environ.get("DOTS_TTS_FLEX_ATTENTION_BACKEND")
-    kernel_options = None if not backend else {"BACKEND": backend.upper()}
-    return flex_attention(
-        q,
-        k,
-        v,
-        block_mask=block_mask,
-        kernel_options=kernel_options,
-    )
-
-
-_compiled_block_mask_flex_attention = torch.compile(
-    _block_mask_flex_attention,
-    fullgraph=True,
-    dynamic=False,
-    mode="max-autotune-no-cudagraphs",
-)
-
-_compiled_create_block_mask = torch.compile(
-    create_block_mask,
-    fullgraph=True,
-    dynamic=False,
-)
 
 
 class Dropout(nn.Module):
@@ -234,7 +205,6 @@ class MultiHeadAttention(nn.Module):
         norm_layer: str = "LayerNorm",
         rotary_bias: bool = False,
         rotary_theta: float | None = 50000,
-        attn_backend: str = "sdpa",
         **_kwargs,
     ):
         super().__init__()
@@ -245,9 +215,6 @@ class MultiHeadAttention(nn.Module):
         self.head_dim = hidden_size // num_heads
         self.scale = self.head_dim**-0.5
         self.rotary_bias = rotary_bias
-        if attn_backend not in {"sdpa", "flex"}:
-            raise ValueError(f"Unsupported attention backend: {attn_backend!r}.")
-        self.attn_backend = attn_backend
 
         self.q_proj = nn.Linear(hidden_size, hidden_size, bias=qkv_bias)
         self.k_proj = nn.Linear(hidden_size, hidden_size, bias=qkv_bias)

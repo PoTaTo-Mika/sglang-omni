@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from einops import rearrange
 
+from sglang_omni.models.dots_tts.components.backbone.inference_utils import (
+    project_attention,
+)
 from sglang_omni.models.dots_tts.components.backbone.layers import (
     Conv1d,
     Mlp,
@@ -154,3 +158,88 @@ class VAESemanticEncoder(nn.Module):
         if self.out_ds_rate > 1:
             z = rearrange(z, "b (s d) h -> b s (d h)", d=self.out_ds_rate)
         return self.out_proj(z)
+
+
+class SemanticEncoderDecodeStep(nn.Module):
+    """One cached patch step of :class:`VAESemanticEncoder`.
+
+    The caller owns the K/V cache and the conv tail: it passes the per-row cache
+    slices plus the mask/rotary for this step and writes the returned K/V back at
+    whatever offset each row is at.
+    """
+
+    def __init__(self, encoder: nn.Module):
+        super().__init__()
+        if not isinstance(encoder, VAESemanticEncoder):
+            raise TypeError(
+                f"SemanticEncoderDecodeStep needs a VAESemanticEncoder, got {type(encoder)!r}"
+            )
+        self.encoder = encoder
+        self.out_ds_rate = int(encoder.out_ds_rate)
+        attn = encoder.encoder.layers[0].attn
+        self.num_heads = int(attn.num_heads)
+        self.head_dim = int(attn.head_dim)
+        self.num_layers = len(encoder.encoder.layers)
+
+    @staticmethod
+    def downsample(
+        encoder: nn.Module,
+        latent_patch: torch.Tensor,
+        *,
+        conv_tail: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Causal ``ds_proj`` over one patch, continued from ``conv_tail``."""
+        raw = latent_patch.transpose(1, 2)
+        ds_proj = encoder.ds_proj
+        projected = F.conv1d(
+            torch.cat([conv_tail, raw], dim=-1),
+            ds_proj.weight,
+            ds_proj.bias,
+            stride=ds_proj.stride[0],
+            padding=0,
+            dilation=ds_proj.dilation[0],
+            groups=ds_proj.groups,
+        ).transpose(1, 2)
+        return encoder.in_proj(projected), raw[..., -ds_proj.left_padding :]
+
+    def forward(
+        self,
+        latent_patch: torch.Tensor,
+        conv_tail: torch.Tensor,
+        layer_caches: tuple[tuple[torch.Tensor, torch.Tensor], ...],
+        attn_mask: torch.Tensor,
+        rotary_cos: torch.Tensor,
+        rotary_sin: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        x, new_conv_tail = self.downsample(
+            self.encoder, latent_patch, conv_tail=conv_tail
+        )
+        new_k = torch.empty(
+            self.num_layers,
+            x.size(0),
+            self.num_heads,
+            self.out_ds_rate,
+            self.head_dim,
+            device=x.device,
+            dtype=x.dtype,
+        )
+        new_v = torch.empty_like(new_k)
+        for layer_idx, layer in enumerate(self.encoder.encoder.layers):
+            cache_k, cache_v = layer_caches[layer_idx]
+            attn_out, key, value = project_attention(
+                layer.attn,
+                layer.attn_norm(x),
+                num_heads=self.num_heads,
+                head_dim=self.head_dim,
+                rotary_cos=rotary_cos if layer.attn.rotary_bias else None,
+                rotary_sin=rotary_sin if layer.attn.rotary_bias else None,
+                key_prefix=cache_k,
+                value_prefix=cache_v,
+                attn_mask=attn_mask,
+                dropout_p=0.0,
+            )
+            new_k[layer_idx].copy_(key)
+            new_v[layer_idx].copy_(value)
+            x = x + attn_out
+            x = x + layer.ffn(layer.ffn_norm(x))
+        return self.encoder._project_embeddings(x), new_conv_tail, new_k, new_v
