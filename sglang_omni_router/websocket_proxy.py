@@ -56,11 +56,7 @@ RelayOutcome = Literal[
     "completed",
     "upstream_failure",
 ]
-HandshakeOutcome = Literal[
-    "application_failure",
-    "upstream_failure",
-    "upstream_unavailable",
-]
+SessionOutcome = RelayOutcome | Literal["upstream_unavailable"]
 ClientRelayOutcome = Literal[
     "client_disconnected",
     "message_too_large",
@@ -72,7 +68,17 @@ ClientRelayOutcome = Literal[
 class _HandshakeFailure:
     error: SpeechAPIError
     close_code: int
-    outcome: HandshakeOutcome
+    outcome: SessionOutcome
+
+
+@dataclass(frozen=True)
+class _SessionResult:
+    outcome: SessionOutcome
+    routed_status_code: int | None = None
+    worker_failure_status_code: int | None = None
+    worker_failure_error: str | None = None
+    client_error: SpeechAPIError | None = None
+    client_close_code: int | None = None
 
 
 _APPLICATION_CLOSE_CODES = {1002, 1003, 1007, 1008, 1009, 1010, 1013}
@@ -121,31 +127,10 @@ class TTSWebSocketProxy:
             )
             return
 
-        worker: Worker | None = None
-        worker_active = False
         start_time = time.perf_counter()
         try:
-            first_message = await asyncio.wait_for(
-                websocket.receive(),
-                timeout=SPEECH_WS_CONFIG_TIMEOUT_S,
-            )
-            if first_message.get("type") == "websocket.disconnect":
-                return
-            first_message_limit = min(
-                self._config.max_payload_size,
-                MAX_SPEECH_WS_CONFIG_MESSAGE_BYTES,
-            )
-            if _message_size(first_message) > first_message_limit:
-                await _send_router_error(
-                    websocket,
-                    SpeechAPIError(
-                        message="session.config WebSocket message exceeds payload limit",
-                        status_code=413,
-                        error_type="BadRequestError",
-                        code=413,
-                    ),
-                    close_code=1009,
-                )
+            first_message = await self._receive_initial_message(websocket)
+            if first_message is None:
                 return
 
             facts = _session_route_facts(first_message)
@@ -164,140 +149,19 @@ class TTSWebSocketProxy:
                 )
                 return
 
-            worker.increment_active()
-            worker_active = True
-            try:
-                connect_options = {
-                    _WEBSOCKET_HEADERS_ARGUMENT: _forward_headers(websocket),
-                    "open_timeout": self._config.health_check_timeout_secs,
-                    "close_timeout": self._config.health_check_timeout_secs,
-                    "compression": None,
-                    "max_queue": 1,
-                    "max_size": _MAX_UPSTREAM_SERVER_MESSAGE_BYTES,
-                }
-                async with websocket_connect(
-                    _upstream_url(worker, websocket),
-                    **connect_options,
-                ) as upstream:
-                    await _send_upstream(upstream, first_message)
-                    outcome = await _relay(
-                        websocket,
-                        upstream,
-                        max_client_message_bytes=min(
-                            self._config.max_payload_size,
-                            MAX_SPEECH_WS_TEXT_MESSAGE_BYTES,
-                        ),
-                    )
-            except asyncio.CancelledError:
-                raise
-            except (WebSocketException, OSError, asyncio.TimeoutError) as exc:
-                handshake_status = _handshake_status_code(exc)
-                if handshake_status is not None:
-                    failure = _handshake_failure(handshake_status)
-                    if handshake_status in WORKER_EVICTION_STATUS_CODES:
-                        worker.record_request_failure(
-                            failure_threshold=self._config.health_failure_threshold,
-                            status_code=handshake_status,
-                            error=f"status={handshake_status}",
-                        )
-                    worker.record_routed_request(service_class="tts_websocket")
-                    log = (
-                        logger.info
-                        if failure.outcome == "application_failure"
-                        else logger.warning
-                    )
-                    log(
-                        "tts_websocket_completed request_id=%s worker=%s "
-                        "outcome=%s status_code=%d duration_ms=%.2f",
-                        request_id,
-                        worker.display_id,
-                        failure.outcome,
-                        handshake_status,
-                        (time.perf_counter() - start_time) * 1000,
-                    )
-                    await _send_router_error(
-                        websocket,
-                        failure.error,
-                        close_code=failure.close_code,
-                    )
-                    return
-                if isinstance(exc, ConnectionClosed) and _is_application_close(exc):
-                    worker.record_routed_request(service_class="tts_websocket")
-                    logger.info(
-                        "tts_websocket_completed request_id=%s worker=%s "
-                        "outcome=application_failure duration_ms=%.2f",
-                        request_id,
-                        worker.display_id,
-                        (time.perf_counter() - start_time) * 1000,
-                    )
-                    await _send_router_error(
-                        websocket,
-                        SpeechAPIError(
-                            message="upstream WebSocket rejected the request",
-                            status_code=400,
-                            error_type="upstream_error",
-                            code=400,
-                        ),
-                        close_code=1008,
-                    )
-                    return
-                worker.record_request_failure(
-                    failure_threshold=self._config.health_failure_threshold,
-                    error=type(exc).__name__,
-                )
-                worker.record_routed_request(service_class="tts_websocket")
-                logger.warning(
-                    "tts_websocket_upstream_failure request_id=%s worker=%s "
-                    "error=%s",
-                    request_id,
-                    worker.display_id,
-                    type(exc).__name__,
-                )
-                await _send_router_error(
+            with worker.request_guard():
+                result = await self._connect_and_relay(
                     websocket,
-                    SpeechAPIError(
-                        message="upstream WebSocket failed",
-                        status_code=502,
-                        error_type="upstream_error",
-                        code=502,
-                    ),
-                    close_code=1011,
+                    worker,
+                    first_message,
                 )
-                return
-
-            if outcome == "client_message_too_large":
-                worker.record_routed_request(service_class="tts_websocket")
-                await _send_router_error(
+                await self._finish_session(
                     websocket,
-                    SpeechAPIError(
-                        message="WebSocket message exceeds payload limit",
-                        status_code=413,
-                        error_type="BadRequestError",
-                        code=413,
-                    ),
-                    close_code=1009,
+                    worker,
+                    request_id=request_id,
+                    start_time=start_time,
+                    result=result,
                 )
-            elif outcome == "upstream_failure":
-                worker.record_request_failure(
-                    failure_threshold=self._config.health_failure_threshold,
-                    error="WebSocketRelayError",
-                )
-                worker.record_routed_request(service_class="tts_websocket")
-            elif outcome == "completed":
-                worker.record_routed_request(
-                    status_code=200,
-                    service_class="tts_websocket",
-                )
-            else:
-                worker.record_routed_request(service_class="tts_websocket")
-            logger.info(
-                "tts_websocket_completed request_id=%s worker=%s outcome=%s "
-                "duration_ms=%.2f",
-                request_id,
-                worker.display_id,
-                outcome,
-                (time.perf_counter() - start_time) * 1000,
-            )
         except asyncio.TimeoutError:
             await _send_router_error(
                 websocket,
@@ -307,9 +171,115 @@ class TTSWebSocketProxy:
         except WebSocketDisconnect:
             pass
         finally:
-            if worker is not None and worker_active:
-                worker.decrement_active()
             self._admission.release()
+
+    async def _receive_initial_message(
+        self,
+        websocket: WebSocket,
+    ) -> dict[str, Any] | None:
+        message = await asyncio.wait_for(
+            websocket.receive(),
+            timeout=SPEECH_WS_CONFIG_TIMEOUT_S,
+        )
+        if message.get("type") == "websocket.disconnect":
+            return None
+        message_limit = min(
+            self._config.max_payload_size,
+            MAX_SPEECH_WS_CONFIG_MESSAGE_BYTES,
+        )
+        if _message_size(message) <= message_limit:
+            return message
+        await _send_router_error(
+            websocket,
+            SpeechAPIError(
+                message="session.config WebSocket message exceeds payload limit",
+                status_code=413,
+                error_type="BadRequestError",
+                code=413,
+            ),
+            close_code=1009,
+        )
+        return None
+
+    async def _connect_and_relay(
+        self,
+        websocket: WebSocket,
+        worker: Worker,
+        first_message: dict[str, Any],
+    ) -> _SessionResult:
+        connect_options = {
+            _WEBSOCKET_HEADERS_ARGUMENT: _forward_headers(websocket),
+            "open_timeout": self._config.health_check_timeout_secs,
+            "close_timeout": self._config.health_check_timeout_secs,
+            "compression": None,
+            "max_queue": 1,
+            "max_size": _MAX_UPSTREAM_SERVER_MESSAGE_BYTES,
+        }
+        try:
+            async with websocket_connect(
+                _upstream_url(worker, websocket),
+                **connect_options,
+            ) as upstream:
+                await _send_upstream(upstream, first_message)
+                outcome = await _relay(
+                    websocket,
+                    upstream,
+                    max_client_message_bytes=min(
+                        self._config.max_payload_size,
+                        MAX_SPEECH_WS_TEXT_MESSAGE_BYTES,
+                    ),
+                )
+        except (WebSocketException, OSError, asyncio.TimeoutError) as exc:
+            return _connection_failure_result(exc)
+        return _relay_result(outcome)
+
+    async def _finish_session(
+        self,
+        websocket: WebSocket,
+        worker: Worker,
+        *,
+        request_id: str,
+        start_time: float,
+        result: _SessionResult,
+    ) -> None:
+        if (
+            result.worker_failure_status_code is not None
+            or result.worker_failure_error is not None
+        ):
+            worker.record_request_failure(
+                failure_threshold=self._config.health_failure_threshold,
+                status_code=result.worker_failure_status_code,
+                error=result.worker_failure_error,
+            )
+        worker.record_routed_request(
+            status_code=result.routed_status_code,
+            service_class="tts_websocket",
+        )
+        log = (
+            logger.warning
+            if result.outcome in {"upstream_failure", "upstream_unavailable"}
+            else logger.info
+        )
+        log(
+            "tts_websocket_completed request_id=%s worker=%s outcome=%s "
+            "status_code=%s duration_ms=%.2f",
+            request_id,
+            worker.display_id,
+            result.outcome,
+            (
+                str(result.client_error.status_code)
+                if result.client_error is not None
+                else "-"
+            ),
+            (time.perf_counter() - start_time) * 1000,
+        )
+        if result.client_error is not None:
+            assert result.client_close_code is not None
+            await _send_router_error(
+                websocket,
+                result.client_error,
+                close_code=result.client_close_code,
+            )
 
     def _select_worker(self, facts: "_SessionRouteFacts") -> Worker:
         required_capabilities: set[Capability] = {"speech", "streaming"}
@@ -330,17 +300,11 @@ class TTSWebSocketProxy:
         )
 
 
+@dataclass(frozen=True)
 class _SessionRouteFacts:
-    def __init__(
-        self,
-        *,
-        model: str | None = None,
-        voice_names: set[str] | None = None,
-        uses_reference_audio: bool = False,
-    ) -> None:
-        self.model = model
-        self.voice_names = voice_names or set()
-        self.uses_reference_audio = uses_reference_audio
+    model: str | None = None
+    voice_names: frozenset[str] = frozenset()
+    uses_reference_audio: bool = False
 
 
 def _session_route_facts(message: dict[str, Any]) -> _SessionRouteFacts:
@@ -362,7 +326,9 @@ def _session_route_facts(message: dict[str, Any]) -> _SessionRouteFacts:
     model = model.strip() if isinstance(model, str) and model.strip() else None
     voice = session.get("voice", session.get("speaker"))
     voice_names = (
-        {voice.strip().lower()} if isinstance(voice, str) and voice.strip() else set()
+        frozenset({voice.strip().lower()})
+        if isinstance(voice, str) and voice.strip()
+        else frozenset()
     )
     uses_reference_audio = _uses_reference_audio(session)
     return _SessionRouteFacts(
@@ -386,6 +352,68 @@ def _uses_reference_audio(session: dict[str, Any]) -> bool:
     )
 
 
+def _relay_result(outcome: RelayOutcome) -> _SessionResult:
+    if outcome == "completed":
+        return _SessionResult(outcome=outcome, routed_status_code=200)
+    if outcome == "upstream_failure":
+        return _SessionResult(
+            outcome=outcome,
+            worker_failure_error="WebSocketRelayError",
+        )
+    if outcome == "client_message_too_large":
+        return _SessionResult(
+            outcome=outcome,
+            client_error=SpeechAPIError(
+                message="WebSocket message exceeds payload limit",
+                status_code=413,
+                error_type="BadRequestError",
+                code=413,
+            ),
+            client_close_code=1009,
+        )
+    return _SessionResult(outcome=outcome)
+
+
+def _connection_failure_result(exc: Exception) -> _SessionResult:
+    status_code = _handshake_status_code(exc)
+    if status_code is not None:
+        failure = _handshake_failure(status_code)
+        worker_failure_status = (
+            status_code if status_code in WORKER_EVICTION_STATUS_CODES else None
+        )
+        return _SessionResult(
+            outcome=failure.outcome,
+            worker_failure_status_code=worker_failure_status,
+            worker_failure_error=(
+                f"status={status_code}" if worker_failure_status is not None else None
+            ),
+            client_error=failure.error,
+            client_close_code=failure.close_code,
+        )
+    if isinstance(exc, ConnectionClosed) and _is_application_close(exc):
+        return _SessionResult(
+            outcome="application_failure",
+            client_error=SpeechAPIError(
+                message="upstream WebSocket rejected the request",
+                status_code=400,
+                error_type="upstream_error",
+                code=400,
+            ),
+            client_close_code=1008,
+        )
+    return _SessionResult(
+        outcome="upstream_failure",
+        worker_failure_error=type(exc).__name__,
+        client_error=SpeechAPIError(
+            message="upstream WebSocket failed",
+            status_code=502,
+            error_type="upstream_error",
+            code=502,
+        ),
+        client_close_code=1011,
+    )
+
+
 async def _relay(
     websocket: WebSocket,
     upstream: Any,
@@ -401,51 +429,91 @@ async def _relay(
     )
     upstream_task = asyncio.create_task(_upstream_to_client(upstream, websocket))
     try:
-        done, _ = await asyncio.wait(
-            {client_task, upstream_task},
-            return_when=asyncio.FIRST_COMPLETED,
+        return await _coordinate_relay(
+            websocket,
+            upstream,
+            client_task=client_task,
+            upstream_task=upstream_task,
         )
-        if client_task in done:
-            client_outcome = await client_task
-            if client_outcome == "client_disconnected":
-                outcome = "client_disconnected"
-            elif client_outcome == "message_too_large":
-                if not upstream_task.done():
-                    upstream_task.cancel()
-                with suppress(Exception):
-                    await upstream.close(code=1009)
-                return "client_message_too_large"
-            elif upstream_task in done:
-                outcome = await upstream_task
-            else:
-                # The receive loop owns the upstream protocol outcome. A send
-                # may observe closure before buffered terminal frames are read.
-                outcome = await upstream_task
-        else:
-            outcome = await upstream_task
-
-        if outcome == "client_disconnected":
-            with suppress(Exception):
-                await upstream.close(code=1000)
-        else:
-            if not client_task.done():
-                client_task.cancel()
-            if websocket.application_state != WebSocketState.CONNECTED:
-                return outcome
-            code = (
-                1011
-                if outcome == "upstream_failure"
-                else getattr(upstream, "close_code", None) or 1000
-            )
-            reason = getattr(upstream, "close_reason", None) or ""
-            with suppress(RuntimeError, WebSocketDisconnect):
-                await websocket.close(code=_safe_close_code(code), reason=reason)
-        return outcome
     finally:
-        for task in (client_task, upstream_task):
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(client_task, upstream_task, return_exceptions=True)
+        await _cancel_relay_tasks(client_task, upstream_task)
+
+
+async def _coordinate_relay(
+    websocket: WebSocket,
+    upstream: Any,
+    *,
+    client_task: asyncio.Task[ClientRelayOutcome],
+    upstream_task: asyncio.Task[RelayOutcome],
+) -> RelayOutcome:
+    done, _ = await asyncio.wait(
+        {client_task, upstream_task},
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    _raise_completed_task_error(done)
+    if client_task in done:
+        client_outcome = client_task.result()
+        if client_outcome == "client_disconnected":
+            outcome: RelayOutcome = "client_disconnected"
+        elif client_outcome == "message_too_large":
+            upstream_task.cancel()
+            await _close_upstream(upstream, code=1009)
+            return "client_message_too_large"
+        else:
+            # The receive loop owns the upstream protocol outcome. A send may
+            # observe closure before buffered terminal frames are read.
+            outcome = await upstream_task
+    else:
+        outcome = upstream_task.result()
+
+    if outcome == "client_disconnected":
+        await _close_upstream(upstream, code=1000)
+    else:
+        client_task.cancel()
+        if websocket.application_state != WebSocketState.CONNECTED:
+            return outcome
+        code = (
+            1011
+            if outcome == "upstream_failure"
+            else getattr(upstream, "close_code", None) or 1000
+        )
+        reason = getattr(upstream, "close_reason", None) or ""
+        with suppress(RuntimeError, WebSocketDisconnect):
+            await websocket.close(code=_safe_close_code(code), reason=reason)
+    return outcome
+
+
+def _raise_completed_task_error(tasks: set[asyncio.Task[Any]]) -> None:
+    for task in tasks:
+        if task.cancelled():
+            continue
+        error = task.exception()
+        if error is not None:
+            raise error
+
+
+async def _close_upstream(upstream: Any, *, code: int) -> None:
+    try:
+        await upstream.close(code=code)
+    except (WebSocketException, OSError, asyncio.TimeoutError):
+        pass
+
+
+async def _cancel_relay_tasks(*tasks: asyncio.Task[Any]) -> None:
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    first_error: Exception | None = None
+    for task in tasks:
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            if first_error is None:
+                first_error = exc
+    if first_error is not None:
+        raise first_error
 
 
 async def _client_to_upstream(

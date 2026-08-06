@@ -3949,6 +3949,36 @@ async def test_tts_websocket_rejects_oversized_followup_before_upstream_send() -
     assert upstream.close_code == 1009
 
 
+@pytest.mark.asyncio
+async def test_tts_websocket_relay_propagates_simultaneous_secondary_failure() -> None:
+    class ConnectedWebSocket:
+        application_state = websocket_proxy_module.WebSocketState.CONNECTED
+
+    class Upstream:
+        close_code = 1000
+        close_reason = ""
+
+    async def client_result():
+        return "client_disconnected"
+
+    async def upstream_failure():
+        raise AssertionError("simultaneous relay defect")
+
+    client_task = asyncio.create_task(client_result())
+    upstream_task = asyncio.create_task(upstream_failure())
+    await asyncio.sleep(0)
+    assert client_task.done()
+    assert upstream_task.done()
+
+    with pytest.raises(AssertionError, match="simultaneous relay defect"):
+        await websocket_proxy_module._coordinate_relay(
+            ConnectedWebSocket(),
+            Upstream(),
+            client_task=client_task,
+            upstream_task=upstream_task,
+        )
+
+
 def test_tts_websocket_is_pinned_and_counted_on_one_worker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4462,6 +4492,61 @@ def test_tts_websocket_policy_close_does_not_evict_worker(
     worker = app.state.workers[0]
     assert worker.is_healthy
     assert worker.consecutive_failures == 0
+    assert worker.failed_requests_by_class == {"tts_websocket": 1}
+
+
+def test_tts_websocket_policy_close_during_initial_send_is_application_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class PolicyConnectionClosed(websocket_proxy_module.WebSocketException):
+        class ReceivedClose:
+            code = 1008
+
+        rcvd = ReceivedClose()
+
+    class PolicyClosingUpstream(_FakeTTSUpstream):
+        async def send(self, message: str | bytes) -> None:
+            raise PolicyConnectionClosed
+
+    monkeypatch.setattr(
+        websocket_proxy_module,
+        "websocket_connect",
+        lambda *args, **kwargs: PolicyClosingUpstream([]),
+    )
+    monkeypatch.setattr(
+        websocket_proxy_module,
+        "ConnectionClosed",
+        PolicyConnectionClosed,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "healthy"}, request=request)
+        if request.url.path == "/v1/audio/voices":
+            return httpx.Response(200, json={"uploaded_voices": []}, request=request)
+        raise AssertionError(f"unexpected HTTP request path: {request.url.path}")
+
+    app = create_app(
+        _router_config(health_failure_threshold=1),
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/v1/audio/speech/stream") as websocket:
+            websocket.send_json({"type": "session.config", "voice": "default"})
+            error = websocket.receive_json()
+            close = websocket.receive()
+
+    assert error["type"] == "error"
+    assert error["error_type"] == "upstream_error"
+    assert error["code"] == 400
+    assert close["type"] == "websocket.close"
+    assert close["code"] == 1008
+
+    worker = app.state.workers[0]
+    assert worker.is_healthy
+    assert worker.consecutive_failures == 0
+    assert worker.active_requests == 0
     assert worker.failed_requests_by_class == {"tts_websocket": 1}
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Set
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -98,7 +99,7 @@ class VoiceRoutingState:
 
     def requires_owner(
         self,
-        voice_names: set[str],
+        voice_names: Set[str],
         *,
         body_exceeds_metadata_limit: bool = False,
     ) -> bool:
