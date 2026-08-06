@@ -319,7 +319,7 @@ class TTSWebSocketProxy:
         if uploaded_voice_request:
             required_capabilities.add("audio_input")
             return require_eligible_worker(
-                self._voice_routing.owner,
+                self._voice_routing.resolve_owner(),
                 required_capabilities=required_capabilities,
                 requested_model=facts.model,
             )

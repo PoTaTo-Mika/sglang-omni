@@ -6,7 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Any, Callable
 from urllib.parse import quote, unquote
 
@@ -180,17 +180,16 @@ def create_app(
         app.state.admin_update_lock = asyncio.Lock()
         app.state.update_journal = journal
         recover_worker_pool_from_journal(journal, workers)
-        await health_checker.start()
-        await voice_routing.start()
-        try:
-            yield
-        finally:
-            await voice_routing.stop()
-            await health_checker.stop()
-            if owns_health_client:
-                await health_client.aclose()
+        async with AsyncExitStack() as resources:
             if owns_client:
-                await client.aclose()
+                resources.push_async_callback(client.aclose)
+            if owns_health_client:
+                resources.push_async_callback(health_client.aclose)
+            await health_checker.start()
+            resources.push_async_callback(health_checker.stop)
+            await voice_routing.start()
+            resources.push_async_callback(voice_routing.stop)
+            yield
 
     resolved_key = resolve_admin_api_key(admin_api_key)
 
@@ -536,7 +535,7 @@ def register_admin_routes(
 
         if (
             voice_routing is not None
-            and worker.url == voice_routing.owner_url
+            and voice_routing.is_owner(worker)
             and not can_own_uploaded_voices(next_config.capabilities)
         ):
             return (
@@ -589,7 +588,7 @@ def register_admin_routes(
         worker = _find_worker(workers, worker_id)
         if worker is None:
             return _error_response(404, "worker not found")
-        if voice_routing is not None and worker.url == voice_routing.owner_url:
+        if voice_routing is not None and voice_routing.is_owner(worker):
             return _error_response(409, "voice owner worker cannot be deleted")
         workers.remove(worker)
         logger.info(

@@ -272,10 +272,6 @@ class ProxyHandler:
     def admission(self) -> AdmissionController:
         return self._admission
 
-    @property
-    def voice_routing(self) -> VoiceRoutingState | None:
-        return self._voice_routing
-
     async def forward_model_request(self, request: Request, path: str) -> Response:
         # Note (Jiaxin Deng): reject before reading the body; past the bound
         # the relay must shed load, not queue it.
@@ -460,7 +456,7 @@ class ProxyHandler:
                 metadata.required_capabilities.add("audio_input")
             if voice_control or uploaded_voice_request:
                 return require_eligible_worker(
-                    self._voice_routing.owner,
+                    self._voice_routing.resolve_owner(),
                     required_capabilities=metadata.required_capabilities,
                     requested_model=metadata.model,
                 )

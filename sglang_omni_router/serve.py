@@ -388,6 +388,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 parser.exit(130)
             return
         logger.info(f"Starting SGLang-Omni Router on {config.host}:{config.port}")
+        voice_owner = config.voice_owner_worker_url or "auto:first-capable"
         logger.info(
             f"Router configuration: workers={len(config.workers)} | "
             f"policy={config.policy} | "
@@ -400,7 +401,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             f"health_check_endpoint={config.health_check_endpoint} | "
             f"health_check_interval_secs={config.health_check_interval_secs} | "
             f"health_check_timeout_secs={config.health_check_timeout_secs} | "
-            f"voice_owner_worker={config.resolved_voice_owner_worker_url} | "
+            f"voice_owner_worker={voice_owner} | "
             f"readiness_requires_routable_worker=true"
         )
         uvicorn.run(

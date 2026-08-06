@@ -26,6 +26,7 @@ from sglang_omni_router.config import (
     RouterConfig,
     WorkerConfig,
 )
+from sglang_omni_router.health import HealthChecker
 from sglang_omni_router.route_metadata import RouteKind
 from sglang_omni_router.selector import WorkerSelector
 from sglang_omni_router.update_journal import JournalUnwritableError, UpdateJournal
@@ -3355,31 +3356,50 @@ def test_max_connections_auto_at_cap_still_warns_when_pool_outgrows_it(
     assert any("under-feed" in record.getMessage() for record in caplog.records)
 
 
-def test_voice_owner_defaults_to_first_capable_worker() -> None:
-    config = _router_config()
-    assert config.resolved_voice_owner_worker_url == "http://worker-a:8101"
+@pytest.mark.asyncio
+async def test_lifespan_unwinds_all_resources_when_voice_stop_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
 
-    heterogeneous = _router_config(
-        worker_configs=[
-            WorkerConfig(url="http://worker-a:8101", capabilities={"chat"}),
-            WorkerConfig(
-                url="http://worker-b:8102",
-                capabilities={"speech", "audio_input"},
-            ),
-        ]
-    )
-    assert heterogeneous.resolved_voice_owner_worker_url == "http://worker-b:8102"
+    async def health_start(_self) -> None:
+        events.append("health_start")
 
-    speech_only = _router_config(
-        worker_configs=[
-            WorkerConfig(
-                url="http://worker-a:8101",
-                capabilities={"speech", "streaming", "audio_output"},
-            )
-        ]
-    )
-    assert speech_only.resolved_voice_owner_worker_url is None
+    async def health_stop(_self) -> None:
+        events.append("health_stop")
 
+    async def voice_start(_self) -> None:
+        events.append("voice_start")
+
+    async def voice_stop(_self) -> None:
+        events.append("voice_stop")
+        raise RuntimeError("voice stop failed")
+
+    async def client_close(_self) -> None:
+        events.append("client_close")
+
+    monkeypatch.setattr(HealthChecker, "start", health_start)
+    monkeypatch.setattr(HealthChecker, "stop", health_stop)
+    monkeypatch.setattr(VoiceRoutingState, "start", voice_start)
+    monkeypatch.setattr(VoiceRoutingState, "stop", voice_stop)
+    monkeypatch.setattr(httpx.AsyncClient, "aclose", client_close)
+
+    app = create_app(_router_config())
+    with pytest.raises(RuntimeError, match="voice stop failed"):
+        async with app.router.lifespan_context(app):
+            pass
+
+    assert events == [
+        "health_start",
+        "voice_start",
+        "voice_stop",
+        "health_stop",
+        "client_close",
+        "client_close",
+    ]
+
+
+def test_voice_owner_config_must_identify_a_capable_worker() -> None:
     with pytest.raises(
         ValueError,
         match="voice_owner_worker_url must identify a configured worker",
@@ -3415,7 +3435,7 @@ async def test_automatic_voice_owner_tracks_dynamic_worker_registration() -> Non
             timeout_secs=5,
             retry_interval_secs=1,
         )
-        assert state.owner is None
+        assert state.resolve_owner() is None
         assert not state.requires_owner({"preset"})
 
         workers.append(
@@ -3428,8 +3448,8 @@ async def test_automatic_voice_owner_tracks_dynamic_worker_registration() -> Non
                 ]
             )[0]
         )
-        assert state.owner is workers[1]
-        assert state.owner_url == "http://worker-b:8102"
+        assert state.resolve_owner() is workers[1]
+        assert state.is_owner(workers[1])
         assert state.requires_owner({"preset"})
         workers[0].replace_config(
             WorkerConfig(
@@ -3437,7 +3457,7 @@ async def test_automatic_voice_owner_tracks_dynamic_worker_registration() -> Non
                 capabilities={"speech", "audio_input"},
             )
         )
-        assert state.owner is workers[1]
+        assert state.resolve_owner() is workers[1]
 
 
 def test_voice_registry_mutation_before_hydration_preserves_owner_state() -> None:

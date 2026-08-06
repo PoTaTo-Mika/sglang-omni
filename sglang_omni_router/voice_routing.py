@@ -57,8 +57,8 @@ class VoiceRoutingState:
         self._pending_mutations: dict[str, bool] = {}
         self._task: asyncio.Task[None] | None = None
 
-    @property
-    def owner(self) -> Worker | None:
+    def resolve_owner(self) -> Worker | None:
+        """Return the fixed voice owner, selecting it once when configured as auto."""
         if self._owner_url is None:
             owner = next(
                 (
@@ -76,10 +76,9 @@ class VoiceRoutingState:
             None,
         )
 
-    @property
-    def owner_url(self) -> str | None:
-        owner = self.owner
-        return None if owner is None else owner.url
+    def is_owner(self, worker: Worker) -> bool:
+        owner = self.resolve_owner()
+        return owner is not None and owner.url == worker.url
 
     async def start(self) -> None:
         if self._hydrated:
@@ -103,7 +102,7 @@ class VoiceRoutingState:
         *,
         body_exceeds_metadata_limit: bool = False,
     ) -> bool:
-        if self.owner is None:
+        if self.resolve_owner() is None:
             return False
         if body_exceeds_metadata_limit:
             return True
@@ -123,7 +122,7 @@ class VoiceRoutingState:
 
     async def _run_hydration(self) -> None:
         while not self._hydrated:
-            owner = self.owner
+            owner = self.resolve_owner()
             if owner is not None and owner.is_routable:
                 await self._hydrate_from(owner)
             if not self._hydrated:
@@ -137,7 +136,7 @@ class VoiceRoutingState:
             )
             response.raise_for_status()
             uploaded_names = _uploaded_voice_names(response.json())
-        except (httpx.HTTPError, ValueError, TypeError) as exc:
+        except (httpx.HTTPError, ValueError) as exc:
             logger.warning(
                 "voice_registry_hydration_failed worker=%s error=%s",
                 owner.display_id,

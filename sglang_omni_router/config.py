@@ -257,19 +257,6 @@ class RouterConfig(BaseModel):
                 )
         return self
 
-    @property
-    def resolved_voice_owner_worker_url(self) -> str | None:
-        if self.voice_owner_worker_url is not None:
-            return self.voice_owner_worker_url
-        return next(
-            (
-                worker.url
-                for worker in self.workers
-                if can_own_uploaded_voices(worker.capabilities)
-            ),
-            None,
-        )
-
     @model_validator(mode="after")
     def _resolve_max_connections(self) -> "RouterConfig":
         if self.max_connections is None:
