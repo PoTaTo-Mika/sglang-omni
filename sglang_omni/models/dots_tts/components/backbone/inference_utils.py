@@ -34,6 +34,8 @@ def project_attention(
     rotary_sin: torch.Tensor | None = None,
     key_prefix: torch.Tensor | None = None,
     value_prefix: torch.Tensor | None = None,
+    kv_buffer: tuple[torch.Tensor, torch.Tensor] | None = None,
+    kv_prefix_len: int = 0,
     attn_mask: torch.Tensor | None = None,
     is_causal: bool = False,
     dropout_p: float | None = None,
@@ -57,7 +59,18 @@ def project_attention(
         q = (q * cos + rotate_half(q) * sin).to(dtype=q.dtype)
         k = (k * cos + rotate_half(k) * sin).to(dtype=k.dtype)
 
-    if key_prefix is not None or value_prefix is not None:
+    if kv_buffer is not None:
+        # note (chenyang): the caller owns a buffer whose first kv_prefix_len
+        # positions already hold the cached keys/values. Writing this step's
+        # k/v straight after them keeps the attention inputs allocation-free,
+        # which is what keeps engine memory flat across a whole generation.
+        key_buffer, value_buffer = kv_buffer
+        end = int(kv_prefix_len) + seq_len
+        key_buffer[:, :, int(kv_prefix_len) : end, :] = k
+        value_buffer[:, :, int(kv_prefix_len) : end, :] = v
+        key = key_buffer[:, :, :end, :]
+        value = value_buffer[:, :, :end, :]
+    elif key_prefix is not None or value_prefix is not None:
         if key_prefix is None or value_prefix is None:
             raise ValueError("key_prefix and value_prefix must be provided together.")
         key = torch.cat([key_prefix, k], dim=2)

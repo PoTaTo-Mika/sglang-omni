@@ -74,6 +74,75 @@ class DotsTtsTailSpec:
         return self.patch_capacity * self.unit_len
 
 
+# note (chenyang): calibrated on one H100 at 32 slots (pools 24.95 GB, startup
+# 38.99 GB, steady peak 63.93 GB). Everything the engine touches is either fixed
+# or linear in the slot count, so the planner below inverts this to pick a slot
+# count that fills a memory target instead of letting memory fall out of an
+# arbitrary max_running_requests.
+TAIL_FIXED_OVERHEAD_BYTES = int(6.74 * 2**30)
+TAIL_ACTIVATION_BYTES_PER_SLOT = int(1.787 * 2**30) - int(0.780 * 2**30)
+
+
+def tail_pool_bytes_per_slot(
+    *,
+    nfe: int,
+    patch_capacity: int,
+    unit_len: int,
+    dit_layers: int,
+    dit_heads: int,
+    dit_head_dim: int,
+    encoder_layers: int,
+    encoder_heads: int,
+    encoder_head_dim: int,
+    encoder_block: int,
+    element_size: int = 2,
+) -> int:
+    """Bytes one slot costs in the tail's static pools plus gather scratch."""
+    cache_tokens = patch_capacity * unit_len
+    query = 2 * unit_len
+    encoder_tokens = patch_capacity * encoder_block
+    dit_pool = nfe * dit_layers * dit_heads * cache_tokens * dit_head_dim
+    dit_scratch = dit_layers * dit_heads * (cache_tokens + query) * dit_head_dim
+    enc_pool = encoder_layers * encoder_heads * encoder_tokens * encoder_head_dim
+    enc_scratch = (
+        encoder_layers
+        * encoder_heads
+        * (encoder_tokens + encoder_block)
+        * encoder_head_dim
+    )
+    return 2 * element_size * (dit_pool + dit_scratch + enc_pool + enc_scratch)
+
+
+def plan_tail_slots(
+    *,
+    total_gpu_bytes: int,
+    gpu_memory_utilization: float,
+    pool_bytes_per_slot: int,
+    kv_bytes_per_slot: int,
+    max_slots: int | None = None,
+) -> int:
+    """Slot count whose static pools plus activations fill the memory target.
+
+    Mirrors how SGLang sizes its KV pool: pick the budget first, then derive the
+    batch capacity, so the engine reaches a stable footprint at startup instead
+    of drifting with load.
+    """
+    budget = int(total_gpu_bytes * float(gpu_memory_utilization))
+    per_slot = (
+        int(pool_bytes_per_slot)
+        + int(kv_bytes_per_slot)
+        + TAIL_ACTIVATION_BYTES_PER_SLOT
+    )
+    slots = (budget - TAIL_FIXED_OVERHEAD_BYTES) // per_slot
+    if slots < 1:
+        raise ValueError(
+            "dots.tts cannot fit a single tail slot in "
+            f"{budget / 2**30:.1f} GiB; lower max_audio_patches or raise "
+            "gpu_memory_utilization"
+        )
+    return int(slots if max_slots is None else min(slots, int(max_slots)))
+
+
 def batched_causal_update_mask(
     *,
     capacity_tokens: int,
@@ -189,6 +258,45 @@ class DotsTtsAcousticTail:
         self._window = zeros(spec.num_slots, spec.window_len, spec.fm_hidden_size)
         self._all_mods = zeros(spec.nfe, spec.num_slots, mods_width)
 
+        # note (chenyang): every decode step needs the cached K/V of the active
+        # rows plus room for this step's fresh K/V. Both are gathered into these
+        # fixed buffers instead of being allocated per step, so the engine's
+        # memory footprint is decided entirely at startup and stays flat no
+        # matter how long a generation runs or how full the batch is.
+        dit_query = 2 * spec.unit_len
+        self._dit_scratch_k = zeros(
+            self._dit_layers,
+            spec.num_slots,
+            self._dit_heads,
+            spec.dit_cache_tokens + dit_query,
+            self._dit_head_dim,
+        )
+        self._dit_scratch_v = torch.zeros_like(self._dit_scratch_k)
+        self._dit_mask = torch.zeros(
+            (spec.num_slots, 1, dit_query, spec.dit_cache_tokens + dit_query),
+            device=self.device,
+            dtype=torch.bool,
+        )
+        encoder_tokens = spec.patch_capacity * self._encoder_block
+        self._encoder_scratch_k = zeros(
+            self._encoder_layers,
+            spec.num_slots,
+            self._encoder_heads,
+            encoder_tokens + self._encoder_block,
+            self._encoder_head_dim,
+        )
+        self._encoder_scratch_v = torch.zeros_like(self._encoder_scratch_k)
+        self._encoder_mask = torch.zeros(
+            (
+                spec.num_slots,
+                1,
+                self._encoder_block,
+                encoder_tokens + self._encoder_block,
+            ),
+            device=self.device,
+            dtype=torch.bool,
+        )
+
         logger.info(
             "dots.tts acoustic tail pools: slots=%s nfe=%s patch_capacity=%s "
             "dit_cache_tokens=%s pool_bytes=%s",
@@ -197,7 +305,12 @@ class DotsTtsAcousticTail:
             spec.patch_capacity,
             spec.dit_cache_tokens,
             2
-            * (self._dit_k.numel() + self._encoder_k.numel())
+            * (
+                self._dit_k.numel()
+                + self._encoder_k.numel()
+                + self._dit_scratch_k.numel()
+                + self._encoder_scratch_k.numel()
+            )
             * self._dit_k.element_size(),
         )
 
@@ -430,67 +543,68 @@ class DotsTtsAcousticTail:
         spec = self.spec
         rows = len(slots)
         unit = spec.unit_len
+        query = 2 * unit
         prev_unit = self._window[slot_index, :unit]
         current_hidden = self._window[slot_index, unit:]
         latent_slice = slice(
             unit + spec.hidden_patch_size,
             unit + spec.hidden_patch_size + spec.latent_patch_size,
         )
-        sdpa_mask = batched_causal_update_mask(
+
+        sdpa_mask = self._dit_mask[:rows, :, :, : capacity + query]
+        self._fill_causal_update_mask(
+            sdpa_mask,
             capacity_tokens=capacity,
             valid_persistent=persistent_index,
             prev_len=unit,
             current_len=unit,
         )
         cos, sin = rotary_cos_sin(
-            self._dit_rotary, start_pos=persistent_index, seq_len=2 * unit
+            self._dit_rotary, start_pos=persistent_index, seq_len=query
         )
         mods = self._all_mods.index_select(1, slot_index)
-
-        # note (chenyang): every ODE step reads only cache rows below its own
-        # valid prefix and writes rows above it, so one gather up front is
-        # equivalent to gathering inside the loop and costs one kernel per step
-        # instead of two.
-        cache_k = self._dit_k[:, :, :, :, :capacity].index_select(2, slot_index)
-        cache_v = self._dit_v[:, :, :, :, :capacity].index_select(2, slot_index)
         token_index = persistent_index.reshape(1, rows, 1) + torch.arange(
             unit, device=self.device
         ).reshape(1, 1, unit)
         layer_index = self._dit_layer_index.reshape(self._dit_layers, 1, 1)
         batch_index = slot_index.reshape(1, rows, 1)
+        # The fresh K/V land right after the gathered prefix, so the first
+        # ``unit`` of them is exactly the block promoted into the cache below.
+        promote = slice(capacity, capacity + unit)
 
         latent = self._sample_noise(slots)
-        new_k = torch.empty(
-            self._dit_layers,
-            rows,
-            self._dit_heads,
-            unit,
-            self._dit_head_dim,
-            device=self.device,
-            dtype=self.dtype,
-        )
-        new_v = torch.empty_like(new_k)
         with sdpa_kernel(_TAIL_SDPA_BACKENDS):
             for ode_idx in range(spec.nfe):
-                step_k, step_v = cache_k[ode_idx], cache_v[ode_idx]
+                key_buffer = self._dit_scratch_k[:, :rows, :, : capacity + query, :]
+                value_buffer = self._dit_scratch_v[:, :rows, :, : capacity + query, :]
+                torch.index_select(
+                    self._dit_k[ode_idx, :, :, :, :capacity],
+                    1,
+                    slot_index,
+                    out=key_buffer[:, :, :, :capacity, :],
+                )
+                torch.index_select(
+                    self._dit_v[ode_idx, :, :, :, :capacity],
+                    1,
+                    slot_index,
+                    out=value_buffer[:, :, :, :capacity, :],
+                )
 
                 def cached_attention(
                     layer_idx: int, block: nn.Module, attn_in: torch.Tensor
                 ) -> torch.Tensor:
-                    out, key, value = project_attention(
+                    out, _key, _value = project_attention(
                         block.attn,
                         attn_in,
                         num_heads=self._dit_heads,
                         head_dim=self._dit_head_dim,
                         rotary_cos=cos,
                         rotary_sin=sin,
-                        key_prefix=step_k[layer_idx],
-                        value_prefix=step_v[layer_idx],
+                        kv_buffer=(key_buffer[layer_idx], value_buffer[layer_idx]),
+                        kv_prefix_len=capacity,
                         attn_mask=sdpa_mask,
                         dropout_p=0.0,
                     )
-                    new_k[layer_idx].copy_(key[:, :, :unit, :])
-                    new_v[layer_idx].copy_(value[:, :, :unit, :])
                     return out
 
                 x = torch.cat(
@@ -505,12 +619,33 @@ class DotsTtsAcousticTail:
                 )
                 latent = (latent + duration.view(-1, 1, 1) * velocity).clone()
                 self._dit_k[ode_idx][layer_index, batch_index, :, token_index] = (
-                    new_k.permute(0, 1, 3, 2, 4)
+                    key_buffer[:, :, :, promote, :].permute(0, 1, 3, 2, 4)
                 )
                 self._dit_v[ode_idx][layer_index, batch_index, :, token_index] = (
-                    new_v.permute(0, 1, 3, 2, 4)
+                    value_buffer[:, :, :, promote, :].permute(0, 1, 3, 2, 4)
                 )
         return latent
+
+    @staticmethod
+    def _fill_causal_update_mask(
+        out: torch.Tensor,
+        *,
+        capacity_tokens: int,
+        valid_persistent: torch.Tensor,
+        prev_len: int,
+        current_len: int,
+    ) -> None:
+        """Write :func:`batched_causal_update_mask` into a preallocated view."""
+        q_len = int(prev_len) + int(current_len)
+        device = valid_persistent.device
+        total_kv = int(capacity_tokens) + q_len
+        kv_idx = torch.arange(total_kv, device=device)
+        q_idx = torch.arange(q_len, device=device).reshape(q_len, 1)
+        tail_idx = kv_idx.reshape(1, total_kv) - int(capacity_tokens)
+        prev_causal = (tail_idx >= 0) & (tail_idx < int(prev_len)) & (tail_idx <= q_idx)
+        tail = torch.where(q_idx < int(prev_len), prev_causal, tail_idx >= 0)
+        past = kv_idx.reshape(1, 1, 1, total_kv) < valid_persistent.reshape(-1, 1, 1, 1)
+        torch.logical_or(past, tail.reshape(1, 1, q_len, total_kv), out=out)
 
     def _sample_noise(self, slots: list[int]) -> torch.Tensor:
         spec = self.spec
@@ -550,7 +685,9 @@ class DotsTtsAcousticTail:
             )
         start_index = torch.tensor(starts, device=self.device, dtype=torch.long)
 
-        sdpa_mask = batched_causal_update_mask(
+        sdpa_mask = self._encoder_mask[:rows, :, :, : capacity + block]
+        self._fill_causal_update_mask(
+            sdpa_mask,
             capacity_tokens=capacity,
             valid_persistent=start_index,
             prev_len=block,
@@ -564,13 +701,26 @@ class DotsTtsAcousticTail:
                 self._encoder_rotary, start_pos=start_index, seq_len=block
             )
 
-        cache_k = self._encoder_k[:, :, :, :capacity].index_select(1, slot_index)
-        cache_v = self._encoder_v[:, :, :, :capacity].index_select(1, slot_index)
+        key_buffer = self._encoder_scratch_k[:, :rows, :, : capacity + block, :]
+        value_buffer = self._encoder_scratch_v[:, :rows, :, : capacity + block, :]
+        torch.index_select(
+            self._encoder_k[:, :, :, :capacity],
+            1,
+            slot_index,
+            out=key_buffer[:, :, :, :capacity, :],
+        )
+        torch.index_select(
+            self._encoder_v[:, :, :, :capacity],
+            1,
+            slot_index,
+            out=value_buffer[:, :, :, :capacity, :],
+        )
         with sdpa_kernel(_TAIL_SDPA_BACKENDS):
-            embedding, conv_tail, new_k, new_v = self._encoder_step(
+            embedding, conv_tail = self._encoder_step(
                 latent_patches.to(dtype=self.dtype),
                 self._encoder_conv_tail.index_select(0, slot_index),
-                tuple(zip(cache_k, cache_v, strict=True)),
+                (key_buffer, value_buffer),
+                capacity,
                 sdpa_mask,
                 cos,
                 sin,
@@ -581,12 +731,13 @@ class DotsTtsAcousticTail:
         ).reshape(1, 1, block)
         layer_index = self._encoder_layer_index.reshape(self._encoder_layers, 1, 1)
         batch_index = slot_index.reshape(1, rows, 1)
-        self._encoder_k[layer_index, batch_index, :, token_index] = new_k.permute(
-            0, 1, 3, 2, 4
-        )
-        self._encoder_v[layer_index, batch_index, :, token_index] = new_v.permute(
-            0, 1, 3, 2, 4
-        )
+        promote = slice(capacity, capacity + block)
+        self._encoder_k[layer_index, batch_index, :, token_index] = key_buffer[
+            :, :, :, promote, :
+        ].permute(0, 1, 3, 2, 4)
+        self._encoder_v[layer_index, batch_index, :, token_index] = value_buffer[
+            :, :, :, promote, :
+        ].permute(0, 1, 3, 2, 4)
         self._encoder_conv_tail[slot_index] = conv_tail
         for slot in slots:
             self._encoder_seq_len[slot] += block

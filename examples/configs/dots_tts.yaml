@@ -25,6 +25,7 @@ stages:
       num_steps: 4
       eos_threshold: 0.8
       max_audio_patches: 500
+      max_running_requests: 16
       server_args_overrides:
         chunked_prefill_size: 0
         disable_cuda_graph: true
@@ -32,8 +33,6 @@ stages:
         disable_radix_cache: true
         enable_torch_compile: false
         max_prefill_tokens: 2048
-        max_running_requests: 8
-        mem_fraction_static: 0.35
         sampling_backend: pytorch
         trust_remote_code: false
     gpu: 0

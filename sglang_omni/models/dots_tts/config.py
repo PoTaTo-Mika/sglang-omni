@@ -7,7 +7,12 @@ from typing import ClassVar
 
 from pydantic import Field
 
-from sglang_omni.config import PipelineConfig, StageConfig
+from sglang_omni.config import (
+    PipelineConfig,
+    StageConfig,
+    StageResourceConfig,
+    StageRuntimeConfig,
+)
 
 _PKG = "sglang_omni.models.dots_tts"
 
@@ -30,6 +35,9 @@ def _stages() -> list[StageConfig]:
             process="pipeline",
             factory=f"{_PKG}.stages.create_reference_encode_executor",
             gpu=0,
+            runtime=StageRuntimeConfig(
+                resources=StageResourceConfig(total_gpu_memory_fraction=0.04)
+            ),
             next=TTS_ENGINE_STAGE,
         ),
         StageConfig(
@@ -38,6 +46,9 @@ def _stages() -> list[StageConfig]:
             factory=f"{_PKG}.stages.create_sglang_tts_engine_executor",
             factory_args={"dtype": "bfloat16"},
             gpu=0,
+            runtime=StageRuntimeConfig(
+                resources=StageResourceConfig(total_gpu_memory_fraction=0.84)
+            ),
             next=AUDIO_DECODE_STAGE,
         ),
         StageConfig(
@@ -45,6 +56,9 @@ def _stages() -> list[StageConfig]:
             process="pipeline",
             factory=f"{_PKG}.stages.create_audio_decode_executor",
             gpu=0,
+            runtime=StageRuntimeConfig(
+                resources=StageResourceConfig(total_gpu_memory_fraction=0.04)
+            ),
             terminal=True,
         ),
     ]
@@ -64,12 +78,18 @@ class DotsTtsPipelineConfig(PipelineConfig):
     speech_reference_text_required: ClassVar[bool] = True
 
     @classmethod
+    def talker_sglang_role_to_stage(cls) -> dict[str, str]:
+        return {"talker": TTS_ENGINE_STAGE}
+
+    @classmethod
+    def generation_sglang_role_to_stage(cls) -> dict[str, str]:
+        return {"generation": TTS_ENGINE_STAGE}
+
+    @classmethod
     def process_safe_edges(cls) -> frozenset[tuple[str, str]]:
         # note (chenyang): every stage rebuilds its inputs from the payload
         # state, and audio_decode owns its own vocoder handle, so all three
-        # handoffs stay correct once they cross a process boundary. No memory
-        # fractions are recommended yet; an operator that splits must declare
-        # them explicitly.
+        # handoffs stay correct once they cross a process boundary.
         return frozenset(
             {
                 (PREPROCESSING_STAGE, REFERENCE_ENCODE_STAGE),

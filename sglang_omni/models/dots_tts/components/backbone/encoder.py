@@ -206,40 +206,30 @@ class SemanticEncoderDecodeStep(nn.Module):
         self,
         latent_patch: torch.Tensor,
         conv_tail: torch.Tensor,
-        layer_caches: tuple[tuple[torch.Tensor, torch.Tensor], ...],
+        kv_buffer: tuple[torch.Tensor, torch.Tensor],
+        kv_prefix_len: int,
         attn_mask: torch.Tensor,
         rotary_cos: torch.Tensor,
         rotary_sin: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run one patch; new K/V land in ``kv_buffer`` after ``kv_prefix_len``."""
         x, new_conv_tail = self.downsample(
             self.encoder, latent_patch, conv_tail=conv_tail
         )
-        new_k = torch.empty(
-            self.num_layers,
-            x.size(0),
-            self.num_heads,
-            self.out_ds_rate,
-            self.head_dim,
-            device=x.device,
-            dtype=x.dtype,
-        )
-        new_v = torch.empty_like(new_k)
+        key_buffer, value_buffer = kv_buffer
         for layer_idx, layer in enumerate(self.encoder.encoder.layers):
-            cache_k, cache_v = layer_caches[layer_idx]
-            attn_out, key, value = project_attention(
+            attn_out, _key, _value = project_attention(
                 layer.attn,
                 layer.attn_norm(x),
                 num_heads=self.num_heads,
                 head_dim=self.head_dim,
                 rotary_cos=rotary_cos if layer.attn.rotary_bias else None,
                 rotary_sin=rotary_sin if layer.attn.rotary_bias else None,
-                key_prefix=cache_k,
-                value_prefix=cache_v,
+                kv_buffer=(key_buffer[layer_idx], value_buffer[layer_idx]),
+                kv_prefix_len=kv_prefix_len,
                 attn_mask=attn_mask,
                 dropout_p=0.0,
             )
-            new_k[layer_idx].copy_(key)
-            new_v[layer_idx].copy_(value)
             x = x + attn_out
             x = x + layer.ffn(layer.ffn_norm(x))
-        return self.encoder._project_embeddings(x), new_conv_tail, new_k, new_v
+        return self.encoder._project_embeddings(x), new_conv_tail

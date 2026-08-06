@@ -96,6 +96,7 @@ def create_sglang_tts_engine_executor(
     num_steps: int = DOTS_TTS_DEFAULT_NUM_STEPS,
     eos_threshold: float = DEFAULT_EOS_THRESHOLD,
     max_audio_patches: int = DOTS_TTS_DEFAULT_MAX_AUDIO_PATCHES,
+    max_running_requests: int = 16,
     server_args_overrides: dict[str, Any] | None = None,
     total_gpu_memory_fraction: float | None = None,
 ) -> Any:
@@ -111,6 +112,7 @@ def create_sglang_tts_engine_executor(
         num_steps=num_steps,
         eos_threshold=eos_threshold,
         max_audio_patches=max_audio_patches,
+        max_running_requests=max_running_requests,
         total_gpu_memory_fraction=total_gpu_memory_fraction,
     ).build(
         model_path,
