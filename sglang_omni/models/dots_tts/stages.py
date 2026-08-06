@@ -166,8 +166,8 @@ def _load_audio_vae(
     from sglang_omni.models.dots_tts.components.vocoder.bigvgan import AudioVAE
 
     audio_vae = AudioVAE(model_config.vocoder).eval()
-    # The checkpoint was saved after weight-norm removal, so mirror that here
-    # before loading or the parameter names will not line up.
+    # note (chenyang): the checkpoint was saved after weight-norm removal, so
+    # mirror that here before loading or the parameter names will not line up.
     audio_vae.remove_weight_norm()
     count = load_dots_tts_module_weights(
         audio_vae, f"{checkpoint_dir}/{DOTS_TTS_VOCODER_FILENAME}"

@@ -299,3 +299,78 @@ def test_slot_pool_is_bounded_and_reusable() -> None:
 
     tail.release_slot(first)
     assert tail.acquire_slot() == first
+
+
+def test_prefill_failure_releases_the_slot() -> None:
+    """A prefill that raises must not strand its slot in the pool.
+
+    The slot is only reachable through the runner's ``_request_states``, so a
+    leak here is unrecoverable: after ``num_slots`` failures every later request
+    dies in ``acquire_slot`` and the engine needs a restart.
+    """
+    from sglang_omni.models.dots_tts.model_runner import DotsTTSModelRunner
+
+    model = _TailModelStub().eval()
+    tail = _build_tail(model, num_slots=2, patch_capacity=8)
+
+    class _Model:
+        latent_dim = LATENT_DIM
+        latent_patch_size = PATCH_SIZE
+
+        def __init__(self) -> None:
+            self.tail = tail
+            self._decode_input_embedding = torch.nn.Embedding(2, FM_HIDDEN)
+
+        def patch_encoder_input(self, latents, *, normalized):
+            raise RuntimeError("prompt audio exceeds the patch-encoder cache")
+
+        def speaker_condition(self, embedding, scale):
+            return torch.zeros(1, FM_HIDDEN)
+
+        def meanflow_modulations(self, g_cond, *, nfe):
+            return torch.zeros(nfe, 8)
+
+    runner = object.__new__(DotsTTSModelRunner)
+    runner.model = _Model()
+    runner.device = torch.device("cpu")
+    runner._nfe = NFE
+    runner._request_states = {}
+
+    payload_state = type(
+        "_State",
+        (),
+        {
+            "spk_emb": torch.zeros(1, 8),
+            "prompt_latent": torch.zeros(1, PATCH_SIZE, LATENT_DIM),
+            "speaker_scale": 1.5,
+            "seed": None,
+        },
+    )()
+    sched_req = type(
+        "_Req",
+        (),
+        {
+            "request_id": "req",
+            "data": type(
+                "_Data",
+                (),
+                {
+                    "state": payload_state,
+                    "prompt_patch_count": 1,
+                    "prompt_span_start": 1,
+                    "input_ids": torch.zeros(2, dtype=torch.long),
+                },
+            )(),
+        },
+    )()
+
+    free_before = len(tail._free_slots)
+    for _attempt in range(free_before + 2):
+        try:
+            runner._materialize_request_state(sched_req)
+        except RuntimeError:
+            pass
+        else:  # pragma: no cover - the stub always raises
+            raise AssertionError("_materialize_request_state must propagate")
+    assert len(tail._free_slots) == free_before
+    assert runner._request_states == {}

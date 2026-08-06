@@ -80,7 +80,8 @@ class DotsTtsEngineBuilder(TtsEngineBuilder):
         }
 
     def adjust_overrides(self, overrides: dict[str, Any]) -> None:
-        # context_length is supplied by build_sglang_server_args directly.
+        # note (chenyang): context_length reaches ServerArgs through
+        # build_sglang_server_args, so an override here would be applied twice.
         overrides.pop("context_length", None)
         overrides["tp_size"] = 1
 

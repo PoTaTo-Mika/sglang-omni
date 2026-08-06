@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 import torch
@@ -68,8 +69,8 @@ class DotsTtsTailSpec:
 
     @property
     def dit_cache_tokens(self) -> int:
-        # One hidden row plus latent_patch_size latent rows per audio patch; the
-        # cache never has to hold the trailing window.
+        # note (chenyang): one hidden row plus latent_patch_size latent rows per
+        # audio patch; the cache never has to hold the trailing window.
         return self.patch_capacity * self.unit_len
 
 
@@ -145,53 +146,7 @@ class DotsTtsAcousticTail:
         self._encoder_heads = int(encoder_attn.num_heads)
         self._encoder_head_dim = int(encoder_attn.head_dim)
 
-        # note (chenyang): the MeanFlow modulations differ per ODE step, so the
-        # cached keys/values of the same flow prefix do too and the DiT pool
-        # needs one cache per step.
-        self._dit_k = torch.zeros(
-            (
-                spec.nfe,
-                self._dit_layers,
-                spec.num_slots,
-                self._dit_heads,
-                spec.dit_cache_tokens,
-                self._dit_head_dim,
-            ),
-            device=device,
-            dtype=dtype,
-        )
-        self._dit_v = torch.zeros_like(self._dit_k)
-        self._encoder_k = torch.zeros(
-            (
-                self._encoder_layers,
-                spec.num_slots,
-                self._encoder_heads,
-                spec.patch_capacity * self._encoder_block,
-                self._encoder_head_dim,
-            ),
-            device=device,
-            dtype=dtype,
-        )
-        self._encoder_v = torch.zeros_like(self._encoder_k)
-        self._encoder_conv_tail = torch.zeros(
-            (
-                spec.num_slots,
-                int(patch_encoder.ds_proj.in_channels),
-                int(patch_encoder.ds_proj.left_padding),
-            ),
-            device=device,
-            dtype=dtype,
-        )
-        self._window = torch.zeros(
-            (spec.num_slots, spec.window_len, spec.fm_hidden_size),
-            device=device,
-            dtype=dtype,
-        )
-        self._all_mods = torch.zeros(
-            (spec.nfe, spec.num_slots, int(dit.fused_adaln[-1].out_features)),
-            device=device,
-            dtype=dtype,
-        )
+        self._allocate_pools(int(dit.fused_adaln[-1].out_features))
         self._times = torch.linspace(0.0, 1.0, spec.nfe + 1, device=device, dtype=dtype)
         self._dit_layer_index = torch.arange(self._dit_layers, device=device)
         self._encoder_layer_index = torch.arange(self._encoder_layers, device=device)
@@ -200,6 +155,39 @@ class DotsTtsAcousticTail:
         self._encoder_seq_len = [0] * spec.num_slots
         self._generators: list[torch.Generator | None] = [None] * spec.num_slots
         self._free_slots = list(reversed(range(spec.num_slots)))
+
+    def _allocate_pools(self, mods_width: int) -> None:
+        """Allocate every slot-indexed buffer the tail keeps for a whole run."""
+        spec = self.spec
+        zeros = partial(torch.zeros, device=self.device, dtype=self.dtype)
+
+        # note (chenyang): the MeanFlow modulations differ per ODE step, so the
+        # cached keys/values of the same flow prefix do too and the DiT pool
+        # needs one cache per step.
+        self._dit_k = zeros(
+            spec.nfe,
+            self._dit_layers,
+            spec.num_slots,
+            self._dit_heads,
+            spec.dit_cache_tokens,
+            self._dit_head_dim,
+        )
+        self._dit_v = torch.zeros_like(self._dit_k)
+        self._encoder_k = zeros(
+            self._encoder_layers,
+            spec.num_slots,
+            self._encoder_heads,
+            spec.patch_capacity * self._encoder_block,
+            self._encoder_head_dim,
+        )
+        self._encoder_v = torch.zeros_like(self._encoder_k)
+        self._encoder_conv_tail = zeros(
+            spec.num_slots,
+            int(self._encoder.ds_proj.in_channels),
+            int(self._encoder.ds_proj.left_padding),
+        )
+        self._window = zeros(spec.num_slots, spec.window_len, spec.fm_hidden_size)
+        self._all_mods = zeros(spec.nfe, spec.num_slots, mods_width)
 
         logger.info(
             "dots.tts acoustic tail pools: slots=%s nfe=%s patch_capacity=%s "
@@ -346,7 +334,9 @@ class DotsTtsAcousticTail:
                 keys: list[torch.Tensor] = []
                 values: list[torch.Tensor] = []
 
-                def collect(_layer_idx, block, attn_in, keys=keys, values=values):
+                def collect(
+                    _layer_idx: int, block: nn.Module, attn_in: torch.Tensor
+                ) -> torch.Tensor:
                     out, key, value = project_attention(
                         block.attn,
                         attn_in,
@@ -484,7 +474,9 @@ class DotsTtsAcousticTail:
             for ode_idx in range(spec.nfe):
                 step_k, step_v = cache_k[ode_idx], cache_v[ode_idx]
 
-                def cached_attention(layer_idx, block, attn_in, k=step_k, v=step_v):
+                def cached_attention(
+                    layer_idx: int, block: nn.Module, attn_in: torch.Tensor
+                ) -> torch.Tensor:
                     out, key, value = project_attention(
                         block.attn,
                         attn_in,
@@ -492,8 +484,8 @@ class DotsTtsAcousticTail:
                         head_dim=self._dit_head_dim,
                         rotary_cos=cos,
                         rotary_sin=sin,
-                        key_prefix=k[layer_idx],
-                        value_prefix=v[layer_idx],
+                        key_prefix=step_k[layer_idx],
+                        value_prefix=step_v[layer_idx],
                         attn_mask=sdpa_mask,
                         dropout_p=0.0,
                     )

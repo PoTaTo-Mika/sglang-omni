@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -96,38 +96,45 @@ class DotsTTSModelRunner(ModelRunner):
                 f"frames={prompt_latents.size(0)} patches={patch_count}"
             )
 
+        # note (chenyang): the slot is only reachable through _request_states, so
+        # anything that raises before the state is registered would leak it for
+        # the lifetime of the process and eventually exhaust the pool.
         slot = model.tail.acquire_slot()
-        if payload_state.seed is not None:
-            model.tail.set_slot_seed(slot, int(payload_state.seed))
+        try:
+            if payload_state.seed is not None:
+                model.tail.set_slot_seed(slot, int(payload_state.seed))
 
-        with self._tail_autocast():
-            g_cond = model.speaker_condition(
-                speaker_embedding, float(payload_state.speaker_scale)
+            with self._tail_autocast():
+                g_cond = model.speaker_condition(
+                    speaker_embedding, float(payload_state.speaker_scale)
+                )
+                all_mods = model.meanflow_modulations(g_cond, nfe=self._nfe)
+                prompt_patch_embeds = model.tail.encode_prompt_patches(
+                    slot,
+                    model.patch_encoder_input(
+                        prompt_latents, normalized=False
+                    ).unsqueeze(0),
+                )
+
+            span_start = int(data.prompt_span_start)
+            prefill_input_embeds = model.get_input_embeddings()(
+                data.input_ids.to(device=device)
+            ).to(dtype=dtype)
+            prefill_input_embeds[span_start : span_start + patch_count] = (
+                prompt_patch_embeds.to(dtype=dtype)
             )
-            all_mods = model.meanflow_modulations(g_cond, nfe=self._nfe)
-            prompt_patch_embeds = model.tail.encode_prompt_patches(
-                slot,
-                model.patch_encoder_input(prompt_latents, normalized=False).unsqueeze(
-                    0
-                ),
+
+            self._request_states[request_id] = _DotsTtsRequestState(
+                slot=slot,
+                prompt_span_start=span_start,
+                prompt_patch_count=patch_count,
+                prompt_latents=prompt_latents,
+                all_mods=all_mods,
+                prefill_input_embeds=prefill_input_embeds.detach(),
             )
-
-        span_start = int(data.prompt_span_start)
-        prefill_input_embeds = model.get_input_embeddings()(
-            data.input_ids.to(device=device)
-        ).to(dtype=dtype)
-        prefill_input_embeds[span_start : span_start + patch_count] = (
-            prompt_patch_embeds.to(dtype=dtype)
-        )
-
-        self._request_states[request_id] = _DotsTtsRequestState(
-            slot=slot,
-            prompt_span_start=span_start,
-            prompt_patch_count=patch_count,
-            prompt_latents=prompt_latents,
-            all_mods=all_mods,
-            prefill_input_embeds=prefill_input_embeds.detach(),
-        )
+        except BaseException:
+            model.tail.release_slot(slot)
+            raise
 
     def custom_prefill_forward(
         self,
@@ -274,7 +281,7 @@ class DotsTTSModelRunner(ModelRunner):
                 offset += prompt_len
         return torch.stack(last_rows, dim=0)
 
-    def _tail_autocast(self):
+    def _tail_autocast(self) -> AbstractContextManager[None]:
         if self.device.type != "cuda":
             return nullcontext()
         dtype = self.model._decode_input_embedding.weight.dtype
