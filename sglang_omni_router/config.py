@@ -142,12 +142,14 @@ class RouterConfig(BaseModel):
     max_payload_size: int = 512 * 1024 * 1024
     max_connections: int | None = None
     max_inflight: int | None = None
+    shutdown_drain_secs: int | None = None
     health_failure_threshold: int = 3
     health_success_threshold: int = 2
     health_check_timeout_secs: int = 5
     health_check_interval_secs: int = 10
     health_check_endpoint: str = "/health"
     voice_owner_worker_url: str | None = None
+    router_state_dir: str | None = None
 
     @field_validator("port")
     @classmethod
@@ -183,6 +185,22 @@ class RouterConfig(BaseModel):
         if value is not None and value <= 0:
             raise ValueError("max_inflight must be > 0")
         return value
+
+    @field_validator("shutdown_drain_secs")
+    @classmethod
+    def _validate_shutdown_drain_secs(cls, value: int | None) -> int | None:
+        if value is not None and value <= 0:
+            raise ValueError("shutdown_drain_secs must be > 0")
+        return value
+
+    @property
+    def effective_shutdown_drain_secs(self) -> int:
+        # Note (Jiaxin Deng): parity with the single-process router, where
+        # uvicorn has no graceful deadline and an in-flight request is bounded
+        # only by its own request timeout.
+        if self.shutdown_drain_secs is not None:
+            return self.shutdown_drain_secs
+        return self.request_timeout_secs
 
     @property
     def effective_max_inflight(self) -> int:
@@ -280,12 +298,14 @@ def build_router_config(
     max_payload_size: int = 512 * 1024 * 1024,
     max_connections: int | None = None,
     max_inflight: int | None = None,
+    shutdown_drain_secs: int | None = None,
     health_failure_threshold: int = 3,
     health_success_threshold: int = 2,
     health_check_timeout_secs: int = 5,
     health_check_interval_secs: int = 10,
     health_check_endpoint: str = "/health",
     voice_owner_worker_url: str | None = None,
+    router_state_dir: str | None = None,
 ) -> RouterConfig:
     if workers is not None and worker_urls:
         raise ValueError("worker_urls and workers cannot both be provided")
@@ -304,12 +324,14 @@ def build_router_config(
         max_payload_size=max_payload_size,
         max_connections=max_connections,
         max_inflight=max_inflight,
+        shutdown_drain_secs=shutdown_drain_secs,
         health_failure_threshold=health_failure_threshold,
         health_success_threshold=health_success_threshold,
         health_check_timeout_secs=health_check_timeout_secs,
         health_check_interval_secs=health_check_interval_secs,
         health_check_endpoint=health_check_endpoint,
         voice_owner_worker_url=voice_owner_worker_url,
+        router_state_dir=router_state_dir,
     )
 
 
