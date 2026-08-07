@@ -124,8 +124,10 @@ STREAM_DONE_SENTINEL = "[DONE]"
 HTTP_DISCONNECT_POLL_INTERVAL_S = 0.05
 HTTP_DISCONNECT_CANCEL_TIMEOUT_S = 0.1
 _BAD_REQUEST_MARKERS = (
+    "Unsupported language:",
     "longer than the model's context length",
     "Requested token count exceeds the model's maximum context length",
+    "Request requires more tokens than the thinker KV cache can hold",
     "accepts audio up to",
     "max_new_tokens must be",
     "exceeds the maximum allowed length",
