@@ -19,15 +19,15 @@ token sampler. So `temperature` and `top_k` do nothing here — use the solver k
 | Latent patch | 4 frames × 128 dims (one patch ≈ 160 ms of audio) |
 | Context length | 2,048 tokens |
 | Sample rate | 48 kHz |
-| Solver | MeanFlow + Euler, engine-wide `num_steps=4` |
+| Solver | MeanFlow + Euler, engine-wide `num_steps=4` (SOAR: flow matching + CFG, `num_steps=10`) |
 
 ## Supported checkpoints
 
 | Checkpoint | Status |
 |---|---|
-| [`dots-studio/dots.tts-mf`](https://huggingface.co/dots-studio/dots.tts-mf) | Supported (MeanFlow, this guide) |
-| [`dots-studio/dots.tts-soar`](https://huggingface.co/dots-studio/dots.tts-soar) | Not covered by this guide. SOAR is flow matching, so it cannot use the batched acoustic tail; see [#1367](https://github.com/sgl-project/sglang-omni/issues/1367) |
-| [`dots-studio/dots.tts-base`](https://huggingface.co/dots-studio/dots.tts-base) | Not covered by this guide |
+| [`dots-studio/dots.tts-mf`](https://huggingface.co/dots-studio/dots.tts-mf) | MeanFlow. Continuous batching, `num_steps=4`. `examples/configs/dots_tts.yaml` |
+| [`dots-studio/dots.tts-soar`](https://huggingface.co/dots-studio/dots.tts-soar) | Flow matching. Single request at a time (`max_running_requests=1`) with CFG, `num_steps=10`. `examples/configs/dots_tts_soar.yaml` |
+| [`dots-studio/dots.tts-base`](https://huggingface.co/dots-studio/dots.tts-base) | Not supported yet |
 
 Tensor parallelism is out of scope; dots.tts runs TP1.
 
@@ -46,7 +46,24 @@ sgl-omni serve \
   --port 8000
 ```
 
-`examples/configs/dots_tts.yaml` is the canonical deployment. It is already tuned:
+To serve SOAR instead, swap both the checkpoint and the config:
+
+```bash
+hf download dots-studio/dots.tts-soar
+
+sgl-omni serve \
+  --model-path dots-studio/dots.tts-soar \
+  --config examples/configs/dots_tts_soar.yaml \
+  --allowed-local-media-path docs/_static/audio \
+  --port 8000
+```
+
+SOAR is a flow-matching checkpoint. It runs the single-request solver with classifier-free
+guidance, so its config pins `max_running_requests: 1` and `num_steps: 10`; continuous
+batching is MeanFlow-only. Every request example below works on either checkpoint — only
+the `model` field changes.
+
+`examples/configs/dots_tts.yaml` is the canonical MeanFlow deployment. It is already tuned:
 compiled acoustic tail and vocoder (`optimize: true`, on by default), continuous batching
 at `max_running_requests=16`, and the backbone decode CUDA graph. `--model-path` alone
 keeps the compiled tail and batching but leaves backbone decode eager, which is slower
@@ -178,7 +195,7 @@ Reference output:
 | `speaker_scale` | float | `1.5` | Scales the speaker x-vector before conditioning. Higher values push harder toward the reference timbre |
 | `guidance_scale` | float | `1.2` | Classifier-free guidance strength for the flow sampler |
 | `eos_threshold` | float | `0.8` | Probability above which the EOS head ends generation. Lower values cut utterances earlier |
-| `num_steps` | int | `4` | MeanFlow solver steps. **Fixed engine-wide** under continuous batching: a request that asks for a different value is rejected |
+| `num_steps` | int | `4` (MF), `10` (SOAR) | Flow solver steps, taken from the config. **Fixed engine-wide** under continuous batching: with MeanFlow a request asking for a different value is rejected. SOAR runs one request at a time, so it honours a per-request value |
 | `ode_method` | string | `"euler"` | Flow solver. Only `euler` is supported under continuous batching |
 | `max_generate_length` | int | `500` | Cap on generated latent patches (≈ 160 ms each), bounded by the engine's `max_generate_length` |
 | `normalize_text` | bool | `false` | Run the upstream text normalizer (numbers, symbols) before tokenizing |
@@ -189,6 +206,10 @@ Reference output:
 and the acoustic tail is a deterministic flow solve once the seed is fixed.
 
 ### Performance
+
+MeanFlow only. SOAR has had no performance work yet, so numbers for it would set the
+wrong expectation; the batched acoustic tail for flow matching is tracked in
+[#1367](https://github.com/sgl-project/sglang-omni/issues/1367).
 
 Throughput on Seed-TTS EN (full set, **N=1088** per run). Client `--max-concurrency`
 sweep against a single dots.tts server started from `examples/configs/dots_tts.yaml`
