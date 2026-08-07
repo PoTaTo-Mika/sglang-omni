@@ -151,7 +151,8 @@ curl -N -X POST http://localhost:8000/v1/audio/speech \
       "text": "By repeating what students say, teachers can demonstrate that they are listening. By extending what students say."
     }],
     "stream": true,
-    "response_format": "pcm"
+    "response_format": "pcm",
+    "seed": 42
   }' \
   --output output.pcm
 ```
@@ -165,6 +166,8 @@ ffmpeg -f s16le -ar 48000 -ac 1 -i output.pcm output.wav
 
 ### Request parameters
 
+Top-level fields:
+
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `model` | string | served model | Served dots.tts model identifier |
@@ -173,16 +176,43 @@ ffmpeg -f s16le -ar 48000 -ac 1 -i output.pcm output.wav
 | `ref_audio` / `ref_text` | string | `null` | Shorthand for `references[0].audio_path` / `references[0].text` |
 | `response_format` | string | `"wav"` | Output audio format (`wav`, `mp3`, `flac`, `opus`, `aac`, `pcm`) |
 | `stream` | bool | `false` | Enable raw PCM streaming |
-| `seed` | int | `null` | Per-request seed for the flow sampler; fixes the output for a given request |
+| `seed` | int | `null` | Seed for the flow sampler. Fixes the output for a given request |
+| `language` | string | `null` | Language tag for the prompt text; `auto` or `auto_detect` detects it from the input |
+| `instructions` | string | `null` | Style instructions; switches the prompt template to `instruction_tts` |
+
+Solver knobs go under `stage_params.latent_engine`. They are **not** top-level fields:
+`CreateSpeechRequest` drops unknown top-level keys, so sending `num_steps` next to
+`input` changes nothing and reports no error.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
 | `speaker_scale` | float | `1.5` | Scales the speaker x-vector before conditioning. Higher values push harder toward the reference timbre |
 | `guidance_scale` | float | `1.2` | Classifier-free guidance strength for the flow sampler |
 | `eos_threshold` | float | `0.8` | Probability above which the EOS head ends generation. Lower values cut utterances earlier |
-| `num_steps` | int | `4` (MF), `10` (SOAR) | Flow solver steps, taken from the config. **Fixed engine-wide** under continuous batching: with MeanFlow a request asking for a different value is rejected. SOAR runs one request at a time, so it honours a per-request value |
-| `ode_method` | string | `"euler"` | Flow solver. Only `euler` is supported under continuous batching |
+| `num_steps` | int | `4` (MF), `10` (SOAR) | Flow solver steps. MeanFlow fixes this engine-wide: another value fails the request. SOAR and base run one request at a time and honour it |
+| `ode_method` | string | `"euler"` | Flow solver. MeanFlow accepts only `euler` |
 | `max_generate_length` | int | `500` | Cap on generated latent patches (≈ 160 ms each), bounded by the engine's `max_generate_length` |
 | `normalize_text` | bool | `false` | Run the upstream text normalizer (numbers, symbols) before tokenizing |
-| `language` | string | `null` | Language tag for the prompt text; `auto` or `auto_detect` detects it from the input |
-| `instructions` | string | `null` | Style instructions; switches the prompt template to `instruction_tts` |
+
+```bash
+curl -X POST http://localhost:8000/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "dots-studio/dots.tts-mf",
+    "input": "Have a nice day and enjoy south california sunshine.",
+    "references": [{
+      "audio_path": "docs/_static/audio/male-voice.wav",
+      "text": "Hey, Adam here. Let'\''s create something that feels real, sounds human, and connects every time."
+    }],
+    "seed": 42,
+    "stage_params": {"latent_engine": {"speaker_scale": 2.0, "eos_threshold": 0.6}}
+  }' \
+  --output output.wav
+```
+
+A rejected solver value comes back as HTTP 500 with the engine's message, for example
+`dots.tts num_steps is fixed for continuous batching`. It is a validation failure, not a
+server fault.
 
 `temperature`, `top_p`, and `top_k` do not apply. The backbone token logits are unused,
 and the acoustic tail is a deterministic flow solve once the seed is fixed.
