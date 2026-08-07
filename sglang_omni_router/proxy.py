@@ -4,12 +4,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 import weakref
 from collections.abc import Callable
-from email import policy
-from email.parser import BytesParser
+from dataclasses import dataclass
 from http import HTTPStatus
 from urllib.parse import unquote
 
@@ -86,6 +86,19 @@ _SSE_UPSTREAM_ERROR_EVENT = (
 )
 
 _OVERLOAD_RETRY_AFTER_SECS = "1"
+
+
+@dataclass(frozen=True)
+class _VoiceUploadRequest:
+    pass
+
+
+@dataclass(frozen=True)
+class _VoiceDeleteRequest:
+    mutation: VoiceMutation
+
+
+_VoiceMutationRequest = _VoiceUploadRequest | _VoiceDeleteRequest
 
 
 class PayloadTooLargeError(ValueError):
@@ -261,7 +274,6 @@ class ProxyHandler:
         self._worker_provider = worker_provider
         self._on_worker_failure = on_worker_failure
         self._voice_routing = voice_routing
-        self._voice_mutation_lock = asyncio.Lock()
 
     def _current_workers(self) -> list[Worker]:
         if self._worker_provider is not None:
@@ -362,11 +374,19 @@ class ProxyHandler:
                 content={"error": {"message": str(exc)}},
             )
 
-        extra_capabilities, large_request_error = (
-            _large_request_extra_capabilities_or_error(
-                self._current_workers(), metadata
-            )
+        voice_owner_handles_large_body = (
+            self._voice_routing is not None
+            and metadata.body_exceeds_metadata_limit
+            and metadata.route_kind in {RouteKind.SPEECH, RouteKind.SPEECH_BATCH}
         )
+        if voice_owner_handles_large_body:
+            extra_capabilities, large_request_error = set(), None
+        else:
+            extra_capabilities, large_request_error = (
+                _large_request_extra_capabilities_or_error(
+                    self._current_workers(), metadata
+                )
+            )
         if large_request_error is not None:
             self._log_route_rejection(
                 request=request,
@@ -382,19 +402,14 @@ class ProxyHandler:
         metadata.required_capabilities.update(extra_capabilities)
 
         voice_mutation = (
-            self._voice_mutation(request, path, body)
+            self._voice_mutation_request(request, path)
             if self._voice_routing is not None
             else None
         )
-        if voice_mutation is None:
-            return await self._select_and_forward(
-                request,
-                path,
-                body,
-                metadata,
-                release,
-            )
-        async with self._voice_mutation_lock:
+        if voice_mutation is not None:
+            assert self._voice_routing is not None
+            self._voice_routing.begin_mutation()
+        try:
             return await self._select_and_forward(
                 request,
                 path,
@@ -403,6 +418,10 @@ class ProxyHandler:
                 release,
                 voice_mutation=voice_mutation,
             )
+        finally:
+            if voice_mutation is not None:
+                assert self._voice_routing is not None
+                self._voice_routing.end_mutation()
 
     async def _select_and_forward(
         self,
@@ -412,7 +431,7 @@ class ProxyHandler:
         metadata: RouteMetadata,
         release: _ReleaseOnce,
         *,
-        voice_mutation: VoiceMutation | None = None,
+        voice_mutation: _VoiceMutationRequest | None = None,
     ) -> Response:
         try:
             worker = self._select_worker(metadata)
@@ -445,6 +464,8 @@ class ProxyHandler:
     ) -> Worker:
         if self._voice_routing is not None:
             voice_control = metadata.route_kind is RouteKind.VOICE_CONTROL
+            if voice_control:
+                self._voice_routing.activate()
             uploaded_voice_request = metadata.route_kind in {
                 RouteKind.SPEECH,
                 RouteKind.SPEECH_BATCH,
@@ -474,7 +495,7 @@ class ProxyHandler:
         metadata: RouteMetadata,
         worker: Worker,
         release: _ReleaseOnce,
-        voice_mutation: VoiceMutation | None = None,
+        voice_mutation: _VoiceMutationRequest | None = None,
     ) -> Response:
         # Note (Jiaxin Deng): stream through instead of buffering. A mid-stream
         # failure after a 2xx cannot become a 502; SSE (text/event-stream) bodies
@@ -516,6 +537,8 @@ class ProxyHandler:
             )
         except httpx.HTTPError as exc:
             worker.decrement_active()
+            if voice_mutation is not None and self._voice_routing is not None:
+                self._voice_routing.mark_uncertain()
             worker.record_routed_request(service_class=metadata.service_class)
             self._record_worker_request_failure(
                 worker,
@@ -540,6 +563,8 @@ class ProxyHandler:
             # worker looks busy forever, and a retiring incarnation never
             # drains, so the data plane reports it to the CP indefinitely.
             worker.decrement_active()
+            if voice_mutation is not None and self._voice_routing is not None:
+                self._voice_routing.mark_uncertain()
             raise
 
         worker_failure_recorded = False
@@ -564,13 +589,6 @@ class ProxyHandler:
                 status_code=upstream.status_code,
                 error=f"status={upstream.status_code}",
             )
-        if (
-            voice_mutation is not None
-            and self._voice_routing is not None
-            and 200 <= upstream.status_code < 300
-        ):
-            self._voice_routing.apply(voice_mutation)
-
         is_event_stream = (upstream.headers.get("content-type") or "").startswith(
             "text/event-stream"
         )
@@ -596,6 +614,17 @@ class ProxyHandler:
             release=release,
             record_completion=record_completion,
         )
+
+        if voice_mutation is not None:
+            assert self._voice_routing is not None
+            return await self._buffer_voice_mutation_response(
+                upstream=upstream,
+                worker=worker,
+                metadata=metadata,
+                mutation_request=voice_mutation,
+                cleanup=cleanup,
+                record_worker_failure=record_worker_failure_once,
+            )
 
         async def iter_bytes():
             outcome = _response_outcome(upstream.status_code)
@@ -635,20 +664,69 @@ class ProxyHandler:
             cleanup=cleanup,
         )
 
-    def _voice_mutation(
+    async def _buffer_voice_mutation_response(
+        self,
+        *,
+        upstream: httpx.Response,
+        worker: Worker,
+        metadata: RouteMetadata,
+        mutation_request: _VoiceMutationRequest,
+        cleanup: _RelayCleanup,
+        record_worker_failure: Callable[..., None],
+    ) -> Response:
+        assert self._voice_routing is not None
+        try:
+            body = await upstream.aread()
+        except asyncio.CancelledError:
+            self._voice_routing.mark_uncertain()
+            await cleanup("stream_cancelled")
+            raise
+        except httpx.HTTPError as exc:
+            self._voice_routing.mark_uncertain()
+            record_worker_failure(error=type(exc).__name__)
+            await cleanup("stream_error")
+            return JSONResponse(
+                status_code=502,
+                content={"error": {"message": "upstream response failed"}},
+                headers=self._diagnostic_headers(worker, metadata),
+            )
+
+        if 200 <= upstream.status_code < 300:
+            try:
+                mutation = _committed_voice_mutation(mutation_request, body)
+            except ValueError as exc:
+                logger.warning(
+                    "voice_registry_commit_uncertain worker=%s error=%s",
+                    worker.display_id,
+                    str(exc),
+                )
+                self._voice_routing.mark_uncertain()
+            else:
+                self._voice_routing.apply(mutation)
+
+        headers = filter_response_headers(upstream.headers, buffered=True)
+        headers.update(self._diagnostic_headers(worker, metadata))
+        await cleanup(_response_outcome(upstream.status_code))
+        return Response(
+            content=body,
+            status_code=upstream.status_code,
+            headers=headers,
+            media_type=upstream.headers.get("content-type"),
+        )
+
+    def _voice_mutation_request(
         self,
         request: Request,
         path: str,
-        body: bytes,
-    ) -> VoiceMutation | None:
+    ) -> _VoiceMutationRequest | None:
         if path == "/v1/audio/voices" and request.method == "POST":
-            name = _multipart_text_field(request, body, "name")
-            return None if name is None else VoiceMutation.create("upload", name)
+            return _VoiceUploadRequest()
 
         prefix = "/v1/audio/voices/"
         if path.startswith(prefix) and request.method == "DELETE":
             name = unquote(path.removeprefix(prefix))
-            return VoiceMutation.create("delete", name)
+            mutation = VoiceMutation.create("delete", name)
+            return None if mutation is None else _VoiceDeleteRequest(mutation)
         return None
 
     def _diagnostic_headers(
@@ -772,35 +850,23 @@ def _request_id_from_headers(request: Request) -> str | None:
     )
 
 
-def _multipart_text_field(
-    request: Request,
+def _committed_voice_mutation(
+    request: _VoiceMutationRequest,
     body: bytes,
-    field_name: str,
-) -> str | None:
-    content_type = request.headers.get("content-type")
-    if not content_type or "multipart/form-data" not in content_type.lower():
-        return None
-    message = BytesParser(policy=policy.default).parsebytes(
-        (f"Content-Type: {content_type}\r\n" "MIME-Version: 1.0\r\n" "\r\n").encode(
-            "utf-8"
-        )
-        + body
-    )
-    if not message.is_multipart():
-        return None
-    for part in message.iter_parts():
-        if part.get_param("name", header="content-disposition") != field_name:
-            continue
-        payload = part.get_payload(decode=True)
-        if payload is None:
-            return None
-        charset = part.get_content_charset() or "utf-8"
-        try:
-            value = payload.decode(charset).strip()
-        except (LookupError, UnicodeDecodeError):
-            return None
-        return value or None
-    return None
+) -> VoiceMutation:
+    if isinstance(request, _VoiceDeleteRequest):
+        return request.mutation
+
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise ValueError("upload response is not valid JSON") from None
+    if not isinstance(payload, dict):
+        raise ValueError("upload response must be an object")
+    mutation = VoiceMutation.create("upload", payload.get("name"))
+    if mutation is None:
+        raise ValueError("upload response must include the stored voice name")
+    return mutation
 
 
 def _payload_too_large_response(
@@ -828,10 +894,7 @@ def _large_request_extra_capabilities_or_error(
     workers: list[Worker],
     metadata: RouteMetadata,
 ) -> tuple[set[Capability], str | None]:
-    if (
-        metadata.route_kind is not RouteKind.GENERATION
-        or not metadata.body_exceeds_metadata_limit
-    ):
+    if not metadata.body_exceeds_metadata_limit:
         return set(), None
 
     candidates = [

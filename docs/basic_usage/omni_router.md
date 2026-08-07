@@ -389,10 +389,12 @@ list, upload, and delete operations to `--voice-owner-worker-url`, and pins
 speech, batch, and WebSocket requests that name an uploaded voice to the same
 worker. It returns `503` if that owner is unavailable instead of silently
 routing the request to a worker without the voice. Built-in voices remain
-balanced by the configured routing policy. By default, the first worker with
-both `speech` and `audio_input` capabilities becomes the owner. Pools without
-such an owner can still route built-in TTS to eligible speech workers, but
-voice management returns `503`.
+balanced by the configured routing policy. By default, the first routable
+worker with both `speech` and `audio_input` capabilities becomes the owner and
+remains the owner for that router process. Configure
+`--voice-owner-worker-url` when the owner must remain stable across router
+restarts. Pools without such an owner can still route built-in TTS to eligible
+speech workers, but voice management returns `503`.
 The owner cannot be removed or have either required capability removed through
 the router's worker API while the router is running.
 
@@ -400,6 +402,13 @@ Voice ownership assumes one router is the writer for the pool, clients perform
 voice mutations through that router, and the owner keeps its speaker directory
 across restarts. Multiple independent routers or direct mutations against a
 worker are not coordinated and are unsupported for uploaded voices.
+The router refreshes its uploaded-voice registry in the background after voice
+traffic begins. An ambiguous mutation outcome makes unknown named voices pin to
+the owner until a refresh succeeds. If the owner does not expose the voice-list
+API, the router treats the registry as unsupported and balances names it has
+not observed through a successful upload. `GET /health` reports the selected
+owner, owner routability, registry state, and uploaded-voice count under
+`voice_routing`.
 
 Large JSON requests are not fully parsed by the router. With a homogeneous pool
 of complete Omni V1 replicas, no extra headers are needed. With mixed models,

@@ -225,7 +225,7 @@ def register_routes(
     *,
     admin_api_key: str | None = None,
 ) -> None:
-    register_health_routes(app, workers, proxy)
+    register_health_routes(app, workers, proxy, voice_routing)
     register_admin_routes(
         app,
         workers,
@@ -242,6 +242,7 @@ def register_health_routes(
     app: FastAPI,
     workers: list[Worker],
     proxy: ProxyHandler,
+    voice_routing: VoiceRoutingState,
 ) -> None:
     @app.get("/live")
     async def live() -> JSONResponse:
@@ -261,7 +262,10 @@ def register_health_routes(
             workers,
             available_status="healthy",
             unavailable_status="unhealthy",
-            extra={"admission": proxy.admission.to_dict()},
+            extra={
+                "admission": proxy.admission.to_dict(),
+                "voice_routing": voice_routing.to_dict(),
+            },
         )
 
 
@@ -849,6 +853,9 @@ def _worker_pool_status_response(
 
 
 def _notify_registry_change(app: FastAPI) -> None:
+    voice_routing = getattr(app.state, "voice_routing", None)
+    if voice_routing is not None:
+        voice_routing.request_refresh()
     # Note (Jiaxin Deng): CP hook, republishes the snapshot after a registry
     # mutation; unset (single-process mode) is a no-op.
     callback = getattr(app.state, "on_registry_change", None)

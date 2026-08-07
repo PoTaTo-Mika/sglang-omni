@@ -15,6 +15,7 @@ from sglang_omni_router import proxy as proxy_module
 from sglang_omni_router import websocket_proxy as websocket_proxy_module
 from sglang_omni_router.app import create_app
 from sglang_omni_router.config import RouterConfig, WorkerConfig
+from sglang_omni_router.route_metadata import ROUTE_HEADER_NAMES
 from sglang_omni_router.selector import WorkerSelector
 from sglang_omni_router.voice_routing import VoiceRoutingState
 from sglang_omni_router.worker import Worker, build_workers
@@ -109,6 +110,7 @@ async def test_automatic_voice_owner_tracks_dynamic_worker_registration() -> Non
                 ]
             )[0]
         )
+        workers[1].state = "healthy"
         assert state.resolve_owner() is workers[1]
         assert state.is_owner(workers[1])
         assert state.requires_owner({"preset"})
@@ -119,6 +121,31 @@ async def test_automatic_voice_owner_tracks_dynamic_worker_registration() -> Non
             )
         )
         assert state.resolve_owner() is workers[1]
+
+
+def test_automatic_voice_owner_skips_an_unroutable_candidate() -> None:
+    workers = build_workers(_router_config().workers)
+    workers[0].state = "healthy"
+    workers[0].set_disabled(True)
+    workers[1].state = "healthy"
+    config = _router_config()
+
+    async def run() -> None:
+        async with httpx.AsyncClient() as client:
+            state = _voice_routing(config, workers, client)
+            assert state.resolve_owner() is workers[1]
+            assert state.to_dict() == {
+                "owner_worker_id": workers[1].worker_id,
+                "owner_url": workers[1].url,
+                "owner_routable": True,
+                "registry_state": "inactive",
+                "uploaded_voice_count": 0,
+                "last_refresh_error": None,
+            }
+            workers[0].set_disabled(False)
+            assert state.resolve_owner() is workers[1]
+
+    asyncio.run(run())
 
 
 def test_voice_registry_mutation_before_hydration_preserves_owner_state() -> None:
@@ -188,6 +215,7 @@ def test_voice_registry_mutations_during_hydration_are_not_overwritten() -> None
                 retry_interval_secs=1,
             )
             await state.start()
+            state.activate()
             await hydration_started.wait()
             state.record_upload("New")
             state.record_delete("Deleted")
@@ -248,24 +276,60 @@ def test_voice_registry_hydration_retries_without_request_path_io() -> None:
     asyncio.run(run())
 
 
+def test_missing_voice_registry_balances_unobserved_named_voices() -> None:
+    async def run() -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/v1/audio/voices"
+            return httpx.Response(404, request=request)
+
+        workers = build_workers(_router_config().workers)
+        workers[0].state = "healthy"
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            state = VoiceRoutingState(
+                workers=workers,
+                owner_url=workers[0].url,
+                client=client,
+                timeout_secs=5,
+                retry_interval_secs=1,
+            )
+            state.record_upload("Clone")
+            await state.start()
+            try:
+                for _ in range(100):
+                    if not state.requires_owner({"Vivian"}):
+                        break
+                    await asyncio.sleep(0.01)
+                assert state.to_dict()["registry_state"] == "unsupported"
+                assert not state.requires_owner({"Vivian"})
+                assert state.requires_owner({"Clone"})
+            finally:
+                await state.stop()
+
+    asyncio.run(run())
+
+
 def test_tts_http_routes_preserve_batch_identity_and_uploaded_voice_owner() -> None:
     seen: list[tuple[str, str, str]] = []
+    uploaded = False
 
     def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal uploaded
         worker = _request_netloc(request)
         path = request.url.path
         if path == "/health":
             return httpx.Response(200, json={"status": "healthy"}, request=request)
         seen.append((request.method, worker, path))
         if path == "/v1/audio/voices" and request.method == "POST":
+            uploaded = True
             return httpx.Response(200, json={"name": "Clone"}, request=request)
         if path == "/v1/audio/voices" and request.method == "GET":
             return httpx.Response(
                 200,
-                json={"uploaded_voices": [{"name": "Clone"}]},
+                json={"uploaded_voices": [{"name": "Clone"}] if uploaded else []},
                 request=request,
             )
         if path == "/v1/audio/voices/Clone" and request.method == "DELETE":
+            uploaded = False
             return httpx.Response(200, json={"success": True}, request=request)
         if path == "/v1/audio/speech/batch":
             return httpx.Response(
@@ -323,6 +387,10 @@ def test_tts_http_routes_preserve_batch_identity_and_uploaded_voice_owner() -> N
             },
         )
         deleted = client.delete("/v1/audio/voices/Clone")
+        for _ in range(100):
+            if app.state.voice_routing.to_dict()["registry_state"] == "ready":
+                break
+            time.sleep(0.01)
         deleted_voice = client.post(
             "/v1/audio/speech",
             json={"input": "hello", "voice": "Clone"},
@@ -333,8 +401,9 @@ def test_tts_http_routes_preserve_batch_identity_and_uploaded_voice_owner() -> N
     assert batch.status_code == 200
     assert deleted.status_code == 200
     assert deleted_voice.status_code == 400
-    assert seen == [
-        ("GET", "worker-b:8102", "/v1/audio/voices"),
+    assert ("GET", "worker-b:8102", "/v1/audio/voices") in seen
+    routed_requests = [request for request in seen if request[0] != "GET"]
+    assert routed_requests == [
         ("POST", "worker-b:8102", "/v1/audio/voices"),
         ("POST", "worker-b:8102", "/v1/audio/speech"),
         ("POST", "worker-b:8102", "/v1/audio/speech/batch"),
@@ -350,26 +419,31 @@ def test_tts_http_routes_preserve_batch_identity_and_uploaded_voice_owner() -> N
 
 
 @pytest.mark.asyncio
-async def test_voice_mutations_commit_in_dispatch_order() -> None:
+async def test_voice_mutations_do_not_serialize_upstream_requests() -> None:
     upload_started = asyncio.Event()
     delete_started = asyncio.Event()
     release_upload = asyncio.Event()
     dispatched: list[str] = []
+    uploaded = False
 
     async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal uploaded
         if request.method == "GET":
             return httpx.Response(
                 200,
-                json={"uploaded_voices": []},
+                json={"uploaded_voices": [{"name": "Clone"}] if uploaded else []},
                 request=request,
             )
         dispatched.append(request.method)
         if request.method == "POST":
             upload_started.set()
             await release_upload.wait()
+            uploaded = True
         else:
             delete_started.set()
-        return httpx.Response(200, json={"ok": True}, request=request)
+            uploaded = False
+        payload = {"name": "Clone"} if request.method == "POST" else {"ok": True}
+        return httpx.Response(200, json=payload, request=request)
 
     def request(method: str, path: str) -> Request:
         boundary = "voice-boundary"
@@ -441,8 +515,7 @@ async def test_voice_mutations_commit_in_dispatch_order() -> None:
                 "/v1/audio/voices/Clone",
             )
         )
-        await asyncio.sleep(0)
-        assert not delete_started.is_set()
+        await asyncio.wait_for(delete_started.wait(), timeout=1)
 
         release_upload.set()
         upload_response, delete_response = await asyncio.gather(
@@ -450,12 +523,10 @@ async def test_voice_mutations_commit_in_dispatch_order() -> None:
             delete_task,
         )
         assert dispatched == ["POST", "DELETE"]
-        for response in (upload_response, delete_response):
-            assert response.status_code == 200
-            assert (
-                b"".join([chunk async for chunk in response.body_iterator])
-                == b'{"ok":true}'
-            )
+        assert upload_response.status_code == 200
+        assert upload_response.body == b'{"name":"Clone"}'
+        assert delete_response.status_code == 200
+        assert delete_response.body == b'{"ok":true}'
 
         await voice_routing.start()
         try:
@@ -463,18 +534,21 @@ async def test_voice_mutations_commit_in_dispatch_order() -> None:
                 if not voice_routing.requires_owner({"preset"}):
                     break
                 await asyncio.sleep(0.01)
-            assert not voice_routing.requires_owner({"clone"})
+            assert voice_routing.requires_owner({"clone"})
         finally:
             await voice_routing.stop()
 
 
 @pytest.mark.parametrize("upload_status", [200, 400])
 @pytest.mark.asyncio
-async def test_voice_upload_mutation_uses_successful_bounded_multipart_request(
+async def test_voice_upload_uses_the_stored_name_from_the_success_response(
     upload_status: int,
 ) -> None:
     boundary = "quoted-voice-boundary"
     body = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="name"\r\n\r\n'
+        "Wrong\r\n"
         f"--{boundary}\r\n"
         'Content-Disposition: form-data; name="audio"; filename="sample.wav"\r\n'
         "Content-Type: audio/wav\r\n\r\n"
@@ -510,13 +584,17 @@ async def test_voice_upload_mutation_uses_successful_bounded_multipart_request(
         receive,
     )
 
+    uploaded = False
+
     def handler(upstream_request: httpx.Request) -> httpx.Response:
+        nonlocal uploaded
         if upstream_request.method == "GET":
             return httpx.Response(
                 200,
-                json={"uploaded_voices": []},
+                json={"uploaded_voices": [{"name": "Clone"}] if uploaded else []},
                 request=upstream_request,
             )
+        uploaded = upload_status == 200
         return httpx.Response(
             upload_status,
             json={"name": "Clone"},
@@ -547,20 +625,95 @@ async def test_voice_upload_mutation_uses_successful_bounded_multipart_request(
 
             response = await proxy.forward_model_request(request, "/v1/audio/voices")
             assert response.status_code == upload_status
-            assert (
-                b"".join([chunk async for chunk in response.body_iterator])
-                == b'{"name":"Clone"}'
-            )
+            assert response.body == b'{"name":"Clone"}'
+            for _ in range(100):
+                if voice_routing.to_dict()["registry_state"] == "ready":
+                    break
+                await asyncio.sleep(0.01)
+            assert not voice_routing.requires_owner({"wrong"})
             assert voice_routing.requires_owner({"clone"}) is (upload_status == 200)
         finally:
             await voice_routing.stop()
 
 
 @pytest.mark.asyncio
-async def test_voice_upload_ownership_is_visible_before_response_body_completes() -> (
-    None
-):
+async def test_uncertain_voice_upload_is_reconciled_before_balancing() -> None:
+    committed = False
+
+    def handler(upstream_request: httpx.Request) -> httpx.Response:
+        nonlocal committed
+        if upstream_request.method == "GET":
+            uploaded = [{"name": "Clone"}] if committed else []
+            return httpx.Response(
+                200,
+                json={"uploaded_voices": uploaded},
+                request=upstream_request,
+            )
+        committed = True
+        raise httpx.ReadError("response lost", request=upstream_request)
+
+    messages = [{"type": "http.request", "body": b"upload", "more_body": False}]
+
+    async def receive() -> dict[str, Any]:
+        if messages:
+            return messages.pop(0)
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/audio/voices",
+            "headers": [(b"content-type", b"multipart/form-data; boundary=x")],
+            "query_string": b"",
+            "scheme": "http",
+            "server": ("testserver", 80),
+            "client": ("testclient", 50000),
+        },
+        receive,
+    )
+    config = _router_config(
+        health_failure_threshold=3,
+        health_check_interval_secs=1,
+    )
+    workers = build_workers(config.workers)
+    workers[0].state = "healthy"
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as async_client:
+        voice_routing = _voice_routing(config, workers, async_client)
+        proxy = proxy_module.ProxyHandler(
+            config=config,
+            workers=workers,
+            selector=WorkerSelector(config.policy),
+            client=async_client,
+            voice_routing=voice_routing,
+        )
+        await voice_routing.start()
+        try:
+            for _ in range(100):
+                if voice_routing.to_dict()["registry_state"] == "ready":
+                    break
+                await asyncio.sleep(0.01)
+
+            response = await proxy.forward_model_request(request, "/v1/audio/voices")
+            assert response.status_code == 502
+            assert voice_routing.requires_owner({"Clone"})
+
+            for _ in range(100):
+                if voice_routing.to_dict()["registry_state"] == "ready":
+                    break
+                await asyncio.sleep(0.01)
+            assert voice_routing.to_dict()["registry_state"] == "ready"
+            assert voice_routing.requires_owner({"Clone"})
+        finally:
+            await voice_routing.stop()
+
+
+@pytest.mark.asyncio
+async def test_voice_upload_ownership_uses_the_completed_response() -> None:
     release_upload_body = asyncio.Event()
+    uploaded = False
     boundary = "voice-boundary"
     body = (
         f"--{boundary}\r\n"
@@ -600,12 +753,14 @@ async def test_voice_upload_ownership_is_visible_before_response_body_completes(
             yield b'{"name":"Clone"}'
 
     def handler(upstream_request: httpx.Request) -> httpx.Response:
+        nonlocal uploaded
         if upstream_request.method == "GET":
             return httpx.Response(
                 200,
-                json={"uploaded_voices": []},
+                json={"uploaded_voices": [{"name": "Clone"}] if uploaded else []},
                 request=upstream_request,
             )
+        uploaded = True
         return httpx.Response(
             200,
             stream=StalledUploadBody(),
@@ -634,13 +789,24 @@ async def test_voice_upload_ownership_is_visible_before_response_body_completes(
                 await asyncio.sleep(0.01)
             assert not voice_routing.requires_owner({"preset"})
 
-            response = await proxy.forward_model_request(request, "/v1/audio/voices")
-            assert response.status_code == 200
-            assert voice_routing.requires_owner({"Clone"})
-            release_upload_body.set()
-            assert b"".join([chunk async for chunk in response.body_iterator]) == (
-                b'{"name":"Clone"}'
+            response_task = asyncio.create_task(
+                proxy.forward_model_request(request, "/v1/audio/voices")
             )
+            await asyncio.sleep(0)
+            state = voice_routing.to_dict()
+            assert state["registry_state"] == "mutating"
+            assert state["uploaded_voice_count"] == 0
+            assert voice_routing.requires_owner({"Clone"})
+
+            release_upload_body.set()
+            response = await response_task
+            assert response.status_code == 200
+            for _ in range(100):
+                if voice_routing.to_dict()["registry_state"] == "ready":
+                    break
+                await asyncio.sleep(0.01)
+            assert voice_routing.requires_owner({"Clone"})
+            assert response.body == b'{"name":"Clone"}'
         finally:
             release_upload_body.set()
             await voice_routing.stop()
@@ -744,6 +910,9 @@ def test_tts_websocket_is_pinned_and_counted_on_one_worker(
         assert kwargs["compression"] is None
         assert kwargs["max_queue"] == 1
         assert kwargs["max_size"] == 512 * 1024 * 1024
+        forwarded_headers = kwargs[websocket_proxy_module._WEBSOCKET_HEADERS_ARGUMENT]
+        assert ROUTE_HEADER_NAMES.isdisjoint(forwarded_headers)
+        assert forwarded_headers["x-client-header"] == "kept"
         return upstream
 
     monkeypatch.setattr(websocket_proxy_module, "websocket_connect", fake_connect)
@@ -759,7 +928,13 @@ def test_tts_websocket_is_pinned_and_counted_on_one_worker(
     app = create_app(_router_config(max_payload_size=1024), client=async_client)
 
     with TestClient(app) as client:
-        with client.websocket_connect("/v1/audio/speech/stream") as websocket:
+        with client.websocket_connect(
+            "/v1/audio/speech/stream",
+            headers={
+                **{name: "ignored" for name in ROUTE_HEADER_NAMES},
+                "x-client-header": "kept",
+            },
+        ) as websocket:
             websocket.send_json(
                 {
                     "type": "session.config",

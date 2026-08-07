@@ -101,13 +101,17 @@ def extract_route_metadata(
     route_capabilities, route_capabilities_header_present = (
         _route_capabilities_from_header(request)
     )
-    body_exceeds_metadata_limit = _is_json_request(request) and (
+    has_json_body = route_kind in {
+        RouteKind.SPEECH,
+        RouteKind.SPEECH_BATCH,
+    } or _is_json_request(request)
+    body_exceeds_metadata_limit = has_json_body and (
         len(body) > ROUTE_METADATA_JSON_LIMIT_BYTES
     )
 
     payload: dict[str, Any] | None = None
     large_json_metadata: LargeJsonMetadata | None = None
-    if _is_json_request(request) and body and not body_exceeds_metadata_limit:
+    if has_json_body and body and not body_exceeds_metadata_limit:
         payload = _parse_json_object(body)
     elif body_exceeds_metadata_limit:
         large_json_metadata = _scan_large_json_metadata(body)

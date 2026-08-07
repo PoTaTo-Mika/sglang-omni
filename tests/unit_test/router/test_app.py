@@ -6,6 +6,7 @@ import json
 import logging
 import shutil
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -2781,6 +2782,66 @@ def test_speech_reference_audio_requires_audio_input_capability(
 
 
 @pytest.mark.parametrize(
+    ("route_path", "payload"),
+    [
+        ("/v1/audio/speech", {"input": "hello", "voice": "Clone"}),
+        (
+            "/v1/audio/speech/batch",
+            {"voice": "default", "items": [{"input": "hello", "voice": "Clone"}]},
+        ),
+    ],
+)
+def test_speech_json_without_content_type_preserves_voice_ownership(
+    route_path: str,
+    payload: dict[str, object],
+) -> None:
+    seen_workers: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "healthy"}, request=request)
+        if request.url.path == "/v1/audio/voices":
+            return httpx.Response(
+                200,
+                json={"uploaded_voices": [{"name": "Clone"}]},
+                request=request,
+            )
+        if request.url.path == route_path:
+            seen_workers.append(_request_netloc(request))
+            return httpx.Response(200, content=b"audio", request=request)
+        raise AssertionError(f"unexpected request path: {request.url.path}")
+
+    worker_configs = [
+        WorkerConfig(url="http://worker-a:8101"),
+        WorkerConfig(url="http://worker-b:8102"),
+    ]
+    app = create_app(
+        _router_config(
+            worker_configs=worker_configs,
+            voice_owner_worker_url="http://worker-b:8102",
+        ),
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+    with TestClient(app) as client:
+        app.state.voice_routing.activate()
+        for _ in range(100):
+            if (
+                client.get("/health").json()["voice_routing"]["registry_state"]
+                == "ready"
+            ):
+                break
+            time.sleep(0.01)
+        response = client.post(
+            route_path,
+            content=json.dumps(payload).encode(),
+        )
+
+    assert response.status_code == 200
+    assert seen_workers == ["worker-b:8102"]
+
+
+@pytest.mark.parametrize(
     "non_owner_capabilities",
     [
         {"speech", "audio_input", "video_input"},
@@ -3425,7 +3486,9 @@ def test_route_registration_split_exposes_exact_route_sets() -> None:
         register(app)
         return {route.path for route in app.routes} - base
 
-    assert _paths(lambda app: register_health_routes(app, workers, proxy)) == {
+    assert _paths(
+        lambda app: register_health_routes(app, workers, proxy, voice_routing)
+    ) == {
         "/live",
         "/ready",
         "/health",

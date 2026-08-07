@@ -39,6 +39,7 @@ from sglang_omni.serve.speech_limits import (
 )
 from sglang_omni_router.config import Capability, RouterConfig
 from sglang_omni_router.proxy import WORKER_EVICTION_STATUS_CODES, AdmissionController
+from sglang_omni_router.route_metadata import ROUTE_HEADER_NAMES
 from sglang_omni_router.selector import (
     NoEligibleWorkerError,
     WorkerSelector,
@@ -92,7 +93,7 @@ _REQUEST_HEADERS_TO_STRIP = {
     "sec-websocket-protocol",
     "sec-websocket-version",
     "upgrade",
-}
+} | ROUTE_HEADER_NAMES
 
 
 class TTSWebSocketProxy:
