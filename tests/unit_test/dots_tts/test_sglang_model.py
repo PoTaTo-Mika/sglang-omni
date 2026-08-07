@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 import torch
 from torch import nn
@@ -77,3 +79,42 @@ def test_weight_loader_routes_every_checkpoint_namespace() -> None:
 
     with pytest.raises(AssertionError, match="Unexpected dots.tts checkpoint weight"):
         model.load_weights([("new_acoustic_block.weight", torch.ones(1, 1))])
+
+
+def test_graph_feedback_buffer_routes_decode_input_embeds() -> None:
+    class _Backbone(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.config = SimpleNamespace(hidden_size=4)
+            self.weight = nn.Parameter(torch.zeros(1))
+            self.seen_embeds: list[torch.Tensor] = []
+
+        def forward(self, *, input_ids, positions, forward_batch, input_embeds, **_):
+            self.seen_embeds.append(input_embeds)
+            return input_embeds
+
+    model = DotsTTSSGLangModel.__new__(DotsTTSSGLangModel)
+    nn.Module.__init__(model)
+    model.qwen2 = _Backbone()
+
+    assert model.graph_feedback_buffer is None
+    model.enable_graph_feedback(3)
+    buffer = model.graph_feedback_buffer
+    assert buffer is not None and buffer.shape == (3, 4)
+
+    buffer[:2].copy_(torch.full((2, 4), 8.0))
+    decode_batch = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_decode=lambda: True),
+        input_embeds=None,
+    )
+    out = model.forward(torch.tensor([1, 2]), torch.tensor([0, 0]), decode_batch)
+    assert out.shape == (2, 4)
+    torch.testing.assert_close(out, torch.full((2, 4), 8.0))
+    assert model.qwen2.seen_embeds[0].data_ptr() == buffer.data_ptr()
+
+    prefill_batch = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_decode=lambda: False),
+        input_embeds=torch.full((1, 4), 2.0),
+    )
+    out = model.forward(torch.tensor([3]), torch.tensor([0]), prefill_batch)
+    torch.testing.assert_close(out, torch.full((1, 4), 2.0))
