@@ -125,8 +125,10 @@ MAX_VOICE_UPLOAD_BODY_BYTES = (
 )
 
 _BAD_REQUEST_MARKERS = (
+    "Unsupported language:",
     "longer than the model's context length",
     "Requested token count exceeds the model's maximum context length",
+    "Request requires more tokens than the thinker KV cache can hold",
     "accepts audio up to",
     "max_new_tokens must be",
     "exceeds the maximum allowed length",
