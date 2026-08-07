@@ -56,12 +56,11 @@ class VoiceRoutingState:
         self._uploaded_names: set[str] = set()
         self._active = False
         self._hydrated = False
-        self._registry_available: bool | None = None
+        self._registry_dirty = False
         self._is_reconciling = False
         self._mutations_inflight = 0
         self._last_refresh_error: str | None = None
-        self._uncertainty_generation = 0
-        self._pending_mutations: dict[str, bool] = {}
+        self._registry_generation = 0
         self._refresh_requested = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
 
@@ -108,27 +107,30 @@ class VoiceRoutingState:
             self._refresh_requested.set()
 
     def activate(self) -> None:
+        if self._active:
+            return
         self._active = True
         self.request_refresh()
 
     def mark_uncertain(self) -> None:
         self._active = True
-        self._uncertainty_generation += 1
-        self._hydrated = False
+        self._registry_dirty = True
         self._last_refresh_error = "mutation outcome is uncertain"
         self._refresh_requested.set()
 
     def begin_mutation(self) -> None:
         self._active = True
         self._mutations_inflight += 1
-        self._uncertainty_generation += 1
-        self._hydrated = False
+        self._registry_generation += 1
+
+    def mark_mutation_dispatched(self) -> None:
+        assert self._mutations_inflight > 0
+        self._registry_dirty = True
 
     def end_mutation(self) -> None:
         assert self._mutations_inflight > 0
         self._mutations_inflight -= 1
         if self._mutations_inflight == 0:
-            self._pending_mutations.clear()
             self._refresh_requested.set()
 
     def to_dict(self) -> dict[str, Any]:
@@ -145,8 +147,8 @@ class VoiceRoutingState:
             registry_state = (
                 "degraded" if self._last_refresh_error is not None else "pending"
             )
-        elif self._registry_available is False:
-            registry_state = "unsupported"
+        elif self._registry_dirty:
+            registry_state = "degraded"
         elif self._last_refresh_error is not None:
             registry_state = "stale"
         else:
@@ -179,7 +181,7 @@ class VoiceRoutingState:
         if not names:
             return False
         self.activate()
-        if not self._hydrated:
+        if not self._hydrated or self._registry_dirty or self._mutations_inflight > 0:
             self.request_refresh()
             # The owner can serve both presets and uploaded voices. Falling back
             # to it preserves correctness when registry discovery is unavailable.
@@ -187,92 +189,76 @@ class VoiceRoutingState:
         return bool(names & self._uploaded_names)
 
     async def _run_reconciliation(self) -> None:
-        await self._refresh_requested.wait()
         loop = asyncio.get_running_loop()
         while True:
+            await self._refresh_requested.wait()
             self._refresh_requested.clear()
-            owner = self.resolve_owner()
-            if (
-                self._mutations_inflight == 0
-                and owner is not None
-                and owner.is_routable
-            ):
-                await self._hydrate_from(owner)
-            periodic_refresh = loop.call_later(
-                self._retry_interval_secs,
-                self._refresh_requested.set,
+            if not await self._reconcile_once():
+                continue
+            retry = loop.call_later(
+                self._retry_interval_secs, self._refresh_requested.set
             )
             try:
                 await self._refresh_requested.wait()
             finally:
-                periodic_refresh.cancel()
+                retry.cancel()
 
-    async def _hydrate_from(self, owner: Worker) -> None:
-        uncertainty_generation = self._uncertainty_generation
+    async def _reconcile_once(self) -> bool:
+        if self._mutations_inflight > 0:
+            return False
+        owner = self.resolve_owner()
+        if owner is None or not owner.is_routable:
+            return not self._hydrated or self._registry_dirty
+
+        registry_generation = self._registry_generation
         self._is_reconciling = True
         try:
             response = await self._client.get(
                 f"{owner.url}/v1/audio/voices",
                 timeout=self._timeout_secs,
             )
-            if response.status_code == 404:
-                uploaded_names: set[str] = set()
-                registry_available = False
-            else:
-                response.raise_for_status()
-                uploaded_names = _uploaded_voice_names(response.json())
-                registry_available = True
+            response.raise_for_status()
+            uploaded_names = _uploaded_voice_names(response.json())
         except (httpx.HTTPError, ValueError) as exc:
-            self._last_refresh_error = type(exc).__name__
-            logger.warning(
-                "voice_registry_hydration_failed worker=%s error=%s",
-                owner.display_id,
-                type(exc).__name__,
-            )
-            return
-        else:
-            for name, uploaded in self._pending_mutations.items():
-                if uploaded:
-                    uploaded_names.add(name)
-                else:
-                    uploaded_names.discard(name)
-            self._uploaded_names = uploaded_names
-            self._registry_available = registry_available
-            self._pending_mutations.clear()
-            if self._uncertainty_generation == uncertainty_generation:
-                self._hydrated = True
-                self._last_refresh_error = None
-                logger.info(
-                    "voice_registry_hydrated worker=%s uploaded_voices=%d",
-                    owner.display_id,
-                    len(uploaded_names),
+            refresh_error = type(exc).__name__
+            if self._last_refresh_error != refresh_error:
+                logger.warning(
+                    f"voice_registry_hydration_failed worker={owner.display_id} "
+                    f"error={refresh_error}"
                 )
+            self._last_refresh_error = refresh_error
+            return True
+        else:
+            if (
+                self._registry_generation != registry_generation
+                or self._mutations_inflight > 0
+            ):
+                return True
+            should_log = (
+                not self._hydrated
+                or self._registry_dirty
+                or self._last_refresh_error is not None
+                or self._uploaded_names != uploaded_names
+            )
+            self._uploaded_names = uploaded_names
+            self._hydrated = True
+            self._registry_dirty = False
+            self._last_refresh_error = None
+            if should_log:
+                logger.info(
+                    f"voice_registry_hydrated worker={owner.display_id} "
+                    f"uploaded_voices={len(uploaded_names)}"
+                )
+            return False
         finally:
             self._is_reconciling = False
 
-    def record_upload(self, name: str) -> None:
-        normalized = _normalize_voice_name(name)
-        if normalized is None:
-            return
-        self._uploaded_names.add(normalized)
-        self._pending_mutations[normalized] = True
-        if not self._hydrated:
-            self.activate()
-
-    def record_delete(self, name: str) -> None:
-        normalized = _normalize_voice_name(name)
-        if normalized is None:
-            return
-        self._uploaded_names.discard(normalized)
-        self._pending_mutations[normalized] = False
-        if not self._hydrated:
-            self.activate()
-
     def apply(self, mutation: VoiceMutation) -> None:
+        assert self._mutations_inflight > 0
         if mutation.operation == "upload":
-            self.record_upload(mutation.name)
+            self._uploaded_names.add(mutation.name)
         else:
-            self.record_delete(mutation.name)
+            self._uploaded_names.discard(mutation.name)
 
 
 def _uploaded_voice_names(payload: Any) -> set[str]:

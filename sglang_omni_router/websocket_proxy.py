@@ -261,18 +261,16 @@ class TTSWebSocketProxy:
             if result.outcome in {"upstream_failure", "upstream_unavailable"}
             else logger.info
         )
+        status_code = (
+            str(result.client_error.status_code)
+            if result.client_error is not None
+            else "-"
+        )
+        duration_ms = (time.perf_counter() - start_time) * 1000
         log(
-            "tts_websocket_completed request_id=%s worker=%s outcome=%s "
-            "status_code=%s duration_ms=%.2f",
-            request_id,
-            worker.display_id,
-            result.outcome,
-            (
-                str(result.client_error.status_code)
-                if result.client_error is not None
-                else "-"
-            ),
-            (time.perf_counter() - start_time) * 1000,
+            f"tts_websocket_completed request_id={request_id} "
+            f"worker={worker.display_id} outcome={result.outcome} "
+            f"status_code={status_code} duration_ms={duration_ms:.2f}"
         )
         if result.client_error is not None:
             assert result.client_close_code is not None

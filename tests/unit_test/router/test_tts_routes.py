@@ -17,7 +17,7 @@ from sglang_omni_router.app import create_app
 from sglang_omni_router.config import RouterConfig, WorkerConfig
 from sglang_omni_router.route_metadata import ROUTE_HEADER_NAMES
 from sglang_omni_router.selector import WorkerSelector
-from sglang_omni_router.voice_routing import VoiceRoutingState
+from sglang_omni_router.voice_routing import VoiceMutation, VoiceRoutingState
 from sglang_omni_router.worker import Worker, build_workers
 
 
@@ -154,7 +154,12 @@ def test_voice_registry_mutation_before_hydration_preserves_owner_state() -> Non
             assert request.url.path == "/v1/audio/voices"
             return httpx.Response(
                 200,
-                json={"uploaded_voices": [{"name": "Existing"}]},
+                json={
+                    "uploaded_voices": [
+                        {"name": "Existing"},
+                        {"name": "New"},
+                    ]
+                },
                 request=request,
             )
 
@@ -168,7 +173,12 @@ def test_voice_registry_mutation_before_hydration_preserves_owner_state() -> Non
                 timeout_secs=5,
                 retry_interval_secs=1,
             )
-            state.record_upload("New")
+            state.begin_mutation()
+            state.mark_mutation_dispatched()
+            mutation = VoiceMutation.create("upload", "New")
+            assert mutation is not None
+            state.apply(mutation)
+            state.end_mutation()
             await state.start()
             try:
                 for _ in range(100):
@@ -188,9 +198,23 @@ def test_voice_registry_mutations_during_hydration_are_not_overwritten() -> None
     async def run() -> None:
         hydration_started = asyncio.Event()
         release_hydration = asyncio.Event()
+        request_count = 0
 
         async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal request_count
             assert request.url.path == "/v1/audio/voices"
+            request_count += 1
+            if request_count > 1:
+                return httpx.Response(
+                    200,
+                    json={
+                        "uploaded_voices": [
+                            {"name": "Existing"},
+                            {"name": "New"},
+                        ]
+                    },
+                    request=request,
+                )
             hydration_started.set()
             await release_hydration.wait()
             return httpx.Response(
@@ -217,8 +241,14 @@ def test_voice_registry_mutations_during_hydration_are_not_overwritten() -> None
             await state.start()
             state.activate()
             await hydration_started.wait()
-            state.record_upload("New")
-            state.record_delete("Deleted")
+            state.begin_mutation()
+            state.mark_mutation_dispatched()
+            upload = VoiceMutation.create("upload", "New")
+            delete = VoiceMutation.create("delete", "Deleted")
+            assert upload is not None and delete is not None
+            state.apply(upload)
+            state.apply(delete)
+            state.end_mutation()
             release_hydration.set()
             try:
                 for _ in range(100):
@@ -270,16 +300,22 @@ def test_voice_registry_hydration_retries_without_request_path_io() -> None:
                     await asyncio.sleep(0.01)
                 assert request_count == 2
                 assert not state.requires_owner({"preset"})
+                await asyncio.sleep(0.03)
+                assert request_count == 2
             finally:
                 await state.stop()
 
     asyncio.run(run())
 
 
-def test_missing_voice_registry_balances_unobserved_named_voices() -> None:
+def test_missing_voice_registry_keeps_unknown_names_on_the_owner() -> None:
     async def run() -> None:
+        request_count = 0
+
         def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal request_count
             assert request.url.path == "/v1/audio/voices"
+            request_count += 1
             return httpx.Response(404, request=request)
 
         workers = build_workers(_router_config().workers)
@@ -290,22 +326,110 @@ def test_missing_voice_registry_balances_unobserved_named_voices() -> None:
                 owner_url=workers[0].url,
                 client=client,
                 timeout_secs=5,
-                retry_interval_secs=1,
+                retry_interval_secs=0.01,
             )
-            state.record_upload("Clone")
+            await state.start()
+            try:
+                for _ in range(100):
+                    state.requires_owner({"Vivian"})
+                    if request_count >= 2:
+                        break
+                    await asyncio.sleep(0.01)
+                assert request_count >= 2
+                assert state.to_dict()["registry_state"] == "degraded"
+                assert state.requires_owner({"Vivian"})
+            finally:
+                await state.stop()
+
+    asyncio.run(run())
+
+
+def test_undispatched_mutation_preserves_the_confirmed_registry() -> None:
+    async def run() -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/v1/audio/voices"
+            return httpx.Response(
+                200,
+                json={"uploaded_voices": []},
+                request=request,
+            )
+
+        workers = build_workers(_router_config().workers)
+        workers[0].state = "healthy"
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            state = VoiceRoutingState(
+                workers=workers,
+                owner_url=workers[0].url,
+                client=client,
+                timeout_secs=5,
+                retry_interval_secs=0.01,
+            )
             await state.start()
             try:
                 for _ in range(100):
                     if not state.requires_owner({"Vivian"}):
                         break
                     await asyncio.sleep(0.01)
-                assert state.to_dict()["registry_state"] == "unsupported"
+                assert state.to_dict()["registry_state"] == "ready"
+
+                workers[0].set_disabled(True)
+                state.begin_mutation()
+                state.end_mutation()
+                await asyncio.sleep(0.02)
+
+                assert state.to_dict()["registry_state"] == "ready"
                 assert not state.requires_owner({"Vivian"})
-                assert state.requires_owner({"Clone"})
             finally:
                 await state.stop()
 
     asyncio.run(run())
+
+
+def test_rejected_voice_mutation_preserves_builtin_routing() -> None:
+    seen_speech_workers: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "healthy"}, request=request)
+        if request.url.path == "/v1/audio/voices" and request.method == "GET":
+            return httpx.Response(
+                200,
+                json={"uploaded_voices": []},
+                request=request,
+            )
+        if request.url.path == "/v1/audio/speech":
+            seen_speech_workers.append(_request_netloc(request))
+            return httpx.Response(200, content=b"audio", request=request)
+        raise AssertionError(
+            f"unexpected upstream request: {request.method} {request.url.path}"
+        )
+
+    app = create_app(
+        _router_config(voice_owner_worker_url="http://worker-b:8102"),
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+    with TestClient(app) as client:
+        for _ in range(100):
+            if not app.state.voice_routing.requires_owner({"Vivian"}):
+                break
+            time.sleep(0.01)
+        assert app.state.voice_routing.to_dict()["registry_state"] == "ready"
+
+        app.state.workers[1].set_disabled(True)
+        rejected = client.post(
+            "/v1/audio/voices",
+            data={"name": "Clone", "consent": "true"},
+            files={"audio_sample": ("clone.wav", b"RIFF", "audio/wav")},
+        )
+        speech = client.post(
+            "/v1/audio/speech",
+            json={"input": "hello", "voice": "Vivian"},
+        )
+
+    assert rejected.status_code == 503
+    assert speech.status_code == 200
+    assert seen_speech_workers == ["worker-a:8101"]
 
 
 def test_tts_http_routes_preserve_batch_identity_and_uploaded_voice_owner() -> None:

@@ -388,10 +388,11 @@ Uploaded TTS voices are mutable worker-local state. The Router sends voice
 list, upload, and delete operations to `--voice-owner-worker-url`, and pins
 speech, batch, and WebSocket requests that name an uploaded voice to the same
 worker. It returns `503` if that owner is unavailable instead of silently
-routing the request to a worker without the voice. Built-in voices remain
-balanced by the configured routing policy. By default, the first routable
-worker with both `speech` and `audio_input` capabilities becomes the owner and
-remains the owner for that router process. Configure
+routing the request to a worker without the voice. Once the uploaded-voice
+registry is available, built-in voices remain balanced by the configured
+routing policy. By default, the first routable worker with both `speech` and
+`audio_input` capabilities becomes the owner and remains the owner for that
+router process. Configure
 `--voice-owner-worker-url` when the owner must remain stable across router
 restarts. Pools without such an owner can still route built-in TTS to eligible
 speech workers, but voice management returns `503`.
@@ -402,12 +403,12 @@ Voice ownership assumes one router is the writer for the pool, clients perform
 voice mutations through that router, and the owner keeps its speaker directory
 across restarts. Multiple independent routers or direct mutations against a
 worker are not coordinated and are unsupported for uploaded voices.
-The router refreshes its uploaded-voice registry in the background after voice
-traffic begins. An ambiguous mutation outcome makes unknown named voices pin to
-the owner until a refresh succeeds. If the owner does not expose the voice-list
-API, the router treats the registry as unsupported and balances names it has
-not observed through a successful upload. `GET /health` reports the selected
-owner, owner routability, registry state, and uploaded-voice count under
+The router loads its uploaded-voice registry in the background after voice
+traffic begins and reconciles it after voice mutations. Until the initial load
+succeeds, or while a mutation outcome is unresolved, every non-default voice
+name is pinned to the owner because the router cannot safely distinguish a
+built-in name from an uploaded name. `GET /health` reports the selected owner,
+owner routability, registry state, and uploaded-voice count under
 `voice_routing`.
 
 Large JSON requests are not fully parsed by the router. With a homogeneous pool

@@ -567,6 +567,10 @@ class ProxyHandler:
                 self._voice_routing.mark_uncertain()
             raise
 
+        if voice_mutation is not None:
+            assert self._voice_routing is not None
+            self._voice_routing.mark_mutation_dispatched()
+
         worker_failure_recorded = False
 
         def record_worker_failure_once(
@@ -696,9 +700,8 @@ class ProxyHandler:
                 mutation = _committed_voice_mutation(mutation_request, body)
             except ValueError as exc:
                 logger.warning(
-                    "voice_registry_commit_uncertain worker=%s error=%s",
-                    worker.display_id,
-                    str(exc),
+                    f"voice_registry_commit_uncertain worker={worker.display_id} "
+                    f"error={exc}"
                 )
                 self._voice_routing.mark_uncertain()
             else:
