@@ -368,7 +368,7 @@ def test_flow_matching_checkpoint_runs_the_single_request_solver(tmp_path) -> No
             "rotary_bias": True,
         },
         "vocoder": {"sample_rate": 48000},
-        # SOAR and base ship without a meanflow block.
+        # note (luojiaxuan): SOAR and base ship without a meanflow block.
         "meanflow": None,
     }
     flow = DotsTTSFlowHead(
@@ -384,7 +384,7 @@ def test_flow_matching_checkpoint_runs_the_single_request_solver(tmp_path) -> No
 
     assert flow.mode == "flow_matching"
     assert not flow.is_batched
-    # Single-request serving keeps per-request num_steps and CFG.
+    # note (luojiaxuan): single-request serving keeps per-request num_steps and CFG.
     flow.validate_request(num_steps=10, ode_method="euler")
 
     with pytest.raises(ValueError, match="max_running_requests=1"):
