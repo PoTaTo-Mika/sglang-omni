@@ -220,6 +220,12 @@ the latency. c=8 is the best latency/throughput trade-off on this card.
 At low concurrency the fixed per-request cost dominates (reference encoding, prefill,
 first vocoder chunks). At high concurrency the batched acoustic tail is the bound.
 
+If you serve one request at a time, set `max_running_requests: 1` instead. That switches
+the engine to the compiled single-request solver, and the batched tail stops padding a
+single request up to its smallest batch bucket. On the same 50-sample slice: 0.818 s mean
+latency (RTF 0.214) at `max_running_requests=1` versus 1.31 s (RTF 0.337) with the
+default 16. It costs throughput, so only do this when requests do not overlap.
+
 To reproduce, start the server as in [Prerequisites](#prerequisites) and run the
 benchmark against it:
 
