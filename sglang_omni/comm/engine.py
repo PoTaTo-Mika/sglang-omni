@@ -211,7 +211,7 @@ class CommEngine:
         request_id: str,
         data_ref: DataRef,
     ) -> StagePayload | None:
-        """Read one non-stream ``DataReady`` object.
+        """Read one non-stream DataReady object.
 
         Payload data is returned to the Stage input handler. Paged KV data is
         installed into its pre-reserved destination and therefore has no value

@@ -21,9 +21,7 @@ class KVBufferRegion:
 
     @property
     def page_count(self) -> int:
-        return (
-            int(self.tensor.numel()) * int(self.tensor.element_size())
-        ) // self.bytes_per_page
+        return (self.tensor.numel() * self.tensor.element_size()) // self.bytes_per_page
 
     def byte_view(self) -> torch.Tensor:
         return self.tensor.view(torch.uint8).reshape(-1)
