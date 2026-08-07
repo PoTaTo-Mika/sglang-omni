@@ -27,7 +27,7 @@ token sampler. So `temperature` and `top_k` do nothing here — use the solver k
 |---|---|
 | [`dots-studio/dots.tts-mf`](https://huggingface.co/dots-studio/dots.tts-mf) | MeanFlow. Continuous batching, `num_steps=4`. `examples/configs/dots_tts.yaml` |
 | [`dots-studio/dots.tts-soar`](https://huggingface.co/dots-studio/dots.tts-soar) | Flow matching. Single request at a time (`max_running_requests=1`) with CFG, `num_steps=10`. `examples/configs/dots_tts_soar.yaml` |
-| [`dots-studio/dots.tts-base`](https://huggingface.co/dots-studio/dots.tts-base) | Not supported yet |
+| [`dots-studio/dots.tts-base`](https://huggingface.co/dots-studio/dots.tts-base) | Flow matching, same as SOAR. Serve it with `examples/configs/dots_tts_soar.yaml` and `--model-path dots-studio/dots.tts-base` |
 
 Tensor parallelism is out of scope; dots.tts runs TP1.
 
@@ -124,18 +124,6 @@ with open("output.wav", "wb") as f:
     f.write(resp.content)
 ```
 
-Reference input:
-
-<audio controls>
-  <source src="../_static/audio/male-voice.wav" type="audio/wav">
-</audio>
-
-Reference output:
-
-<audio controls>
-  <source src="../_static/audio/dots-1.wav" type="audio/wav">
-</audio>
-
 `ref_audio` / `ref_text` are accepted as a shorthand for
 `references[0].audio_path` / `references[0].text`.
 
@@ -174,12 +162,6 @@ The response is 16-bit mono PCM at 48 kHz with no in-band JSON framing; convert 
 ```bash
 ffmpeg -f s16le -ar 48000 -ac 1 -i output.pcm output.wav
 ```
-
-Reference output:
-
-<audio controls>
-  <source src="../_static/audio/dots-2.wav" type="audio/wav">
-</audio>
 
 ### Request parameters
 
