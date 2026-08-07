@@ -253,9 +253,10 @@ class TtsSeedttsBenchmarkConfig:
     disable_tqdm: bool = False
     max_running_requests: int = 64
     cuda_graph_max_bs: int = 64
-    # Optional sglang-omni pipeline config yaml forwarded to the managed TTS
-    # server as ``--config`` (e.g. examples/configs/dots_tts.yaml to run the
-    # canonical optimized deployment).
+    # note (luojiaxuan): optional sglang-omni pipeline config yaml forwarded
+    # to the managed TTS server as ``--config`` (e.g.
+    # examples/configs/dots_tts.yaml to run the canonical optimized
+    # deployment).
     server_config: str | None = None
     # Transcribe phase
     lang: str = "en"
