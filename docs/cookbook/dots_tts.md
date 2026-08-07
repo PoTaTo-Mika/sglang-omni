@@ -26,8 +26,8 @@ token sampler. So `temperature` and `top_k` do nothing here — use the solver k
 | Checkpoint | Status |
 |---|---|
 | [`dots-studio/dots.tts-mf`](https://huggingface.co/dots-studio/dots.tts-mf) | Supported (MeanFlow, this guide) |
-| [`dots-studio/dots.tts-soar`](https://huggingface.co/dots-studio/dots.tts-soar) | Single-request serving added in [#1391](https://github.com/sgl-project/sglang-omni/pull/1391) (`examples/configs/dots_tts_soar.yaml`, `max_running_requests=1`). Continuous batching stays MeanFlow-only |
-| [`dots-studio/dots.tts-base`](https://huggingface.co/dots-studio/dots.tts-base) | Not supported yet |
+| [`dots-studio/dots.tts-soar`](https://huggingface.co/dots-studio/dots.tts-soar) | Not covered by this guide. SOAR is flow matching, so it cannot use the batched acoustic tail; see [#1367](https://github.com/sgl-project/sglang-omni/issues/1367) |
+| [`dots-studio/dots.tts-base`](https://huggingface.co/dots-studio/dots.tts-base) | Not covered by this guide |
 
 Tensor parallelism is out of scope; dots.tts runs TP1.
 
