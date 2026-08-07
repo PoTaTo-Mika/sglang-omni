@@ -207,10 +207,6 @@ and the acoustic tail is a deterministic flow solve once the seed is fixed.
 
 ### Performance
 
-MeanFlow only. SOAR has had no performance work yet, so numbers for it would set the
-wrong expectation; the batched acoustic tail for flow matching is tracked in
-[#1367](https://github.com/sgl-project/sglang-omni/issues/1367).
-
 Throughput on Seed-TTS EN (full set, **N=1088** per run). Client `--max-concurrency`
 sweep against a single dots.tts server started from `examples/configs/dots_tts.yaml`
 (`max_running_requests=16`, bf16, `num_steps=4`, backbone decode CUDA graph and
