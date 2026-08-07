@@ -33,6 +33,7 @@ from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
 
 from .audio_lengths import qwen3_asr_num_audio_tokens
+from .languages import resolve_language
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +121,9 @@ def make_qwen3_asr_scheduler_adapters(
 
     def request_builder(payload: StagePayload) -> Qwen3ASRRequestData:
         params = payload.request.params or {}
+        language = params.get("language")
+        requested_language = "en" if language is None else str(language)
+        forced_language = resolve_language(requested_language)
         prepared = prepare_audio(
             payload, source_name="Qwen3-ASR", target_sample_rate=_SAMPLE_RATE
         )
@@ -161,10 +165,6 @@ def make_qwen3_asr_scheduler_adapters(
             f"num_audio_tokens={num_audio_tokens} feat_shape={tuple(features.shape)}"
         )
 
-        lang_raw = str(params.get("language") or "en").strip().lower()
-        forced_language = {"zh": "Chinese", "cn": "Chinese"}.get(
-            lang_raw, "Chinese" if lang_raw.startswith("zh") else "English"
-        )
         input_ids = _build_prompt_ids(num_audio_tokens, forced_language)
 
         audio_item = MultimodalDataItem(
@@ -248,7 +248,7 @@ def make_qwen3_asr_scheduler_adapters(
             max_new_tokens=request_max_new_tokens,
             temperature=temperature,
             audio_duration_s=audio_duration_s,
-            language=str(params.get("language") or "en"),
+            language=requested_language,
             engine_start_s=time.perf_counter(),
             stage_payload=payload,
         )

@@ -5,6 +5,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 from transformers import WhisperFeatureExtractor
 
@@ -14,6 +15,10 @@ from sglang_omni.models.qwen3_asr.audio_lengths import (
     qwen3_asr_num_audio_tokens,
 )
 from sglang_omni.models.qwen3_asr.configuration_qwen3_asr import Qwen3ASRProcessor
+from sglang_omni.models.qwen3_asr.languages import (
+    LANGUAGE_CODE_TO_NAME,
+    resolve_language,
+)
 from sglang_omni.models.qwen3_asr.request_builders import (
     Qwen3ASRRequestData,
     make_qwen3_asr_scheduler_adapters,
@@ -26,6 +31,7 @@ class _FakeTokenizer:
     vocab_size = 1000
 
     def __init__(self) -> None:
+        self.call_texts: list[str] = []
         self.encode_calls: list[str] = []
         self.decode_calls: list[dict] = []
 
@@ -41,6 +47,7 @@ class _FakeTokenizer:
 
     def __call__(self, text: str, *, add_special_tokens: bool = False):
         assert not add_special_tokens
+        self.call_texts.append(text)
         audio_pad_count = text.count("<|audio_pad|>")
         return SimpleNamespace(input_ids=[11] + [42] * audio_pad_count + [12, 13, 14])
 
@@ -82,6 +89,112 @@ def test_qwen3_asr_audio_token_length_formula_is_shared() -> None:
     assert torch.equal(qwen3_asr_audio_token_lengths(lengths), expected)
     assert torch.equal(processor._get_feat_extract_output_lengths(lengths), expected)
     assert qwen3_asr_num_audio_tokens(3000) == 390
+
+
+@pytest.mark.parametrize(
+    ("language_code", "expected_name"), sorted(LANGUAGE_CODE_TO_NAME.items())
+)
+def test_qwen3_asr_resolves_every_supported_language_code(
+    language_code: str,
+    expected_name: str,
+) -> None:
+    assert resolve_language(language_code) == expected_name
+    assert resolve_language(language_code.upper()) == expected_name
+
+
+@pytest.mark.parametrize("language_name", sorted(LANGUAGE_CODE_TO_NAME.values()))
+def test_qwen3_asr_resolves_canonical_names_case_insensitively(
+    language_name: str,
+) -> None:
+    assert resolve_language(f"  {language_name.swapcase()}  ") == language_name
+
+
+@pytest.mark.parametrize("language", ["cn", "zh-CN", "zh_Hant"])
+def test_qwen3_asr_preserves_chinese_compatibility_aliases(language: str) -> None:
+    assert resolve_language(language) == "Chinese"
+
+
+@pytest.mark.parametrize(
+    ("language", "expected_name", "expected_language"),
+    [
+        (None, "English", "en"),
+        ("en", "English", "en"),
+        ("es", "Spanish", "es"),
+        ("fReNcH", "French", "fReNcH"),
+    ],
+)
+def test_qwen3_asr_request_builder_uses_canonical_language_prompt(
+    monkeypatch,
+    language: str | None,
+    expected_name: str,
+    expected_language: str,
+) -> None:
+    tokenizer = _FakeTokenizer()
+    feature_extractor = lambda *args, **kwargs: SimpleNamespace(
+        input_features=torch.zeros((1, 128, 100)),
+        attention_mask=torch.ones((1, 100), dtype=torch.long),
+    )
+    monkeypatch.setattr(
+        transcription,
+        "load_audio",
+        lambda source, **kwargs: np.zeros(1600, dtype=np.float32),
+    )
+    request_builder, _ = make_qwen3_asr_scheduler_adapters(
+        tokenizer=tokenizer,
+        max_new_tokens=32,
+        feature_extractor=feature_extractor,
+    )
+    payload = StagePayload(
+        request_id="req-language",
+        request=OmniRequest(
+            inputs={"audio_bytes": b"wav"},
+            params={} if language is None else {"language": language},
+        ),
+        data={},
+    )
+
+    data = request_builder(payload)
+
+    assert tokenizer.call_texts[-1].endswith(f"language {expected_name}<asr_text>")
+    assert data.language == expected_language
+
+
+@pytest.mark.parametrize(
+    ("language", "error_match"),
+    [
+        ("", "language hint is empty.*supported language code"),
+        ("   ", "language hint is empty.*supported language code"),
+        ("Klingon", "Unsupported language: 'Klingon'.*supported language code"),
+    ],
+)
+def test_qwen3_asr_rejects_explicit_unsupported_language_before_loading_audio(
+    monkeypatch,
+    language: str,
+    error_match: str,
+) -> None:
+    monkeypatch.setattr(
+        transcription,
+        "load_audio",
+        lambda source, **kwargs: pytest.fail(
+            "invalid language must fail before audio loading"
+        ),
+    )
+    request_builder, _ = make_qwen3_asr_scheduler_adapters(
+        tokenizer=_FakeTokenizer(),
+        max_new_tokens=32,
+        feature_extractor=object(),
+    )
+    payload = StagePayload(
+        request_id="req-unsupported-language",
+        request=OmniRequest(
+            inputs={"audio_bytes": b"wav"},
+            params={"language": language},
+        ),
+        data={},
+    )
+
+    with pytest.raises(ValueError, match=error_match):
+        request_builder(payload)
 
 
 def test_qwen3_asr_request_builder_records_inclusive_audio_offsets(monkeypatch) -> None:
