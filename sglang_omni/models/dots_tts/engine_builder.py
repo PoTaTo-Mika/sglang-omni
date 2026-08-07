@@ -79,7 +79,7 @@ class DotsTTSEngineBuilder(TtsEngineBuilder):
                 "dots.tts uses its DiT compile path; SGLang backbone compile is disabled"
             )
         if not bool(overrides.get("disable_cuda_graph", True)):
-            # The decode graph must be captured with hidden states (FULL);
+            # note (luojiaxuan): the decode graph must be captured with hidden states (FULL);
             # its can_run gate requires an exact hidden-mode match with the
             # acoustic tail's per-step request.
             overrides["enable_return_hidden_states"] = True
@@ -101,7 +101,7 @@ class DotsTTSEngineBuilder(TtsEngineBuilder):
                 get_decode_cuda_graph_max_bs,
             )
 
-            # Installed before init_cuda_graphs so capture bakes the buffer
+            # note (luojiaxuan): installed before init_cuda_graphs so capture bakes the buffer
             # address into the decode graph. Generously sized: rows are tiny
             # (hidden_size elements) and capture may pad above
             # max_running_requests.

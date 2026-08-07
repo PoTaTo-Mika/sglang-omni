@@ -19,7 +19,7 @@ from sglang_omni.models.weight_loader import default_weight_loader
 class DotsTTSSGLangModel(nn.Module):
     """Keep AR execution in SGLang; add only dots-specific model operators."""
 
-    # Class-level default so partially-constructed instances (tests build via
+    # note (luojiaxuan): class-level default so partially-constructed instances (tests build via
     # __new__) resolve the graph-feedback probe to "disabled".
     _graph_feedback_buffer: torch.Tensor | None = None
 
@@ -118,7 +118,7 @@ class DotsTTSSGLangModel(nn.Module):
             self._graph_feedback_buffer is not None
             and forward_batch.forward_mode.is_decode()
         ):
-            # Same source for capture, replay, and eager decode; rows beyond
+            # note (luojiaxuan): same source for capture, replay, and eager decode; rows beyond
             # the live batch are padding and their outputs are discarded.
             input_embeds = self._graph_feedback_buffer[: input_ids.shape[0]]
         elif input_embeds is None:
