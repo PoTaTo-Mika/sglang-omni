@@ -343,8 +343,6 @@ def test_validate_request_batched_gates_prompt_and_span_budget() -> None:
     )
 
 
-
-
 def test_flow_matching_checkpoint_runs_the_single_request_solver(tmp_path) -> None:
     torch.save(
         {"mean": torch.zeros(LATENT_DIM), "var": torch.ones(LATENT_DIM)},
