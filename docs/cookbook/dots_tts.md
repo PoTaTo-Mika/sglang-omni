@@ -1,7 +1,8 @@
 # dots.tts
 
 [dots.tts](https://huggingface.co/dots-studio/dots.tts-mf) is a text-to-speech model
-from rednote-hilab (published under `dots-studio`). It outputs **48 kHz speech** and
+from rednote-hilab. The Hugging Face ids are `dots-studio/dots.tts-*`; the older
+`rednote-hilab/dots.tts-*` ids redirect there and work too. It outputs **48 kHz speech** and
 clones a speaker from a short reference clip plus its transcript.
 
 dots.tts is a **continuous-latent** model, not a codec model. The backbone emits no
@@ -25,7 +26,7 @@ token sampler. So `temperature` and `top_k` do nothing here — use the solver k
 | Checkpoint | Status |
 |---|---|
 | [`dots-studio/dots.tts-mf`](https://huggingface.co/dots-studio/dots.tts-mf) | Supported (MeanFlow, this guide) |
-| [`dots-studio/dots.tts-soar`](https://huggingface.co/dots-studio/dots.tts-soar) | Not supported yet — the SOAR solver and its CFG branch are tracked in [#1367](https://github.com/sgl-project/sglang-omni/issues/1367) |
+| [`dots-studio/dots.tts-soar`](https://huggingface.co/dots-studio/dots.tts-soar) | Single-request serving added in [#1391](https://github.com/sgl-project/sglang-omni/pull/1391) (`examples/configs/dots_tts_soar.yaml`, `max_running_requests=1`). Continuous batching stays MeanFlow-only |
 | [`dots-studio/dots.tts-base`](https://huggingface.co/dots-studio/dots.tts-base) | Not supported yet |
 
 Tensor parallelism is out of scope; dots.tts runs TP1.
