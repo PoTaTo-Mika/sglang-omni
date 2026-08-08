@@ -191,6 +191,9 @@ def extract_route_metadata(
             speech_facts=None,
         )
 
+    if route_kind is RouteKind.SPEECH_BATCH and stream:
+        raise RouteMetadataError("stream is not supported for batch speech requests")
+
     return RouteMetadata(
         request_id=request_id or str(uuid.uuid4()),
         model=model,
@@ -564,8 +567,11 @@ def _speech_batch_route_facts(payload: dict[str, Any]) -> SpeechRouteFacts:
     if not isinstance(items, list):
         return _speech_route_facts(payload)
 
+    default_facts = _speech_route_facts(payload)
     models: set[str] = set()
-    voice_names: set[str] = set()
+    # The worker validates a named batch default before constructing effective
+    # items, so an item-level reference does not suppress default voice lookup.
+    voice_names = set(default_facts.voice_names_requiring_registry)
     has_reference_audio = False
     defaults = {key: value for key, value in payload.items() if key != "items"}
     for item in items:

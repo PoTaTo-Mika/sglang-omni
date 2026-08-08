@@ -650,7 +650,8 @@ def test_tts_http_routes_preserve_batch_identity_and_uploaded_voice_owner() -> N
             "/v1/audio/speech/batch",
             {
                 "voice": "Clone",
-                "items": [{"input": "hello", "ref_audio": "data:audio/wav"}],
+                "ref_audio": "data:audio/wav",
+                "items": [{"input": "hello"}],
             },
         ),
     ],
@@ -690,6 +691,40 @@ def test_explicit_reference_does_not_require_the_uploaded_voice_owner(
 
     assert response.status_code == 200
     assert seen_workers == ["worker-a:8101"]
+
+
+def test_batch_item_reference_keeps_uploaded_default_voice_on_owner() -> None:
+    seen_workers: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "healthy"}, request=request)
+        if request.url.path == "/v1/audio/voices":
+            return httpx.Response(
+                200,
+                json={"uploaded_voice_names": ["Clone"]},
+                request=request,
+            )
+        if request.url.path == "/v1/audio/speech/batch":
+            seen_workers.append(_request_netloc(request))
+            return httpx.Response(200, json={"results": []}, request=request)
+        raise AssertionError(f"unexpected upstream request: {request.url.path}")
+
+    app = create_app(
+        _router_config(voice_owner_worker_url="http://worker-b:8102"),
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/audio/speech/batch",
+            json={
+                "voice": "Clone",
+                "items": [{"input": "hello", "ref_audio": "data:audio/wav"}],
+            },
+        )
+
+    assert response.status_code == 200
+    assert seen_workers == ["worker-b:8102"]
 
 
 def test_batch_item_model_override_selects_its_effective_model() -> None:
@@ -751,6 +786,77 @@ def test_mixed_model_batch_is_rejected_before_forwarding() -> None:
 
     assert response.status_code == 400
     assert "one model" in response.json()["error"]["message"]
+    assert seen_paths == []
+
+
+def test_batch_streaming_is_rejected_before_worker_selection() -> None:
+    seen_paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "healthy"}, request=request)
+        seen_paths.append(request.url.path)
+        return httpx.Response(200, json={}, request=request)
+
+    app = create_app(
+        _router_config(
+            worker_configs=[
+                WorkerConfig(
+                    url="http://worker-a:8101",
+                    capabilities={"speech"},
+                )
+            ]
+        ),
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/audio/speech/batch",
+            json={"stream": True, "items": [{"input": "hello"}]},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == (
+        "stream is not supported for batch speech requests"
+    )
+    assert seen_paths == []
+
+
+def test_large_batch_item_model_requires_a_route_hint_with_a_voice_owner() -> None:
+    seen_paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "healthy"}, request=request)
+        seen_paths.append(request.url.path)
+        return httpx.Response(200, json={}, request=request)
+
+    app = create_app(
+        _router_config(
+            worker_configs=[
+                WorkerConfig(url="http://worker-a:8101", model="model-a"),
+                WorkerConfig(url="http://worker-b:8102", model="model-b"),
+            ],
+            voice_owner_worker_url="http://worker-a:8101",
+        ),
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    body = json.dumps(
+        {
+            "items": [
+                {"input": "x" * (1024 * 1024), "model": "model-b"},
+            ]
+        }
+    ).encode()
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/audio/speech/batch",
+            content=body,
+            headers={"content-type": "application/json"},
+        )
+
+    assert response.status_code == 400
+    assert "x-sglang-omni-route-model" in response.json()["error"]["message"]
     assert seen_paths == []
 
 

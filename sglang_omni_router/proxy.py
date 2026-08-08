@@ -375,23 +375,25 @@ class ProxyHandler:
             )
 
         is_large_speech_request = (
-            self._voice_routing is not None
-            and metadata.is_body_over_metadata_limit
+            metadata.is_body_over_metadata_limit
             and metadata.route_kind in {RouteKind.SPEECH, RouteKind.SPEECH_BATCH}
         )
         if is_large_speech_request:
             metadata.required_capabilities.add("audio_input")
+        large_request_candidates, large_request_error = (
+            _large_request_candidates_and_model_error(self._current_workers(), metadata)
+        )
         voice_owner_handles_large_body = (
             is_large_speech_request
             and self._voice_routing is not None
             and self._voice_routing.ensure_owner() is not None
         )
-        if voice_owner_handles_large_body:
-            extra_capabilities, large_request_error = set(), None
+        if large_request_error is not None or voice_owner_handles_large_body:
+            extra_capabilities = set()
         else:
             extra_capabilities, large_request_error = (
                 _large_request_extra_capabilities_or_error(
-                    self._current_workers(), metadata
+                    large_request_candidates, metadata
                 )
             )
         if large_request_error is not None:
@@ -973,44 +975,13 @@ def _payload_too_large_response(
 
 
 def _large_request_extra_capabilities_or_error(
-    workers: list[Worker],
+    candidates: list[Worker],
     metadata: RouteMetadata,
 ) -> tuple[set[Capability], str | None]:
     if not metadata.is_body_over_metadata_limit:
         return set(), None
-
-    candidates = [
-        worker
-        for worker in workers
-        if worker.is_routable
-        and all(
-            worker.supports(capability) for capability in metadata.required_capabilities
-        )
-    ]
-    candidate_models = {
-        worker.model for worker in candidates if worker.model is not None
-    }
-    if (
-        metadata.route_kind is RouteKind.SPEECH_BATCH
-        and len(candidate_models) > 1
-        and not metadata.has_route_model_header
-    ):
-        return set(), (
-            "large speech batch requests across mixed-model workers require "
-            "x-sglang-omni-route-model"
-        )
-
-    if metadata.model is not None and any(worker.model for worker in candidates):
-        candidates = [worker for worker in candidates if worker.model == metadata.model]
     if not candidates:
         return set(), None
-
-    models = {worker.model for worker in candidates}
-    if metadata.model is None and len(models) > 1:
-        return set(), (
-            "large JSON requests across mixed-model workers require "
-            "x-sglang-omni-route-model"
-        )
 
     capability_sets = {frozenset(worker.capabilities) for worker in candidates}
     if metadata.has_route_capabilities_header or len(capability_sets) <= 1:
@@ -1028,3 +999,42 @@ def _large_request_extra_capabilities_or_error(
         "large JSON requests across mixed-capability workers require "
         "x-sglang-omni-route-capabilities"
     )
+
+
+def _large_request_candidates_and_model_error(
+    workers: list[Worker],
+    metadata: RouteMetadata,
+) -> tuple[list[Worker], str | None]:
+    if not metadata.is_body_over_metadata_limit:
+        return [], None
+    candidates = [
+        worker
+        for worker in workers
+        if worker.is_routable
+        and all(
+            worker.supports(capability) for capability in metadata.required_capabilities
+        )
+    ]
+    candidate_models = {
+        worker.model for worker in candidates if worker.model is not None
+    }
+    if (
+        metadata.route_kind is RouteKind.SPEECH_BATCH
+        and len(candidate_models) > 1
+        and not metadata.has_route_model_header
+    ):
+        return (
+            candidates,
+            "large speech batch requests across mixed-model workers require "
+            "x-sglang-omni-route-model",
+        )
+    if metadata.model is not None and any(worker.model for worker in candidates):
+        candidates = [worker for worker in candidates if worker.model == metadata.model]
+    models = {worker.model for worker in candidates}
+    if metadata.model is None and len(models) > 1:
+        return (
+            candidates,
+            "large JSON requests across mixed-model workers require "
+            "x-sglang-omni-route-model",
+        )
+    return candidates, None

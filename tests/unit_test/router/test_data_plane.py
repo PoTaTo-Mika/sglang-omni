@@ -270,6 +270,32 @@ def test_dp_large_speech_body_preserves_audio_input_routing(tmp_path: Path) -> N
     )
 
 
+def test_dp_large_speech_body_rejects_a_speech_only_pool(tmp_path: Path) -> None:
+    upstream = _Recorder()
+    app, snapshot_path = _dp_app(tmp_path, upstream)
+    writer = SnapshotWriter(snapshot_path, cp_epoch="e")
+    body = json.dumps(
+        {
+            "input": "hello",
+            "voice": "default",
+            "ref_audio": "data:audio/wav;base64," + "A" * (1024 * 1024),
+        }
+    ).encode()
+
+    with TestClient(app) as client:
+        _snapshot(writer, _entry(capabilities=["speech"]))
+        _wait_for(lambda: client.get("/ready").status_code == 200)
+        response = client.post(
+            "/v1/audio/speech",
+            content=body,
+            headers={"content-type": "application/json"},
+        )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["message"] == "no eligible upstream"
+    assert upstream.requests == []
+
+
 def test_dp_sheds_when_the_snapshot_goes_stale_and_recovers(
     tmp_path: Path,
 ) -> None:
