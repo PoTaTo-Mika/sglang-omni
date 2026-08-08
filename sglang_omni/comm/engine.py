@@ -55,6 +55,9 @@ class _PendingTransfer(msgspec.Struct):
     ops: list[Any]
     ack: asyncio.Future[None]
     task: asyncio.Task | None = None
+    lease: KVPageLease | None = None
+    retain_pending_on_failure: bool = False
+    receiver_terminal: bool = False
 
 
 class _PayloadSendJob(msgspec.Struct, frozen=True):
@@ -110,6 +113,8 @@ class CommEngine:
         ] = {}
         self._send_workers: dict[str, asyncio.Task] = {}
         self._pending: dict[str, _PendingTransfer] = {}
+        # Failed pending KV transfers stay pinned until this dying process exits.
+        self._retained_pending_kv_transfers: list[_PendingTransfer] = []
         self._kv_pools: dict[str, KVPool] = {}
         self._kv_receivers: dict[str, KVReceiver] = {}
         self._kv_ready: dict[str, asyncio.Future[KVTransferReadyMessage]] = {}
@@ -313,22 +318,19 @@ class CommEngine:
     ) -> DataRef:
         """Reserve remote pages, transfer directly, and wait for receiver ACK."""
 
-        try:
-            return await self._send_kv_pages_impl(
-                control_plane=control_plane,
-                request_id=request_id,
-                source_pool_id=source_pool_id,
-                source_page_indices=source_page_indices,
-                target_pool_id=target_pool_id,
-                from_stage=from_stage,
-                to_stage=to_stage,
-                target_endpoint=target_endpoint,
-                metadata=metadata,
-                transfer_id=transfer_id,
-            )
-        finally:
-            if lease is not None:
-                lease.release()
+        return await self._send_kv_pages_impl(
+            control_plane=control_plane,
+            request_id=request_id,
+            source_pool_id=source_pool_id,
+            source_page_indices=source_page_indices,
+            target_pool_id=target_pool_id,
+            from_stage=from_stage,
+            to_stage=to_stage,
+            target_endpoint=target_endpoint,
+            metadata=metadata,
+            transfer_id=transfer_id,
+            lease=lease,
+        )
 
     async def _send_kv_pages_impl(
         self,
@@ -343,32 +345,31 @@ class CommEngine:
         target_endpoint: str,
         metadata: dict[str, Any] | None,
         transfer_id: str | None,
+        lease: KVPageLease | None,
     ) -> DataRef:
-
-        pool = self._kv_pools.get(source_pool_id)
-        if pool is None:
-            raise KeyError(f"unknown source KV pool {source_pool_id!r}")
-        pool.validate_page_indices(source_page_indices)
         transfer_id = transfer_id or (
             f"{request_id}:kv_pages:{from_stage}:{to_stage}:{uuid4().hex}"
         )
-        if transfer_id in self._kv_ready or transfer_id in self._pending:
-            raise RuntimeError(f"duplicate KV transfer {transfer_id!r}")
-
-        transport = self.router.outbound(to_stage)
-        if transport is not TransportKind.CUDA_IPC:
-            raise NotImplementedError(
-                "paged KV transfer currently supports only cuda_ipc; topology "
-                f"selected {transport.value}"
-            )
-        relay = self.relay(transport)
-        relay.register_kv_pool(pool)
-
-        ready_future = asyncio.get_running_loop().create_future()
-        self._kv_ready[transfer_id] = ready_future
-        self._outbound_kv_requests[transfer_id] = request_id
-        object_id: str | None = None
         try:
+            pool = self._kv_pools.get(source_pool_id)
+            if pool is None:
+                raise KeyError(f"unknown source KV pool {source_pool_id!r}")
+            pool.validate_page_indices(source_page_indices)
+            if transfer_id in self._kv_ready or transfer_id in self._pending:
+                raise RuntimeError(f"duplicate KV transfer {transfer_id!r}")
+
+            transport = self.router.outbound(to_stage)
+            if transport is not TransportKind.CUDA_IPC:
+                raise NotImplementedError(
+                    "paged KV transfer currently supports only cuda_ipc; topology "
+                    f"selected {transport.value}"
+                )
+            relay = self.relay(transport)
+            relay.register_kv_pool(pool)
+
+            ready_future = asyncio.get_running_loop().create_future()
+            self._kv_ready[transfer_id] = ready_future
+            self._outbound_kv_requests[transfer_id] = request_id
             await control_plane.send_to_stage(
                 to_stage,
                 target_endpoint,
@@ -406,32 +407,30 @@ class CommEngine:
                     relay_info=op.metadata,
                 ),
             )
-            object_id = data_ref.object_id
-            pending_task = await self._publish_data_ready(
+            self._register_pending(
+                data_ref.object_id,
+                [op],
+                lease=lease,
+                retain_pending_on_failure=True,
+            )
+            # DataReady may expose the source from this point onward. Pending
+            # now owns the lease even if publication or its caller is cancelled.
+            lease = None
+            pending_task = await self._publish_registered_data_ready(
                 control_plane=control_plane,
                 request_id=request_id,
                 from_stage=from_stage,
                 to_stage=to_stage,
                 target_endpoint=target_endpoint,
                 data_ref=data_ref,
-                ops=[op],
             )
-            await pending_task
+            await asyncio.shield(pending_task)
             return data_ref
-        except asyncio.CancelledError:
-            if object_id is not None:
-                self._fail_pending(
-                    object_id,
-                    RuntimeError(f"KV transfer {transfer_id!r} was cancelled"),
-                )
-            raise
-        except Exception as exc:
-            if object_id is not None:
-                self._fail_pending(object_id, exc)
-            raise
         finally:
             self._kv_ready.pop(transfer_id, None)
             self._outbound_kv_requests.pop(transfer_id, None)
+            if lease is not None:
+                lease.release()
 
     def kv_transfer_ready(self, message: KVTransferReadyMessage) -> None:
         future = self._kv_ready.get(message.transfer_id)
@@ -610,12 +609,14 @@ class CommEngine:
             )
             return
         if ack.success:
+            pending.receiver_terminal = True
             if not pending.ack.done():
                 pending.ack.set_result(None)
             return
         error = ack.error
         if error is None:
             raise ValueError("failed data_ack is missing error")
+        pending.receiver_terminal = True
         if not pending.ack.done():
             pending.ack.set_exception(RuntimeError(error))
 
@@ -765,6 +766,28 @@ class CommEngine:
 
         object_id = data_ref.object_id
         self._register_pending(object_id, ops)
+        return await self._publish_registered_data_ready(
+            control_plane=control_plane,
+            request_id=request_id,
+            from_stage=from_stage,
+            to_stage=to_stage,
+            target_endpoint=target_endpoint,
+            data_ref=data_ref,
+            chunk_id=chunk_id,
+        )
+
+    async def _publish_registered_data_ready(
+        self,
+        *,
+        control_plane: Any,
+        request_id: str,
+        from_stage: str,
+        to_stage: str,
+        target_endpoint: str,
+        data_ref: DataRef,
+        chunk_id: int | None = None,
+    ) -> asyncio.Task:
+        object_id = data_ref.object_id
         try:
             await control_plane.send_to_stage(
                 to_stage,
@@ -782,12 +805,21 @@ class CommEngine:
             raise
         return self._arm_pending(object_id)
 
-    def _register_pending(self, object_id: str, ops: list[Any]) -> None:
+    def _register_pending(
+        self,
+        object_id: str,
+        ops: list[Any],
+        *,
+        lease: KVPageLease | None = None,
+        retain_pending_on_failure: bool = False,
+    ) -> None:
         if object_id in self._pending:
             raise RuntimeError(f"duplicate pending transfer {object_id!r}")
         self._pending[object_id] = _PendingTransfer(
             ops=ops,
             ack=asyncio.get_running_loop().create_future(),
+            lease=lease,
+            retain_pending_on_failure=retain_pending_on_failure,
         )
 
     def _arm_pending(self, object_id: str) -> asyncio.Task:
@@ -798,13 +830,29 @@ class CommEngine:
         return pending.task
 
     async def _watch_pending(self, object_id: str, pending: _PendingTransfer) -> None:
+        retained = False
         try:
-            await asyncio.wait_for(pending.ack, timeout=self._ack_timeout_s)
+            ack = (
+                asyncio.shield(pending.ack)
+                if pending.retain_pending_on_failure
+                else pending.ack
+            )
+            await asyncio.wait_for(ack, timeout=self._ack_timeout_s)
             for op in pending.ops:
                 op.mark_receiver_done()
             for op in pending.ops:
                 await op.wait_for_completion(timeout=self._ack_timeout_s)
+        except asyncio.CancelledError as exc:
+            if pending.retain_pending_on_failure and not pending.receiver_terminal:
+                # A local failure is not proof that the peer stopped reading.
+                self._retain_pending_kv_transfer(object_id, pending, exc)
+                retained = True
+            raise
         except Exception as exc:
+            if pending.retain_pending_on_failure and not pending.receiver_terminal:
+                self._retain_pending_kv_transfer(object_id, pending, exc)
+                retained = True
+                raise
             for op in pending.ops:
                 with suppress(Exception):
                     op.mark_receiver_failed(exc)
@@ -813,7 +861,24 @@ class CommEngine:
                     await op.wait_for_completion(timeout=self._ack_timeout_s)
             raise
         finally:
-            self._pending.pop(object_id, None)
+            if not retained:
+                self._pending.pop(object_id, None)
+                if pending.lease is not None:
+                    pending.lease.release()
+
+    def _retain_pending_kv_transfer(
+        self,
+        object_id: str,
+        pending: _PendingTransfer,
+        error: BaseException,
+    ) -> None:
+        self._pending.pop(object_id, None)
+        self._retained_pending_kv_transfers.append(pending)
+        logger.error(
+            "Retaining pending KV transfer %s after sender failure: %s",
+            object_id,
+            error,
+        )
 
     def _fail_pending(self, object_id: str, exc: BaseException) -> None:
         pending = self._pending.get(object_id)

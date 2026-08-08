@@ -137,6 +137,19 @@ class _LinkedControlPlane:
             raise AssertionError(f"unexpected message {type(message).__name__}")
 
 
+class _DropDataReadyControlPlane(_LinkedControlPlane):
+    async def send_to_stage(
+        self,
+        next_stage: str,
+        next_stage_endpoint: str,
+        message: Any,
+    ) -> None:
+        if isinstance(message, DataReadyMessage):
+            self.messages.append(message)
+            return
+        await super().send_to_stage(next_stage, next_stage_endpoint, message)
+
+
 def _engine(stage_name: str, relay: _PagedRelay) -> CommEngine:
     return CommEngine(
         CommRouter(
@@ -150,9 +163,11 @@ def _engine(stage_name: str, relay: _PagedRelay) -> CommEngine:
     )
 
 
-def _linked_pair() -> tuple[_PagedRelay, CommEngine, Any, _LinkedControlPlane]:
+def _linked_pair(
+    control_plane: _LinkedControlPlane | None = None,
+) -> tuple[_PagedRelay, CommEngine, Any, _LinkedControlPlane]:
     relay = _PagedRelay()
-    control_plane = _LinkedControlPlane()
+    control_plane = control_plane or _LinkedControlPlane()
     source = _engine("source", relay)
     destination = make_stage(
         name="destination",
@@ -227,6 +242,7 @@ def test_kv_transfer_requires_cuda_ipc_topology() -> None:
             )
         )
         source.register_kv_pool(_pool("source_pool"))
+        lease = Mock()
 
         with pytest.raises(NotImplementedError, match="only cuda_ipc"):
             await source.send_kv_pages(
@@ -238,7 +254,9 @@ def test_kv_transfer_requires_cuda_ipc_topology() -> None:
                 from_stage="source",
                 to_stage="destination",
                 target_endpoint="unused",
+                lease=lease,
             )
+        lease.release.assert_called_once_with()
 
     asyncio.run(_run())
 
@@ -315,6 +333,40 @@ def test_kv_transfer_rejects_layout_mismatch() -> None:
             KVTransferPrepareMessage,
             KVTransferReadyMessage,
         ]
+
+    asyncio.run(_run())
+
+
+def test_kv_ack_timeout_retains_pending_sender_resources() -> None:
+    async def _run() -> None:
+        relay, source, destination, control_plane = _linked_pair(
+            _DropDataReadyControlPlane()
+        )
+        source._ack_timeout_s = 0.0
+        source.register_kv_pool(_pool("source_pool"))
+        destination._comm.register_kv_pool(_pool("destination_pool"))
+        destination._comm.register_kv_receiver("destination_pool", _Receiver((0,)))
+        lease = Mock()
+
+        with pytest.raises(TimeoutError):
+            await source.send_kv_pages(
+                control_plane=control_plane,
+                request_id="request",
+                transfer_id="transfer",
+                source_pool_id="source_pool",
+                source_page_indices=(1,),
+                target_pool_id="destination_pool",
+                from_stage="source",
+                to_stage="destination",
+                target_endpoint="unused",
+                lease=lease,
+            )
+
+        lease.release.assert_not_called()
+        assert not relay.put_ops[0].waited
+        assert relay.put_ops[0].failed is None
+        assert "transfer" not in source._pending
+        assert len(source._retained_pending_kv_transfers) == 1
 
     asyncio.run(_run())
 
