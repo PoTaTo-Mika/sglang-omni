@@ -959,6 +959,12 @@ class CudaIpcRelay(Relay):
                 f"KV pool {pool.pool_id!r} is on {pool.device}, but relay uses "
                 f"{expected_device}"
             )
+        for buffer in pool.buffers:
+            if buffer.bytes_per_page % 8 != 0:
+                raise ValueError(
+                    f"CUDA IPC KV buffer {buffer.name!r} bytes_per_page must be "
+                    f"a multiple of 8, got {buffer.bytes_per_page}"
+                )
         self._kv_pools[pool.pool_id] = pool
         self._kv_pool_registration_ids.setdefault(
             pool.pool_id,
@@ -1081,15 +1087,14 @@ class CudaIpcRelay(Relay):
             )
             self._remote_kv_pools[remote_pool_key] = source_buffers
 
-        copy_args = []
-        for source, target in zip(source_buffers, destination.buffers, strict=True):
-            item_size = target.bytes_per_page
-            if item_size <= 0 or item_size % 8 != 0:
-                raise ValueError(
-                    f"CUDA IPC KV buffer {target.name!r} bytes_per_page must be "
-                    f"a positive multiple of 8, got {item_size}"
-                )
-            copy_args.append((source, target.byte_view(), item_size))
+        copy_args = tuple(
+            (source, target.byte_view(), target.bytes_per_page)
+            for source, target in zip(
+                source_buffers,
+                destination.buffers,
+                strict=True,
+            )
+        )
 
         ready_event = torch.cuda.Event.from_ipc_handle(
             destination_device,

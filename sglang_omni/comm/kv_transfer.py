@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 import torch
@@ -18,13 +18,35 @@ class KVBufferRegion:
     name: str
     tensor: torch.Tensor
     bytes_per_page: int
+    _byte_view: torch.Tensor = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self.bytes_per_page <= 0:
+            raise ValueError(
+                f"KV buffer {self.name!r} bytes_per_page must be positive, "
+                f"got {self.bytes_per_page}"
+            )
+        byte_length = self.tensor.numel() * self.tensor.element_size()
+        if byte_length % self.bytes_per_page != 0:
+            raise ValueError(
+                f"KV buffer {self.name!r} byte length {byte_length} must be "
+                f"divisible by bytes_per_page {self.bytes_per_page}"
+            )
+        try:
+            byte_view = self.tensor.view(torch.uint8).view(-1)
+        except RuntimeError as error:
+            raise ValueError(
+                f"KV buffer {self.name!r} must expose a flattenable aliasing "
+                "byte view"
+            ) from error
+        object.__setattr__(self, "_byte_view", byte_view)
 
     @property
     def page_count(self) -> int:
-        return (self.tensor.numel() * self.tensor.element_size()) // self.bytes_per_page
+        return self._byte_view.numel() // self.bytes_per_page
 
     def byte_view(self) -> torch.Tensor:
-        return self.tensor.view(torch.uint8).reshape(-1)
+        return self._byte_view
 
 
 @dataclass(frozen=True)
