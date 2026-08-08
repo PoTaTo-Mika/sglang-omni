@@ -1,16 +1,9 @@
 # dots.tts
 
-[dots.tts](https://huggingface.co/dots-studio/dots.tts-mf) is a text-to-speech model
-from rednote-hilab. The Hugging Face ids are `dots-studio/dots.tts-*`; the older
-`rednote-hilab/dots.tts-*` ids redirect there and work too. It outputs **48 kHz speech** and
-clones a speaker from a short reference clip plus its transcript.
+[dots.tts](https://huggingface.co/dots-studio/dots.tts-mf) is a text-to-speech model from rednote-hilab.It outputs 48 kHz speech and clones a speaker from a short reference clip plus its transcript.
 
-dots.tts is a **continuous-latent** model, not a codec model. The backbone emits no
-audio tokens. Each AR step gives a hidden state; a **MeanFlow DiT** uses it to sample
-one latent patch (4 frames × 128 dims); a **semantic encoder** turns the patch back into
-the next backbone input; an **AudioVAE** decodes latents to waveform. No codebook, no
-token sampler. So `temperature` and `top_k` do nothing here — use the solver knobs
-(`num_steps`, `guidance_scale`) instead.
+dots.tts is a continuous-latent model, not a codec model. The backbone emits no audio tokens. Each AR step gives a hidden state; a MeanFlow DiT uses it to sample one latent patch (4 frames × 128 dims); a semantic encoder turns the patch back into the next backbone input; an AudioVAE decodes latents to waveform. No codebook, no token sampler. So `temperature` and `top_k` do nothing here — use the solver knobs (`num_steps`, `guidance_scale`) instead.
+
 
 | Component | Spec |
 |---|---|
@@ -29,12 +22,9 @@ token sampler. So `temperature` and `top_k` do nothing here — use the solver k
 | [`dots-studio/dots.tts-soar`](https://huggingface.co/dots-studio/dots.tts-soar) | Flow matching. Single request at a time (`max_running_requests=1`) with CFG, `num_steps=10`. `examples/configs/dots_tts_soar.yaml` |
 | [`dots-studio/dots.tts-base`](https://huggingface.co/dots-studio/dots.tts-base) | Flow matching, same as SOAR. Serve it with `examples/configs/dots_tts_soar.yaml` and `--model-path dots-studio/dots.tts-base` |
 
-Tensor parallelism is out of scope; dots.tts runs TP1.
-
 ## Prerequisites
 
-Install `sglang-omni` by following [Installation](../get_started/installation.md), then
-download and serve the model:
+Install `sglang-omni` by following [Installation](../get_started/installation.md), then download and launch the server:
 
 ```bash
 hf download dots-studio/dots.tts-mf
@@ -58,34 +48,21 @@ sgl-omni serve \
   --port 8000
 ```
 
-SOAR is a flow-matching checkpoint. It runs the single-request solver with classifier-free
-guidance, so its config pins `max_running_requests: 1` and `num_steps: 10`; continuous
-batching is MeanFlow-only. Every request example below works on either checkpoint — only
-the `model` field changes.
+SOAR is a flow-matching checkpoint. It runs the single-request solver with classifier-free guidance, so its config pins `max_running_requests: 1` and `num_steps: 10`; continuous batching is MeanFlow-only. Every request example below works on either checkpoint — only the `model` field changes.
 
-`examples/configs/dots_tts.yaml` is the canonical MeanFlow deployment. It is already tuned:
-compiled acoustic tail and vocoder (`optimize: true`, on by default), continuous batching
-at `max_running_requests=16`, and the backbone decode CUDA graph. `--model-path` alone
-keeps the compiled tail and batching but leaves backbone decode eager, which is slower
-per request (see [Performance](#performance)). Use the config file.
+`examples/configs/dots_tts.yaml` is the canonical MeanFlow deployment. It is already tuned; compiled acoustic tail and vocoder (`optimize: true`, on by default); continuous batching at `max_running_requests=16`; and the backbone decode CUDA graph. `--model-path` alone keeps the compiled tail and batching but leaves backbone decode eager, which is slower per request (see [Performance](#performance)). Use the config file.
 
-The examples below read local clips from `docs/_static/audio`. To fetch reference audio
-over HTTP instead, allow the domains you need, e.g. `--allowed-media-domain
-huggingface.co`.
+The examples below read local clips from `docs/_static/audio`. To fetch reference audio over HTTP instead, allow the domains you need, e.g. `--allowed-media-domain huggingface.co`.
 
 ## Synthesizing Speech
 
-**dots.tts needs a reference clip and its transcript.** The speaker comes entirely from
-the reference (x-vector plus prompt latents), so there is no zero-shot `voice` preset.
-Under the default continuous-batching deployment, a request without `references` is
-rejected.
+dots.tts needs a reference clip and its transcript. The speaker comes entirely from the reference (x-vector plus prompt latents), so there is no zero-shot `voice` preset. Under the default continuous-batching deployment, a request without `references` is rejected.
 
 ### Voice Cloning
 
-The reference transcript matters. It is prefixed to your input text so the model can
-align prompt audio with prompt text. A wrong transcript hurts cloning quality.
+The reference transcript matters. It is prefixed to your input text so the model can align prompt audio with prompt text. A wrong transcript hurts cloning quality.
 
-1. Use curl
+1. Use curl:
 
 ```bash
 curl -X POST http://localhost:8000/v1/audio/speech \
@@ -124,14 +101,11 @@ with open("output.wav", "wb") as f:
     f.write(resp.content)
 ```
 
-`ref_audio` / `ref_text` are accepted as a shorthand for
-`references[0].audio_path` / `references[0].text`.
+`ref_audio` / `ref_text` are accepted as a shorthand for `references[0].audio_path` / `references[0].text`.
 
 ### Streaming
 
-Streaming lets you play audio while generation is still running, which cuts
-time-to-first-audio. dots.tts streams raw 48 kHz PCM: the AudioVAE decoder emits a
-waveform chunk every few latent patches instead of waiting for the whole utterance.
+Streaming lets you play audio while generation is still running, which cuts time-to-first-audio. dots.tts streams raw 48 kHz PCM: the AudioVAE decoder emits a waveform chunk every few latent patches instead of waiting for the whole utterance.
 
 Set `"stream": true` and `"response_format": "pcm"`:
 
@@ -152,8 +126,7 @@ curl -N -X POST http://localhost:8000/v1/audio/speech \
   --output output.pcm
 ```
 
-The `-N` flag disables curl's output buffering so chunks are written as they arrive.
-The response is 16-bit mono PCM at 48 kHz with no in-band JSON framing; convert it with:
+The `-N` flag disables curl's output buffering so chunks are written as they arrive. The response is 16-bit mono PCM at 48 kHz with no in-band JSON framing; convert it with:
 
 ```bash
 ffmpeg -f s16le -ar 48000 -ac 1 -i output.pcm output.wav
@@ -205,19 +178,13 @@ curl -X POST http://localhost:8000/v1/audio/speech \
   --output output.wav
 ```
 
-A rejected solver value comes back as HTTP 500 with the engine's message, for example
-`dots.tts num_steps is fixed for continuous batching`. It is a validation failure, not a
-server fault.
+A rejected solver value comes back as HTTP 500 with the engine's message, for example `dots.tts num_steps is fixed for continuous batching`. It is a validation failure, not a  server fault.
 
-`temperature`, `top_p`, and `top_k` do not apply. The backbone token logits are unused,
-and the acoustic tail is a deterministic flow solve once the seed is fixed.
+`temperature`, `top_p`, and `top_k` do not apply. The backbone token logits are unused; the acoustic tail is a deterministic flow solve once the seed is fixed.
 
 ### Performance
 
-Throughput on Seed-TTS EN. Client `--max-concurrency` sweep against a single dots.tts
-server started from `examples/configs/dots_tts.yaml` (`max_running_requests=16`, bf16,
-`num_steps=4`, backbone decode CUDA graph and graph-captured acoustic tail on). Each row
-is the mean of two runs, seed 42. Hardware: **1x H100**.
+We report throughput on Seed-TTS EN. Client `--max-concurrency` sweep against a single dots.tts server started from `examples/configs/dots_tts.yaml` (`max_running_requests=16`, bf16, `num_steps=4`, backbone decode CUDA graph and graph-captured acoustic tail on). Each row is the mean of two runs, seed 42. Hardware: **1x H100**.
 
 | Concurrency | Throughput (req/s) | Mean latency | RTF (per-req) | audio_s/s | WER |
 |---:|---:|---:|---:|---:|---:|
@@ -228,12 +195,8 @@ is the mean of two runs, seed 42. Hardware: **1x H100**.
 | 16 | 4.64 | 3.43 s | 0.830 | 19.36 | 1.31% |
 | 32 | 4.43 | 7.15 s | 1.797 | 18.47 | 1.27% |
 
-Zero failed requests in every run, and no sample above 50% WER. c=1 is a 50-sample
-latency probe; the other rows use the full 1,088-sample set. WER is measured on the first
-run of each row.
+Zero failed requests in every run, and no sample above 50% WER. c=1 is a 50-sample latency probe; the other rows use the full 1,088-sample set. WER is measured on the first run of each row.
 
-Throughput peaks at c=16. Past it latency keeps climbing while throughput does not, so
-c=8 to c=16 is the useful operating band; c=8 is the best latency/throughput trade-off.
 
 - **Concurrency** — Maximum number of in-flight client requests (`--max-concurrency`).
 - **Throughput (req/s)** — Completed requests divided by total benchmark wall-clock time.
@@ -242,18 +205,8 @@ c=8 to c=16 is the useful operating band; c=8 is the best latency/throughput tra
 - **audio_s/s** — Total seconds of audio produced divided by total benchmark wall-clock time.
 - **WER** — Corpus word error rate of the generated speech, transcribed with `Qwen/Qwen3-ASR-1.7B`.
 
-At low concurrency the fixed per-request cost dominates (reference encoding, prefill,
-first vocoder chunks). At high concurrency the batched acoustic tail is the bound.
 
-If you serve one request at a time, set `max_running_requests: 1` instead. That switches
-the engine to the compiled single-request solver, and the batched tail stops padding a
-single request up to its smallest batch bucket. On the same 50-sample slice, mean of two
-runs: 0.64 s mean latency (RTF 0.165) at `max_running_requests=1` versus 1.11 s
-(RTF 0.284) with the default 16. It costs throughput, so only do this when requests do
-not overlap.
-
-To reproduce, start the server as in [Prerequisites](#prerequisites) and run the
-benchmark against it:
+To reproduce, start the server as in [Prerequisites](#prerequisites) and run the benchmark against it:
 
 ```bash
 python -m benchmarks.eval.benchmark_tts_seedtts \
@@ -272,8 +225,3 @@ python -m benchmarks.eval.benchmark_tts_seedtts \
   --transcribe-only --port 8000 \
   --output-dir results/dots-seedtts-en-c16
 ```
-
-The first command generates audio and reports speed. The second transcribes the saved
-audio with Qwen3-ASR and reports WER. Stop the TTS server before the second command:
-`--transcribe-only` starts its own ASR server on `--port`. Change `--max-concurrency` to
-reproduce each row.
