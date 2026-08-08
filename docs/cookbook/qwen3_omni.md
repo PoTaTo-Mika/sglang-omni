@@ -8,8 +8,8 @@ command for your hardware, then check the tables to confirm your combination is 
 ## Prerequisites
 
 ```bash
-docker pull lmsysorg/sglang-omni:dev
-docker run -it --shm-size 32g --gpus all lmsysorg/sglang-omni:dev /bin/zsh
+docker pull hongccc/sglang-omni:dev
+docker run -it --shm-size 32g --gpus all hongccc/sglang-omni:dev /bin/zsh
 ```
 
 ```bash

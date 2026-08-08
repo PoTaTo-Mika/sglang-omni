@@ -9,7 +9,7 @@ Two install paths. Docker is recommended — UCX, flash-attn, sglang, and CUDA a
 **1. Pull the image**
 
 ```bash
-docker pull lmsysorg/sglang-omni:dev
+docker pull hongccc/sglang-omni:dev
 ```
 
 Only the `dev` tag is published today. It moves with main — pin by digest for reproducible runs:
@@ -27,7 +27,7 @@ docker run -it \
     --ipc host \
     --network host \
     --privileged \
-    lmsysorg/sglang-omni:dev \
+    hongccc/sglang-omni:dev \
     /bin/zsh
 ```
 
