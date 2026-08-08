@@ -24,11 +24,29 @@ from sglang_omni_router.voice_routing import (
     VoiceMutation,
     VoiceRoutingState,
 )
-from sglang_omni_router.worker import Worker, build_workers
+from sglang_omni_router.worker import Worker, build_workers, worker_id_from_url
 
 
 def _request_netloc(request: httpx.Request) -> str:
     return f"{request.url.host}:{request.url.port}"
+
+
+def _wait_for_router_ready(client: TestClient) -> None:
+    for _ in range(100):
+        if client.get("/ready").status_code == 200:
+            return
+        time.sleep(0.01)
+    raise AssertionError("router did not become ready")
+
+
+def _wait_for_voice_registry_ready(client: TestClient) -> dict[str, Any]:
+    state: dict[str, Any] = {}
+    for _ in range(100):
+        state = client.get("/health").json()["voice_routing"]
+        if state["registry_state"] == "ready":
+            return state
+        time.sleep(0.01)
+    raise AssertionError(f"voice registry did not become ready: {state}")
 
 
 def _router_config(
@@ -462,24 +480,28 @@ def test_rejected_voice_mutation_preserves_builtin_routing() -> None:
     )
 
     with TestClient(app) as client:
-        for _ in range(100):
-            if not app.state.voice_routing.requires_owner({"Vivian"}):
-                break
-            time.sleep(0.01)
-        assert app.state.voice_routing.to_dict()["registry_state"] == "ready"
+        _wait_for_router_ready(client)
+        assert client.get("/v1/audio/voices").status_code == 200
+        _wait_for_voice_registry_ready(client)
 
-        app.state.workers[1].set_disabled(True)
+        disabled = client.put(
+            f"/workers/{worker_id_from_url('http://worker-b:8102')}",
+            json={"disabled": True},
+        )
+        assert disabled.status_code == 200
         rejected = client.post(
             "/v1/audio/voices",
             data={"name": "Clone", "consent": "true"},
             files={"audio_sample": ("clone.wav", b"RIFF", "audio/wav")},
         )
+        registry_after_rejection = client.get("/health").json()["voice_routing"]
         speech = client.post(
             "/v1/audio/speech",
             json={"input": "hello", "voice": "Vivian"},
         )
 
     assert rejected.status_code == 503
+    assert registry_after_rejection["registry_state"] == "ready"
     assert speech.status_code == 200
     assert seen_speech_workers == ["worker-a:8101"]
 
@@ -515,14 +537,12 @@ def test_voice_registry_uses_the_control_http_client() -> None:
         health_client=httpx.AsyncClient(transport=httpx.MockTransport(control_handler)),
     )
     with TestClient(app) as client:
-        for _ in range(100):
-            if not app.state.voice_routing.requires_owner({"Vivian"}):
-                break
-            time.sleep(0.01)
+        _wait_for_router_ready(client)
         response = client.post(
             "/v1/audio/speech",
             json={"input": "hello", "voice": "Vivian"},
         )
+        _wait_for_voice_registry_ready(client)
 
     assert response.status_code == 200
     assert "/v1/audio/voices" in control_requests
@@ -583,11 +603,10 @@ def test_tts_http_routes_preserve_batch_identity_and_uploaded_voice_owner() -> N
     )
 
     with TestClient(app) as client:
-        for _ in range(200):
-            if not app.state.voice_routing.requires_owner({"preset"}):
-                break
-            time.sleep(0.01)
-        assert not app.state.voice_routing.requires_owner({"preset"})
+        _wait_for_router_ready(client)
+        assert client.get("/v1/audio/voices").status_code == 200
+        _wait_for_voice_registry_ready(client)
+        seen.clear()
         upload = client.post(
             "/v1/audio/voices",
             data={"name": "Clone", "consent": "true"},
@@ -608,10 +627,7 @@ def test_tts_http_routes_preserve_batch_identity_and_uploaded_voice_owner() -> N
             },
         )
         deleted = client.delete("/v1/audio/voices/Clone")
-        for _ in range(100):
-            if app.state.voice_routing.to_dict()["registry_state"] == "ready":
-                break
-            time.sleep(0.01)
+        _wait_for_voice_registry_ready(client)
         deleted_voice = client.post(
             "/v1/audio/speech",
             json={"input": "hello", "voice": "Clone"},
@@ -633,7 +649,7 @@ def test_tts_http_routes_preserve_batch_identity_and_uploaded_voice_owner() -> N
     ]
     owner = app.state.workers[1].to_dict()
     assert owner["routed_requests_by_class"] == {
-        "voice_control": 2,
+        "voice_control": 3,
         "speech_http": 1,
         "speech_batch": 1,
     }
@@ -681,12 +697,15 @@ def test_explicit_reference_does_not_require_the_uploaded_voice_owner(
         client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
     )
     with TestClient(app) as client:
-        for _ in range(100):
-            if app.state.voice_routing.requires_owner({"clone"}):
-                break
-            time.sleep(0.01)
-        assert app.state.voice_routing.requires_owner({"clone"})
-        app.state.workers[1].set_disabled(True)
+        _wait_for_router_ready(client)
+        assert client.get("/v1/audio/voices").status_code == 200
+        registry = _wait_for_voice_registry_ready(client)
+        assert registry["uploaded_voice_count"] == 1
+        disabled = client.put(
+            f"/workers/{worker_id_from_url('http://worker-b:8102')}",
+            json={"disabled": True},
+        )
+        assert disabled.status_code == 200
         response = client.post(path, json=payload)
 
     assert response.status_code == 200
@@ -1594,12 +1613,15 @@ def test_tts_websocket_explicit_reference_bypasses_uploaded_voice_owner(
         client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
     )
     with TestClient(app) as client:
-        for _ in range(100):
-            if app.state.voice_routing.requires_owner({"clone"}):
-                break
-            time.sleep(0.01)
-        assert app.state.voice_routing.requires_owner({"clone"})
-        app.state.workers[1].set_disabled(True)
+        _wait_for_router_ready(client)
+        assert client.get("/v1/audio/voices").status_code == 200
+        registry = _wait_for_voice_registry_ready(client)
+        assert registry["uploaded_voice_count"] == 1
+        disabled = client.put(
+            f"/workers/{worker_id_from_url('http://worker-b:8102')}",
+            json={"disabled": True},
+        )
+        assert disabled.status_code == 200
         with client.websocket_connect("/v1/audio/speech/stream") as websocket:
             websocket.send_json(
                 {

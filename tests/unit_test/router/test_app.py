@@ -2824,7 +2824,7 @@ def test_speech_json_without_content_type_preserves_voice_ownership(
     )
 
     with TestClient(app) as client:
-        app.state.voice_routing.activate()
+        assert client.get("/v1/audio/voices").status_code == 200
         for _ in range(100):
             if (
                 client.get("/health").json()["voice_routing"]["registry_state"]
