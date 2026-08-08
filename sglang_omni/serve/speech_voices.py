@@ -162,6 +162,13 @@ class SpeakerSampleStore:
                 "cache_stats": self.cache.stats(),
             }
 
+    def uploaded_voice_names(self) -> list[str]:
+        with self._lock:
+            return sorted(
+                (voice.name for voice in self._voices.values()),
+                key=str.lower,
+            )
+
     def get(self, name: str) -> UploadedVoice | None:
         normalized = normalize_voice_name(name)
         with self._lock:

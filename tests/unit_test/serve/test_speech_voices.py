@@ -134,6 +134,8 @@ def test_voice_routes_upload_list_use_and_delete(tmp_path: Path, monkeypatch) ->
     assert listed.json()["uploaded_voices"][0]["ref_text"] == (
         "The narrator reference transcript."
     )
+    names_only = client.get("/v1/audio/voices", params={"names_only": "true"})
+    assert names_only.json() == {"uploaded_voice_names": ["Narrator_01"]}
 
     speech = client.post(
         "/v1/audio/speech",

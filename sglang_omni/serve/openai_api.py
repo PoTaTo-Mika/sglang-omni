@@ -269,8 +269,12 @@ def create_app(
 
 def _register_voices(app: FastAPI) -> None:
     @app.get("/v1/audio/voices")
-    async def list_voices() -> JSONResponse:
+    async def list_voices(names_only: bool = False) -> JSONResponse:
         voice_store: SpeakerSampleStore = app.state.speaker_sample_store
+        if names_only:
+            return JSONResponse(
+                content={"uploaded_voice_names": voice_store.uploaded_voice_names()}
+            )
         response = VoiceListResponse.model_validate(voice_store.list_response())
         return JSONResponse(content=response.model_dump(exclude_none=True))
 

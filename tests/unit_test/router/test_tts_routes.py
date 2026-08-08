@@ -17,7 +17,11 @@ from sglang_omni_router.app import create_app
 from sglang_omni_router.config import RouterConfig, WorkerConfig
 from sglang_omni_router.route_metadata import ROUTE_HEADER_NAMES
 from sglang_omni_router.selector import WorkerSelector
-from sglang_omni_router.voice_routing import VoiceMutation, VoiceRoutingState
+from sglang_omni_router.voice_routing import (
+    MAX_VOICE_REGISTRY_RESPONSE_BYTES,
+    VoiceMutation,
+    VoiceRoutingState,
+)
 from sglang_omni_router.worker import Worker, build_workers
 
 
@@ -97,7 +101,8 @@ async def test_automatic_voice_owner_tracks_dynamic_worker_registration() -> Non
             timeout_secs=5,
             retry_interval_secs=1,
         )
-        assert state.resolve_owner() is None
+        assert state.owner() is None
+        assert state.to_dict()["registry_state"] == "unassigned"
         assert not state.requires_owner({"preset"})
 
         workers.append(
@@ -111,8 +116,9 @@ async def test_automatic_voice_owner_tracks_dynamic_worker_registration() -> Non
             )[0]
         )
         workers[1].state = "healthy"
-        assert state.resolve_owner() is workers[1]
-        assert state.is_owner(workers[1])
+        assert state.owner() is None
+        assert state.ensure_owner() is workers[1]
+        assert state.owner() is workers[1]
         assert state.requires_owner({"preset"})
         workers[0].replace_config(
             WorkerConfig(
@@ -120,7 +126,7 @@ async def test_automatic_voice_owner_tracks_dynamic_worker_registration() -> Non
                 capabilities={"speech", "audio_input"},
             )
         )
-        assert state.resolve_owner() is workers[1]
+        assert state.owner() is workers[1]
 
 
 def test_automatic_voice_owner_skips_an_unroutable_candidate() -> None:
@@ -133,7 +139,7 @@ def test_automatic_voice_owner_skips_an_unroutable_candidate() -> None:
     async def run() -> None:
         async with httpx.AsyncClient() as client:
             state = _voice_routing(config, workers, client)
-            assert state.resolve_owner() is workers[1]
+            assert state.ensure_owner() is workers[1]
             assert state.to_dict() == {
                 "owner_worker_id": workers[1].worker_id,
                 "owner_url": workers[1].url,
@@ -143,7 +149,7 @@ def test_automatic_voice_owner_skips_an_unroutable_candidate() -> None:
                 "last_refresh_error": None,
             }
             workers[0].set_disabled(False)
-            assert state.resolve_owner() is workers[1]
+            assert state.owner() is workers[1]
 
     asyncio.run(run())
 
@@ -337,6 +343,48 @@ def test_missing_voice_registry_keeps_unknown_names_on_the_owner() -> None:
                     await asyncio.sleep(0.01)
                 assert request_count >= 2
                 assert state.to_dict()["registry_state"] == "degraded"
+                assert (
+                    state.to_dict()["last_refresh_error"]
+                    == "HTTPStatusError:status=404"
+                )
+                assert state.requires_owner({"Vivian"})
+            finally:
+                await state.stop()
+
+    asyncio.run(run())
+
+
+def test_voice_registry_response_size_is_bounded() -> None:
+    async def run() -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/v1/audio/voices"
+            return httpx.Response(
+                200,
+                content=b"x" * (MAX_VOICE_REGISTRY_RESPONSE_BYTES + 1),
+                request=request,
+            )
+
+        workers = build_workers(_router_config().workers)
+        workers[0].state = "healthy"
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            state = VoiceRoutingState(
+                workers=workers,
+                owner_url=workers[0].url,
+                client=client,
+                timeout_secs=5,
+                retry_interval_secs=1,
+            )
+            await state.start()
+            try:
+                state.requires_owner({"Vivian"})
+                for _ in range(100):
+                    if state.to_dict()["last_refresh_error"] is not None:
+                        break
+                    await asyncio.sleep(0.01)
+                assert (
+                    state.to_dict()["last_refresh_error"]
+                    == "VoiceRegistryResponseTooLargeError"
+                )
                 assert state.requires_owner({"Vivian"})
             finally:
                 await state.stop()
@@ -430,6 +478,51 @@ def test_rejected_voice_mutation_preserves_builtin_routing() -> None:
     assert rejected.status_code == 503
     assert speech.status_code == 200
     assert seen_speech_workers == ["worker-a:8101"]
+
+
+def test_voice_registry_uses_the_control_http_client() -> None:
+    data_plane_requests: list[str] = []
+    control_requests: list[str] = []
+
+    def data_handler(request: httpx.Request) -> httpx.Response:
+        data_plane_requests.append(request.url.path)
+        if request.url.path == "/v1/audio/speech":
+            return httpx.Response(200, content=b"audio", request=request)
+        raise AssertionError(
+            f"control request used data-plane client: {request.url.path}"
+        )
+
+    def control_handler(request: httpx.Request) -> httpx.Response:
+        control_requests.append(request.url.path)
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "healthy"}, request=request)
+        if request.url.path == "/v1/audio/voices":
+            assert request.url.params.get("names_only") == "true"
+            return httpx.Response(
+                200,
+                json={"uploaded_voice_names": []},
+                request=request,
+            )
+        raise AssertionError(f"unexpected control request: {request.url.path}")
+
+    app = create_app(
+        _router_config(voice_owner_worker_url="http://worker-a:8101"),
+        client=httpx.AsyncClient(transport=httpx.MockTransport(data_handler)),
+        health_client=httpx.AsyncClient(transport=httpx.MockTransport(control_handler)),
+    )
+    with TestClient(app) as client:
+        for _ in range(100):
+            if not app.state.voice_routing.requires_owner({"Vivian"}):
+                break
+            time.sleep(0.01)
+        response = client.post(
+            "/v1/audio/speech",
+            json={"input": "hello", "voice": "Vivian"},
+        )
+
+    assert response.status_code == 200
+    assert "/v1/audio/voices" in control_requests
+    assert data_plane_requests == ["/v1/audio/speech"]
 
 
 def test_tts_http_routes_preserve_batch_identity_and_uploaded_voice_owner() -> None:

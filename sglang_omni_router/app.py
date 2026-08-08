@@ -147,7 +147,7 @@ def create_app(
     voice_routing = VoiceRoutingState(
         workers=workers,
         owner_url=config.voice_owner_worker_url,
-        client=client,
+        client=health_client,
         timeout_secs=config.health_check_timeout_secs,
         retry_interval_secs=config.health_check_interval_secs,
     )
@@ -537,10 +537,11 @@ def register_admin_routes(
                     None,
                 )
 
-        if (
-            voice_routing is not None
-            and voice_routing.is_owner(worker)
-            and not can_own_uploaded_voices(next_config.capabilities)
+        voice_owner = (
+            voice_routing.ensure_owner() if voice_routing is not None else None
+        )
+        if voice_owner is worker and not can_own_uploaded_voices(
+            next_config.capabilities
         ):
             return (
                 _error_response(
@@ -592,7 +593,10 @@ def register_admin_routes(
         worker = _find_worker(workers, worker_id)
         if worker is None:
             return _error_response(404, "worker not found")
-        if voice_routing is not None and voice_routing.is_owner(worker):
+        voice_owner = (
+            voice_routing.ensure_owner() if voice_routing is not None else None
+        )
+        if voice_owner is worker:
             return _error_response(409, "voice owner worker cannot be deleted")
         workers.remove(worker)
         logger.info(

@@ -384,7 +384,7 @@ class ProxyHandler:
         voice_owner_handles_large_body = (
             is_large_speech_request
             and self._voice_routing is not None
-            and self._voice_routing.resolve_owner() is not None
+            and self._voice_routing.ensure_owner() is not None
         )
         if voice_owner_handles_large_body:
             extra_capabilities, large_request_error = set(), None
@@ -484,7 +484,7 @@ class ProxyHandler:
                 metadata.required_capabilities.add("audio_input")
             if is_voice_control or requires_voice_owner:
                 return require_eligible_worker(
-                    self._voice_routing.resolve_owner(),
+                    self._voice_routing.ensure_owner(),
                     required_capabilities=metadata.required_capabilities,
                     requested_model=metadata.model,
                 )
