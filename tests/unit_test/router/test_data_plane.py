@@ -611,6 +611,9 @@ def test_dp_flushes_cumulative_counters_to_the_cp(tmp_path: Path) -> None:
         assert report["workers"][0]["routed_total"] == 2
         assert report["workers"][0]["successful_total"] == 2
         assert report["workers"][0]["current_active"] == 0
+        assert report["workers"][0]["routed_requests_by_class"] == {"generation": 2}
+        assert report["workers"][0]["successful_requests_by_class"] == {"generation": 2}
+        assert report["workers"][0]["failed_requests_by_class"] == {}
 
 
 def test_failure_reports_retry_with_a_bound_then_give_up(tmp_path: Path) -> None:

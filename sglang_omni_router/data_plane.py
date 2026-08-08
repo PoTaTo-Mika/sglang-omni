@@ -394,6 +394,15 @@ def create_data_plane_app(
                         "successful_total": worker.successful_requests,
                         "failed_total": worker.failed_requests,
                         "current_active": worker.active_requests,
+                        "routed_requests_by_class": dict(
+                            worker.routed_requests_by_class
+                        ),
+                        "successful_requests_by_class": dict(
+                            worker.successful_requests_by_class
+                        ),
+                        "failed_requests_by_class": dict(
+                            worker.failed_requests_by_class
+                        ),
                     }
                     for worker in view.reportable_workers()
                 ],
