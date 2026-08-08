@@ -222,10 +222,12 @@ Relevant model CI ownership:
   speech topology and verifies VAD-driven raw PCM16 response streaming.
 - `test_asr_ci_multi_speaker.py`: MOSS-Transcribe-Diarize multi-speaker
   ASR/diarization correctness + speed via the managed router at DP=2. It
-  runs movies800times (non-stream + stream), aishell4_long, and googletime,
-  writes `moss_transcribe_diarize_results.json`,
+  runs movies800times (non-stream + stream), aishell4_long, aishell4_long90
+  (a 90 minute concat tier with catastrophic bounds instead of calibrated
+  thresholds), and googletime, writes `moss_transcribe_diarize_results.json`,
   `moss_transcribe_diarize_stream_results.json`,
-  `moss_transcribe_diarize_aishell4_long_results.json`, and
+  `moss_transcribe_diarize_aishell4_long_results.json`,
+  `moss_transcribe_diarize_aishell4_long90_results.json`, and
   `moss_transcribe_diarize_googletime_results.json`, and enforces calibrated
   accuracy/speed thresholds generated from `tune-ci-thresholds`.
 - `test_asr_ci_seedtts.py`: SeedTTS ASR correctness + speed via SGLang Omni
