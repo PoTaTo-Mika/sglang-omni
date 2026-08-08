@@ -7,6 +7,7 @@ import logging
 import os
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from typing import Any, Callable, NamedTuple
 
 import torch
@@ -1080,6 +1081,16 @@ class CudaIpcRelay(Relay):
             )
             self._remote_kv_pools[remote_pool_key] = source_buffers
 
+        copy_args = []
+        for source, target in zip(source_buffers, destination.buffers, strict=True):
+            item_size = target.bytes_per_page
+            if item_size <= 0 or item_size % 8 != 0:
+                raise ValueError(
+                    f"CUDA IPC KV buffer {target.name!r} bytes_per_page must be "
+                    f"a positive multiple of 8, got {item_size}"
+                )
+            copy_args.append((source, target.byte_view(), item_size))
+
         ready_event = torch.cuda.Event.from_ipc_handle(
             destination_device,
             source_meta["ready_event"],
@@ -1095,20 +1106,25 @@ class CudaIpcRelay(Relay):
             device=destination_device,
         )
         stream = torch.cuda.current_stream(destination_device)
+        done_event = torch.cuda.Event()
+        from sgl_kernel import transfer_kv_per_layer_mla
+
         with torch.cuda.device(destination_device), torch.cuda.stream(stream):
             stream.wait_event(ready_event)
-            from sgl_kernel import transfer_kv_per_layer_mla
-
-            for source, target in zip(source_buffers, destination.buffers, strict=True):
-                transfer_kv_per_layer_mla(
-                    src=source,
-                    dst=target.byte_view(),
-                    src_indices=source_indices,
-                    dst_indices=destination_indices,
-                    item_size=target.bytes_per_page,
-                )
-        done_event = torch.cuda.Event()
-        done_event.record(stream)
+            try:
+                for source, target, item_size in copy_args:
+                    transfer_kv_per_layer_mla(
+                        src=source,
+                        dst=target,
+                        src_indices=source_indices,
+                        dst_indices=destination_indices,
+                        item_size=item_size,
+                    )
+                done_event.record(stream)
+            except Exception:
+                with suppress(Exception):
+                    stream.synchronize()
+                raise
         transfer_size = sum(
             buffer.bytes_per_page * len(source_page_indices)
             for buffer in destination.buffers
