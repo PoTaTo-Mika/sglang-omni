@@ -133,11 +133,6 @@ Streaming lets you play audio while generation is still running, which cuts
 time-to-first-audio. dots.tts streams raw 48 kHz PCM: the AudioVAE decoder emits a
 waveform chunk every few latent patches instead of waiting for the whole utterance.
 
-Streaming needs `vocoder: optimize: false` in the config today. With the compiled
-vocoder the first streaming request crashes the pipeline stage process — see
-[#1392](https://github.com/sgl-project/sglang-omni/issues/1392). Non-streaming requests
-are not affected, so keep `optimize: true` if you do not stream.
-
 Set `"stream": true` and `"response_format": "pcm"`:
 
 ```bash
