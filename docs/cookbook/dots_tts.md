@@ -214,25 +214,26 @@ and the acoustic tail is a deterministic flow solve once the seed is fixed.
 
 ### Performance
 
-Throughput on Seed-TTS EN (full set, **N=1088** per run). Client `--max-concurrency`
-sweep against a single dots.tts server started from `examples/configs/dots_tts.yaml`
-(`max_running_requests=16`, bf16, `num_steps=4`, backbone decode CUDA graph and
-graph-captured acoustic tail on). Hardware: **1× H200**.
+Throughput on Seed-TTS EN. Client `--max-concurrency` sweep against a single dots.tts
+server started from `examples/configs/dots_tts.yaml` (`max_running_requests=16`, bf16,
+`num_steps=4`, backbone decode CUDA graph and graph-captured acoustic tail on). Each row
+is the mean of two runs, seed 42. Hardware: **1x H100**.
 
 | Concurrency | Throughput (req/s) | Mean latency | RTF (per-req) | audio_s/s | WER |
 |---:|---:|---:|---:|---:|---:|
-| 1 | 0.76 | 1.31 s | 0.337 | 3.01 | 1.24% |
-| 2 | 1.23 | 1.63 s | 0.397 | 5.11 | 1.30% |
-| 4 | 1.99 | 2.01 s | 0.488 | 8.29 | 1.28% |
-| 8 | 3.52 | 2.27 s | 0.550 | 14.71 | 1.25% |
-| 16 | 4.09 | 3.89 s | 0.941 | 17.06 | 1.32% |
-| 32 | 4.17 | 7.60 s | 1.911 | 17.39 | 1.31% |
+| 1 | 0.90 | 1.11 s | 0.284 | 3.58 | 1.06% |
+| 2 | 1.48 | 1.35 s | 0.329 | 6.16 | 1.25% |
+| 4 | 2.43 | 1.64 s | 0.399 | 10.14 | 1.36% |
+| 8 | 3.99 | 2.00 s | 0.486 | 16.65 | 1.31% |
+| 16 | 4.64 | 3.43 s | 0.830 | 19.36 | 1.31% |
+| 32 | 4.43 | 7.15 s | 1.797 | 18.47 | 1.27% |
 
-All rows: 0 failed requests, no sample above 50% WER. c=1 is a 50-sample latency probe;
-the other rows use the full 1,088-sample set.
+Zero failed requests in every run, and no sample above 50% WER. c=1 is a 50-sample
+latency probe; the other rows use the full 1,088-sample set. WER is measured on the first
+run of each row.
 
-Throughput saturates near c=16: going from 8 to 32 buys 18% more throughput but 3.3×
-the latency. c=8 is the best latency/throughput trade-off on this card.
+Throughput peaks at c=16. Past it latency keeps climbing while throughput does not, so
+c=8 to c=16 is the useful operating band; c=8 is the best latency/throughput trade-off.
 
 - **Concurrency** — Maximum number of in-flight client requests (`--max-concurrency`).
 - **Throughput (req/s)** — Completed requests divided by total benchmark wall-clock time.
@@ -246,9 +247,10 @@ first vocoder chunks). At high concurrency the batched acoustic tail is the boun
 
 If you serve one request at a time, set `max_running_requests: 1` instead. That switches
 the engine to the compiled single-request solver, and the batched tail stops padding a
-single request up to its smallest batch bucket. On the same 50-sample slice: 0.818 s mean
-latency (RTF 0.214) at `max_running_requests=1` versus 1.31 s (RTF 0.337) with the
-default 16. It costs throughput, so only do this when requests do not overlap.
+single request up to its smallest batch bucket. On the same 50-sample slice, mean of two
+runs: 0.64 s mean latency (RTF 0.165) at `max_running_requests=1` versus 1.11 s
+(RTF 0.284) with the default 16. It costs throughput, so only do this when requests do
+not overlap.
 
 To reproduce, start the server as in [Prerequisites](#prerequisites) and run the
 benchmark against it:
