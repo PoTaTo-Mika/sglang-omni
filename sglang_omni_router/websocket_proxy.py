@@ -67,6 +67,7 @@ SessionOutcome = (
     | Literal[
         "configuration_timeout",
         "router_overloaded",
+        "session_cancelled",
         "upstream_unavailable",
     ]
 )
@@ -128,13 +129,12 @@ class TTSWebSocketProxy:
         await websocket.accept()
         request_id = _request_id(websocket)
         start_time = time.perf_counter()
-        if not self._admission.try_acquire():
-            await self._complete_session(
-                websocket,
-                None,
-                request_id=request_id,
-                start_time=start_time,
-                result=_SessionResult(
+        worker: Worker | None = None
+        result: _SessionResult | None = None
+        is_admitted = self._admission.try_acquire()
+        try:
+            if not is_admitted:
+                result = _SessionResult(
                     outcome="router_overloaded",
                     client_error=SpeechAPIError(
                         message="router overloaded: max in-flight requests reached",
@@ -143,43 +143,31 @@ class TTSWebSocketProxy:
                         code=503,
                     ),
                     client_close_code=1013,
-                ),
-            )
-            return
+                )
+                await self._complete_session(websocket, None, result=result)
+                return
 
-        worker: Worker | None = None
-        try:
             first_message = await self._receive_initial_message(websocket)
             if isinstance(first_message, _SessionResult):
-                await self._complete_session(
-                    websocket,
-                    None,
-                    request_id=request_id,
-                    start_time=start_time,
-                    result=first_message,
-                )
+                result = first_message
+                await self._complete_session(websocket, None, result=result)
                 return
 
             facts = _session_route_facts(first_message)
             try:
                 worker = self._select_worker(facts)
             except NoEligibleWorkerError:
-                await self._complete_session(
-                    websocket,
-                    None,
-                    request_id=request_id,
-                    start_time=start_time,
-                    result=_SessionResult(
-                        outcome="upstream_unavailable",
-                        client_error=SpeechAPIError(
-                            message="no eligible upstream",
-                            status_code=503,
-                            error_type="server_error",
-                            code=503,
-                        ),
-                        client_close_code=1013,
+                result = _SessionResult(
+                    outcome="upstream_unavailable",
+                    client_error=SpeechAPIError(
+                        message="no eligible upstream",
+                        status_code=503,
+                        error_type="server_error",
+                        code=503,
                     ),
+                    client_close_code=1013,
                 )
+                await self._complete_session(websocket, None, result=result)
                 return
 
             with worker.request_guard():
@@ -191,42 +179,42 @@ class TTSWebSocketProxy:
                 await self._complete_session(
                     websocket,
                     worker,
+                    result=result,
+                )
+        except asyncio.TimeoutError:
+            result = _SessionResult(
+                outcome="configuration_timeout",
+                client_error=bad_request(
+                    "session.config was not received before timeout"
+                ),
+                client_close_code=1008,
+            )
+            await self._complete_session(
+                websocket,
+                None,
+                result=result,
+            )
+        except WebSocketDisconnect:
+            result = _SessionResult(outcome="client_disconnected")
+            await self._complete_session(
+                websocket,
+                worker,
+                result=result,
+            )
+        except asyncio.CancelledError:
+            if result is None:
+                result = _SessionResult(outcome="session_cancelled")
+            raise
+        finally:
+            if is_admitted:
+                self._admission.release()
+            if result is not None:
+                self._log_session_completion(
+                    worker,
                     request_id=request_id,
                     start_time=start_time,
                     result=result,
                 )
-        except asyncio.TimeoutError:
-            await self._complete_session(
-                websocket,
-                None,
-                request_id=request_id,
-                start_time=start_time,
-                result=_SessionResult(
-                    outcome="configuration_timeout",
-                    client_error=bad_request(
-                        "session.config was not received before timeout"
-                    ),
-                    client_close_code=1008,
-                ),
-            )
-        except WebSocketDisconnect:
-            await self._complete_session(
-                websocket,
-                worker,
-                request_id=request_id,
-                start_time=start_time,
-                result=_SessionResult(outcome="client_disconnected"),
-            )
-        except asyncio.CancelledError:
-            self._log_session_completion(
-                worker,
-                request_id=request_id,
-                start_time=start_time,
-                result=_SessionResult(outcome="client_disconnected"),
-            )
-            raise
-        finally:
-            self._admission.release()
 
     async def _receive_initial_message(
         self,
@@ -292,8 +280,6 @@ class TTSWebSocketProxy:
         websocket: WebSocket,
         worker: Worker | None,
         *,
-        request_id: str,
-        start_time: float,
         result: _SessionResult,
     ) -> None:
         if worker is not None:
@@ -310,13 +296,6 @@ class TTSWebSocketProxy:
                 status_code=result.routed_status_code,
                 service_class="tts_websocket",
             )
-        self._log_session_completion(
-            worker,
-            request_id=request_id,
-            start_time=start_time,
-            result=result,
-        )
-
         if result.client_error is not None:
             assert result.client_close_code is not None
             await _send_router_error(
@@ -347,7 +326,11 @@ class TTSWebSocketProxy:
         status_code = (
             str(result.client_error.status_code)
             if result.client_error is not None
-            else "-"
+            else (
+                str(result.routed_status_code)
+                if result.routed_status_code is not None
+                else "-"
+            )
         )
         duration_ms = (time.perf_counter() - start_time) * 1000
         log(

@@ -1376,6 +1376,7 @@ async def test_tts_websocket_relay_propagates_simultaneous_secondary_failure() -
 
 def test_tts_websocket_is_pinned_and_counted_on_one_worker(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     upstream = _FakeTTSUpstream(
         [
@@ -1407,24 +1408,25 @@ def test_tts_websocket_is_pinned_and_counted_on_one_worker(
     async_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     app = create_app(_router_config(max_payload_size=1024), client=async_client)
 
-    with TestClient(app) as client:
-        with client.websocket_connect(
-            "/v1/audio/speech/stream",
-            headers={
-                **{name: "ignored" for name in ROUTE_HEADER_NAMES},
-                "x-client-header": "kept",
-            },
-        ) as websocket:
-            websocket.send_json(
-                {
-                    "type": "session.config",
-                    "model": None,
-                    "voice": "default",
-                }
-            )
-            assert websocket.receive_json()["type"] == "session.configured"
-            assert websocket.receive_bytes() == b"pcm"
-            assert websocket.receive_json()["type"] == "session.done"
+    with caplog.at_level(logging.INFO, logger="sglang_omni_router.websocket_proxy"):
+        with TestClient(app) as client:
+            with client.websocket_connect(
+                "/v1/audio/speech/stream",
+                headers={
+                    **{name: "ignored" for name in ROUTE_HEADER_NAMES},
+                    "x-client-header": "kept",
+                },
+            ) as websocket:
+                websocket.send_json(
+                    {
+                        "type": "session.config",
+                        "model": None,
+                        "voice": "default",
+                    }
+                )
+                assert websocket.receive_json()["type"] == "session.configured"
+                assert websocket.receive_bytes() == b"pcm"
+                assert websocket.receive_json()["type"] == "session.done"
 
     assert len(upstream.sent) == 1
     assert json.loads(upstream.sent[0])["type"] == "session.config"
@@ -1432,6 +1434,58 @@ def test_tts_websocket_is_pinned_and_counted_on_one_worker(
     assert worker.active_requests == 0
     assert worker.routed_requests_by_class == {"tts_websocket": 1}
     assert worker.successful_requests_by_class == {"tts_websocket": 1}
+    terminal_logs = [
+        record.getMessage()
+        for record in caplog.records
+        if "tts_websocket_completed" in record.getMessage()
+    ]
+    assert len(terminal_logs) == 1
+    assert "outcome=completed status_code=200" in terminal_logs[0]
+
+
+@pytest.mark.asyncio
+async def test_tts_websocket_cancellation_emits_one_terminal_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class CancellingWebSocket:
+        application_state = websocket_proxy_module.WebSocketState.CONNECTED
+        client_state = websocket_proxy_module.WebSocketState.CONNECTED
+        headers: dict[str, str] = {}
+        url = URL("ws://router/v1/audio/speech/stream")
+
+        async def accept(self) -> None:
+            pass
+
+        async def receive(self) -> dict[str, Any]:
+            return {"type": "websocket.receive", "text": "oversized"}
+
+        async def send_json(self, payload: dict[str, Any]) -> None:
+            raise asyncio.CancelledError
+
+    config = _router_config(max_payload_size=1)
+    workers = build_workers(config.workers)
+    async with httpx.AsyncClient() as client:
+        proxy = websocket_proxy_module.TTSWebSocketProxy(
+            config=config,
+            workers=workers,
+            selector=WorkerSelector(config.policy),
+            admission=proxy_module.AdmissionController(config.effective_max_inflight),
+            voice_routing=_voice_routing(config, workers, client),
+        )
+        with caplog.at_level(
+            logging.INFO,
+            logger="sglang_omni_router.websocket_proxy",
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await proxy.forward(CancellingWebSocket())
+
+    terminal_logs = [
+        record.getMessage()
+        for record in caplog.records
+        if "tts_websocket_completed" in record.getMessage()
+    ]
+    assert len(terminal_logs) == 1
+    assert "outcome=client_message_too_large status_code=413" in terminal_logs[0]
 
 
 def test_tts_websocket_overload_records_a_terminal_log(
