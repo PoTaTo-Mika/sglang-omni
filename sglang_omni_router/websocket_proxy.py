@@ -39,7 +39,12 @@ from sglang_omni.serve.speech_limits import (
 )
 from sglang_omni_router.config import Capability, RouterConfig
 from sglang_omni_router.proxy import WORKER_EVICTION_STATUS_CODES, AdmissionController
-from sglang_omni_router.route_metadata import ROUTE_HEADER_NAMES
+from sglang_omni_router.route_metadata import (
+    ROUTE_HEADER_NAMES,
+    RouteKind,
+    SpeechRouteFacts,
+    extract_speech_route_facts,
+)
 from sglang_omni_router.selector import (
     NoEligibleWorkerError,
     WorkerSelector,
@@ -280,12 +285,14 @@ class TTSWebSocketProxy:
                 close_code=result.client_close_code,
             )
 
-    def _select_worker(self, facts: "_SessionRouteFacts") -> Worker:
+    def _select_worker(self, facts: SpeechRouteFacts) -> Worker:
         required_capabilities: set[Capability] = {"speech", "streaming"}
         if facts.uses_reference_audio:
             required_capabilities.add("audio_input")
-        uploaded_voice_request = self._voice_routing.requires_owner(facts.voice_names)
-        if uploaded_voice_request:
+        requires_voice_owner = self._voice_routing.requires_owner(
+            facts.voice_names_requiring_registry
+        )
+        if requires_voice_owner:
             required_capabilities.add("audio_input")
             return require_eligible_worker(
                 self._voice_routing.resolve_owner(),
@@ -299,56 +306,22 @@ class TTSWebSocketProxy:
         )
 
 
-@dataclass(frozen=True)
-class _SessionRouteFacts:
-    model: str | None = None
-    voice_names: frozenset[str] = frozenset()
-    uses_reference_audio: bool = False
-
-
-def _session_route_facts(message: dict[str, Any]) -> _SessionRouteFacts:
+def _session_route_facts(message: dict[str, Any]) -> SpeechRouteFacts:
     text = message.get("text")
     if not isinstance(text, str):
-        return _SessionRouteFacts()
+        return extract_speech_route_facts({}, RouteKind.SPEECH)
     try:
         payload = json.loads(text)
     except (json.JSONDecodeError, TypeError):
-        return _SessionRouteFacts()
+        return extract_speech_route_facts({}, RouteKind.SPEECH)
     if not isinstance(payload, dict) or payload.get("type") != "session.config":
-        return _SessionRouteFacts()
+        return extract_speech_route_facts({}, RouteKind.SPEECH)
     session = payload.get("session")
     if session is None:
         session = {key: value for key, value in payload.items() if key != "type"}
     if not isinstance(session, dict):
-        return _SessionRouteFacts()
-    model = session.get("model")
-    model = model.strip() if isinstance(model, str) and model.strip() else None
-    voice = session.get("voice", session.get("speaker"))
-    voice_names = (
-        frozenset({voice.strip().lower()})
-        if isinstance(voice, str) and voice.strip()
-        else frozenset()
-    )
-    uses_reference_audio = _uses_reference_audio(session)
-    return _SessionRouteFacts(
-        model=model,
-        voice_names=voice_names,
-        uses_reference_audio=uses_reference_audio,
-    )
-
-
-def _uses_reference_audio(session: dict[str, Any]) -> bool:
-    reference_fields = ("audio_path", "ref_audio", "audio", "data")
-    if session.get("ref_audio"):
-        return True
-    references = session.get("references")
-    if not isinstance(references, list):
-        return False
-    return any(
-        isinstance(reference, dict)
-        and any(reference.get(field) for field in reference_fields)
-        for reference in references
-    )
+        return extract_speech_route_facts({}, RouteKind.SPEECH)
+    return extract_speech_route_facts(session, RouteKind.SPEECH)
 
 
 def _relay_result(outcome: RelayOutcome) -> _SessionResult:

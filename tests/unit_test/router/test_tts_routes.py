@@ -542,6 +542,159 @@ def test_tts_http_routes_preserve_batch_identity_and_uploaded_voice_owner() -> N
     }
 
 
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        (
+            "/v1/audio/speech",
+            {"input": "hello", "voice": "Clone", "ref_audio": "data:audio/wav"},
+        ),
+        (
+            "/v1/audio/speech/batch",
+            {
+                "voice": "Clone",
+                "items": [{"input": "hello", "ref_audio": "data:audio/wav"}],
+            },
+        ),
+    ],
+)
+def test_explicit_reference_does_not_require_the_uploaded_voice_owner(
+    path: str,
+    payload: dict[str, Any],
+) -> None:
+    seen_workers: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "healthy"}, request=request)
+        if request.url.path == "/v1/audio/voices":
+            return httpx.Response(
+                200,
+                json={"uploaded_voices": [{"name": "Clone"}]},
+                request=request,
+            )
+        if request.url.path == path:
+            seen_workers.append(_request_netloc(request))
+            return httpx.Response(200, json={"ok": True}, request=request)
+        raise AssertionError(f"unexpected upstream request: {request.url.path}")
+
+    app = create_app(
+        _router_config(voice_owner_worker_url="http://worker-b:8102"),
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    with TestClient(app) as client:
+        for _ in range(100):
+            if app.state.voice_routing.requires_owner({"clone"}):
+                break
+            time.sleep(0.01)
+        assert app.state.voice_routing.requires_owner({"clone"})
+        app.state.workers[1].set_disabled(True)
+        response = client.post(path, json=payload)
+
+    assert response.status_code == 200
+    assert seen_workers == ["worker-a:8101"]
+
+
+def test_batch_item_model_override_selects_its_effective_model() -> None:
+    seen_workers: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "healthy"}, request=request)
+        if request.url.path == "/v1/audio/speech/batch":
+            seen_workers.append(_request_netloc(request))
+            return httpx.Response(200, json={"results": []}, request=request)
+        raise AssertionError(f"unexpected upstream request: {request.url.path}")
+
+    app = create_app(
+        _router_config(
+            worker_configs=[
+                WorkerConfig(url="http://worker-a:8101", model="model-a"),
+                WorkerConfig(url="http://worker-b:8102", model="model-b"),
+            ]
+        ),
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/audio/speech/batch",
+            json={"model": "model-a", "items": [{"input": "x", "model": "model-b"}]},
+        )
+
+    assert response.status_code == 200
+    assert seen_workers == ["worker-b:8102"]
+
+
+def test_mixed_model_batch_is_rejected_before_forwarding() -> None:
+    seen_paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "healthy"}, request=request)
+        seen_paths.append(request.url.path)
+        return httpx.Response(200, json={}, request=request)
+
+    app = create_app(
+        _router_config(
+            worker_configs=[
+                WorkerConfig(url="http://worker-a:8101", model="model-a"),
+                WorkerConfig(url="http://worker-b:8102", model="model-b"),
+            ]
+        ),
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/audio/speech/batch",
+            json={
+                "model": "model-a",
+                "items": [{"input": "one"}, {"input": "two", "model": "model-b"}],
+            },
+        )
+
+    assert response.status_code == 400
+    assert "one model" in response.json()["error"]["message"]
+    assert seen_paths == []
+
+
+def test_large_speech_body_without_voice_owner_requires_audio_input() -> None:
+    forwarded: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "healthy"}, request=request)
+        forwarded.append(request.url.path)
+        return httpx.Response(200, json={}, request=request)
+
+    app = create_app(
+        _router_config(
+            worker_configs=[
+                WorkerConfig(
+                    url="http://worker-a:8101",
+                    capabilities={"speech"},
+                )
+            ]
+        ),
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    body = json.dumps(
+        {
+            "input": "hello",
+            "voice": "default",
+            "ref_audio": "data:audio/wav;base64," + "A" * (1024 * 1024),
+        }
+    ).encode()
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/audio/speech",
+            content=body,
+            headers={"content-type": "application/json"},
+        )
+
+    assert response.status_code == 503
+    assert forwarded == []
+
+
 @pytest.mark.asyncio
 async def test_voice_mutations_do_not_serialize_upstream_requests() -> None:
     upload_started = asyncio.Event()
@@ -1076,6 +1229,52 @@ def test_tts_websocket_is_pinned_and_counted_on_one_worker(
     assert worker.active_requests == 0
     assert worker.routed_requests_by_class == {"tts_websocket": 1}
     assert worker.successful_requests_by_class == {"tts_websocket": 1}
+
+
+def test_tts_websocket_explicit_reference_bypasses_uploaded_voice_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    upstream = _FakeTTSUpstream([json.dumps({"type": "session.done"})])
+
+    def fake_connect(url: str, **kwargs):
+        assert url == "ws://worker-a:8101/v1/audio/speech/stream"
+        return upstream
+
+    monkeypatch.setattr(websocket_proxy_module, "websocket_connect", fake_connect)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "healthy"}, request=request)
+        if request.url.path == "/v1/audio/voices":
+            return httpx.Response(
+                200,
+                json={"uploaded_voices": [{"name": "Clone"}]},
+                request=request,
+            )
+        raise AssertionError(f"unexpected HTTP request path: {request.url.path}")
+
+    app = create_app(
+        _router_config(voice_owner_worker_url="http://worker-b:8102"),
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    with TestClient(app) as client:
+        for _ in range(100):
+            if app.state.voice_routing.requires_owner({"clone"}):
+                break
+            time.sleep(0.01)
+        assert app.state.voice_routing.requires_owner({"clone"})
+        app.state.workers[1].set_disabled(True)
+        with client.websocket_connect("/v1/audio/speech/stream") as websocket:
+            websocket.send_json(
+                {
+                    "type": "session.config",
+                    "voice": "Clone",
+                    "ref_audio": "data:audio/wav;base64,AAAA",
+                }
+            )
+            assert websocket.receive_json()["type"] == "session.done"
+
+    assert len(upstream.sent) == 1
 
 
 def test_tts_websocket_protocol_rejection_does_not_evict_worker(

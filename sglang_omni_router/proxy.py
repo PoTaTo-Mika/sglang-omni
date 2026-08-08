@@ -374,10 +374,17 @@ class ProxyHandler:
                 content={"error": {"message": str(exc)}},
             )
 
-        voice_owner_handles_large_body = (
+        is_large_speech_request = (
             self._voice_routing is not None
             and metadata.body_exceeds_metadata_limit
             and metadata.route_kind in {RouteKind.SPEECH, RouteKind.SPEECH_BATCH}
+        )
+        if is_large_speech_request:
+            metadata.required_capabilities.add("audio_input")
+        voice_owner_handles_large_body = (
+            is_large_speech_request
+            and self._voice_routing is not None
+            and self._voice_routing.resolve_owner() is not None
         )
         if voice_owner_handles_large_body:
             extra_capabilities, large_request_error = set(), None
@@ -463,19 +470,19 @@ class ProxyHandler:
         metadata: RouteMetadata,
     ) -> Worker:
         if self._voice_routing is not None:
-            voice_control = metadata.route_kind is RouteKind.VOICE_CONTROL
-            if voice_control:
+            is_voice_control = metadata.route_kind is RouteKind.VOICE_CONTROL
+            if is_voice_control:
                 self._voice_routing.activate()
-            uploaded_voice_request = metadata.route_kind in {
+            requires_voice_owner = metadata.route_kind in {
                 RouteKind.SPEECH,
                 RouteKind.SPEECH_BATCH,
             } and self._voice_routing.requires_owner(
-                metadata.voice_names,
+                metadata.voice_names_requiring_registry,
                 body_exceeds_metadata_limit=metadata.body_exceeds_metadata_limit,
             )
-            if uploaded_voice_request:
+            if requires_voice_owner:
                 metadata.required_capabilities.add("audio_input")
-            if voice_control or uploaded_voice_request:
+            if is_voice_control or requires_voice_owner:
                 return require_eligible_worker(
                     self._voice_routing.resolve_owner(),
                     required_capabilities=metadata.required_capabilities,
@@ -908,6 +915,19 @@ def _large_request_extra_capabilities_or_error(
             worker.supports(capability) for capability in metadata.required_capabilities
         )
     ]
+    candidate_models = {
+        worker.model for worker in candidates if worker.model is not None
+    }
+    if (
+        metadata.route_kind is RouteKind.SPEECH_BATCH
+        and len(candidate_models) > 1
+        and not metadata.route_model_header_present
+    ):
+        return set(), (
+            "large speech batch requests across mixed-model workers require "
+            "x-sglang-omni-route-model"
+        )
+
     if metadata.model is not None and any(worker.model for worker in candidates):
         candidates = [worker for worker in candidates if worker.model == metadata.model]
     if not candidates:

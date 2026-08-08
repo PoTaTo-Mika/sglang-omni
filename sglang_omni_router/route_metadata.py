@@ -77,10 +77,18 @@ class RouteMetadata:
     stream: bool
     required_capabilities: set[Capability]
     body_exceeds_metadata_limit: bool
+    route_model_header_present: bool
     route_capabilities_header_present: bool
     route_kind: RouteKind
     service_class: ServiceClass
-    voice_names: set[str]
+    voice_names_requiring_registry: set[str]
+
+
+@dataclass(frozen=True)
+class SpeechRouteFacts:
+    model: str | None
+    voice_names_requiring_registry: frozenset[str]
+    uses_reference_audio: bool
 
 
 @dataclass
@@ -116,15 +124,26 @@ def extract_route_metadata(
     elif body_exceeds_metadata_limit:
         large_json_metadata = _scan_large_json_metadata(body)
 
+    speech_facts = (
+        extract_speech_route_facts(payload, route_kind)
+        if payload is not None
+        and route_kind in {RouteKind.SPEECH, RouteKind.SPEECH_BATCH}
+        else None
+    )
     if payload is not None:
         request_id = request_id or _string_or_none(payload.get("request_id"))
-        model = _string_or_none(payload.get("model"))
+        model = (
+            speech_facts.model
+            if speech_facts is not None
+            else _string_or_none(payload.get("model"))
+        )
         stream = payload.get("stream") is True
         required_capabilities = _required_capabilities(
             route_kind,
             payload,
             stream=stream,
             route_capabilities=set(),
+            speech_facts=speech_facts,
         )
         _validate_body_route_headers(
             model=model,
@@ -146,6 +165,7 @@ def extract_route_metadata(
             payload,
             stream=stream,
             route_capabilities=route_capabilities,
+            speech_facts=None,
         )
         _validate_body_route_headers(
             model=model,
@@ -168,6 +188,7 @@ def extract_route_metadata(
             payload,
             stream=stream,
             route_capabilities=route_capabilities,
+            speech_facts=None,
         )
 
     return RouteMetadata(
@@ -176,10 +197,15 @@ def extract_route_metadata(
         stream=stream,
         required_capabilities=required_capabilities,
         body_exceeds_metadata_limit=body_exceeds_metadata_limit,
+        route_model_header_present=route_model_header_present,
         route_capabilities_header_present=route_capabilities_header_present,
         route_kind=route_kind,
         service_class=_service_class_for_route(route_kind),
-        voice_names=_voice_names(route_kind, payload),
+        voice_names_requiring_registry=(
+            set(speech_facts.voice_names_requiring_registry)
+            if speech_facts is not None
+            else set()
+        ),
     )
 
 
@@ -455,6 +481,7 @@ def _required_capabilities(
     *,
     stream: bool,
     route_capabilities: set[Capability],
+    speech_facts: SpeechRouteFacts | None,
 ) -> set[Capability]:
     if route_kind in {RouteKind.SPEECH, RouteKind.SPEECH_BATCH}:
         capabilities: set[Capability] = {"speech"}
@@ -469,19 +496,25 @@ def _required_capabilities(
         capabilities.add("streaming")
     capabilities.update(route_capabilities)
     if payload is not None:
-        capabilities.update(_infer_payload_capabilities(route_kind, payload))
+        capabilities.update(
+            _infer_payload_capabilities(
+                route_kind,
+                payload,
+                speech_facts=speech_facts,
+            )
+        )
     return capabilities
 
 
 def _infer_payload_capabilities(
     route_kind: RouteKind,
     payload: dict[str, Any],
+    *,
+    speech_facts: SpeechRouteFacts | None,
 ) -> set[Capability]:
     capabilities: set[Capability] = set()
     capabilities.update(_infer_input_field_capabilities(payload))
-    if route_kind is RouteKind.SPEECH and _speech_uses_reference_audio(payload):
-        capabilities.add("audio_input")
-    if route_kind is RouteKind.SPEECH_BATCH and _batch_uses_reference_audio(payload):
+    if speech_facts is not None and speech_facts.uses_reference_audio:
         capabilities.add("audio_input")
     if _modalities_include_audio(payload) or _has_non_empty(payload.get("audio")):
         capabilities.add("audio_output")
@@ -501,32 +534,66 @@ def _service_class_for_route(route_kind: RouteKind) -> ServiceClass:
     return "generation"
 
 
-def _voice_names(
+def extract_speech_route_facts(
+    payload: dict[str, Any],
     route_kind: RouteKind,
-    payload: dict[str, Any] | None,
-) -> set[str]:
-    if payload is None or route_kind not in {
-        RouteKind.SPEECH,
-        RouteKind.SPEECH_BATCH,
-    }:
-        return set()
-
-    names: set[str] = set()
-    default_voice = _voice_name(payload)
-    if default_voice is not None:
-        names.add(default_voice)
+) -> SpeechRouteFacts:
+    if route_kind is RouteKind.SPEECH:
+        return _speech_route_facts(payload)
     if route_kind is RouteKind.SPEECH_BATCH:
-        items = payload.get("items")
-        if isinstance(items, list):
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                item_voice = _voice_name(item)
-                if item_voice is not None:
-                    names.add(item_voice)
-                elif default_voice is not None:
-                    names.add(default_voice)
-    return names
+        return _speech_batch_route_facts(payload)
+    raise ValueError(f"{route_kind.value} is not a speech route")
+
+
+def _speech_route_facts(payload: dict[str, Any]) -> SpeechRouteFacts:
+    voice_name = _voice_name(payload)
+    has_explicit_reference = _has_explicit_speech_reference(payload)
+    return SpeechRouteFacts(
+        model=_string_or_none(payload.get("model")),
+        voice_names_requiring_registry=(
+            frozenset({voice_name})
+            if voice_name is not None and not has_explicit_reference
+            else frozenset()
+        ),
+        uses_reference_audio=_speech_uses_reference_audio(payload),
+    )
+
+
+def _speech_batch_route_facts(payload: dict[str, Any]) -> SpeechRouteFacts:
+    items = payload.get("items")
+    if not isinstance(items, list):
+        return _speech_route_facts(payload)
+
+    models: set[str] = set()
+    voice_names: set[str] = set()
+    uses_reference_audio = False
+    defaults = {key: value for key, value in payload.items() if key != "items"}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        effective = dict(defaults)
+        effective.update(
+            {key: value for key, value in item.items() if value is not None}
+        )
+        item_voice = _voice_name(item)
+        if item_voice is not None:
+            effective["voice"] = item_voice
+        facts = _speech_route_facts(effective)
+        if facts.model is not None:
+            models.add(facts.model)
+        voice_names.update(facts.voice_names_requiring_registry)
+        uses_reference_audio = uses_reference_audio or facts.uses_reference_audio
+
+    if len(models) > 1:
+        raise RouteMetadataError(
+            "speech batch items must resolve to one model for router forwarding"
+        )
+    model = next(iter(models), _string_or_none(payload.get("model")))
+    return SpeechRouteFacts(
+        model=model,
+        voice_names_requiring_registry=frozenset(voice_names),
+        uses_reference_audio=uses_reference_audio,
+    )
 
 
 def _voice_name(payload: dict[str, Any]) -> str | None:
@@ -535,17 +602,6 @@ def _voice_name(payload: dict[str, Any]) -> str | None:
         return None
     normalized = value.strip().lower()
     return normalized or None
-
-
-def _batch_uses_reference_audio(payload: dict[str, Any]) -> bool:
-    if _speech_uses_reference_audio(payload):
-        return True
-    items = payload.get("items")
-    if not isinstance(items, list):
-        return False
-    return any(
-        isinstance(item, dict) and _speech_uses_reference_audio(item) for item in items
-    )
 
 
 def _infer_input_field_capabilities(payload: dict[str, Any]) -> set[Capability]:
@@ -588,6 +644,10 @@ def _speech_uses_reference_audio(payload: dict[str, Any]) -> bool:
         and any(_has_non_empty(reference.get(field)) for field in reference_fields)
         for reference in references
     )
+
+
+def _has_explicit_speech_reference(payload: dict[str, Any]) -> bool:
+    return payload.get("ref_audio") is not None or bool(payload.get("references"))
 
 
 def _infer_message_part_capabilities(messages: Any) -> set[Capability]:

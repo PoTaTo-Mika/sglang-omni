@@ -3865,10 +3865,11 @@ async def test_a_cancelled_upstream_send_returns_the_active_gauge() -> None:
         stream=False,
         required_capabilities=set(),
         body_exceeds_metadata_limit=False,
+        route_model_header_present=False,
         route_capabilities_header_present=False,
         route_kind=RouteKind.GENERATION,
         service_class="generation",
-        voice_names=set(),
+        voice_names_requiring_registry=set(),
     )
     release = proxy_module._ReleaseOnce(proxy.admission)
 
