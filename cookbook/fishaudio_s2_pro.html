@@ -505,7 +505,16 @@
 <p><a class="reference external" href="https://huggingface.co/fishaudio/s2-pro">Fish Audio S2-Pro</a> is a text-to-speech model served through <code class="docutils literal notranslate"><span class="pre">/v1/audio/speech</span></code>. It supports plain TTS, voice cloning with a reference clip, and streaming audio chunks.</p>
 <section id="prerequisites">
 <h2>Prerequisites<a class="headerlink" href="#prerequisites" title="Link to this heading">#</a></h2>
-<p>Install <code class="docutils literal notranslate"><span class="pre">sglang-omni</span></code> by following <a class="reference internal" href="../get_started/installation.html"><span class="std std-doc">Installation</span></a>, then download the model:</p>
+<p>Install <code class="docutils literal notranslate"><span class="pre">sglang-omni</span></code> by following <a class="reference internal" href="../get_started/installation.html"><span class="std std-doc">Installation</span></a>.</p>
+<p>Fish Audio uses the Descript DAC codec, which is not included in the base
+<code class="docutils literal notranslate"><span class="pre">sglang-omni</span></code> package. From the SGLang-Omni repository root, install its
+model-specific dependencies:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s2">&quot;descript-audiotools==0.7.2&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s2">&quot;descript-audio-codec==1.0.0&quot;</span>
+</pre></div>
+</div>
+<p>Then download the model:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>hf<span class="w"> </span>download<span class="w"> </span>fishaudio/s2-pro
 </pre></div>
 </div>

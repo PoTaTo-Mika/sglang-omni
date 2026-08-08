@@ -525,14 +525,22 @@ SGLang-Omni it runs as a <code class="docutils literal notranslate"><span class=
 <code class="docutils literal notranslate"><span class="pre">/v1/audio/speech</span></code> endpoint.</p>
 <section id="prerequisites">
 <h2>Prerequisites<a class="headerlink" href="#prerequisites" title="Link to this heading">#</a></h2>
-<p>Install <code class="docutils literal notranslate"><span class="pre">sglang-omni</span></code> by following <a class="reference internal" href="../get_started/installation.html"><span class="std std-doc">Installation</span></a>, then
-download the model:</p>
+<p>Install <code class="docutils literal notranslate"><span class="pre">sglang-omni</span></code> by following <a class="reference internal" href="../get_started/installation.html"><span class="std std-doc">Installation</span></a>.</p>
+<p>ZONOS2 uses the Descript DAC codec, which is not included in the base
+<code class="docutils literal notranslate"><span class="pre">sglang-omni</span></code> package. From the SGLang-Omni repository root, install its
+model-specific dependencies:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s2">&quot;descript-audiotools==0.7.2&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s2">&quot;descript-audio-codec==1.0.0&quot;</span>
+</pre></div>
+</div>
+<p>Then download the model:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>hf<span class="w"> </span>download<span class="w"> </span>Zyphra/zonos2
 </pre></div>
 </div>
-<p>The processor ships with the checkpoint, so no extra TTS package is needed. Voice cloning
-transcodes reference audio (file, URL, or base64 data-URI) with <strong>ffmpeg</strong>, so <code class="docutils literal notranslate"><span class="pre">ffmpeg</span></code> must
-be on the server’s <code class="docutils literal notranslate"><span class="pre">PATH</span></code> (e.g. <code class="docutils literal notranslate"><span class="pre">apt-get</span> <span class="pre">install</span> <span class="pre">ffmpeg</span></code>).</p>
+<p>The processor ships with the checkpoint. Voice cloning transcodes reference audio
+(file, URL, or base64 data-URI) with <strong>ffmpeg</strong>, so <code class="docutils literal notranslate"><span class="pre">ffmpeg</span></code> must be on the
+server’s <code class="docutils literal notranslate"><span class="pre">PATH</span></code> (e.g. <code class="docutils literal notranslate"><span class="pre">apt-get</span> <span class="pre">install</span> <span class="pre">ffmpeg</span></code>).</p>
 </section>
 <section id="server-configuration">
 <h2>Server Configuration<a class="headerlink" href="#server-configuration" title="Link to this heading">#</a></h2>
