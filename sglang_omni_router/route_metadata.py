@@ -76,9 +76,9 @@ class RouteMetadata:
     model: str | None
     stream: bool
     required_capabilities: set[Capability]
-    body_exceeds_metadata_limit: bool
-    route_model_header_present: bool
-    route_capabilities_header_present: bool
+    is_body_over_metadata_limit: bool
+    has_route_model_header: bool
+    has_route_capabilities_header: bool
     route_kind: RouteKind
     service_class: ServiceClass
     voice_names_requiring_registry: set[str]
@@ -88,7 +88,7 @@ class RouteMetadata:
 class SpeechRouteFacts:
     model: str | None
     voice_names_requiring_registry: frozenset[str]
-    uses_reference_audio: bool
+    has_reference_audio: bool
 
 
 @dataclass
@@ -104,24 +104,24 @@ def extract_route_metadata(
     body: bytes,
 ) -> RouteMetadata:
     request_id = _request_id_from_request(request)
-    route_model, route_model_header_present = _route_model_from_header(request)
-    route_stream, route_stream_header_present = _route_stream_from_header(request)
-    route_capabilities, route_capabilities_header_present = (
-        _route_capabilities_from_header(request)
+    route_model, has_route_model_header = _route_model_from_header(request)
+    route_stream, has_route_stream_header = _route_stream_from_header(request)
+    route_capabilities, has_route_capabilities_header = _route_capabilities_from_header(
+        request
     )
     has_json_body = route_kind in {
         RouteKind.SPEECH,
         RouteKind.SPEECH_BATCH,
     } or _is_json_request(request)
-    body_exceeds_metadata_limit = has_json_body and (
+    is_body_over_metadata_limit = has_json_body and (
         len(body) > ROUTE_METADATA_JSON_LIMIT_BYTES
     )
 
     payload: dict[str, Any] | None = None
     large_json_metadata: LargeJsonMetadata | None = None
-    if has_json_body and body and not body_exceeds_metadata_limit:
+    if has_json_body and body and not is_body_over_metadata_limit:
         payload = _parse_json_object(body)
-    elif body_exceeds_metadata_limit:
+    elif is_body_over_metadata_limit:
         large_json_metadata = _scan_large_json_metadata(body)
 
     speech_facts = (
@@ -150,11 +150,11 @@ def extract_route_metadata(
             stream=stream,
             required_capabilities=required_capabilities,
             route_model=route_model,
-            route_model_header_present=route_model_header_present,
+            has_route_model_header=has_route_model_header,
             route_stream=route_stream,
-            route_stream_header_present=route_stream_header_present,
+            has_route_stream_header=has_route_stream_header,
             route_capabilities=route_capabilities,
-            route_capabilities_header_present=route_capabilities_header_present,
+            has_route_capabilities_header=has_route_capabilities_header,
         )
     elif large_json_metadata is not None:
         request_id = request_id or large_json_metadata.request_id
@@ -172,11 +172,11 @@ def extract_route_metadata(
             stream=stream,
             required_capabilities=required_capabilities,
             route_model=route_model,
-            route_model_header_present=route_model_header_present,
+            has_route_model_header=has_route_model_header,
             route_stream=route_stream,
-            route_stream_header_present=route_stream_header_present,
+            has_route_stream_header=has_route_stream_header,
             route_capabilities=set(),
-            route_capabilities_header_present=False,
+            has_route_capabilities_header=False,
         )
         if model is None:
             model = route_model
@@ -196,9 +196,9 @@ def extract_route_metadata(
         model=model,
         stream=stream,
         required_capabilities=required_capabilities,
-        body_exceeds_metadata_limit=body_exceeds_metadata_limit,
-        route_model_header_present=route_model_header_present,
-        route_capabilities_header_present=route_capabilities_header_present,
+        is_body_over_metadata_limit=is_body_over_metadata_limit,
+        has_route_model_header=has_route_model_header,
+        has_route_capabilities_header=has_route_capabilities_header,
         route_kind=route_kind,
         service_class=_service_class_for_route(route_kind),
         voice_names_requiring_registry=(
@@ -266,19 +266,19 @@ def _validate_body_route_headers(
     stream: bool,
     required_capabilities: set[Capability],
     route_model: str | None,
-    route_model_header_present: bool,
+    has_route_model_header: bool,
     route_stream: bool,
-    route_stream_header_present: bool,
+    has_route_stream_header: bool,
     route_capabilities: set[Capability],
-    route_capabilities_header_present: bool,
+    has_route_capabilities_header: bool,
 ) -> None:
-    if route_model_header_present and model is not None and route_model != model:
+    if has_route_model_header and model is not None and route_model != model:
         raise RouteMetadataError(f"{ROUTE_MODEL_HEADER} conflicts with JSON body model")
-    if route_stream_header_present and route_stream != stream:
+    if has_route_stream_header and route_stream != stream:
         raise RouteMetadataError(
             f"{ROUTE_STREAM_HEADER} conflicts with JSON body stream"
         )
-    if route_capabilities_header_present and not route_capabilities.issubset(
+    if has_route_capabilities_header and not route_capabilities.issubset(
         required_capabilities
     ):
         raise RouteMetadataError(
@@ -514,7 +514,7 @@ def _infer_payload_capabilities(
 ) -> set[Capability]:
     capabilities: set[Capability] = set()
     capabilities.update(_infer_input_field_capabilities(payload))
-    if speech_facts is not None and speech_facts.uses_reference_audio:
+    if speech_facts is not None and speech_facts.has_reference_audio:
         capabilities.add("audio_input")
     if _modalities_include_audio(payload) or _has_non_empty(payload.get("audio")):
         capabilities.add("audio_output")
@@ -555,7 +555,7 @@ def _speech_route_facts(payload: dict[str, Any]) -> SpeechRouteFacts:
             if voice_name is not None and not has_explicit_reference
             else frozenset()
         ),
-        uses_reference_audio=_speech_uses_reference_audio(payload),
+        has_reference_audio=_speech_has_reference_audio(payload),
     )
 
 
@@ -566,7 +566,7 @@ def _speech_batch_route_facts(payload: dict[str, Any]) -> SpeechRouteFacts:
 
     models: set[str] = set()
     voice_names: set[str] = set()
-    uses_reference_audio = False
+    has_reference_audio = False
     defaults = {key: value for key, value in payload.items() if key != "items"}
     for item in items:
         if not isinstance(item, dict):
@@ -582,7 +582,7 @@ def _speech_batch_route_facts(payload: dict[str, Any]) -> SpeechRouteFacts:
         if facts.model is not None:
             models.add(facts.model)
         voice_names.update(facts.voice_names_requiring_registry)
-        uses_reference_audio = uses_reference_audio or facts.uses_reference_audio
+        has_reference_audio = has_reference_audio or facts.has_reference_audio
 
     if len(models) > 1:
         raise RouteMetadataError(
@@ -592,7 +592,7 @@ def _speech_batch_route_facts(payload: dict[str, Any]) -> SpeechRouteFacts:
     return SpeechRouteFacts(
         model=model,
         voice_names_requiring_registry=frozenset(voice_names),
-        uses_reference_audio=uses_reference_audio,
+        has_reference_audio=has_reference_audio,
     )
 
 
@@ -632,7 +632,7 @@ def _modalities_include_audio(payload: dict[str, Any]) -> bool:
     return False
 
 
-def _speech_uses_reference_audio(payload: dict[str, Any]) -> bool:
+def _speech_has_reference_audio(payload: dict[str, Any]) -> bool:
     reference_fields = ("audio_path", "ref_audio", "audio", "data")
     if _has_non_empty(payload.get("ref_audio")):
         return True

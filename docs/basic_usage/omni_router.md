@@ -262,7 +262,8 @@ The endpoints have different meanings:
   `max_inflight`, `peak_inflight`, `rejected_total`). This returns `503` when no
   worker is routable.
 - `GET /workers`: detailed worker state, including `health_state`, `disabled`,
-  `routable`, `active_requests`, failure counters, and last error.
+  `routable`, `active_requests`, aggregate and per-service-class request
+  counters, and last error.
 - `GET /v1/models`: merged model list from routable workers.
 
 ## Send Requests Through the Router
@@ -371,10 +372,15 @@ The router infers required capabilities from each request:
 - `audios`, `audio_inputs`, or audio message parts require `audio_input`
 - `videos`, `video`, or video message parts require `video_input`
 - `modalities: ["audio"]` or `audio` output fields require `audio_output`
-- `/v1/audio/speech` and `/v1/audio/speech/batch` require `speech`, plus
-  `streaming` for streamed speech
-- `/v1/audio/speech/stream` WebSocket sessions require `speech` and `streaming`
-- `/v1/audio/voices` management requests require `speech`
+- `/v1/audio/speech` and `/v1/audio/speech/batch` require `speech`;
+  `/v1/audio/speech` also requires `streaming` when `stream: true` (batch speech
+  does not support streaming)
+- speech requests using `ref_audio` or audio-bearing `references` also require
+  `audio_input`
+- `/v1/audio/speech/stream` WebSocket sessions require `speech` and `streaming`,
+  plus `audio_input` when configured with reference audio
+- `/v1/audio/voices` management and synthesis using an uploaded voice require
+  the owner worker, which has both `speech` and `audio_input`
 
 Register narrower worker capabilities only when a worker cannot serve one of
 those request classes.
@@ -410,6 +416,9 @@ name is pinned to the owner because the router cannot safely distinguish a
 built-in name from an uploaded name. `GET /health` reports the selected owner,
 owner routability, registry state, and uploaded-voice count under
 `voice_routing`.
+The router hydrates this registry through the compact
+`GET /v1/audio/voices?names_only=true` response rather than transferring stored
+reference metadata.
 
 Large JSON requests are not fully parsed by the router. With a homogeneous pool
 of complete Omni V1 replicas, no extra headers are needed. With mixed models,
@@ -423,22 +432,30 @@ when the router cannot infer a single safe worker set:
 
 Speech and speech-batch JSON bodies larger than 1 MiB are conservatively pinned
 to the voice owner because the router cannot fully inspect them to rule out an
-uploaded voice reference. Route-hint headers do not override voice ownership.
+uploaded voice reference. Without an eligible owner, the router conservatively
+requires `audio_input`; it never weakens capability selection at the size
+boundary. Route-hint headers do not override voice ownership.
 
 These headers are router-only hints and are not forwarded to workers.
 
 ## Request Diagnostics
 
-Routed responses include:
+Routed HTTP responses include:
 
 - `X-SGLang-Omni-Worker`: selected worker ID
 - `X-SGLang-Omni-Request-ID`: request ID from the request headers or body, or a
   router-generated ID
 - `X-SGLang-Omni-Route-Attempt`: currently `1`
 
-Router logs include a route-completion record for buffered and streaming
-requests. Each record contains the request ID, selected worker, path, stream
-flag, inferred capabilities, status code, duration, and terminal outcome.
+HTTP routes emit `route_completed` after worker selection and `route_rejected`
+before selection. Completion records contain the request ID, selected worker,
+path, stream flag, inferred capabilities, status code, duration, and terminal
+outcome.
+
+WebSocket sessions cannot add HTTP response headers after the upgrade. Router
+rejections are sent as a TTS `error` event followed by a protocol-appropriate
+close code. Every accepted WebSocket emits one `tts_websocket_completed` record,
+including rejections before worker selection; those records use `worker=-`.
 
 ## Overload Behavior
 
@@ -446,9 +463,12 @@ The router bounds its concurrent work. Once `--max-connections` in-flight model
 requests are being relayed, additional model requests are rejected immediately,
 before the request body is read:
 
-- status `503` with an OpenAI-style error envelope (`"type": "overloaded_error"`)
-- a `Retry-After: 1` header
-- a `route_rejected` log record with `reason=router_overloaded`
+- HTTP requests receive status `503`, an OpenAI-style error envelope
+  (`"type": "overloaded_error"`), a `Retry-After: 1` header, and a
+  `route_rejected` log with `reason=router_overloaded`
+- WebSocket requests receive a TTS `error` event with
+  `error_type=overloaded_error`, close code `1013`, and a terminal log with
+  `outcome=router_overloaded`
 
 Health and management endpoints (`/live`, `/ready`, `/health`, `/workers`, admin
 routes) are never gated. `GET /health` reports the current in-flight level, the
@@ -608,9 +628,10 @@ Behavior differences to know about:
 - **Worker weight updates wait for the data planes.** Before broadcasting, the
   CP publishes the disabled-worker snapshot and waits until every live DP has
   acknowledged it; on timeout the update fails closed and nothing is sent.
-- **Counters are aggregated.** `/workers` totals are summed across DPs and
-  stay monotonic across DP restarts; `active_requests` is a best-effort gauge
-  over live DPs. Counters reset with the CP, matching single-process restarts.
+- **Counters are aggregated.** `/workers` aggregate totals and
+  `*_requests_by_class` maps are summed across DPs and stay monotonic across DP
+  restarts; `active_requests` is a best-effort gauge over live DPs. Counters
+  reset with the CP, matching single-process restarts.
 - **File descriptors scale with `N`.** Each DP holds a full-size upstream pool
   (a skewed keep-alive client mix can pin the whole bound onto one DP, which
   must still carry it) with keep-alives split `pool / N`; the startup log

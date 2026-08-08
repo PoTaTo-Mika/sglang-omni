@@ -174,11 +174,11 @@ class VoiceRoutingState:
         self,
         voice_names: Set[str],
         *,
-        body_exceeds_metadata_limit: bool = False,
+        is_body_over_metadata_limit: bool = False,
     ) -> bool:
         if self.ensure_owner() is None:
             return False
-        if body_exceeds_metadata_limit:
+        if is_body_over_metadata_limit:
             return True
         names = {
             normalized

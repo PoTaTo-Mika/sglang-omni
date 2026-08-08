@@ -8,7 +8,7 @@ import json
 import logging
 import time
 import weakref
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from http import HTTPStatus
 from urllib.parse import unquote
@@ -149,12 +149,12 @@ class _ReleaseOnce:
 
     def __init__(self, admission: AdmissionController) -> None:
         self._admission = admission
-        self._released = False
+        self._is_released = False
 
     def __call__(self) -> None:
-        if self._released:
+        if self._is_released:
             return
-        self._released = True
+        self._is_released = True
         self._admission.release()
 
 
@@ -180,12 +180,12 @@ class _RelayCleanup:
         self._worker = worker
         self._release = release
         self._record_completion = record_completion
-        self._done = False
+        self._is_done = False
 
     async def __call__(self, outcome: str) -> None:
-        if self._done:
+        if self._is_done:
             return
-        self._done = True
+        self._is_done = True
         # aclose() raising on a broken mid-stream connection must not skip the
         # decrement, otherwise least_request drifts permanently.
         try:
@@ -376,7 +376,7 @@ class ProxyHandler:
 
         is_large_speech_request = (
             self._voice_routing is not None
-            and metadata.body_exceeds_metadata_limit
+            and metadata.is_body_over_metadata_limit
             and metadata.route_kind in {RouteKind.SPEECH, RouteKind.SPEECH_BATCH}
         )
         if is_large_speech_request:
@@ -478,7 +478,7 @@ class ProxyHandler:
                 RouteKind.SPEECH_BATCH,
             } and self._voice_routing.requires_owner(
                 metadata.voice_names_requiring_registry,
-                body_exceeds_metadata_limit=metadata.body_exceeds_metadata_limit,
+                is_body_over_metadata_limit=metadata.is_body_over_metadata_limit,
             )
             if requires_voice_owner:
                 metadata.required_capabilities.add("audio_input")
@@ -504,11 +504,42 @@ class ProxyHandler:
         release: _ReleaseOnce,
         voice_mutation: _VoiceMutationRequest | None = None,
     ) -> Response:
-        # Note (Jiaxin Deng): stream through instead of buffering. A mid-stream
-        # failure after a 2xx cannot become a 502; SSE (text/event-stream) bodies
-        # get a terminal error event, other bodies (audio, JSON) truncate.
-        stream = metadata.stream
         start_time = time.perf_counter()
+        upstream = await self._open_upstream(
+            request=request,
+            path=path,
+            body=body,
+            metadata=metadata,
+            worker=worker,
+            voice_mutation=voice_mutation,
+            start_time=start_time,
+        )
+        if isinstance(upstream, JSONResponse):
+            return upstream
+        if voice_mutation is not None:
+            assert self._voice_routing is not None
+            self._voice_routing.mark_mutation_dispatched()
+        return await self._build_relay_response(
+            upstream=upstream,
+            worker=worker,
+            path=path,
+            metadata=metadata,
+            release=release,
+            start_time=start_time,
+            voice_mutation=voice_mutation,
+        )
+
+    async def _open_upstream(
+        self,
+        *,
+        request: Request,
+        path: str,
+        body: bytes,
+        metadata: RouteMetadata,
+        worker: Worker,
+        voice_mutation: _VoiceMutationRequest | None,
+        start_time: float,
+    ) -> httpx.Response | JSONResponse:
         upstream_request = self._client.build_request(
             request.method,
             build_upstream_url(worker, path, request),
@@ -574,10 +605,19 @@ class ProxyHandler:
                 self._voice_routing.mark_uncertain()
             raise
 
-        if voice_mutation is not None:
-            assert self._voice_routing is not None
-            self._voice_routing.mark_mutation_dispatched()
+        return upstream
 
+    async def _build_relay_response(
+        self,
+        *,
+        upstream: httpx.Response,
+        worker: Worker,
+        path: str,
+        metadata: RouteMetadata,
+        release: _ReleaseOnce,
+        start_time: float,
+        voice_mutation: _VoiceMutationRequest | None,
+    ) -> Response:
         worker_failure_recorded = False
 
         def record_worker_failure_once(
@@ -600,9 +640,6 @@ class ProxyHandler:
                 status_code=upstream.status_code,
                 error=f"status={upstream.status_code}",
             )
-        is_event_stream = (upstream.headers.get("content-type") or "").startswith(
-            "text/event-stream"
-        )
 
         def record_completion(outcome: str) -> None:
             status_code = upstream.status_code if outcome == "completed" else None
@@ -637,26 +674,28 @@ class ProxyHandler:
                 record_worker_failure=record_worker_failure_once,
             )
 
-        async def iter_bytes():
-            outcome = _response_outcome(upstream.status_code)
-            try:
-                async for chunk in upstream.aiter_bytes():
-                    yield chunk
-            except asyncio.CancelledError:
-                outcome = "stream_cancelled"
-                raise
-            except httpx.HTTPError as exc:
-                outcome = "stream_error"
-                record_worker_failure_once(error=type(exc).__name__)
-                if is_event_stream:
-                    yield _SSE_UPSTREAM_ERROR_EVENT
-                    return
-                raise
-            finally:
-                await cleanup(outcome)
+        return await self._streaming_relay_response(
+            upstream=upstream,
+            worker=worker,
+            metadata=metadata,
+            cleanup=cleanup,
+            record_worker_failure=record_worker_failure_once,
+        )
 
+    async def _streaming_relay_response(
+        self,
+        *,
+        upstream: httpx.Response,
+        worker: Worker,
+        metadata: RouteMetadata,
+        cleanup: _RelayCleanup,
+        record_worker_failure: Callable[..., None],
+    ) -> Response:
         try:
-            headers = filter_response_headers(upstream.headers, buffered=not stream)
+            headers = filter_response_headers(
+                upstream.headers,
+                buffered=not metadata.stream,
+            )
             headers.update(self._diagnostic_headers(worker, metadata))
         except Exception:
             await upstream.aclose()
@@ -664,16 +703,49 @@ class ProxyHandler:
             raise
         media_type = (
             upstream.headers.get("content-type", "text/event-stream")
-            if stream
+            if metadata.stream
             else upstream.headers.get("content-type")
         )
         return _RelayResponse(
-            iter_bytes(),
+            self._iter_upstream_bytes(
+                upstream,
+                cleanup=cleanup,
+                record_worker_failure=record_worker_failure,
+            ),
             status_code=upstream.status_code,
             headers=headers,
             media_type=media_type,
             cleanup=cleanup,
         )
+
+    async def _iter_upstream_bytes(
+        self,
+        upstream: httpx.Response,
+        *,
+        cleanup: _RelayCleanup,
+        record_worker_failure: Callable[..., None],
+    ) -> AsyncIterator[bytes]:
+        # A mid-stream failure after a 2xx cannot become a 502. SSE responses
+        # receive a terminal error event; audio and JSON responses truncate.
+        outcome = _response_outcome(upstream.status_code)
+        is_event_stream = (upstream.headers.get("content-type") or "").startswith(
+            "text/event-stream"
+        )
+        try:
+            async for chunk in upstream.aiter_bytes():
+                yield chunk
+        except asyncio.CancelledError:
+            outcome = "stream_cancelled"
+            raise
+        except httpx.HTTPError as exc:
+            outcome = "stream_error"
+            record_worker_failure(error=type(exc).__name__)
+            if is_event_stream:
+                yield _SSE_UPSTREAM_ERROR_EVENT
+                return
+            raise
+        finally:
+            await cleanup(outcome)
 
     async def _buffer_voice_mutation_response(
         self,
@@ -904,7 +976,7 @@ def _large_request_extra_capabilities_or_error(
     workers: list[Worker],
     metadata: RouteMetadata,
 ) -> tuple[set[Capability], str | None]:
-    if not metadata.body_exceeds_metadata_limit:
+    if not metadata.is_body_over_metadata_limit:
         return set(), None
 
     candidates = [
@@ -921,7 +993,7 @@ def _large_request_extra_capabilities_or_error(
     if (
         metadata.route_kind is RouteKind.SPEECH_BATCH
         and len(candidate_models) > 1
-        and not metadata.route_model_header_present
+        and not metadata.has_route_model_header
     ):
         return set(), (
             "large speech batch requests across mixed-model workers require "
@@ -941,7 +1013,7 @@ def _large_request_extra_capabilities_or_error(
         )
 
     capability_sets = {frozenset(worker.capabilities) for worker in candidates}
-    if metadata.route_capabilities_header_present or len(capability_sets) <= 1:
+    if metadata.has_route_capabilities_header or len(capability_sets) <= 1:
         return set(), None
 
     maximal_sets = [

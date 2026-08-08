@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import threading
 import time
 from typing import Any
 
@@ -36,6 +38,7 @@ def _router_config(
     health_check_interval_secs: int = 10,
     worker_configs: list[WorkerConfig] | None = None,
     voice_owner_worker_url: str | None = None,
+    max_inflight: int | None = None,
 ) -> RouterConfig:
     return RouterConfig(
         workers=worker_configs
@@ -48,6 +51,7 @@ def _router_config(
         health_failure_threshold=health_failure_threshold,
         health_check_interval_secs=health_check_interval_secs,
         voice_owner_worker_url=voice_owner_worker_url,
+        max_inflight=max_inflight,
     )
 
 
@@ -1322,6 +1326,85 @@ def test_tts_websocket_is_pinned_and_counted_on_one_worker(
     assert worker.active_requests == 0
     assert worker.routed_requests_by_class == {"tts_websocket": 1}
     assert worker.successful_requests_by_class == {"tts_websocket": 1}
+
+
+def test_tts_websocket_overload_records_a_terminal_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    app = create_app(
+        _router_config(max_inflight=1),
+        client=httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200,
+                    json={"status": "healthy"},
+                    request=request,
+                )
+            )
+        ),
+    )
+    with TestClient(app) as client:
+        assert app.state.proxy.admission.try_acquire()
+        with caplog.at_level(
+            logging.WARNING,
+            logger="sglang_omni_router.websocket_proxy",
+        ):
+            with client.websocket_connect("/v1/audio/speech/stream") as websocket:
+                error = websocket.receive_json()
+                close = websocket.receive()
+        app.state.proxy.admission.release()
+
+    assert error["error_type"] == "overloaded_error"
+    assert close["code"] == 1013
+    terminal_logs = [
+        record.getMessage()
+        for record in caplog.records
+        if "tts_websocket_completed" in record.getMessage()
+    ]
+    assert len(terminal_logs) == 1
+    assert "worker=- outcome=router_overloaded status_code=503" in terminal_logs[0]
+
+
+def test_tts_websocket_relay_uses_the_installed_websockets_client() -> None:
+    from websockets.sync.server import serve
+
+    upstream_messages: list[dict[str, Any]] = []
+
+    def upstream_handler(connection) -> None:
+        upstream_messages.append(json.loads(connection.recv()))
+        connection.send(json.dumps({"type": "session.done"}))
+
+    with serve(upstream_handler, "127.0.0.1", 0) as server:
+        port = server.socket.getsockname()[1]
+        server_thread = threading.Thread(target=server.serve_forever)
+        server_thread.start()
+        try:
+
+            def handler(request: httpx.Request) -> httpx.Response:
+                if request.url.path == "/health":
+                    return httpx.Response(
+                        200,
+                        json={"status": "healthy"},
+                        request=request,
+                    )
+                raise AssertionError(f"unexpected HTTP request: {request.url.path}")
+
+            app = create_app(
+                _router_config(
+                    worker_configs=[WorkerConfig(url=f"http://127.0.0.1:{port}")]
+                ),
+                client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+            )
+            with TestClient(app) as client:
+                with client.websocket_connect("/v1/audio/speech/stream") as websocket:
+                    websocket.send_json({"type": "session.config", "voice": "default"})
+                    assert websocket.receive_json()["type"] == "session.done"
+        finally:
+            server.shutdown()
+            server_thread.join(timeout=5)
+
+    assert not server_thread.is_alive()
+    assert upstream_messages == [{"type": "session.config", "voice": "default"}]
 
 
 def test_tts_websocket_explicit_reference_bypasses_uploaded_voice_owner(

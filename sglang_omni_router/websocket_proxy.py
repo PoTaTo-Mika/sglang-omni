@@ -62,7 +62,14 @@ RelayOutcome = Literal[
     "completed",
     "upstream_failure",
 ]
-SessionOutcome = RelayOutcome | Literal["upstream_unavailable"]
+SessionOutcome = (
+    RelayOutcome
+    | Literal[
+        "configuration_timeout",
+        "router_overloaded",
+        "upstream_unavailable",
+    ]
+)
 ClientRelayOutcome = Literal[
     "client_disconnected",
     "message_too_large",
@@ -120,38 +127,58 @@ class TTSWebSocketProxy:
     async def forward(self, websocket: WebSocket) -> None:
         await websocket.accept()
         request_id = _request_id(websocket)
+        start_time = time.perf_counter()
         if not self._admission.try_acquire():
-            await _send_router_error(
+            await self._complete_session(
                 websocket,
-                SpeechAPIError(
-                    message="router overloaded: max in-flight requests reached",
-                    status_code=503,
-                    error_type="overloaded_error",
-                    code=503,
+                None,
+                request_id=request_id,
+                start_time=start_time,
+                result=_SessionResult(
+                    outcome="router_overloaded",
+                    client_error=SpeechAPIError(
+                        message="router overloaded: max in-flight requests reached",
+                        status_code=503,
+                        error_type="overloaded_error",
+                        code=503,
+                    ),
+                    client_close_code=1013,
                 ),
-                close_code=1013,
             )
             return
 
-        start_time = time.perf_counter()
+        worker: Worker | None = None
         try:
             first_message = await self._receive_initial_message(websocket)
-            if first_message is None:
+            if isinstance(first_message, _SessionResult):
+                await self._complete_session(
+                    websocket,
+                    None,
+                    request_id=request_id,
+                    start_time=start_time,
+                    result=first_message,
+                )
                 return
 
             facts = _session_route_facts(first_message)
             try:
                 worker = self._select_worker(facts)
             except NoEligibleWorkerError:
-                await _send_router_error(
+                await self._complete_session(
                     websocket,
-                    SpeechAPIError(
-                        message="no eligible upstream",
-                        status_code=503,
-                        error_type="server_error",
-                        code=503,
+                    None,
+                    request_id=request_id,
+                    start_time=start_time,
+                    result=_SessionResult(
+                        outcome="upstream_unavailable",
+                        client_error=SpeechAPIError(
+                            message="no eligible upstream",
+                            status_code=503,
+                            error_type="server_error",
+                            code=503,
+                        ),
+                        client_close_code=1013,
                     ),
-                    close_code=1013,
                 )
                 return
 
@@ -161,7 +188,7 @@ class TTSWebSocketProxy:
                     worker,
                     first_message,
                 )
-                await self._finish_session(
+                await self._complete_session(
                     websocket,
                     worker,
                     request_id=request_id,
@@ -169,43 +196,64 @@ class TTSWebSocketProxy:
                     result=result,
                 )
         except asyncio.TimeoutError:
-            await _send_router_error(
+            await self._complete_session(
                 websocket,
-                bad_request("session.config was not received before timeout"),
-                close_code=1008,
+                None,
+                request_id=request_id,
+                start_time=start_time,
+                result=_SessionResult(
+                    outcome="configuration_timeout",
+                    client_error=bad_request(
+                        "session.config was not received before timeout"
+                    ),
+                    client_close_code=1008,
+                ),
             )
         except WebSocketDisconnect:
-            pass
+            await self._complete_session(
+                websocket,
+                worker,
+                request_id=request_id,
+                start_time=start_time,
+                result=_SessionResult(outcome="client_disconnected"),
+            )
+        except asyncio.CancelledError:
+            self._log_session_completion(
+                worker,
+                request_id=request_id,
+                start_time=start_time,
+                result=_SessionResult(outcome="client_disconnected"),
+            )
+            raise
         finally:
             self._admission.release()
 
     async def _receive_initial_message(
         self,
         websocket: WebSocket,
-    ) -> dict[str, Any] | None:
+    ) -> dict[str, Any] | _SessionResult:
         message = await asyncio.wait_for(
             websocket.receive(),
             timeout=SPEECH_WS_CONFIG_TIMEOUT_S,
         )
         if message.get("type") == "websocket.disconnect":
-            return None
+            return _SessionResult(outcome="client_disconnected")
         message_limit = min(
             self._config.max_payload_size,
             MAX_SPEECH_WS_CONFIG_MESSAGE_BYTES,
         )
         if _message_size(message) <= message_limit:
             return message
-        await _send_router_error(
-            websocket,
-            SpeechAPIError(
+        return _SessionResult(
+            outcome="client_message_too_large",
+            client_error=SpeechAPIError(
                 message="session.config WebSocket message exceeds payload limit",
                 status_code=413,
                 error_type="BadRequestError",
                 code=413,
             ),
-            close_code=1009,
+            client_close_code=1009,
         )
-        return None
 
     async def _connect_and_relay(
         self,
@@ -239,31 +287,61 @@ class TTSWebSocketProxy:
             return _connection_failure_result(exc)
         return _relay_result(outcome)
 
-    async def _finish_session(
+    async def _complete_session(
         self,
         websocket: WebSocket,
-        worker: Worker,
+        worker: Worker | None,
         *,
         request_id: str,
         start_time: float,
         result: _SessionResult,
     ) -> None:
-        if (
-            result.worker_failure_status_code is not None
-            or result.worker_failure_error is not None
-        ):
-            worker.record_request_failure(
-                failure_threshold=self._config.health_failure_threshold,
-                status_code=result.worker_failure_status_code,
-                error=result.worker_failure_error,
+        if worker is not None:
+            if (
+                result.worker_failure_status_code is not None
+                or result.worker_failure_error is not None
+            ):
+                worker.record_request_failure(
+                    failure_threshold=self._config.health_failure_threshold,
+                    status_code=result.worker_failure_status_code,
+                    error=result.worker_failure_error,
+                )
+            worker.record_routed_request(
+                status_code=result.routed_status_code,
+                service_class="tts_websocket",
             )
-        worker.record_routed_request(
-            status_code=result.routed_status_code,
-            service_class="tts_websocket",
+        self._log_session_completion(
+            worker,
+            request_id=request_id,
+            start_time=start_time,
+            result=result,
         )
+
+        if result.client_error is not None:
+            assert result.client_close_code is not None
+            await _send_router_error(
+                websocket,
+                result.client_error,
+                close_code=result.client_close_code,
+            )
+
+    def _log_session_completion(
+        self,
+        worker: Worker | None,
+        *,
+        request_id: str,
+        start_time: float,
+        result: _SessionResult,
+    ) -> None:
         log = (
             logger.warning
-            if result.outcome in {"upstream_failure", "upstream_unavailable"}
+            if result.outcome
+            in {
+                "configuration_timeout",
+                "router_overloaded",
+                "upstream_failure",
+                "upstream_unavailable",
+            }
             else logger.info
         )
         status_code = (
@@ -274,20 +352,14 @@ class TTSWebSocketProxy:
         duration_ms = (time.perf_counter() - start_time) * 1000
         log(
             f"tts_websocket_completed request_id={request_id} "
-            f"worker={worker.display_id} outcome={result.outcome} "
+            f"worker={worker.display_id if worker is not None else '-'} "
+            f"outcome={result.outcome} "
             f"status_code={status_code} duration_ms={duration_ms:.2f}"
         )
-        if result.client_error is not None:
-            assert result.client_close_code is not None
-            await _send_router_error(
-                websocket,
-                result.client_error,
-                close_code=result.client_close_code,
-            )
 
     def _select_worker(self, facts: SpeechRouteFacts) -> Worker:
         required_capabilities: set[Capability] = {"speech", "streaming"}
-        if facts.uses_reference_audio:
+        if facts.has_reference_audio:
             required_capabilities.add("audio_input")
         requires_voice_owner = self._voice_routing.requires_owner(
             facts.voice_names_requiring_registry
@@ -535,9 +607,9 @@ async def _upstream_to_client(
 
 class _TTSProtocolState:
     def __init__(self) -> None:
-        self._received_error = False
-        self._failed_audio = False
-        self._session_done = False
+        self._has_received_error = False
+        self._has_failed_audio = False
+        self._is_session_done = False
 
     def observe(self, message: str) -> None:
         try:
@@ -548,23 +620,23 @@ class _TTSProtocolState:
             return
         message_type = payload.get("type")
         if message_type == "error":
-            self._received_error = True
+            self._has_received_error = True
         elif message_type == "audio.done" and payload.get("error") is True:
-            self._failed_audio = True
+            self._has_failed_audio = True
         elif message_type == "session.done":
-            self._session_done = True
-            self._received_error = False
+            self._is_session_done = True
+            self._has_received_error = False
 
     @property
     def has_application_failure(self) -> bool:
-        return self._received_error or self._failed_audio
+        return self._has_received_error or self._has_failed_audio
 
     def clean_close_outcome(self) -> RelayOutcome:
-        if self._failed_audio:
+        if self._has_failed_audio:
             return "application_failure"
-        if self._session_done:
+        if self._is_session_done:
             return "completed"
-        if self._received_error:
+        if self._has_received_error:
             return "application_failure"
         return "upstream_failure"
 
