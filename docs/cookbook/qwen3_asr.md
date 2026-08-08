@@ -13,7 +13,9 @@ MODEL_PATH=$(hf download Qwen/Qwen3-ASR-1.7B --revision "${MODEL_REVISION}")
 
 ## Server Configuration
 
-Qwen3-ASR runs a single ASR stage on one GPU.
+Qwen3-ASR runs a single ASR stage on one GPU. Its default `auto` dtype follows
+the checkpoint configuration (BF16 for Qwen3-ASR-1.7B); pass
+`--stages.asr.factory-args.dtype float16` to force FP16.
 Async decode is enabled by default for decode batches of at least two requests,
 allowing the shared one-step-lookahead path to overlap host-side result
 processing with the next GPU decode forward. Use `--decode-mode sync` to disable
@@ -70,15 +72,33 @@ print(resp.json()["text"])
 |---|---|---|---|
 | `file` | file | required | Audio file uploaded as multipart form data |
 | `model` | string | server default | Model identifier |
-| `language` | string | `en` | Language hint; `zh`/`cn` select Chinese, other values use English prompting |
+| `language` | string | `en` | Language hint as a supported code or canonical name (case-insensitive) |
 | `prompt` | string | none | Accepted for OpenAI compatibility; Qwen3-ASR currently ignores it |
 | `response_format` | string | `json` | `json`, `verbose_json`, or `text` |
-| `temperature` | float | `0.01` effective | Sampling temperature; `0` is converted to near-greedy `0.01` |
+| `temperature` | float | `0` | Sampling temperature; `0` uses greedy decoding |
 | `max_new_tokens` | integer | server stage limit | Per-request generation-token limit |
 | `stream` | boolean | `false` | Return transcript events over SSE |
 
 `verbose_json` uses the model adapter's verbose response schema and includes
 duration-based usage (rounded-up audio seconds) when duration probing succeeds.
+
+### Language Hints
+
+Qwen3-ASR accepts the following 30 language codes and their canonical names:
+
+| Codes | Canonical names |
+|---|---|
+| `ar`, `yue`, `zh`, `cs`, `da`, `nl`, `en`, `fil`, `fi`, `fr` | Arabic, Cantonese, Chinese, Czech, Danish, Dutch, English, Filipino, Finnish, French |
+| `de`, `el`, `hi`, `hu`, `id`, `it`, `ja`, `ko`, `mk`, `ms` | German, Greek, Hindi, Hungarian, Indonesian, Italian, Japanese, Korean, Macedonian, Malay |
+| `fa`, `pl`, `pt`, `ro`, `ru`, `es`, `sv`, `th`, `tr`, `vi` | Persian, Polish, Portuguese, Romanian, Russian, Spanish, Swedish, Thai, Turkish, Vietnamese |
+
+For example, `language=es` and `language=Spanish` both force the prompt suffix
+`language Spanish<asr_text>`. The legacy `cn` and regional `zh-*` spellings are
+also accepted as Chinese. Unsupported language hints return HTTP 400 instead of
+silently falling back to English.
+
+The model also has ASR coverage for 22 Chinese dialects, but those dialect names
+are not supported as forced `language` hints; use `Chinese`/`zh` for them.
 
 ## Benchmarking
 
@@ -173,5 +193,8 @@ sgl-omni serve --model-path Qwen/Qwen3-ASR-1.7B \
 ## Known Limitations
 
 - The endpoint accepts one uploaded file per request.
+- Audio duration is bounded by the configured context and requested
+  `max_new_tokens`, rather than a fixed 30-second window. Split audio or reduce
+  `max_new_tokens` if the request exceeds that token budget.
 - `prompt` is accepted by the HTTP endpoint for OpenAI compatibility, but Qwen3-ASR currently ignores it.
 - Audio is resampled to 16 kHz before transcription.
