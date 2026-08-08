@@ -1,9 +1,8 @@
 # dots.tts
 
-[dots.tts](https://huggingface.co/dots-studio/dots.tts-mf) is a text-to-speech model from rednote-hilab.It outputs 48 kHz speech and clones a speaker from a short reference clip plus its transcript.
+[dots.tts](https://huggingface.co/dots-studio/dots.tts-mf) is a text-to-speech model from rednote-hilab. It outputs 48 kHz speech and clones a speaker from a short reference clip plus its transcript.
 
 dots.tts is a continuous-latent model, not a codec model. The backbone emits no audio tokens. Each AR step gives a hidden state; a MeanFlow DiT uses it to sample one latent patch (4 frames × 128 dims); a semantic encoder turns the patch back into the next backbone input; an AudioVAE decodes latents to waveform. No codebook, no token sampler. So `temperature` and `top_k` do nothing here — use the solver knobs (`num_steps`, `guidance_scale`) instead.
-
 
 | Component | Spec |
 |---|---|
@@ -178,7 +177,7 @@ curl -X POST http://localhost:8000/v1/audio/speech \
   --output output.wav
 ```
 
-A rejected solver value comes back as HTTP 500 with the engine's message, for example `dots.tts num_steps is fixed for continuous batching`. It is a validation failure, not a  server fault.
+A rejected solver value comes back as HTTP 500 with the engine's message, for example `dots.tts num_steps is fixed for continuous batching`. It is a validation failure, not a server fault.
 
 `temperature`, `top_p`, and `top_k` do not apply. The backbone token logits are unused; the acoustic tail is a deterministic flow solve once the seed is fixed.
 
@@ -197,14 +196,12 @@ We report throughput on Seed-TTS EN. Client `--max-concurrency` sweep against a 
 
 Zero failed requests in every run, and no sample above 50% WER. c=1 is a 50-sample latency probe; the other rows use the full 1,088-sample set. WER is measured on the first run of each row.
 
-
 - **Concurrency** — Maximum number of in-flight client requests (`--max-concurrency`).
 - **Throughput (req/s)** — Completed requests divided by total benchmark wall-clock time.
 - **Mean latency** — Average end-to-end time per request (send to full response received).
 - **RTF (per-req)** — Average ratio of processing time to generated audio duration per request. `<1` is faster than real time.
 - **audio_s/s** — Total seconds of audio produced divided by total benchmark wall-clock time.
 - **WER** — Corpus word error rate of the generated speech, transcribed with `Qwen/Qwen3-ASR-1.7B`.
-
 
 To reproduce, start the server as in [Prerequisites](#prerequisites) and run the benchmark against it:
 
