@@ -179,15 +179,28 @@ def merge_concat_references(
     return "".join(merged)
 
 
+def _filler_cut_boundary_s(reference: str, limit_s: float) -> float:
+    ends = [
+        end
+        for match in CONCAT_SEGMENT_RE.finditer(reference)
+        if (end := float(match.group(4))) <= limit_s
+    ]
+    if not ends:
+        raise ValueError(
+            f"filler clip has no reference segment ending within {limit_s:.2f}s"
+        )
+    return max(ends)
+
+
 def build_long_audio_concat_sample(
     clips: Sequence[Movies800Sample],
     target_duration_s: float,
     gap_s: float = 0.8,
     sample_id: str = "long_audio_concat",
 ) -> Movies800Sample:
-    # note (db-ol): the first clip is the filler, truncated so the total
-    # lands on target_duration_s. Later clips are appended whole, so their
-    # content sits at the deepest context positions.
+    # note (db-ol): the first clip is the filler, cut at a reference boundary
+    # and silence padded so the total lands on target_duration_s. Later clips
+    # are appended whole, so their content sits at the deepest positions.
     import numpy as np
     import soundfile as sf
 
@@ -217,7 +230,10 @@ def build_long_audio_concat_sample(
             f"filler clip is {len(waveforms[0]) / sample_rate:.1f}s but "
             f"{filler_s:.1f}s are needed to reach target_duration_s"
         )
-    waveforms[0] = waveforms[0][: int(filler_s * sample_rate)]
+    cut_s = _filler_cut_boundary_s(clips[0].expected_text, filler_s)
+    kept = waveforms[0][: int(cut_s * sample_rate)]
+    padding = np.zeros(int(filler_s * sample_rate) - len(kept), dtype=np.float32)
+    waveforms[0] = np.concatenate([kept, padding])
 
     gap = np.zeros(int(gap_s * sample_rate), dtype=np.float32)
     parts: list[np.ndarray] = []
@@ -234,7 +250,7 @@ def build_long_audio_concat_sample(
     merged_reference = merge_concat_references(
         [clip.expected_text for clip in clips],
         offsets,
-        [filler_s] + [None] * (len(clips) - 1),
+        [cut_s] + [None] * (len(clips) - 1),
     )
 
     staging_dir = Path(tempfile.mkdtemp(prefix=f"{sample_id}_"))

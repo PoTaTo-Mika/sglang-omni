@@ -423,3 +423,43 @@ def test_merge_concat_references_rejects_reference_without_segments() -> None:
 
     with pytest.raises(ValueError, match="no parseable timestamped segments"):
         merge_concat_references(["no markup here"], [0.0], [None])
+
+
+def test_concat_filler_cut_aligns_to_reference_boundary(tmp_path) -> None:
+    import numpy as np
+    import soundfile as sf
+
+    from benchmarks.tasks.transcribe_diarize import (
+        Movies800Sample,
+        build_long_audio_concat_sample,
+    )
+
+    rate = 100
+    sf.write(tmp_path / "filler.wav", np.full(1000, 0.5, dtype=np.float32), rate)
+    sf.write(tmp_path / "tail.wav", np.full(200, 0.5, dtype=np.float32), rate)
+    clips = [
+        Movies800Sample(
+            sample_id="filler",
+            audio_path=str(tmp_path / "filler.wav"),
+            expected_text="[0.00][S01]hello[4.00][5.00][S01]world[9.50]",
+        ),
+        Movies800Sample(
+            sample_id="tail",
+            audio_path=str(tmp_path / "tail.wav"),
+            expected_text="[0.00][S01]tail[2.00]",
+        ),
+    ]
+
+    sample = build_long_audio_concat_sample(
+        clips, target_duration_s=10.0, gap_s=1.0, sample_id="t"
+    )
+
+    waveform, out_rate = sf.read(sample.audio_path)
+    assert out_rate == rate
+    assert len(waveform) == 1000
+    assert np.allclose(waveform[:400], 0.5, atol=1e-3)
+    assert np.allclose(waveform[400:800], 0.0, atol=1e-4)
+    assert np.allclose(waveform[800:], 0.5, atol=1e-3)
+    assert "world" not in sample.expected_text
+    assert "hello" in sample.expected_text
+    assert "[8.00][S02]tail[10.00]" in sample.expected_text
