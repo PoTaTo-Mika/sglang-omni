@@ -929,6 +929,11 @@ class OmniScheduler:
         )
         return req_data
 
+    def _sleep_during_idle(self) -> None:
+        with self._request_admission_lock:
+            request_build_pending = bool(self._pending_request_builds)
+        time.sleep(0 if request_build_pending else 0.001)
+
     def _stage_request_build_payloads(
         self, recv_reqs: list[Any]
     ) -> tuple[list[Any], list[Any]]:
@@ -2169,7 +2174,7 @@ class OmniScheduler:
                     self.process_batch_result(batch, result)
             else:
                 self.self_check_during_idle()
-                time.sleep(0.001)
+                self._sleep_during_idle()
 
             self.last_batch = batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
@@ -2462,7 +2467,7 @@ class OmniScheduler:
                         self.process_batch_result(batch, result)
                 else:
                     self.self_check_during_idle()
-                    time.sleep(0.001)
+                    self._sleep_during_idle()
 
             self.last_batch = batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():

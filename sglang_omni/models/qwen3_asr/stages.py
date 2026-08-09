@@ -21,7 +21,7 @@ def create_sglang_qwen3_asr_executor(
     mm_attention_backend: str | None = None,
     request_build_max_workers: int = 8,
     request_build_max_pending: int | None = 32,
-    request_build_inline_when_idle: bool = True,
+    request_build_inline_when_idle: bool = False,
     prefill_coalesce_requests: int = 16,
     prefill_coalesce_wait_ms: float = 24.0,
     prefill_coalesce_when_idle: bool = True,

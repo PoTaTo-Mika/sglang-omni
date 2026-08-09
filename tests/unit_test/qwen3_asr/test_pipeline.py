@@ -103,7 +103,7 @@ def test_qwen3_asr_config_uses_batched_stage_with_64_running_requests() -> None:
     assert config.stages[0].factory_args["max_running_requests"] == 64
     assert config.stages[0].factory_args["request_build_max_workers"] == 8
     assert config.stages[0].factory_args["request_build_max_pending"] == 32
-    assert config.stages[0].factory_args["request_build_inline_when_idle"] is True
+    assert config.stages[0].factory_args["request_build_inline_when_idle"] is False
     assert config.stages[0].factory_args["prefill_coalesce_requests"] == 16
     assert config.stages[0].factory_args["prefill_coalesce_wait_ms"] == 24
     assert config.stages[0].factory_args["prefill_coalesce_when_idle"] is True
@@ -137,7 +137,7 @@ def test_qwen3_asr_stage_default_allows_64_running_requests() -> None:
     assert signature.parameters["max_running_requests"].default == 64
     assert signature.parameters["request_build_max_workers"].default == 8
     assert signature.parameters["request_build_max_pending"].default == 32
-    assert signature.parameters["request_build_inline_when_idle"].default is True
+    assert signature.parameters["request_build_inline_when_idle"].default is False
     assert signature.parameters["prefill_coalesce_requests"].default == 16
     assert signature.parameters["prefill_coalesce_wait_ms"].default == 24.0
     assert signature.parameters["prefill_coalesce_when_idle"].default is True

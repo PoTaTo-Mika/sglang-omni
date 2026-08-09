@@ -97,6 +97,22 @@ def test_request_build_inline_rejects_parallel_or_busy_work() -> None:
     assert scheduler._should_build_requests_inline([object()]) is False
 
 
+def test_scheduler_idle_sleep_only_yields_while_request_build_is_pending(
+    monkeypatch,
+) -> None:
+    scheduler = object.__new__(OmniScheduler)
+    scheduler._request_admission_lock = threading.RLock()
+    scheduler._pending_request_builds = {}
+    sleep_calls = []
+    monkeypatch.setattr(omni_scheduler_module.time, "sleep", sleep_calls.append)
+
+    scheduler._sleep_during_idle()
+    scheduler._pending_request_builds["req"] = object()
+    scheduler._sleep_during_idle()
+
+    assert sleep_calls == [0.001, 0]
+
+
 def test_simple_scheduler_batch_and_error_contracts() -> None:
     """Preserves batched success output and per-request batch failure emission."""
     good = SimpleScheduler(
