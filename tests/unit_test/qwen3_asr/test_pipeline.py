@@ -35,7 +35,7 @@ def _make_engine_builder(
         mm_embedding_cache_size_bytes=0,
         enable_torch_compile=False,
         mm_attention_backend=mm_attention_backend,
-        request_build_max_workers=1,
+        request_build_max_workers=8,
         request_build_max_pending=32,
         prefill_coalesce_requests=16,
         prefill_coalesce_wait_ms=24.0,
@@ -100,7 +100,7 @@ def test_qwen3_asr_config_uses_batched_stage_with_64_running_requests() -> None:
     assert config.stages[0].factory.endswith("create_sglang_qwen3_asr_executor")
     assert config.stages[0].factory_args["device"] == "cuda:0"
     assert config.stages[0].factory_args["max_running_requests"] == 64
-    assert config.stages[0].factory_args["request_build_max_workers"] == 1
+    assert config.stages[0].factory_args["request_build_max_workers"] == 8
     assert config.stages[0].factory_args["request_build_max_pending"] == 32
     assert config.stages[0].factory_args["prefill_coalesce_requests"] == 16
     assert config.stages[0].factory_args["prefill_coalesce_wait_ms"] == 24
@@ -133,7 +133,7 @@ def test_qwen3_asr_stage_default_allows_64_running_requests() -> None:
     signature = inspect.signature(create_sglang_qwen3_asr_executor)
 
     assert signature.parameters["max_running_requests"].default == 64
-    assert signature.parameters["request_build_max_workers"].default == 1
+    assert signature.parameters["request_build_max_workers"].default == 8
     assert signature.parameters["request_build_max_pending"].default == 32
     assert signature.parameters["prefill_coalesce_requests"].default == 16
     assert signature.parameters["prefill_coalesce_wait_ms"].default == 24.0

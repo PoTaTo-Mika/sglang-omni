@@ -34,7 +34,7 @@ class Qwen3ASRPipelineConfig(PipelineConfig):
                 "device": "cuda:0",
                 "max_running_requests": 64,
                 "max_new_tokens": 128,
-                "request_build_max_workers": 1,
+                "request_build_max_workers": 8,
                 "request_build_max_pending": 32,
                 "prefill_coalesce_requests": 16,
                 "prefill_coalesce_wait_ms": 24,
