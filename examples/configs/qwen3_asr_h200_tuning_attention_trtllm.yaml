@@ -7,4 +7,4 @@ runtime_overrides:
     request_build_max_workers: 16
     request_build_max_pending: 64
     server_args_overrides:
-      attention_backend: trtllm_mha
+      decode_attention_backend: trtllm_mha
