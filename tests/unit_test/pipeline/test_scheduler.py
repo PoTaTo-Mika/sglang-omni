@@ -110,7 +110,7 @@ def test_scheduler_idle_sleep_only_yields_while_request_build_is_pending(
     scheduler._pending_request_builds["req"] = object()
     scheduler._sleep_during_idle()
 
-    assert sleep_calls == [0.001, 0]
+    assert sleep_calls == [0.001, 0.0001]
 
 
 def test_simple_scheduler_batch_and_error_contracts() -> None:

@@ -932,7 +932,7 @@ class OmniScheduler:
     def _sleep_during_idle(self) -> None:
         with self._request_admission_lock:
             request_build_pending = bool(self._pending_request_builds)
-        time.sleep(0 if request_build_pending else 0.001)
+        time.sleep(0.0001 if request_build_pending else 0.001)
 
     def _stage_request_build_payloads(
         self, recv_reqs: list[Any]
