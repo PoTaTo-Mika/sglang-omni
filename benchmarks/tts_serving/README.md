@@ -65,6 +65,7 @@ The Docker image installs `ffmpeg`.
 benchmark_tts_serving.py       # entry point under benchmarks/eval/
 spec.py                        # spec schema and load-stage defaults
 scenarios.py                   # deterministic scenario matrix
+text_corpus.py                 # pinned target-text corpus loading
 http_client.py                 # HTTP request dispatch
 sdk_client.py                  # OpenAI SDK compatibility path
 ws_client.py                   # WebSocket speech-stream path
@@ -208,6 +209,9 @@ docker build -f benchmarks/tts_serving/Dockerfile \
 ```
 
 Run the image with a spec mounted at the contract path:
+
+Specs using `text_corpus: seedtts-en` download the pinned SeedTTS metadata to
+the container's temporary Hugging Face cache on first use.
 
 ```bash
 docker run --rm \
