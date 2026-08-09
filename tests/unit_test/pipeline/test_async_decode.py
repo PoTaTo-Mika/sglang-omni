@@ -563,7 +563,7 @@ def _drive_loop(seq, min_bs=2):
 
     def launch(b):
         events.append("launch")
-        return ("sched_output", "pending_step")
+        return (b.copy(), "sched_output", "pending_step")
 
     s._run_batch_launch = launch
     s._resolve_and_process = lambda pb, ps, pstep: events.append("resolve")
@@ -692,7 +692,7 @@ def test_full_running_batch_keeps_lookahead_with_waiting_requests():
 
     def launch(batch):
         events.append("launch")
-        return "sched_output", "pending_step"
+        return batch.copy(), "sched_output", "pending_step"
 
     s._run_batch_launch = launch
 
@@ -779,7 +779,7 @@ def test_fast_path_does_not_double_free_req_finished_by_drain():
     s._batch_is_decode = lambda b: True
     s.self_check_during_idle = lambda: None
     s.self_check_during_busy = lambda: None
-    s._run_batch_launch = lambda b: ("sched_output", "pending_step")
+    s._run_batch_launch = lambda b: (b.copy(), "sched_output", "pending_step")
     # real drain helper -> exercises the real fast-path ordering under test
     s._resolve_pending_async = OmniScheduler._resolve_pending_async.__get__(s)
 
@@ -880,7 +880,7 @@ def test_async_path_resolve_failure_calls_handle_batch_failure():
         async_pending=(prev_batch, "prev_sched", "prev_step"),
     )
 
-    s._run_batch_launch = lambda b: ("sched_output", "pending_step")
+    s._run_batch_launch = lambda b: (b.copy(), "sched_output", "pending_step")
 
     def resolve(pb, ps, pstep):
         raise RuntimeError("resolve boom")

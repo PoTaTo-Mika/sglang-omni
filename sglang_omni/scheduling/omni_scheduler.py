@@ -1322,8 +1322,9 @@ class OmniScheduler:
     def _run_batch_launch(self, batch):
         """Async: build SchedulerOutput and launch the decode step on the GPU
         (forward + sample, then ``post_decode_launch`` publishes the resolve
-        payload), without waiting. Returns ``(sched_output, pending_step)``; the
-        caller holds the pending step (launch-first keeps two steps in flight)."""
+        payload), without waiting. Returns the runner-owned resolve-batch
+        snapshot, its SchedulerOutput, and the pending step; launch-first keeps
+        two steps in flight while avoiding a duplicate ScheduleBatch copy."""
         self._emit_prefill_start_for_batch(batch)
         # One forward per launch; mirror upstream run_batch's per-forward
         # counter (the matching resolve does no forward, so it must not count).
@@ -1331,7 +1332,11 @@ class OmniScheduler:
         batch.forward_iter = self.forward_ct
         sched_output = self._build_sched_output(batch)
         pending_step = self._model_runner.execute_launch(sched_output)
-        return sched_output, pending_step
+        return (
+            pending_step.schedule_batch,
+            pending_step.scheduler_output,
+            pending_step,
+        )
 
     def _run_batch_resolve(self, batch, sched_output, pending_step, skip_rids=()):
         """Async: resolve the given launched step (wait event, host collect),
@@ -2431,12 +2436,18 @@ class OmniScheduler:
 
             if use_lookahead:
                 try:
-                    sched_output, pending_step = self._run_batch_launch(batch)
+                    pending_batch, sched_output, pending_step = (
+                        self._run_batch_launch(batch)
+                    )
                 except Exception as exc:
                     self._handle_batch_failure(batch, exc)
                 else:
                     prev_pending = self._async_pending
-                    self._async_pending = (batch.copy(), sched_output, pending_step)
+                    self._async_pending = (
+                        pending_batch,
+                        sched_output,
+                        pending_step,
+                    )
                     if prev_pending is not None:
                         pb, ps, pstep = prev_pending
                         try:
