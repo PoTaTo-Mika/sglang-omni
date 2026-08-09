@@ -108,7 +108,7 @@ def test_qwen3_asr_config_uses_batched_stage_with_64_running_requests() -> None:
     assert config.stages[0].factory_args["request_build_max_pending"] == 32
     assert config.stages[0].factory_args["request_build_inline_when_idle"] is False
     assert config.stages[0].factory_args["prefill_coalesce_requests"] == 16
-    assert config.stages[0].factory_args["prefill_coalesce_wait_ms"] == 12
+    assert config.stages[0].factory_args["prefill_coalesce_wait_ms"] == 24
     assert config.stages[0].factory_args["prefill_coalesce_when_idle"] is True
     assert (
         config.stages[0].factory_args["prefill_coalesce_requires_pending_builds"]
