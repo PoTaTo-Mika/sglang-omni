@@ -363,5 +363,5 @@ def test_qwen3_asr_threads_explicit_cuda_graph_bs(monkeypatch, caplog) -> None:
     assert scheduler.prefill_coalesce_when_idle is True
     assert scheduler.prefill_coalesce_requires_pending_builds is True
     assert scheduler.prefill_coalesce_after_builds_during_decode is True
-    assert scheduler.request_build_inline_when_idle is True
+    assert scheduler.request_build_inline_when_idle is False
     assert scheduler.shutdown_callback is fake_encoder_service.close
