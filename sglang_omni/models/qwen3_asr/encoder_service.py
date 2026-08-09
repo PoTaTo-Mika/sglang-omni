@@ -103,7 +103,7 @@ def _text_hidden_size(model: Any) -> int:
 
 
 class Qwen3ASRPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.Tensor]):
-    """Encode before admission with single-flight deduplication and a CPU LRU."""
+    """Encode before admission with single-flight deduplication and a bounded LRU."""
 
     ENCODE_TIMEOUT_S = 300.0
 
@@ -127,10 +127,12 @@ class Qwen3ASRPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.T
             if self._device.type == "cuda"
             else None
         )
+        # note (luojiaxuan): Keep hot embeddings on the model device so cache
+        # hits do not serialize request builders on pageable CPU-to-GPU copies.
         self._cache = StageOutputCache(
             max_size=cache_max_entries,
             max_bytes=cache_max_bytes,
-            cache_device="cpu",
+            cache_device=self._device,
         )
         self._namespace = cache_namespace
         self._max_batch_size = max(int(max_batch_size), 1)
