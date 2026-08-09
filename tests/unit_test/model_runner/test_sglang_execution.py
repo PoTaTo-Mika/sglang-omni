@@ -143,3 +143,32 @@ def test_execution_bridge_rejects_speculative_decoding() -> None:
             req_to_token_pool="pool",
             spec_algorithm=_SpecAlgorithm(future_map, is_none=False),
         )
+
+
+def test_record_completion_reuses_two_events() -> None:
+    bridge, _ = _make_bridge()
+
+    class FakeEvent:
+        def __init__(self) -> None:
+            self.records = 0
+
+        def record(self) -> None:
+            self.records += 1
+
+    created: list[FakeEvent] = []
+
+    def make_event() -> FakeEvent:
+        event = FakeEvent()
+        created.append(event)
+        return event
+
+    bridge.device_module = SimpleNamespace(Event=make_event)
+
+    first = bridge.record_completion()
+    second = bridge.record_completion()
+    third = bridge.record_completion()
+
+    assert created == [first, second]
+    assert third is first
+    assert first.records == 2
+    assert second.records == 1
