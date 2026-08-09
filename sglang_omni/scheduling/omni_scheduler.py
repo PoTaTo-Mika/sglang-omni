@@ -899,7 +899,9 @@ class OmniScheduler:
         self._drain_request_build_results()
 
     def _should_build_requests_inline(self, recv_reqs: list[Any]) -> bool:
-        if not self.request_build_inline_when_idle or len(recv_reqs) != 1:
+        if len(recv_reqs) != 1 or not getattr(
+            self, "request_build_inline_when_idle", False
+        ):
             return False
         running_batch = self.running_batch
         if running_batch is not None and not running_batch.is_empty():
