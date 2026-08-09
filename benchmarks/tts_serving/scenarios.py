@@ -11,6 +11,10 @@ from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
 from benchmarks.tts_serving.spec import BenchmarkSpec, LoadStage, SpecError
+from benchmarks.tts_serving.text_corpus import (
+    SEEDTTS_TEXT_CORPUS_REVISION,
+    load_seedtts_target_texts,
+)
 from benchmarks.tts_serving.voice_upload_fixtures import (
     VOICE_UPLOAD_FIXTURE_SIZES,
     VOICE_UPLOAD_WAV_FIXTURE_SIZE,
@@ -77,6 +81,9 @@ VOICE_DESIGN_INSTRUCTIONS = (
     "A warm, steady adult voice with precise articulation and no dramatic affect."
 )
 INITIAL_CODEC_CHUNK_FRAMES = 4
+TEXT_CORPUS_SINGLE_REQUEST_WORKLOADS = frozenset(
+    {"speech_normal", "rest_stream", "ws_normal"}
+)
 
 PROFILE_MIXES = {
     "stress": (
@@ -381,7 +388,6 @@ def _build_scheduled_stage_scenarios(
         for scenario in required_scenarios
         if scenario.workload not in scheduled_workloads
     ]
-
     resolved: list[tuple[float, int, int, Scenario]] = []
     next_index = len(required_scenarios)
     for source_rank, schedule in enumerate(stage.workload_schedules):
@@ -433,6 +439,17 @@ def _build_scheduled_stage_scenarios(
         stage.coverage_schedule.end_s,
         len(coverage_scenarios),
     )
+    collision_offsets = {
+        offset
+        for schedule in stage.workload_schedules
+        for offset in schedule.collision_offsets_s
+    }
+    coverage_at_collision = sorted(collision_offsets.intersection(coverage_offsets))
+    if coverage_at_collision:
+        raise SpecError(
+            "scheduled coverage offsets must not equal collision offsets: "
+            f"{coverage_at_collision}"
+        )
     coverage_rank = len(stage.workload_schedules)
     for source_index, (scenario, offset) in enumerate(
         zip(coverage_scenarios, coverage_offsets, strict=True)
@@ -447,6 +464,23 @@ def _build_scheduled_stage_scenarios(
         )
 
     resolved.sort(key=lambda item: item[:3])
+    for collision_offset in sorted(collision_offsets):
+        cohort = [
+            scenario
+            for offset, _, _, scenario in resolved
+            if offset == collision_offset
+        ]
+        observed_workloads = [scenario.workload for scenario in cohort]
+        if (
+            len(cohort) != len(scheduled_workloads)
+            or set(observed_workloads) != scheduled_workloads
+        ):
+            raise SpecError(
+                f"collision offset {collision_offset} must resolve to exactly one "
+                f"request per scheduled workload; observed={observed_workloads}"
+            )
+    if stage.text_corpus is not None:
+        resolved = _assign_text_corpus(spec, stage, resolved)
     return [scenario for _, _, _, scenario in resolved]
 
 
@@ -483,6 +517,119 @@ def _scheduled_workload_scenario(
     if workload == "ws_stream_audio":
         return _websocket_stream_audio(index, spec, stage)
     raise ValueError(f"unsupported scheduled workload: {workload}")
+
+
+def _assign_text_corpus(
+    spec: BenchmarkSpec,
+    stage: LoadStage,
+    resolved: list[tuple[float, int, int, Scenario]],
+) -> list[tuple[float, int, int, Scenario]]:
+    assert stage.text_corpus is not None
+    texts = list(_load_text_corpus(stage.text_corpus))
+    random.Random(f"{spec.seed}:{stage.id}:{stage.text_corpus}").shuffle(texts)
+    required_text_count = 0
+    for _, _, _, scenario in resolved:
+        if scenario.workload in TEXT_CORPUS_SINGLE_REQUEST_WORKLOADS:
+            required_text_count += 1
+        elif scenario.workload == "batch_32_all_valid":
+            batch_size = scenario.planned_metadata["batch_size"]
+            assert isinstance(batch_size, int)
+            required_text_count += batch_size
+    if required_text_count > len(texts):
+        raise SpecError(
+            f"text corpus {stage.text_corpus!r} has {len(texts)} unique texts but "
+            f"the scheduled stage requires {required_text_count}"
+        )
+
+    text_index = 0
+    assigned: list[tuple[float, int, int, Scenario]] = []
+    for offset, source_rank, source_index, scenario in resolved:
+        if scenario.workload in TEXT_CORPUS_SINGLE_REQUEST_WORKLOADS:
+            scenario = _with_target_text(
+                scenario,
+                stage.text_corpus,
+                texts[text_index],
+            )
+            text_index += 1
+        elif scenario.workload == "batch_32_all_valid":
+            batch_size = scenario.planned_metadata["batch_size"]
+            assert isinstance(batch_size, int)
+            scenario = _with_batch_target_texts(
+                scenario,
+                stage.text_corpus,
+                texts[text_index : text_index + batch_size],
+            )
+            text_index += batch_size
+        assigned.append((offset, source_rank, source_index, scenario))
+    assert text_index == required_text_count
+    return assigned
+
+
+def _with_target_text(
+    scenario: Scenario,
+    corpus_name: str,
+    target_text: str,
+) -> Scenario:
+    if scenario.workload in {"speech_normal", "rest_stream"}:
+        payload = {**scenario.payload, "input": target_text}
+        script = scenario.script
+    elif scenario.workload == "ws_normal":
+        input_step = scenario.script[1]
+        script = [
+            scenario.script[0],
+            {
+                **input_step,
+                "payload": {
+                    **input_step["payload"],
+                    "text": target_text,
+                },
+            },
+            *scenario.script[2:],
+        ]
+        payload = scenario.payload
+    else:
+        raise ValueError(f"unsupported corpus-backed workload: {scenario.workload}")
+    return replace(
+        scenario,
+        payload=payload,
+        script=script,
+        planned_metadata={
+            **scenario.planned_metadata,
+            "text_corpus": corpus_name,
+            "text_corpus_revision": SEEDTTS_TEXT_CORPUS_REVISION,
+        },
+    )
+
+
+def _with_batch_target_texts(
+    scenario: Scenario,
+    corpus_name: str,
+    target_texts: list[str],
+) -> Scenario:
+    items = scenario.payload["items"]
+    assert isinstance(items, list)
+    assert len(items) == len(target_texts)
+    return replace(
+        scenario,
+        payload={
+            **scenario.payload,
+            "items": [
+                {**item, "input": target_text}
+                for item, target_text in zip(items, target_texts, strict=True)
+            ],
+        },
+        planned_metadata={
+            **scenario.planned_metadata,
+            "text_corpus": corpus_name,
+            "text_corpus_revision": SEEDTTS_TEXT_CORPUS_REVISION,
+        },
+    )
+
+
+def _load_text_corpus(name: str) -> tuple[str, ...]:
+    if name != "seedtts-en":
+        raise SpecError(f"unsupported text corpus: {name}")
+    return load_seedtts_target_texts()
 
 
 def _required_stage_scenarios(

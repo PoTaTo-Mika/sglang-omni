@@ -18,6 +18,7 @@ DEFAULT_PROFILE = "stress"
 VALID_PROFILES = {DEFAULT_PROFILE}
 VALID_LOAD_MODES = {"closed_loop", "open_loop", "ramp", "burst", "soak", "scheduled"}
 VALID_ARRIVAL_DISTRIBUTIONS = {"deterministic", "poisson"}
+VALID_TEXT_CORPORA = {"seedtts-en"}
 DEFAULT_ENDPOINTS = ("speech", "speech_stream", "voices", "batch", "websocket")
 SCHEDULED_WORKLOAD_ENDPOINTS = {
     "speech_normal": "speech",
@@ -86,6 +87,7 @@ LOAD_STAGE_KEYS = {
     "voice_cache_pressure_voice_count",
     "voice_speaker_cap_count",
     "speaker_max_uploaded",
+    "text_corpus",
     "coverage_schedule",
     "workload_schedules",
 }
@@ -214,6 +216,7 @@ class LoadStage:
     voice_cache_pressure_voice_count: int = 0
     voice_speaker_cap_count: int = 0
     speaker_max_uploaded: int | None = None
+    text_corpus: str | None = None
     coverage_schedule: CoverageSchedule | None = None
     workload_schedules: tuple[WorkloadSchedule, ...] = field(default_factory=tuple)
 
@@ -271,6 +274,8 @@ class LoadStage:
                 )
             request_count = sum(item.request_count for item in workload_schedules)
         else:
+            if "text_corpus" in obj:
+                raise SpecError("text_corpus is only valid for scheduled stages")
             coverage_schedule = None
             workload_schedules = ()
             request_count = _positive_int(
@@ -336,6 +341,12 @@ class LoadStage:
             obj.get("speaker_max_uploaded"),
             "params.load_stages[].speaker_max_uploaded",
         )
+        text_corpus = _optional_str(obj, "text_corpus")
+        if text_corpus is not None and text_corpus not in VALID_TEXT_CORPORA:
+            raise SpecError(
+                "params.load_stages[].text_corpus must be one of "
+                f"{sorted(VALID_TEXT_CORPORA)}"
+            )
         return cls(
             id=stage_id,
             mode=mode,
@@ -349,6 +360,7 @@ class LoadStage:
             voice_cache_pressure_voice_count=voice_cache_pressure_voice_count,
             voice_speaker_cap_count=voice_speaker_cap_count,
             speaker_max_uploaded=speaker_max_uploaded,
+            text_corpus=text_corpus,
             coverage_schedule=coverage_schedule,
             workload_schedules=workload_schedules,
         )
@@ -373,6 +385,7 @@ class LoadStage:
             "voice_cache_pressure_voice_count": self.voice_cache_pressure_voice_count,
             "voice_speaker_cap_count": self.voice_speaker_cap_count,
             "speaker_max_uploaded": self.speaker_max_uploaded,
+            "text_corpus": self.text_corpus,
             "coverage_schedule": (
                 asdict(self.coverage_schedule)
                 if self.coverage_schedule is not None
@@ -721,8 +734,8 @@ def _offsets(value: Any, path: str) -> tuple[float, ...]:
     if not isinstance(value, list):
         raise SpecError(f"{path} must be a list")
     offsets = tuple(_finite_nonnegative_float(item, f"{path}[]") for item in value)
-    if any(current < previous for previous, current in zip(offsets, offsets[1:])):
-        raise SpecError(f"{path} must be nondecreasing")
+    if any(current <= previous for previous, current in zip(offsets, offsets[1:])):
+        raise SpecError(f"{path} must be strictly increasing")
     return offsets
 
 
@@ -746,6 +759,19 @@ def _workload_schedules(value: Any) -> tuple[WorkloadSchedule, ...]:
             collision_workloads[offset].add(schedule.workload)
     if not collision_workloads:
         raise SpecError("scheduled stages require at least one collision offset")
+    collision_offsets = set(collision_workloads)
+    background_at_collision = {
+        schedule.workload: sorted(
+            collision_offsets.intersection(schedule.background_offsets_s)
+        )
+        for schedule in schedules
+        if collision_offsets.intersection(schedule.background_offsets_s)
+    }
+    if background_at_collision:
+        raise SpecError(
+            "scheduled background offsets must not equal collision offsets; "
+            f"overlaps by workload: {background_at_collision}"
+        )
     scheduled_workloads = set(workloads)
     invalid = {
         offset: sorted(scheduled_workloads - workloads_at_offset)

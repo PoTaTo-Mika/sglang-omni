@@ -97,7 +97,7 @@ def build_results_report(
         and _is_benchmark_passed(spec, results, capabilities)
     )
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "scenario_schema_version": SCENARIO_SCHEMA_VERSION,
         "scenario_set_hash": scenario_set_hash(scenarios) if scenarios else None,
         "workload_spec_hash": workload_spec_hash(spec),
@@ -1858,6 +1858,9 @@ def _mixed_arrival_evidence(
             continue
         stage_results = [result for result in results if result.stage_id == stage.id]
         performance = _performance_results(stage_results)
+        coverage_results = [
+            result for result in stage_results if result.workload is None
+        ]
         schedule_by_workload = {
             schedule.workload: schedule for schedule in stage.workload_schedules
         }
@@ -1913,6 +1916,11 @@ def _mixed_arrival_evidence(
                 for schedule in stage.workload_schedules
                 if epoch in schedule.collision_offsets_s
             }
+            offset_members = [
+                result
+                for result in stage_results
+                if result.configured_offset_s == epoch
+            ]
             members = [
                 result
                 for result in performance
@@ -1926,7 +1934,8 @@ def _mixed_arrival_evidence(
                 for workload in sorted(expected_workloads)
                 if member_counts.get(workload, 0) != 1
             }
-            if invalid_membership:
+            unexpected_member_count = len(offset_members) != len(expected_workloads)
+            if invalid_membership or unexpected_member_count:
                 failures.append(
                     {
                         "stage": stage.id,
@@ -1934,13 +1943,19 @@ def _mixed_arrival_evidence(
                         "contract": "collision_membership",
                         "expected_count_per_workload": 1,
                         "observed_counts": invalid_membership,
+                        "expected_request_count_at_offset": len(expected_workloads),
+                        "observed_request_count_at_offset": len(offset_members),
                     }
                 )
             common_overlap_s = (
-                _common_overlap_s(members) if not invalid_membership else None
+                _common_overlap_s(members)
+                if not invalid_membership and not unexpected_member_count
+                else None
             )
-            if not invalid_membership and (
-                common_overlap_s is None or common_overlap_s <= 0
+            if (
+                not invalid_membership
+                and not unexpected_member_count
+                and (common_overlap_s is None or common_overlap_s <= 0)
             ):
                 failures.append(
                     {
@@ -1952,6 +1967,7 @@ def _mixed_arrival_evidence(
                 )
             epoch_valid = (
                 not invalid_membership
+                and not unexpected_member_count
                 and common_overlap_s is not None
                 and common_overlap_s > 0
             )
@@ -1964,12 +1980,20 @@ def _mixed_arrival_evidence(
                         for workload in observed_workloads
                         if workload is not None
                     ),
+                    "request_count_at_offset": len(offset_members),
                     "common_overlap_s": common_overlap_s,
                     "valid": epoch_valid,
                 }
             )
         evidence[stage.id] = {
             "workloads": by_workload,
+            "coverage_request_count": len(coverage_results),
+            "coverage_passed_count": sum(
+                _result_passed(spec, result) for result in coverage_results
+            ),
+            "expected_error_request_count": sum(
+                not result.expected_success for result in coverage_results
+            ),
             "configured_collision_epoch_count": len(collision_epochs),
             "observed_collision_epoch_count": sum(
                 epoch["valid"] for epoch in epoch_evidence

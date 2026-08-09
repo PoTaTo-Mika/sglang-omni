@@ -758,14 +758,17 @@ def main() -> int:
         print(f"benchmark harness failed: {exc}")
         return 2
 
-    scenarios = build_scenarios(spec)
-    stage_request_total = sum(stage.request_count for stage in spec.params.load_stages)
-    harness_log.append(
-        f"loaded spec={Path(args.spec)} profile={spec.params.profile} "
-        f"stage_requests={stage_request_total} scenarios={len(scenarios)} "
-        f"load_stages={[stage.id for stage in spec.params.load_stages]}"
-    )
+    scenarios: list[Scenario] = []
     try:
+        scenarios = build_scenarios(spec)
+        stage_request_total = sum(
+            stage.request_count for stage in spec.params.load_stages
+        )
+        harness_log.append(
+            f"loaded spec={Path(args.spec)} profile={spec.params.profile} "
+            f"stage_requests={stage_request_total} scenarios={len(scenarios)} "
+            f"load_stages={[stage.id for stage in spec.params.load_stages]}"
+        )
         results = asyncio.run(_run_benchmark(spec, scenarios, harness_log))
         report = build_results_report(spec, results, scenarios=scenarios)
         write_artifacts(out_dir, spec, scenarios, results, report)
