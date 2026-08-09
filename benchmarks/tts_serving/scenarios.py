@@ -2293,9 +2293,7 @@ def _websocket_normal(index: int, spec: BenchmarkSpec, stage: LoadStage) -> Scen
                 "payload": {"type": "input.text", "text": "Hello."},
             },
             {"action": "send_json", "payload": {"type": "input.done"}},
-            {"action": "expect", "event": "audio.start"},
-            {"action": "expect_audio_until_done"},
-            {"action": "expect", "event": "session.done"},
+            {"action": "expect_audio_until_session_done", "min_binary_frames": 1},
         ],
         description="stateful WebSocket speech stream",
     )
