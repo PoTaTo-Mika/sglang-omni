@@ -108,7 +108,7 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
             "mem_fraction_static": self.mem_fraction_static,
             "max_prefill_tokens": 4096,
             "chunked_prefill_size": 4096,
-            "sampling_backend": "pytorch",
+            "sampling_backend": "flashinfer",
             "dtype": dtype,
         }
         if self.mm_attention_backend is not None:
