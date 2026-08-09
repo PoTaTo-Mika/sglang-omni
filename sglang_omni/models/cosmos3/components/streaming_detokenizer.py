@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import queue as queue_mod
+import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any
@@ -41,6 +42,8 @@ class Cosmos3StreamingDetokenizer:
         self._running = False
         self._state: dict[str, _RequestState] = {}
         self._done_seen: OrderedDict[str, None] = OrderedDict()
+        # Stage aborts run on the event-loop thread while handlers run here.
+        self._state_lock = threading.RLock()
 
     def start(self) -> None:
         self._running = True
@@ -73,33 +76,36 @@ class Cosmos3StreamingDetokenizer:
         self._running = False
 
     def abort(self, request_id: str) -> None:
-        self._state.pop(request_id, None)
-        self._done_seen.pop(request_id, None)
+        with self._state_lock:
+            self._state.pop(request_id, None)
+            self._done_seen.pop(request_id, None)
 
     def _ensure_state(self, request_id: str) -> _RequestState:
-        state = self._state.get(request_id)
-        if state is None:
-            state = _RequestState()
-            self._state[request_id] = state
-        return state
+        with self._state_lock:
+            state = self._state.get(request_id)
+            if state is None:
+                state = _RequestState()
+                self._state[request_id] = state
+            return state
 
     def _on_stream_chunk(self, request_id: str, item: Any) -> None:
-        raw_token = item.data
-        token_id = (
-            int(raw_token.item()) if hasattr(raw_token, "item") else int(raw_token)
-        )
-        state = self._ensure_state(request_id)
-        state.pending_tokens.append(token_id)
-        candidate = self._tokenizer.decode(
-            state.pending_tokens,
-            skip_special_tokens=True,
-        )
-        if candidate.endswith("\ufffd"):
-            return
-        state.pending_tokens.clear()
-        if not candidate:
-            return
-        self._emit_text(request_id, candidate)
+        with self._state_lock:
+            raw_token = item.data
+            token_id = (
+                int(raw_token.item()) if hasattr(raw_token, "item") else int(raw_token)
+            )
+            state = self._ensure_state(request_id)
+            state.pending_tokens.append(token_id)
+            candidate = self._tokenizer.decode(
+                state.pending_tokens,
+                skip_special_tokens=True,
+            )
+            if candidate.endswith("\ufffd"):
+                return
+            state.pending_tokens.clear()
+            if not candidate:
+                return
+            self._emit_text(request_id, candidate)
 
     def _emit_text(self, request_id: str, text: str) -> None:
         self.outbox.put(
@@ -117,52 +123,57 @@ class Cosmos3StreamingDetokenizer:
         )
 
     def _on_stream_done(self, request_id: str) -> None:
-        state = self._state.get(request_id)
-        if state is None:
-            self._done_seen[request_id] = None
-            if len(self._done_seen) > _DONE_SEEN_MAX:
-                for _ in range(len(self._done_seen) - _DONE_SEEN_EVICT_TO):
-                    self._done_seen.popitem(last=False)
-            return
-        state.done = True
-        if state.payload is not None:
-            self._finalize(request_id)
+        with self._state_lock:
+            state = self._state.get(request_id)
+            if state is None:
+                self._done_seen[request_id] = None
+                if len(self._done_seen) > _DONE_SEEN_MAX:
+                    for _ in range(len(self._done_seen) - _DONE_SEEN_EVICT_TO):
+                        self._done_seen.popitem(last=False)
+                return
+            state.done = True
+            if state.payload is not None:
+                self._finalize(request_id)
 
     def _on_new_request(self, request_id: str, payload: StagePayload) -> None:
-        state = self._ensure_state(request_id)
-        state.payload = payload
-        if request_id in self._done_seen:
-            state.done = True
-            self._done_seen.pop(request_id, None)
-        is_streaming = bool((payload.request.params or {}).get("stream", False))
-        if state.done or not is_streaming:
-            self._finalize(request_id)
+        with self._state_lock:
+            state = self._ensure_state(request_id)
+            state.payload = payload
+            if request_id in self._done_seen:
+                state.done = True
+                self._done_seen.pop(request_id, None)
+            is_streaming = bool((payload.request.params or {}).get("stream", False))
+            if state.done or not is_streaming:
+                self._finalize(request_id)
 
     def _finalize(self, request_id: str) -> None:
-        state = self._state.pop(request_id, None)
-        self._done_seen.pop(request_id, None)
-        if state is None or state.payload is None:
-            return
-        if state.pending_tokens:
-            trailing_text = self._tokenizer.decode(
-                state.pending_tokens,
-                skip_special_tokens=True,
-            )
-            if trailing_text:
-                self._emit_text(request_id, trailing_text)
+        with self._state_lock:
+            state = self._state.pop(request_id, None)
+            self._done_seen.pop(request_id, None)
+            if state is None or state.payload is None:
+                return
+            if state.pending_tokens:
+                trailing_text = self._tokenizer.decode(
+                    state.pending_tokens,
+                    skip_special_tokens=True,
+                )
+                if trailing_text:
+                    self._emit_text(request_id, trailing_text)
 
-        is_streaming = bool((state.payload.request.params or {}).get("stream", False))
-        state.payload.data = self._build_result(
-            state.payload,
-            is_streaming=is_streaming,
-        )
-        self.outbox.put(
-            OutgoingMessage(
-                request_id=request_id,
-                type="result",
-                data=state.payload,
+            is_streaming = bool(
+                (state.payload.request.params or {}).get("stream", False)
             )
-        )
+            state.payload.data = self._build_result(
+                state.payload,
+                is_streaming=is_streaming,
+            )
+            self.outbox.put(
+                OutgoingMessage(
+                    request_id=request_id,
+                    type="result",
+                    data=state.payload,
+                )
+            )
 
     def _build_result(
         self,
