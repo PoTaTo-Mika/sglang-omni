@@ -8,6 +8,7 @@ import threading
 import weakref
 from array import array
 from collections import deque
+from concurrent.futures import Future
 from queue import Queue
 from types import SimpleNamespace
 
@@ -2073,6 +2074,30 @@ def test_omni_scheduler_request_builder_errors_do_not_stop_loop() -> None:
     assert output.type == "error"
     assert isinstance(output.data, ValueError)
     assert scheduler.waiting_queue == []
+
+
+def test_omni_scheduler_drains_completed_request_builds_out_of_order() -> None:
+    scheduler = object.__new__(OmniScheduler)
+    scheduler._request_admission_lock = threading.RLock()
+    scheduler._aborted_request_ids = set()
+    first = Future()
+    second = Future()
+    second.set_result("built-second")
+    scheduler._pending_request_builds = {
+        "first": ("payload-first", False, first),
+        "second": ("payload-second", True, second),
+    }
+    enqueued: list[tuple[object, bool, object]] = []
+    scheduler._enqueue_built_request = (
+        lambda payload, stream_done, data, **_: enqueued.append(
+            (payload, stream_done, data)
+        )
+    )
+
+    scheduler._drain_request_build_results()
+
+    assert enqueued == [("payload-second", True, "built-second")]
+    assert list(scheduler._pending_request_builds) == ["first"]
 
 
 def test_omni_scheduler_follower_request_builder_errors_do_not_emit() -> None:
