@@ -1,0 +1,9 @@
+config_cls: Qwen3ASRPipelineConfig
+name: qwen3-asr-h200-tuning-torch-compile
+model_path: Qwen/Qwen3-ASR-1.7B
+
+runtime_overrides:
+  asr:
+    enable_torch_compile: true
+    request_build_max_workers: 16
+    request_build_max_pending: 64
