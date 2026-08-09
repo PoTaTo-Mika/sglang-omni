@@ -225,9 +225,7 @@ def _stub_arkasr_engine_build(
         lambda worker: graph_init_workers.append(worker),
     )
     monkeypatch.setattr(sglang_backend, "SGLangOutputProcessor", lambda **k: object())
-    monkeypatch.setattr(
-        omni_scheduler, "OmniScheduler", lambda **k: SimpleNamespace(**k)
-    )
+    monkeypatch.setattr(omni_scheduler, "OmniScheduler", SimpleNamespace)
     return SimpleNamespace(
         graph_init_workers=graph_init_workers,
         adapter_kwargs=adapter_kwargs,
