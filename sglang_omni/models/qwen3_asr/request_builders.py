@@ -200,6 +200,7 @@ def make_qwen3_asr_scheduler_adapters(
                 fingerprint, estimated_audio_tokens
             )
 
+        estimated_input_ids = None
         if context_length is not None:
             assert estimated_audio_tokens is not None
             # WhisperFeatureExtractor emits floor(samples / hop_length) frames.
@@ -251,7 +252,12 @@ def make_qwen3_asr_scheduler_adapters(
             assert estimated_audio_tokens is not None
             num_audio_tokens = estimated_audio_tokens
 
-        input_ids = _build_prompt_ids(num_audio_tokens, forced_language)
+        input_ids = (
+            estimated_input_ids
+            if estimated_input_ids is not None
+            and num_audio_tokens == estimated_audio_tokens
+            else _build_prompt_ids(num_audio_tokens, forced_language)
+        )
         _validate_context_budget(input_ids, request_max_new_tokens)
 
         audio_item = MultimodalDataItem(
