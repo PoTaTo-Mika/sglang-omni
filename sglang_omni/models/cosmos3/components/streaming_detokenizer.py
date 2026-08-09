@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 import queue as queue_mod
 import threading
+import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any
@@ -22,6 +23,8 @@ logger = logging.getLogger(__name__)
 
 _DONE_SEEN_MAX = 10000
 _DONE_SEEN_EVICT_TO = 5000
+_STATE_MAX = 10000
+_STATE_ORPHAN_IDLE_S = 300.0
 
 
 @dataclass
@@ -29,6 +32,7 @@ class _RequestState:
     pending_tokens: list[int] = field(default_factory=list)
     payload: StagePayload | None = None
     done: bool = False
+    last_seen: float = 0.0
 
 
 class Cosmos3StreamingDetokenizer:
@@ -82,11 +86,32 @@ class Cosmos3StreamingDetokenizer:
 
     def _ensure_state(self, request_id: str) -> _RequestState:
         with self._state_lock:
+            now = time.monotonic()
             state = self._state.get(request_id)
             if state is None:
-                state = _RequestState()
+                state = _RequestState(last_seen=now)
                 self._state[request_id] = state
+            state.last_seen = now
+            if len(self._state) > _STATE_MAX:
+                self._evict_idle_orphans(now)
             return state
+
+    def _evict_idle_orphans(self, now: float) -> None:
+        cutoff = now - _STATE_ORPHAN_IDLE_S
+        with self._state_lock:
+            stale = [
+                request_id
+                for request_id, state in self._state.items()
+                if state.payload is None and not state.done and state.last_seen < cutoff
+            ]
+            for request_id in stale:
+                self._state.pop(request_id, None)
+        if stale:
+            logger.warning(
+                "Evicted %d idle orphan stream states (cap %d exceeded)",
+                len(stale),
+                _STATE_MAX,
+            )
 
     def _on_stream_chunk(self, request_id: str, item: Any) -> None:
         with self._state_lock:
