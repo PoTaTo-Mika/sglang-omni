@@ -1,0 +1,8 @@
+config_cls: Qwen3ASRPipelineConfig
+name: qwen3-asr-h200-tuning-workers32
+model_path: Qwen/Qwen3-ASR-1.7B
+
+runtime_overrides:
+  asr:
+    request_build_max_workers: 32
+    request_build_max_pending: 128
