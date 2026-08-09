@@ -113,6 +113,29 @@ def test_scheduler_idle_sleep_only_yields_while_request_build_is_pending(
     assert sleep_calls == [0.001, 0.0001]
 
 
+def test_request_build_drain_does_not_wait_for_earlier_future() -> None:
+    scheduler = object.__new__(OmniScheduler)
+    scheduler._request_admission_lock = threading.RLock()
+    scheduler._aborted_request_ids = set()
+    slow_future = SimpleNamespace(done=lambda: False)
+    fast_future = SimpleNamespace(done=lambda: True, result=lambda: "fast-result")
+    scheduler._pending_request_builds = {
+        "slow": (SimpleNamespace(request_id="slow"), False, slow_future),
+        "fast": (SimpleNamespace(request_id="fast"), False, fast_future),
+    }
+    enqueued: list[tuple[str, str]] = []
+    scheduler._enqueue_built_request = (
+        lambda payload, _stream_done, result, **_kwargs: enqueued.append(
+            (payload.request_id, result)
+        )
+    )
+
+    scheduler._drain_request_build_results()
+
+    assert enqueued == [("fast", "fast-result")]
+    assert list(scheduler._pending_request_builds) == ["slow"]
+
+
 def test_simple_scheduler_batch_and_error_contracts() -> None:
     """Preserves batched success output and per-request batch failure emission."""
     good = SimpleScheduler(
