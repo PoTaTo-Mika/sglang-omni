@@ -191,6 +191,11 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
             audio_encoder_service=self.audio_encoder_service,
         )
 
+    def make_model_runner(self, model_worker: Any, output_proc: Any) -> Any:
+        from sglang_omni.models.qwen3_asr.model_runner import Qwen3ASRModelRunner
+
+        return Qwen3ASRModelRunner(model_worker, output_proc)
+
     def extra_scheduler_callbacks(self) -> dict[str, Any]:
         if self.audio_encoder_service is None:
             return {}
