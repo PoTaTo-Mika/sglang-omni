@@ -19,7 +19,7 @@ def create_sglang_qwen3_asr_executor(
     enable_async_decode: bool = True,
     async_decode_min_batch_size: int = 1,
     mm_attention_backend: str | None = None,
-    request_build_max_workers: int = 8,
+    request_build_max_workers: int = 1,
     request_build_max_pending: int | None = 32,
     prefill_coalesce_requests: int = 16,
     prefill_coalesce_wait_ms: float = 24.0,
