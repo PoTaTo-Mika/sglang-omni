@@ -15,10 +15,7 @@ from sglang_omni.models.qwen3_asr.encoder_service import (
     build_cache_namespace,
 )
 from sglang_omni.scheduling.engine_factory import AsrEngineBuilder
-from sglang_omni.scheduling.generation_batch_policy import (
-    build_default_cuda_graph_bs,
-    get_decode_cuda_graph_bs,
-)
+from sglang_omni.scheduling.generation_batch_policy import get_decode_cuda_graph_bs
 from sglang_omni.utils.gpu_compat import get_visible_gpu_sm_version
 from sglang_omni.utils.gpu_memory import format_bytes_gib, get_process_gpu_memory_bytes
 
@@ -93,35 +90,6 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
         self.model_path: str | None = None
         self.audio_encoder_service: Any = None
 
-    def build(
-        self,
-        model_path: str,
-        *,
-        device: str = "cuda:0",
-        gpu_id: int | None = None,
-        dtype: str = "bfloat16",
-        server_args_overrides: dict[str, Any] | None = None,
-    ) -> Any:
-        overrides = dict(server_args_overrides or {})
-        max_bs = int(
-            overrides.get(
-                "cuda_graph_max_bs",
-                overrides.get("max_running_requests", self.max_running_requests),
-            )
-        )
-        dense_low_bs = range(1, min(max_bs, 8) + 1)
-        overrides.setdefault(
-            "cuda_graph_bs",
-            sorted({*build_default_cuda_graph_bs(max_bs), *dense_low_bs}),
-        )
-        return super().build(
-            model_path,
-            device=device,
-            gpu_id=gpu_id,
-            dtype=dtype,
-            server_args_overrides=overrides,
-        )
-
     def pre_infra_setup(self, checkpoint_dir: str) -> None:
         self.model_path = checkpoint_dir
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -135,6 +103,7 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
 
     def generation_defaults(self, *, dtype: str) -> dict[str, Any]:
         defaults: dict[str, Any] = {
+            "attention_backend": "flashinfer",
             "max_running_requests": self.max_running_requests,
             "disable_cuda_graph": False,
             "disable_overlap_schedule": True,
