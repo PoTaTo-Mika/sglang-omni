@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Callable
 
 import torch
@@ -109,16 +110,35 @@ def make_qwen3_asr_scheduler_adapters(
     vocab_size = len(tokenizer)
     asr_text_token_ids = _encode_literal(tokenizer, _ASR_TEXT)
 
-    def _build_prompt_ids(num_audio_tokens: int, language: str | None) -> list[int]:
+    @lru_cache(maxsize=None)
+    def _prompt_parts(language: str | None) -> tuple[tuple[int, ...], tuple[int, ...]]:
         prompt = (
             f"<|im_start|>user\n"
-            f"{_AUDIO_START}{_AUDIO_PAD * num_audio_tokens}{_AUDIO_END}"
+            f"{_AUDIO_START}{_AUDIO_PAD}{_AUDIO_END}"
             f"<|im_end|>\n"
             f"<|im_start|>assistant\n"
         )
         if language is not None:
             prompt += f"language {language}<asr_text>"
-        return tokenizer(prompt, add_special_tokens=False).input_ids
+        template_ids = tokenizer(prompt, add_special_tokens=False).input_ids
+        pad_positions = [
+            index
+            for index, token_id in enumerate(template_ids)
+            if token_id == audio_pad_token_id
+        ]
+        if len(pad_positions) != 1:
+            raise ValueError(
+                "Qwen3-ASR prompt template must contain exactly one audio pad token"
+            )
+        audio_pad_index = pad_positions[0]
+        return (
+            tuple(template_ids[:audio_pad_index]),
+            tuple(template_ids[audio_pad_index + 1 :]),
+        )
+
+    def _build_prompt_ids(num_audio_tokens: int, language: str | None) -> list[int]:
+        prefix_ids, suffix_ids = _prompt_parts(language)
+        return [*prefix_ids, *([audio_pad_token_id] * num_audio_tokens), *suffix_ids]
 
     def _validate_context_budget(
         input_ids: list[int], request_max_new_tokens: int

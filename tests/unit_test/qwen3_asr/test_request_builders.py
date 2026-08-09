@@ -94,6 +94,15 @@ def test_qwen3_asr_audio_token_length_formula_is_shared() -> None:
     assert qwen3_asr_num_audio_tokens(3000) == 390
 
 
+@pytest.mark.parametrize("num_mel_frames", range(0, 401))
+def test_qwen3_asr_scalar_audio_token_length_matches_tensor_formula(
+    num_mel_frames: int,
+) -> None:
+    expected = int(qwen3_asr_audio_token_lengths(num_mel_frames).item())
+
+    assert qwen3_asr_num_audio_tokens(num_mel_frames) == expected
+
+
 @pytest.mark.parametrize(
     ("language_code", "expected_name"), sorted(LANGUAGE_CODE_TO_NAME.items())
 )
@@ -193,6 +202,41 @@ def test_qwen3_asr_request_builder_omits_language_prompt_for_auto_detection(
     assert data.language is None
     assert data.req.vocab_size == len(tokenizer)
     assert set(data.req.sampling_params.stop_token_ids) == {2}
+
+
+def test_qwen3_asr_request_builder_caches_prompt_template_per_language(
+    monkeypatch,
+) -> None:
+    tokenizer = _FakeTokenizer()
+    feature_extractor = lambda *args, **kwargs: SimpleNamespace(
+        input_features=torch.zeros((1, 128, 100)),
+        attention_mask=torch.ones((1, 100), dtype=torch.long),
+    )
+    monkeypatch.setattr(
+        transcription,
+        "load_audio",
+        lambda source, **kwargs: np.zeros(1600, dtype=np.float32),
+    )
+    request_builder, _ = make_qwen3_asr_scheduler_adapters(
+        tokenizer=tokenizer,
+        max_new_tokens=32,
+        feature_extractor=feature_extractor,
+    )
+
+    for request_id in ("req-first", "req-second"):
+        request_builder(
+            StagePayload(
+                request_id=request_id,
+                request=OmniRequest(
+                    inputs={"audio_bytes": b"wav"},
+                    params={"language": "en"},
+                ),
+                data={},
+            )
+        )
+
+    assert len(tokenizer.call_texts) == 1
+    assert tokenizer.call_texts[0].count("<|audio_pad|>") == 1
 
 
 @pytest.mark.parametrize(
