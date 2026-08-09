@@ -37,6 +37,7 @@ def _make_engine_builder(
         mm_attention_backend=mm_attention_backend,
         request_build_max_workers=8,
         request_build_max_pending=32,
+        request_build_inline_when_idle=True,
         prefill_coalesce_requests=16,
         prefill_coalesce_wait_ms=24.0,
         prefill_coalesce_when_idle=True,
@@ -102,6 +103,7 @@ def test_qwen3_asr_config_uses_batched_stage_with_64_running_requests() -> None:
     assert config.stages[0].factory_args["max_running_requests"] == 64
     assert config.stages[0].factory_args["request_build_max_workers"] == 8
     assert config.stages[0].factory_args["request_build_max_pending"] == 32
+    assert config.stages[0].factory_args["request_build_inline_when_idle"] is True
     assert config.stages[0].factory_args["prefill_coalesce_requests"] == 16
     assert config.stages[0].factory_args["prefill_coalesce_wait_ms"] == 24
     assert config.stages[0].factory_args["prefill_coalesce_when_idle"] is True
@@ -135,6 +137,7 @@ def test_qwen3_asr_stage_default_allows_64_running_requests() -> None:
     assert signature.parameters["max_running_requests"].default == 64
     assert signature.parameters["request_build_max_workers"].default == 8
     assert signature.parameters["request_build_max_pending"].default == 32
+    assert signature.parameters["request_build_inline_when_idle"].default is True
     assert signature.parameters["prefill_coalesce_requests"].default == 16
     assert signature.parameters["prefill_coalesce_wait_ms"].default == 24.0
     assert signature.parameters["prefill_coalesce_when_idle"].default is True
@@ -360,4 +363,5 @@ def test_qwen3_asr_threads_explicit_cuda_graph_bs(monkeypatch, caplog) -> None:
     assert scheduler.prefill_coalesce_when_idle is True
     assert scheduler.prefill_coalesce_requires_pending_builds is True
     assert scheduler.prefill_coalesce_after_builds_during_decode is True
+    assert scheduler.request_build_inline_when_idle is True
     assert scheduler.shutdown_callback is fake_encoder_service.close

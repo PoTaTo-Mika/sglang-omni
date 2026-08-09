@@ -199,6 +199,7 @@ class OmniScheduler:
         prefill_coalesce_after_builds_during_decode: bool = False,
         request_build_max_workers: int = 1,
         request_build_max_pending: int | None = None,
+        request_build_inline_when_idle: bool = False,
         shutdown_callback: Callable[[], None] | None = None,
     ):
         self.inbox: _queue_mod.Queue[IncomingMessage] = _queue_mod.Queue()
@@ -249,6 +250,7 @@ class OmniScheduler:
         self._pending_request_builds: dict[str, tuple[Any, bool, Future]] = {}
         self._backlogged_request_build_payloads: deque[Any] = deque()
         self._request_build_max_pending_observed = 0
+        self.request_build_inline_when_idle = bool(request_build_inline_when_idle)
 
         # --- Core scheduling state (read/written by upstream methods) -----
         self.server_args = server_args
@@ -829,6 +831,7 @@ class OmniScheduler:
         """Convert incoming payloads to SGLang Reqs and enqueue."""
         self._drain_request_build_results()
         recv_reqs, rejected_reqs = self._stage_request_build_payloads(recv_reqs)
+        build_inline = self._should_build_requests_inline(recv_reqs)
         for payload in rejected_reqs:
             self._reject_request_build_backlog_overflow(payload)
         for payload in recv_reqs:
@@ -862,7 +865,9 @@ class OmniScheduler:
                 self._deferred_request_payloads[req_id] = payload
                 continue
             active_stage = _get_active_stage()
-            request_build_executor = self._request_build_executor
+            request_build_executor = (
+                None if build_inline else self._request_build_executor
+            )
             if request_build_executor is not None:
                 with self._request_admission_lock:
                     if (
@@ -892,6 +897,20 @@ class OmniScheduler:
                 continue
             self._enqueue_built_request(payload, pending_stream_done, req_data)
         self._drain_request_build_results()
+
+    def _should_build_requests_inline(self, recv_reqs: list[Any]) -> bool:
+        if not self.request_build_inline_when_idle or len(recv_reqs) != 1:
+            return False
+        running_batch = self.running_batch
+        if running_batch is not None and not running_batch.is_empty():
+            return False
+        if self.waiting_queue or self.chunked_req is not None:
+            return False
+        with self._request_admission_lock:
+            return not (
+                self._pending_request_builds
+                or self._backlogged_request_build_payloads
+            )
 
     def _run_request_builder(self, payload: Any, active_stage: str | None) -> Any:
         req_id = payload.request_id

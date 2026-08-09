@@ -63,6 +63,40 @@ def _new_stage_payload(request_id: str) -> StagePayload:
     )
 
 
+def _inline_build_scheduler() -> OmniScheduler:
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.request_build_inline_when_idle = True
+    scheduler.running_batch = None
+    scheduler.waiting_queue = []
+    scheduler.chunked_req = None
+    scheduler._request_admission_lock = threading.RLock()
+    scheduler._pending_request_builds = {}
+    scheduler._backlogged_request_build_payloads = []
+    return scheduler
+
+
+def test_request_build_inline_when_scheduler_is_idle() -> None:
+    scheduler = _inline_build_scheduler()
+
+    assert scheduler._should_build_requests_inline([object()]) is True
+
+    scheduler.running_batch = SimpleNamespace(is_empty=lambda: True)
+    assert scheduler._should_build_requests_inline([object()]) is True
+
+
+def test_request_build_inline_rejects_parallel_or_busy_work() -> None:
+    scheduler = _inline_build_scheduler()
+
+    assert scheduler._should_build_requests_inline([object(), object()]) is False
+
+    scheduler.running_batch = SimpleNamespace(is_empty=lambda: False)
+    assert scheduler._should_build_requests_inline([object()]) is False
+
+    scheduler.running_batch = None
+    scheduler._pending_request_builds["req"] = object()
+    assert scheduler._should_build_requests_inline([object()]) is False
+
+
 def test_simple_scheduler_batch_and_error_contracts() -> None:
     """Preserves batched success output and per-request batch failure emission."""
     good = SimpleScheduler(

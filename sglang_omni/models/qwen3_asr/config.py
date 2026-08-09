@@ -36,6 +36,7 @@ class Qwen3ASRPipelineConfig(PipelineConfig):
                 "max_new_tokens": 128,
                 "request_build_max_workers": 8,
                 "request_build_max_pending": 32,
+                "request_build_inline_when_idle": True,
                 "prefill_coalesce_requests": 16,
                 "prefill_coalesce_wait_ms": 24,
                 "prefill_coalesce_when_idle": True,

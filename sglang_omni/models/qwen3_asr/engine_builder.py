@@ -39,6 +39,7 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
         mm_attention_backend: str | None,
         request_build_max_workers: int,
         request_build_max_pending: int | None,
+        request_build_inline_when_idle: bool,
         prefill_coalesce_requests: int,
         prefill_coalesce_wait_ms: float,
         prefill_coalesce_when_idle: bool,
@@ -68,6 +69,7 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
         self.mm_attention_backend = mm_attention_backend
         self.request_build_max_workers = request_build_max_workers
         self.request_build_max_pending = request_build_max_pending
+        self.request_build_inline_when_idle = request_build_inline_when_idle
         self.prefill_coalesce_requests = prefill_coalesce_requests
         self.prefill_coalesce_wait_ms = prefill_coalesce_wait_ms
         self.prefill_coalesce_when_idle = prefill_coalesce_when_idle
@@ -211,6 +213,7 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
             "async_decode_min_batch_size": self.async_decode_min_batch_size,
             "request_build_max_workers": self.request_build_max_workers,
             "request_build_max_pending": self.request_build_max_pending,
+            "request_build_inline_when_idle": self.request_build_inline_when_idle,
             "prefill_coalesce_requests": self.prefill_coalesce_requests,
             "prefill_coalesce_wait_ms": self.prefill_coalesce_wait_ms,
             "prefill_coalesce_when_idle": self.prefill_coalesce_when_idle,
