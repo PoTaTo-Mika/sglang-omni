@@ -353,7 +353,7 @@ def test_qwen3_asr_threads_explicit_cuda_graph_bs(monkeypatch, caplog) -> None:
         64,
     ]
     assert "cuda_graph_bs=[1, 2, 4, 8, 12, 16, 24, 32, 40, 48, 56, 64]" in caplog.text
-    assert build_kwargs["attention_backend"] == "triton"
+    assert "attention_backend" not in build_kwargs
     assert "mm_attention_backend" not in build_kwargs
     assert memory_queries == [0, 0, 0]
     assert adapter_kwargs["context_length"] == 2048
