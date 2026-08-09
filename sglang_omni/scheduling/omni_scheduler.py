@@ -197,7 +197,6 @@ class OmniScheduler:
         prefill_coalesce_when_idle: bool = False,
         prefill_coalesce_requires_pending_builds: bool = False,
         prefill_coalesce_after_builds_during_decode: bool = False,
-        prefill_coalesce_after_builds_min_running_requests: int = 0,
         request_build_max_workers: int = 1,
         request_build_max_pending: int | None = None,
         request_build_inline_when_idle: bool = False,
@@ -308,9 +307,6 @@ class OmniScheduler:
         )
         self.prefill_coalesce_after_builds_during_decode = bool(
             prefill_coalesce_after_builds_during_decode
-        )
-        self.prefill_coalesce_after_builds_min_running_requests = max(
-            0, int(prefill_coalesce_after_builds_min_running_requests)
         )
 
         # Token / memory info (upstream reads from tp_worker.get_worker_info)
@@ -1207,13 +1203,6 @@ class OmniScheduler:
                 )
             if not build_work_pending and not (
                 self.prefill_coalesce_after_builds_during_decode and not decode_is_idle
-            ):
-                return _Upstream.get_new_batch_prefill(self, running_batch)
-            if (
-                not build_work_pending
-                and self.prefill_coalesce_after_builds_min_running_requests > 0
-                and len(running_batch.reqs)
-                < self.prefill_coalesce_after_builds_min_running_requests
             ):
                 return _Upstream.get_new_batch_prefill(self, running_batch)
         waiting = self.waiting_queue

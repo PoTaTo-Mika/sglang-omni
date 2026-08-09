@@ -44,7 +44,6 @@ def _make_engine_builder(
         prefill_coalesce_when_idle=True,
         prefill_coalesce_requires_pending_builds=True,
         prefill_coalesce_after_builds_during_decode=True,
-        prefill_coalesce_after_builds_min_running_requests=5,
     )
 
 
@@ -119,12 +118,6 @@ def test_qwen3_asr_config_uses_batched_stage_with_64_running_requests() -> None:
         config.stages[0].factory_args["prefill_coalesce_after_builds_during_decode"]
         is True
     )
-    assert (
-        config.stages[0].factory_args[
-            "prefill_coalesce_after_builds_min_running_requests"
-        ]
-        == 5
-    )
     assert "request_build_max_backlog" not in config.stages[0].factory_args
     assert config.stages[0].factory_args["enable_pre_lm_encoder"] is True
     assert config.stages[0].factory_args["pre_lm_cache_max_entries"] == 4096
@@ -157,12 +150,6 @@ def test_qwen3_asr_stage_default_allows_64_running_requests() -> None:
     assert (
         signature.parameters["prefill_coalesce_after_builds_during_decode"].default
         is True
-    )
-    assert (
-        signature.parameters[
-            "prefill_coalesce_after_builds_min_running_requests"
-        ].default
-        == 5
     )
     assert "request_build_max_backlog" not in signature.parameters
 
@@ -381,6 +368,5 @@ def test_qwen3_asr_threads_explicit_cuda_graph_bs(monkeypatch, caplog) -> None:
     assert scheduler.prefill_coalesce_when_idle is True
     assert scheduler.prefill_coalesce_requires_pending_builds is True
     assert scheduler.prefill_coalesce_after_builds_during_decode is True
-    assert scheduler.prefill_coalesce_after_builds_min_running_requests == 5
     assert scheduler.request_build_inline_when_idle is False
     assert scheduler.shutdown_callback is fake_encoder_service.close
