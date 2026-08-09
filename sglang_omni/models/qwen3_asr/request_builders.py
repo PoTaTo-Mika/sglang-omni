@@ -343,10 +343,12 @@ def make_qwen3_asr_scheduler_adapters(
         output_ids = list(data.output_ids or [])
         # Keep the marker handling at token level. Byte-level BPE decode->encode
         # is not an identity transform for all whitespace/Unicode transcripts.
-        raw = _decode_token_ids(tokenizer, output_ids, skip_special_tokens=False)
-        logger.debug(
-            f"[qwen3-asr] n_out={len(output_ids)} ids={output_ids[:40]} raw={raw!r}"
-        )
+        if logger.isEnabledFor(logging.DEBUG):
+            raw = _decode_token_ids(tokenizer, output_ids, skip_special_tokens=False)
+            logger.debug(
+                f"[qwen3-asr] n_out={len(output_ids)} "
+                f"ids={output_ids[:40]} raw={raw!r}"
+            )
         asr_text_idx = _find_subsequence(output_ids, asr_text_token_ids)
         detected_language = None
         if data.language is None and asr_text_idx is not None:
