@@ -19,7 +19,7 @@ from sglang_omni.models.registry import PIPELINE_CONFIG_REGISTRY
 from tests.unit_test.fakes import FakeServerArgs
 
 
-def test_qwen3_asr_config_uses_batched_stage_with_32_running_requests() -> None:
+def test_qwen3_asr_config_uses_batched_stage_with_64_running_requests() -> None:
     config = Qwen3ASRPipelineConfig(model_path="Qwen/Qwen3-ASR-1.7B")
 
     assert config.entry_stage == "asr"
@@ -28,7 +28,7 @@ def test_qwen3_asr_config_uses_batched_stage_with_32_running_requests() -> None:
     assert config.gpu_placement == {"asr": 0}
     assert config.stages[0].factory.endswith("create_sglang_qwen3_asr_executor")
     assert config.stages[0].factory_args["device"] == "cuda:0"
-    assert config.stages[0].factory_args["max_running_requests"] == 32
+    assert config.stages[0].factory_args["max_running_requests"] == 64
     assert config.stages[0].factory_args["request_build_max_workers"] == 8
     assert config.stages[0].factory_args["request_build_max_pending"] == 32
     assert "request_build_max_backlog" not in config.stages[0].factory_args
@@ -43,10 +43,10 @@ def test_qwen3_asr_config_uses_batched_stage_with_32_running_requests() -> None:
     )
 
 
-def test_qwen3_asr_stage_default_allows_32_running_requests() -> None:
+def test_qwen3_asr_stage_default_allows_64_running_requests() -> None:
     signature = inspect.signature(create_sglang_qwen3_asr_executor)
 
-    assert signature.parameters["max_running_requests"].default == 32
+    assert signature.parameters["max_running_requests"].default == 64
     assert signature.parameters["request_build_max_workers"].default == 8
     assert signature.parameters["request_build_max_pending"].default == 32
     assert "request_build_max_backlog" not in signature.parameters
@@ -205,8 +205,21 @@ def test_qwen3_asr_threads_explicit_cuda_graph_bs(monkeypatch) -> None:
         server_args_overrides={"context_length": 2048},
     )
 
-    assert build_kwargs["cuda_graph_max_bs"] == 32
-    assert build_kwargs["cuda_graph_bs"] == [1, 2, 4, 8, 12, 16, 24, 32]
+    assert build_kwargs["cuda_graph_max_bs"] == 64
+    assert build_kwargs["cuda_graph_bs"] == [
+        1,
+        2,
+        4,
+        8,
+        12,
+        16,
+        24,
+        32,
+        40,
+        48,
+        56,
+        64,
+    ]
     assert adapter_kwargs["context_length"] == 2048
     assert scheduler.enable_async_decode is False
     assert scheduler.async_decode_min_batch_size == 4
