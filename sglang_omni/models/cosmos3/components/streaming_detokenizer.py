@@ -94,7 +94,7 @@ class Cosmos3StreamingDetokenizer:
             state.pending_tokens,
             skip_special_tokens=True,
         )
-        if "\ufffd" in candidate:
+        if candidate.endswith("\ufffd"):
             return
         state.pending_tokens.clear()
         if not candidate:
