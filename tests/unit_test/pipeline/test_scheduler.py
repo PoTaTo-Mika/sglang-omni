@@ -503,10 +503,7 @@ def test_omni_scheduler_custom_runner_advances_forward_ct() -> None:
             )
 
         def execute_launch(self, sched_output):
-            return SimpleNamespace(
-                schedule_batch=sched_output.batch_data,
-                scheduler_output=sched_output,
-            )
+            return SimpleNamespace()
 
     scheduler = object.__new__(OmniScheduler)
     scheduler._model_runner = FakeModelRunner()
