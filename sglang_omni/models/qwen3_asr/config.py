@@ -34,6 +34,8 @@ class Qwen3ASRPipelineConfig(PipelineConfig):
                 "device": "cuda:0",
                 "max_running_requests": 64,
                 "max_new_tokens": 128,
+                "enable_torch_compile": True,
+                "torch_compile_max_bs": 1,
                 "request_build_max_workers": 8,
                 "request_build_max_pending": 32,
                 "request_build_inline_when_idle": False,

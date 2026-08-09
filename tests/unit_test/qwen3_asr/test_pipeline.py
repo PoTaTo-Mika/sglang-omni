@@ -34,6 +34,7 @@ def _make_engine_builder(
         mem_fraction_static=None,
         mm_embedding_cache_size_bytes=0,
         enable_torch_compile=False,
+        torch_compile_max_bs=1,
         mm_attention_backend=mm_attention_backend,
         request_build_max_workers=8,
         request_build_max_pending=32,
@@ -101,6 +102,8 @@ def test_qwen3_asr_config_uses_batched_stage_with_64_running_requests() -> None:
     assert config.stages[0].factory.endswith("create_sglang_qwen3_asr_executor")
     assert config.stages[0].factory_args["device"] == "cuda:0"
     assert config.stages[0].factory_args["max_running_requests"] == 64
+    assert config.stages[0].factory_args["enable_torch_compile"] is True
+    assert config.stages[0].factory_args["torch_compile_max_bs"] == 1
     assert config.stages[0].factory_args["request_build_max_workers"] == 8
     assert config.stages[0].factory_args["request_build_max_pending"] == 32
     assert config.stages[0].factory_args["request_build_inline_when_idle"] is False
@@ -203,6 +206,7 @@ def test_qwen3_asr_stage_default_disables_torch_compile() -> None:
     signature = inspect.signature(create_sglang_qwen3_asr_executor)
 
     assert signature.parameters["enable_torch_compile"].default is False
+    assert signature.parameters["torch_compile_max_bs"].default == 1
 
 
 def test_qwen3_asr_stage_default_enables_async_decode() -> None:
