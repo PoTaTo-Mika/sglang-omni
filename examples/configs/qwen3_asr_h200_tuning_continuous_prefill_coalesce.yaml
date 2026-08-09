@@ -1,0 +1,12 @@
+config_cls: Qwen3ASRPipelineConfig
+name: qwen3-asr-h200-tuning-continuous-prefill-coalesce
+model_path: Qwen/Qwen3-ASR-1.7B
+
+runtime_overrides:
+  asr:
+    request_build_max_workers: 16
+    request_build_max_pending: 64
+    prefill_coalesce_requests: 16
+    prefill_coalesce_wait_ms: 24
+    prefill_coalesce_when_idle: true
+    prefill_coalesce_requires_pending_builds: false
