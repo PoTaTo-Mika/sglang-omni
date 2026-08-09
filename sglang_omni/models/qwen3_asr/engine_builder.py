@@ -109,7 +109,6 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
             "max_prefill_tokens": 4096,
             "chunked_prefill_size": 4096,
             "sampling_backend": "pytorch",
-            "log_level": "warning",
             "dtype": dtype,
         }
         if self.mm_attention_backend is not None:
