@@ -76,8 +76,6 @@ class SGLangExecutionBridge:
             needs_cpu_seq_lens=True,
         )
         self._relay_payload_type = RelayPayload
-        self._completion_events: tuple[Any, Any] | None = None
-        self._completion_event_slot = 0
 
     @contextlib.contextmanager
     def forward_context(
@@ -127,12 +125,6 @@ class SGLangExecutionBridge:
 
     def record_completion(self):
         """Record completion of the current launch on its producing stream."""
-        if self._completion_events is None:
-            self._completion_events = (
-                self.device_module.Event(),
-                self.device_module.Event(),
-            )
-        event = self._completion_events[self._completion_event_slot]
-        self._completion_event_slot ^= 1
+        event = self.device_module.Event()
         event.record()
         return event
