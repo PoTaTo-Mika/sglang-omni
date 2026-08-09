@@ -32,7 +32,7 @@ class Qwen3ASRPipelineConfig(PipelineConfig):
             factory=f"{_PKG}.stages.create_sglang_qwen3_asr_executor",
             factory_args={
                 "device": "cuda:0",
-                "max_running_requests": 32,
+                "max_running_requests": 64,
                 "max_new_tokens": 128,
                 "request_build_max_workers": 8,
                 "request_build_max_pending": 32,

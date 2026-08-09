@@ -28,12 +28,15 @@ from sglang_omni.proto import OmniRequest, StagePayload
 
 class _FakeTokenizer:
     eos_token_id = 2
-    vocab_size = 1000
+    vocab_size = 100
 
     def __init__(self) -> None:
         self.call_texts: list[str] = []
         self.encode_calls: list[str] = []
         self.decode_calls: list[dict] = []
+
+    def __len__(self) -> int:
+        return 102
 
     def convert_tokens_to_ids(self, token: str) -> int:
         assert token == "<|audio_pad|>"
@@ -117,7 +120,6 @@ def test_qwen3_asr_preserves_chinese_compatibility_aliases(language: str) -> Non
 @pytest.mark.parametrize(
     ("language", "expected_name", "expected_language"),
     [
-        (None, "English", "en"),
         ("en", "English", "en"),
         ("es", "Spanish", "es"),
         ("fReNcH", "French", "fReNcH"),
@@ -125,7 +127,7 @@ def test_qwen3_asr_preserves_chinese_compatibility_aliases(language: str) -> Non
 )
 def test_qwen3_asr_request_builder_uses_canonical_language_prompt(
     monkeypatch,
-    language: str | None,
+    language: str,
     expected_name: str,
     expected_language: str,
 ) -> None:
@@ -148,7 +150,7 @@ def test_qwen3_asr_request_builder_uses_canonical_language_prompt(
         request_id="req-language",
         request=OmniRequest(
             inputs={"audio_bytes": b"wav"},
-            params={} if language is None else {"language": language},
+            params={"language": language},
         ),
         data={},
     )
@@ -157,6 +159,40 @@ def test_qwen3_asr_request_builder_uses_canonical_language_prompt(
 
     assert tokenizer.call_texts[-1].endswith(f"language {expected_name}<asr_text>")
     assert data.language == expected_language
+
+
+def test_qwen3_asr_request_builder_omits_language_prompt_for_auto_detection(
+    monkeypatch,
+) -> None:
+    tokenizer = _FakeTokenizer()
+    feature_extractor = lambda *args, **kwargs: SimpleNamespace(
+        input_features=torch.zeros((1, 128, 100)),
+        attention_mask=torch.ones((1, 100), dtype=torch.long),
+    )
+    monkeypatch.setattr(
+        transcription,
+        "load_audio",
+        lambda source, **kwargs: np.zeros(1600, dtype=np.float32),
+    )
+    request_builder, _ = make_qwen3_asr_scheduler_adapters(
+        tokenizer=tokenizer,
+        max_new_tokens=32,
+        feature_extractor=feature_extractor,
+    )
+    payload = StagePayload(
+        request_id="req-auto-language",
+        request=OmniRequest(inputs={"audio_bytes": b"wav"}),
+        data={},
+    )
+
+    data = request_builder(payload)
+
+    assert tokenizer.call_texts[-1].startswith("<|im_start|>user\n")
+    assert tokenizer.call_texts[-1].endswith("<|im_start|>assistant\n")
+    assert "<asr_text>" not in tokenizer.call_texts[-1]
+    assert data.language is None
+    assert data.req.vocab_size == len(tokenizer)
+    assert set(data.req.sampling_params.stop_token_ids) == {2}
 
 
 @pytest.mark.parametrize(
@@ -349,6 +385,118 @@ def test_qwen3_asr_rejects_full_context_before_mel_extraction(
         request_builder(payload)
 
 
+def test_qwen3_asr_embedding_cache_hit_skips_mel_extraction(monkeypatch) -> None:
+    class _UnexpectedFeatureExtractor:
+        hop_length = 160
+
+        def __call__(self, *args, **kwargs):
+            raise AssertionError("feature extractor should not be called")
+
+    class _EncoderService:
+        def __init__(self) -> None:
+            self.lookup: tuple[str, int] | None = None
+            self.embedding = torch.zeros((13, 4))
+
+        def lookup_cached_embedding(
+            self, audio_fingerprint: str, expected_tokens: int
+        ) -> torch.Tensor | None:
+            self.lookup = (audio_fingerprint, expected_tokens)
+            return self.embedding
+
+        def attach_embedding(self, item, embedding: torch.Tensor) -> None:
+            item.precomputed_embeddings = embedding
+            item.feature = None
+
+        def encode_item(self, item) -> None:
+            raise AssertionError("encoder should not be called on a cache hit")
+
+    monkeypatch.setattr(
+        transcription,
+        "load_audio",
+        lambda source, **kwargs: np.zeros(16000, dtype=np.float32),
+    )
+    encoder_service = _EncoderService()
+    request_builder, _ = make_qwen3_asr_scheduler_adapters(
+        tokenizer=_FakeTokenizer(),
+        max_new_tokens=32,
+        feature_extractor=_UnexpectedFeatureExtractor(),
+        audio_encoder_service=encoder_service,
+    )
+    payload = StagePayload(
+        request_id="req-asr-cache-hit",
+        request=OmniRequest(inputs={"audio_bytes": b"wav"}),
+        data={},
+    )
+
+    data = request_builder(payload)
+
+    item = data.req.multimodal_inputs.mm_items[0]
+    assert encoder_service.lookup == (data.req.extra_key, 13)
+    assert item.feature is None
+    assert item.precomputed_embeddings is encoder_service.embedding
+    assert item.num_audio_tokens == 13
+
+
+def test_qwen3_asr_embedding_cache_miss_extracts_and_encodes(monkeypatch) -> None:
+    class _FeatureExtractor:
+        hop_length = 160
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __call__(self, *args, **kwargs):
+            self.calls += 1
+            return SimpleNamespace(
+                input_features=torch.zeros((1, 128, 100)),
+                attention_mask=torch.ones((1, 100), dtype=torch.long),
+            )
+
+    class _EncoderService:
+        def __init__(self) -> None:
+            self.lookup: tuple[str, int] | None = None
+            self.encoded_feature: torch.Tensor | None = None
+
+        def lookup_cached_embedding(
+            self, audio_fingerprint: str, expected_tokens: int
+        ) -> None:
+            self.lookup = (audio_fingerprint, expected_tokens)
+            return None
+
+        def attach_embedding(self, item, embedding: torch.Tensor) -> None:
+            raise AssertionError("no cached embedding should be attached")
+
+        def encode_item(self, item) -> None:
+            self.encoded_feature = item.feature
+            item.precomputed_embeddings = torch.zeros((item.num_audio_tokens, 4))
+            item.feature = None
+
+    monkeypatch.setattr(
+        transcription,
+        "load_audio",
+        lambda source, **kwargs: np.zeros(16000, dtype=np.float32),
+    )
+    feature_extractor = _FeatureExtractor()
+    encoder_service = _EncoderService()
+    request_builder, _ = make_qwen3_asr_scheduler_adapters(
+        tokenizer=_FakeTokenizer(),
+        max_new_tokens=32,
+        feature_extractor=feature_extractor,
+        audio_encoder_service=encoder_service,
+    )
+    payload = StagePayload(
+        request_id="req-asr-cache-miss",
+        request=OmniRequest(inputs={"audio_bytes": b"wav"}),
+        data={},
+    )
+
+    data = request_builder(payload)
+
+    assert encoder_service.lookup == (data.req.extra_key, 13)
+    assert feature_extractor.calls == 1
+    assert encoder_service.encoded_feature is not None
+    assert data.req.multimodal_inputs.mm_items[0].feature is None
+
+
 def test_qwen3_asr_result_adapter_decodes_without_text_round_trip() -> None:
     tokenizer = _FakeTokenizer()
     _, result_adapter = make_qwen3_asr_scheduler_adapters(
@@ -364,13 +512,13 @@ def test_qwen3_asr_result_adapter_decodes_without_text_round_trip() -> None:
     data = Qwen3ASRRequestData(
         output_ids=[10, 100, 101, 20, 21, 22, 99],
         stage_payload=payload,
-        language="en",
         audio_duration_s=1.25,
     )
 
     result = result_adapter(data)
 
     assert result.data["text"] == " leading\u00a0middle  "
+    assert result.data["language"] == "English"
     assert tokenizer.encode_calls == ["<asr_text>"]
     assert tokenizer.decode_calls[-1] == {
         "token_ids": [20, 21, 22, 99],
@@ -388,6 +536,7 @@ def test_qwen3_asr_request_builder_encodes_after_offsets_are_final(
         input_features=torch.zeros((1, 128, 3000)),
         attention_mask=torch.ones((1, num_mel_frames), dtype=torch.long),
     )
+    feature_extractor.hop_length = 160
     monkeypatch.setattr(
         transcription,
         "load_audio",
@@ -396,6 +545,11 @@ def test_qwen3_asr_request_builder_encodes_after_offsets_are_final(
     observed: dict[str, object] = {}
 
     class _EncoderService:
+        def lookup_cached_embedding(
+            self, audio_fingerprint: str, expected_tokens: int
+        ) -> None:
+            return None
+
         def encode_item(self, item) -> None:
             observed["offsets"] = item.offsets
             observed["num_audio_tokens"] = item.num_audio_tokens

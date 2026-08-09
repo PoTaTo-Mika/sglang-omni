@@ -386,12 +386,14 @@ that happened to contain an older version of the test.
     the `remove_if` eviction predicate evaluated outside the lock (re-entrant
     and deadlock-free), and concurrent remove_if/put state integrity.
 - `unit_test/qwen3_asr/`: Qwen3-ASR unit tests:
-  - pipeline config, stage factory concurrency defaults, async-decode default,
+  - pipeline config and stage factory `max_running_requests=64` default,
+    async-decode default,
     and `--decode-mode async|sync` CLI overrides
   - single-source audio token length formula used by both processor and
     request builder paths
   - all 30 language-code/name mappings, Chinese compatibility aliases,
-    canonical forced-language prompts, and early unsupported-language rejection
+    automatic language detection, canonical forced-language prompts, and early
+    unsupported-language rejection
   - token-level result adapter marker handling, avoiding decode/encode
     text round-trips for byte-level BPE output.
 - `unit_test/fun_asr/`: Fun-ASR-Nano unit tests:
