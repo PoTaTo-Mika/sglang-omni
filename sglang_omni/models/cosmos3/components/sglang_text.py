@@ -8,7 +8,10 @@ from typing import Any
 
 import torch
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.qwen3 import Qwen3ForCausalLM
+
+from sglang_omni.models.cosmos3.hf_config import Cosmos3OmniConfig
 
 _TEXT_ROOTS = ("embed_tokens.", "layers.", "norm.", "lm_head.")
 _GEN_WEIGHT_MARKERS = (
@@ -31,29 +34,17 @@ _ATTENTION_NAME_MAP = (
 
 
 def resolve_cosmos3_text_positions(
-    positions: torch.Tensor,
-    forward_batch: Any,
+    forward_batch: ForwardBatch,
 ) -> torch.Tensor:
     """Return Cosmos3's explicit three-axis text mRoPE positions.
 
     Cosmos3 assigns the same monotonically increasing position to the
     temporal, height, and width axes for every text token. SGLang computes
     that ``[3, num_tokens]`` tensor on ``ForwardBatch`` for mRoPE models. The
-    fallback keeps direct/eager calls on the same contract instead of relying
-    on the numerically equivalent one-dimensional RoPE path.
+    scheduler populates that tensor before invoking the model.
     """
 
-    mrope_positions = getattr(forward_batch, "mrope_positions", None)
-    if mrope_positions is None:
-        if positions.ndim == 1:
-            return positions.unsqueeze(0).expand(3, -1)
-        mrope_positions = positions
-    if mrope_positions.ndim != 2 or mrope_positions.shape[0] != 3:
-        raise ValueError(
-            "Cosmos3 text mRoPE positions must have shape [3, num_tokens], "
-            f"got {tuple(mrope_positions.shape)}"
-        )
-    return mrope_positions
+    return forward_batch.mrope_positions
 
 
 def map_cosmos3_text_weight_name(name: str) -> str | None:
@@ -80,13 +71,12 @@ class Cosmos3TextForCausalLM(Qwen3ForCausalLM):
 
     def __init__(
         self,
-        config: Any,
+        config: Cosmos3OmniConfig,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
-        text_config = getattr(config, "text_config", config)
-        if hasattr(config, "tie_word_embeddings"):
-            text_config.tie_word_embeddings = bool(config.tie_word_embeddings)
+        text_config = config.text_config
+        text_config.tie_word_embeddings = bool(config.tie_word_embeddings)
         super().__init__(
             text_config,
             quant_config=quant_config,
@@ -107,7 +97,7 @@ class Cosmos3TextForCausalLM(Qwen3ForCausalLM):
         # Qwen3ForCausalLM normally consumes the scheduler's flat positions.
         # Cosmos3 follows Qwen3-VL's explicit T/H/W text-position convention,
         # so route SGLang's computed mRoPE positions into every decoder layer.
-        positions = resolve_cosmos3_text_positions(positions, forward_batch)
+        positions = resolve_cosmos3_text_positions(forward_batch)
         return super().forward(
             input_ids=input_ids,
             positions=positions,

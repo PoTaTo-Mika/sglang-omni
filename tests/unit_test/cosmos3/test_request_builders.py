@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import torch
+from transformers import GenerationConfig
 
 from sglang_omni.models.cosmos3.payload_types import Cosmos3PipelineState
 from sglang_omni.models.cosmos3.request_builders import (
@@ -37,7 +38,7 @@ def _state() -> Cosmos3PipelineState:
 
 
 def test_sampling_defaults_follow_nano_generation_config() -> None:
-    generation_config = SimpleNamespace(
+    generation_config = GenerationConfig(
         do_sample=True,
         temperature=0.7,
         top_p=0.8,
@@ -58,7 +59,7 @@ def test_sampling_defaults_follow_nano_generation_config() -> None:
 
 
 def test_none_sampling_values_fall_back_to_nano_defaults() -> None:
-    generation_config = SimpleNamespace(
+    generation_config = GenerationConfig(
         do_sample=True,
         temperature=0.7,
         top_p=0.8,
@@ -94,7 +95,7 @@ def test_none_sampling_values_fall_back_to_nano_defaults() -> None:
 
 
 def test_builds_plain_sglang_ar_request() -> None:
-    generation_config = SimpleNamespace(
+    generation_config = GenerationConfig(
         do_sample=True,
         temperature=0.7,
         top_p=0.8,
@@ -167,7 +168,7 @@ def test_scheduler_ignores_unset_openai_sampling_placeholders(monkeypatch) -> No
         ),
         data=_state().to_dict(),
     )
-    generation_config = SimpleNamespace(
+    generation_config = GenerationConfig(
         do_sample=True,
         temperature=0.7,
         top_p=0.8,
@@ -206,7 +207,7 @@ def test_scheduler_honors_explicit_openai_sampling_values(monkeypatch) -> None:
         ),
         data=_state().to_dict(),
     )
-    generation_config = SimpleNamespace(
+    generation_config = GenerationConfig(
         do_sample=True,
         temperature=0.7,
         top_p=0.8,

@@ -10,7 +10,6 @@ from sglang.srt.models.qwen3 import Qwen3ForCausalLM
 from sglang_omni.models.cosmos3.components.sglang_text import (
     Cosmos3TextForCausalLM,
     map_cosmos3_text_weight_name,
-    resolve_cosmos3_text_positions,
 )
 
 
@@ -99,22 +98,6 @@ def test_text_wrapper_uses_nested_text_config(monkeypatch) -> None:
     }
     assert text_config.tie_word_embeddings is False
     assert model.root_config is root_config
-
-
-def test_cosmos_text_positions_fill_all_three_mrope_axes() -> None:
-    positions = torch.arange(4, dtype=torch.long)
-
-    resolved = resolve_cosmos3_text_positions(
-        positions,
-        SimpleNamespace(mrope_positions=None),
-    )
-
-    assert resolved.shape == (3, 4)
-    assert resolved.tolist() == [
-        [0, 1, 2, 3],
-        [0, 1, 2, 3],
-        [0, 1, 2, 3],
-    ]
 
 
 def test_text_forward_prefers_scheduler_mrope_positions(monkeypatch) -> None:

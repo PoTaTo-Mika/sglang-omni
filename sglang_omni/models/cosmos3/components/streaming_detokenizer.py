@@ -9,13 +9,17 @@ import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 from sglang_omni.models.cosmos3.components.text_preprocessor import (
     load_cosmos3_tokenizer,
 )
-from sglang_omni.models.cosmos3.payload_types import Cosmos3PipelineState
-from sglang_omni.models.cosmos3.request_builders import THINKER_STAGE
+from sglang_omni.models.cosmos3.payload_types import (
+    Cosmos3PipelineState,
+    PromptInputs,
+    TextOutput,
+)
+from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
 
@@ -113,12 +117,9 @@ class Cosmos3StreamingDetokenizer:
                 _STATE_MAX,
             )
 
-    def _on_stream_chunk(self, request_id: str, item: Any) -> None:
+    def _on_stream_chunk(self, request_id: str, item: StreamItem) -> None:
         with self._state_lock:
-            raw_token = item.data
-            token_id = (
-                int(raw_token.item()) if hasattr(raw_token, "item") else int(raw_token)
-            )
+            token_id = int(item.data.item())
             state = self._ensure_state(request_id)
             state.pending_tokens.append(token_id)
             candidate = self._tokenizer.decode(
@@ -207,11 +208,9 @@ class Cosmos3StreamingDetokenizer:
         is_streaming: bool,
     ) -> dict[str, Any]:
         state = Cosmos3PipelineState.from_dict(payload.data)
-        text_out = state.text_out or state.engine_outputs.get(THINKER_STAGE)
-        if not isinstance(text_out, dict):
-            text_out = {"output_ids": [], "is_final": True}
+        text_out = cast(TextOutput, state.text_out)
 
-        output_ids = list(text_out.get("output_ids") or [])
+        output_ids = text_out["output_ids"]
         result: dict[str, Any] = {"modality": "text"}
         if not is_streaming:
             result["text"] = self._tokenizer.decode(
@@ -223,14 +222,8 @@ class Cosmos3StreamingDetokenizer:
             if text_out.get(key) is not None:
                 result[key] = text_out[key]
 
-        input_ids = (
-            state.prompt.get("input_ids") if isinstance(state.prompt, dict) else None
-        )
-        prompt_tokens = (
-            int(input_ids.numel())
-            if hasattr(input_ids, "numel")
-            else len(input_ids or [])
-        )
+        prompt = cast(PromptInputs, state.prompt)
+        prompt_tokens = int(prompt["input_ids"].numel())
         result["usage"] = {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": len(output_ids),

@@ -74,9 +74,7 @@ def _normalize_text_messages(inputs: Any) -> list[dict[str, str]]:
     return messages
 
 
-def _reject_media_inputs(container: Any) -> None:
-    if not isinstance(container, dict):
-        return
+def _reject_media_inputs(container: dict[str, Any]) -> None:
     populated_media = [key for key in _MEDIA_INPUT_KEYS if container.get(key)]
     if populated_media:
         raise ValueError(
@@ -85,17 +83,8 @@ def _reject_media_inputs(container: Any) -> None:
         )
 
 
-def _flatten_single_batch(value: Any, *, name: str) -> torch.Tensor:
-    tensor = value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
-    if tensor.ndim == 2:
-        if tensor.shape[0] != 1:
-            raise ValueError(f"Tokenizer returned batched {name}; expected one prompt")
-        tensor = tensor[0]
-    if tensor.ndim != 1:
-        raise ValueError(
-            f"Tokenizer returned invalid {name} shape {tuple(tensor.shape)}"
-        )
-    return tensor.to(dtype=torch.long)
+def _flatten_single_batch(value: torch.Tensor) -> torch.Tensor:
+    return value[0].to(dtype=torch.long)
 
 
 def validate_prompt_seq_len(
@@ -154,7 +143,7 @@ class Cosmos3TextPreprocessor:
             tokenizer if tokenizer is not None else load_cosmos3_tokenizer(model_path)
         )
         ensure_chat_template(self.tokenizer, model_path=model_path)
-        if not getattr(self.tokenizer, "chat_template", None):
+        if not self.tokenizer.chat_template:
             raise ValueError(
                 f"Tokenizer for {model_path!r} does not define a chat template"
             )
@@ -171,15 +160,13 @@ class Cosmos3TextPreprocessor:
             add_special_tokens=False,
             return_tensors="pt",
         )
-        input_ids = _flatten_single_batch(encoded["input_ids"], name="input_ids")
+        input_ids = _flatten_single_batch(encoded["input_ids"])
         raw_attention_mask = encoded.get("attention_mask")
         attention_mask = (
             torch.ones_like(input_ids)
             if raw_attention_mask is None
-            else _flatten_single_batch(raw_attention_mask, name="attention_mask")
+            else _flatten_single_batch(raw_attention_mask)
         )
-        if attention_mask.shape != input_ids.shape:
-            raise ValueError("Tokenizer returned mismatched input_ids/attention_mask")
         return input_ids, attention_mask, prompt_text
 
     @staticmethod
