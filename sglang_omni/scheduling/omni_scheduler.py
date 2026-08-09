@@ -967,17 +967,11 @@ class OmniScheduler:
             with self._request_admission_lock:
                 if not self._pending_request_builds:
                     return
-                completed = next(
-                    (
-                        (req_id, pending)
-                        for req_id, pending in self._pending_request_builds.items()
-                        if pending[2].done()
-                    ),
-                    None,
+                req_id, (payload, pending_stream_done, future) = next(
+                    iter(self._pending_request_builds.items())
                 )
-                if completed is None:
+                if not future.done():
                     return
-                req_id, (payload, pending_stream_done, future) = completed
                 self._pending_request_builds.pop(req_id, None)
                 if req_id in self._aborted_request_ids:
                     continue
