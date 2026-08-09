@@ -45,6 +45,7 @@ class _StubScheduler:
         coalesce_when_idle: bool = False,
         requires_pending_builds: bool = False,
         coalesce_after_builds_during_decode: bool = False,
+        coalesce_after_builds_min_running_requests: int = 0,
     ) -> None:
         self.prefill_coalesce_requests = coalesce_requests
         self.prefill_coalesce_wait_s = wait_ms / 1e3
@@ -52,6 +53,9 @@ class _StubScheduler:
         self.prefill_coalesce_requires_pending_builds = requires_pending_builds
         self.prefill_coalesce_after_builds_during_decode = (
             coalesce_after_builds_during_decode
+        )
+        self.prefill_coalesce_after_builds_min_running_requests = (
+            coalesce_after_builds_min_running_requests
         )
         self.chunked_req = None
         self.waiting_queue: list = []
@@ -267,6 +271,28 @@ def test_decode_can_coalesce_after_build_work_drains(upstream, clock):
     sched.waiting_queue = [_req(100.0)]
 
     clock.return_value = 100.001
+    assert sched.get_new_batch_prefill() is None
+
+
+def test_small_decode_batch_releases_after_build_work_drains(upstream, clock):
+    sched = _StubScheduler(
+        coalesce_requests=8,
+        wait_ms=6.0,
+        coalesce_when_idle=True,
+        requires_pending_builds=True,
+        coalesce_after_builds_during_decode=True,
+        coalesce_after_builds_min_running_requests=5,
+    )
+    sched.running_batch = SimpleNamespace(
+        is_empty=lambda: False,
+        reqs=[object()] * 4,
+    )
+    sched.waiting_queue = [_req(100.0)]
+
+    clock.return_value = 100.001
+    assert sched.get_new_batch_prefill() is _UPSTREAM_BATCH
+
+    sched.running_batch.reqs.append(object())
     assert sched.get_new_batch_prefill() is None
 
 

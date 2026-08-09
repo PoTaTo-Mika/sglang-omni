@@ -46,6 +46,7 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
         prefill_coalesce_when_idle: bool,
         prefill_coalesce_requires_pending_builds: bool,
         prefill_coalesce_after_builds_during_decode: bool,
+        prefill_coalesce_after_builds_min_running_requests: int,
         enable_pre_lm_encoder: bool = True,
         pre_lm_cache_max_entries: int = 4096,
         pre_lm_cache_size_bytes: int = 2 * 1024**3,
@@ -81,6 +82,9 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
         self.prefill_coalesce_after_builds_during_decode = (
             prefill_coalesce_after_builds_during_decode
         )
+        self.prefill_coalesce_after_builds_min_running_requests = (
+            prefill_coalesce_after_builds_min_running_requests
+        )
         self.enable_pre_lm_encoder = enable_pre_lm_encoder
         self.pre_lm_cache_max_entries = pre_lm_cache_max_entries
         self.pre_lm_cache_size_bytes = pre_lm_cache_size_bytes
@@ -113,7 +117,7 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
             "mem_fraction_static": self.mem_fraction_static,
             "max_prefill_tokens": 4096,
             "chunked_prefill_size": 4096,
-            "sampling_backend": "flashinfer",
+            "sampling_backend": "pytorch",
             "dtype": dtype,
         }
         if self.mm_attention_backend is not None:
@@ -225,5 +229,8 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
             ),
             "prefill_coalesce_after_builds_during_decode": (
                 self.prefill_coalesce_after_builds_during_decode
+            ),
+            "prefill_coalesce_after_builds_min_running_requests": (
+                self.prefill_coalesce_after_builds_min_running_requests
             ),
         }
