@@ -360,7 +360,7 @@ def test_qwen3_asr_threads_explicit_cuda_graph_bs(monkeypatch, caplog) -> None:
     assert scheduler.enable_async_decode is False
     assert scheduler.async_decode_min_batch_size == 4
     assert scheduler.prefill_coalesce_requests == 16
-    assert scheduler.prefill_coalesce_wait_ms == 24.0
+    assert scheduler.prefill_coalesce_wait_ms == 40.0
     assert scheduler.prefill_coalesce_when_idle is True
     assert scheduler.prefill_coalesce_requires_pending_builds is True
     assert scheduler.prefill_coalesce_after_builds_during_decode is True
