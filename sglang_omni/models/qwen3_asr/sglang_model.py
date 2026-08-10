@@ -28,9 +28,7 @@ from .configuration_qwen3_asr import Qwen3ASRConfig
 
 logger = logging.getLogger(__name__)
 
-_MROPE_ONLY_KEYS = frozenset(
-    {"interleaved", "mrope_interleaved", "mrope_section"}
-)
+_MROPE_ONLY_KEYS = frozenset({"interleaved", "mrope_interleaved", "mrope_section"})
 
 
 def _normalize_asr_text_rope(text_config: Any) -> None:
@@ -94,9 +92,7 @@ def _enable_fused_asr_qk_norm_rope(language_model: nn.Module) -> None:
         attention = layer.self_attn
         if attention.head_dim not in (64, 128, 256):
             continue
-        attention._asr_unfused_forward_prepare_native = (
-            attention.forward_prepare_native
-        )
+        attention._asr_unfused_forward_prepare_native = attention.forward_prepare_native
         attention.forward_prepare_native = MethodType(
             _fused_asr_forward_prepare_native,
             attention,
