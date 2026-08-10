@@ -62,6 +62,7 @@ def test_forward_uses_available_mrope_positions(
 
     expected_positions = mrope_positions[0] if use_mrope_positions else positions
     assert torch.equal(seen_positions, expected_positions)
+    assert seen_positions.dtype == torch.int32
     assert actual is output
 
 
@@ -84,6 +85,37 @@ def test_asr_text_rope_drops_only_multimodal_parameters() -> None:
     assert config.rope_parameters == expected
     assert config.rope_scaling == expected
     assert original["mrope_section"] == [24, 20, 20]
+
+
+def test_fused_asr_qk_norm_rope_is_bound_per_attention() -> None:
+    def original(positions, hidden_states):
+        return positions, hidden_states
+
+    supported = SimpleNamespace(
+        head_dim=128,
+        forward_prepare_native=original,
+    )
+    unsupported = SimpleNamespace(
+        head_dim=96,
+        forward_prepare_native=original,
+    )
+    language_model = SimpleNamespace(
+        model=SimpleNamespace(
+            layers=[
+                SimpleNamespace(self_attn=supported),
+                SimpleNamespace(self_attn=unsupported),
+            ]
+        )
+    )
+
+    sglang_model._enable_fused_asr_qk_norm_rope(language_model)
+
+    assert supported._asr_unfused_forward_prepare_native is original
+    assert (
+        supported.forward_prepare_native.__func__
+        is sglang_model._fused_asr_forward_prepare_native
+    )
+    assert unsupported.forward_prepare_native is original
 
 
 def test_get_audio_feature_preserves_masks_in_mixed_batch() -> None:
