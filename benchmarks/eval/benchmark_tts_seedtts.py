@@ -173,10 +173,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Any
 
 from benchmarks.benchmarker.runner import BenchmarkRunner, RunConfig
 from benchmarks.benchmarker.utils import managed_omni_server
@@ -252,6 +254,7 @@ class TtsSeedttsBenchmarkConfig:
     initial_codec_chunk_frames: int | None = None
     disable_tqdm: bool = False
     max_running_requests: int = 64
+    max_queued_requests: int | None = None
     cuda_graph_max_bs: int = 64
     # note (luojiaxuan): optional sglang-omni pipeline config yaml forwarded
     # to the managed TTS server as ``--config`` (e.g.
@@ -315,6 +318,7 @@ def _build_results_config(
         "request_rate": config.request_rate,
         "initial_codec_chunk_frames": config.initial_codec_chunk_frames,
         "max_running_requests": config.max_running_requests,
+        "max_queued_requests": config.max_queued_requests,
         "cuda_graph_max_bs": config.cuda_graph_max_bs,
         "server_config": config.server_config,
         "quantization": config.quantization,
@@ -460,6 +464,7 @@ def _config_from_args(args: argparse.Namespace) -> TtsSeedttsBenchmarkConfig:
         initial_codec_chunk_frames=args.initial_codec_chunk_frames,
         disable_tqdm=args.disable_tqdm,
         max_running_requests=args.max_running_requests,
+        max_queued_requests=args.max_queued_requests,
         cuda_graph_max_bs=args.cuda_graph_max_bs,
         server_config=args.server_config,
         quantization=args.quantization,
@@ -484,6 +489,67 @@ def _parse_token_count(value: str) -> int | str:
     if token_count <= 0:
         raise argparse.ArgumentTypeError("token count must be positive")
     return token_count
+
+
+def _parse_concurrencies(value: str) -> list[int]:
+    tokens = [token.strip() for token in value.split(",") if token.strip()]
+    if not tokens:
+        raise argparse.ArgumentTypeError(
+            "concurrencies must be a non-empty comma-separated list"
+        )
+    values: list[int] = []
+    for token in tokens:
+        try:
+            parsed = int(token)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(f"invalid concurrency {token!r}") from exc
+        if parsed <= 0:
+            raise argparse.ArgumentTypeError("concurrency must be > 0")
+        values.append(parsed)
+    return values
+
+
+async def run_tts_concurrency_sweep(
+    config: TtsSeedttsBenchmarkConfig,
+    concurrencies: list[int],
+) -> dict[str, Any]:
+    """Run generate-only once per concurrency and write a summary JSON."""
+    rows: list[dict[str, Any]] = []
+    for concurrency in concurrencies:
+        point = replace(config, concurrency=concurrency)
+        print(f"[conc={concurrency}] generate pass")
+        results = await run_tts_seedtts_benchmark(point)
+        summary = results["summary"]
+        success = int(summary.get("successful_requests") or 0)
+        failed = int(summary.get("failed_requests") or 0)
+        row = {
+            "concurrency": concurrency,
+            "success": success,
+            "failed": failed,
+            "latency_p95_s": summary.get("latency_p95_s"),
+            "audio_ttfp_p95_s": summary.get("audio_ttfp_p95_s"),
+            "summary": summary,
+        }
+        rows.append(row)
+        print_speed_summary(summary, config.model, concurrency=concurrency)
+        print(
+            f"  success={success} failed={failed} "
+            f"latency_p95={row['latency_p95_s']} "
+            f"ttfa_p95={row['audio_ttfp_p95_s']}"
+        )
+
+    payload = {
+        "config": _build_results_config(config, base_url=build_base_url(config)),
+        "concurrencies": concurrencies,
+        "rows": rows,
+    }
+    out_path = os.path.join(config.output_dir, "concurrency_sweep.json")
+    os.makedirs(config.output_dir, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    logger.info("Wrote concurrency sweep to %s", out_path)
+    return payload
 
 
 async def benchmark(config: TtsSeedttsBenchmarkConfig) -> dict:
@@ -600,6 +666,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Maximum concurrent requests.",
     )
     parser.add_argument(
+        "--concurrencies",
+        type=_parse_concurrencies,
+        default=None,
+        help="Comma-separated concurrency levels to sweep (requires --generate-only).",
+    )
+    parser.add_argument(
         "--request-rate",
         type=float,
         default=float("inf"),
@@ -676,6 +748,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "SGLang generation stage max_running_requests for the server "
             "started by this benchmark. Recommended to keep equal to "
             "--cuda-graph-max-bs. Defaults to 64."
+        ),
+    )
+    parser.add_argument(
+        "--max-queued-requests",
+        type=int,
+        default=None,
+        help=(
+            "SGLang generation stage max_queued_requests for the managed "
+            "server. Omit to leave the pipeline default."
         ),
     )
     parser.add_argument(
@@ -761,8 +842,12 @@ def main() -> None:
         parser.error("--initial-codec-chunk-frames must be non-negative")
     if args.max_running_requests <= 0:
         parser.error("--max-running-requests must be positive")
+    if args.max_queued_requests is not None and args.max_queued_requests < 1:
+        parser.error("--max-queued-requests must be >= 1")
     if args.cuda_graph_max_bs <= 0:
         parser.error("--cuda-graph-max-bs must be positive")
+    if args.concurrencies is not None and not args.generate_only:
+        parser.error("--concurrencies currently requires --generate-only")
     if args.use_existing_server and not (args.generate_only or args.transcribe_only):
         parser.error(
             "--use-existing-server currently requires --generate-only or "
@@ -797,8 +882,14 @@ def main() -> None:
                 run_tts_seedtts_transcribe(config, asr_router_port=config.port)
         return
 
+    async def _run_generate() -> None:
+        if args.concurrencies is not None:
+            await run_tts_concurrency_sweep(config, args.concurrencies)
+        else:
+            await benchmark(config)
+
     if args.use_existing_server:
-        asyncio.run(benchmark(config))
+        asyncio.run(_run_generate())
     else:
         with managed_omni_server(
             model_path=config.model,
@@ -806,13 +897,14 @@ def main() -> None:
             host=config.host,
             server_config=config.server_config,
             max_running_requests=config.max_running_requests,
+            max_queued_requests=config.max_queued_requests,
             cuda_graph_max_bs=config.cuda_graph_max_bs,
             quantization=config.quantization,
             log_file=Path(config.output_dir) / "server_logs" / "tts_server.log",
             timeout=args.server_timeout,
             wait_for_gpu_release=wait_for_gpu_release,
         ):
-            asyncio.run(benchmark(config))
+            asyncio.run(_run_generate())
 
     if args.generate_only:
         return

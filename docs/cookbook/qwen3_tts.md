@@ -79,6 +79,47 @@ sgl-omni serve \
   --port 8000
 ```
 
+### Overload / admission policy
+
+Two SGLang generation-stage knobs bound how the server behaves past saturation:
+
+| Knob | Meaning | Qwen3-TTS default |
+|---|---|---|
+| `--max-running-requests` | Concurrent running slots | `16` |
+| `--max-queued-requests` | Waiting-queue depth before fast-reject | `16` |
+
+Every request enters the waiting queue before it can run, so
+`--max-queued-requests` must be **≥ 1**. Rough capacity is about
+`max_running_requests + max_queued_requests`. Additional arrivals are rejected
+immediately with HTTP **503** and message `The request queue is full.` instead
+of being admitted into an unbounded FIFO that blows up TTFA.
+
+Raising `--max-running-requests` does **not** automatically raise the waiting
+bound. For a ceiling-32 experiment:
+
+```bash
+sgl-omni serve \
+  --model-path Qwen/Qwen3-TTS-12Hz-0.6B-Base \
+  --config examples/configs/qwen3_tts_0_6b.yaml \
+  --max-running-requests 32 \
+  --max-queued-requests 16 \
+  --port 8000
+```
+
+For realtime serving keep `max_queued_requests` ≤ `max_running_requests` unless
+you intentionally want a longer buffered spike. Sweep past the ceiling with:
+
+```bash
+python -m benchmarks.eval.benchmark_tts_seedtts \
+  --generate-only --use-existing-server --stream \
+  --model Qwen/Qwen3-TTS-12Hz-0.6B-Base \
+  --port 8000 \
+  --max-running-requests 32 \
+  --max-queued-requests 16 \
+  --concurrencies 16,32,48,64 \
+  --max-samples 64
+```
+
 ## Synthesizing Speech
 
 ### Text-only Requests
