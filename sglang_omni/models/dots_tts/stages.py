@@ -434,7 +434,11 @@ def create_vocoder_executor(
     )
     logging.getLogger(__name__).info(
         "dots.tts vocoder backend: %s (merge_steps=%d, batch_size=%d, wait_ms=%d)",
-        "compiled streaming chunks" if vocoder.optimize else "eager per-patch decode",
+        (
+            f"native CUDA graphs ({vocoder.cuda_graph_count} shapes)"
+            if vocoder.cuda_graph_count
+            else "eager merged chunks" if vocoder.optimize else "eager per-patch decode"
+        ),
         vocoder.merge_steps,
         max_batch_size,
         max_batch_wait_ms,
