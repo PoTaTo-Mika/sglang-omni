@@ -63,6 +63,20 @@ def _new_stage_payload(request_id: str) -> StagePayload:
     )
 
 
+def test_scheduler_idle_sleep_yields_to_pending_request_builds(monkeypatch) -> None:
+    scheduler = object.__new__(OmniScheduler)
+    scheduler._request_admission_lock = threading.RLock()
+    scheduler._pending_request_builds = {}
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(omni_scheduler_module.time, "sleep", sleep_calls.append)
+
+    scheduler._sleep_during_idle()
+    scheduler._pending_request_builds["req"] = object()
+    scheduler._sleep_during_idle()
+
+    assert sleep_calls == [0.001, 0.0001]
+
+
 def test_simple_scheduler_batch_and_error_contracts() -> None:
     """Preserves batched success output and per-request batch failure emission."""
     good = SimpleScheduler(
