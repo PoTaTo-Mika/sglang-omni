@@ -50,6 +50,19 @@ def test_streaming_never_uses_the_compiled_stream_step() -> None:
             vocoder.decode_delta("req", state, is_final=False)
     vocoder.decode_delta("req", state, is_final=True)
 
-    assert codec.inference.stream_calls, "streaming produced no vocoder steps"
+    assert [call["frames"] for call in codec.inference.stream_calls] == [3, 6, 3]
     assert all(not call["use_compiled"] for call in codec.inference.stream_calls)
     assert all(call["optimize"] for call in codec.inference.stream_calls)
+
+
+def test_unoptimized_streaming_keeps_per_patch_decode() -> None:
+    codec = _FakeCodec()
+    vocoder = DotsTTSStreamingVocoder(codec, optimize=False, merge_steps=4)
+    state = vocoder.create_stream_state("req")
+
+    for _ in range(2):
+        vocoder.ingest("req", state, torch.zeros(1, 3, 5))
+        if vocoder.should_decode(state, is_final=False):
+            vocoder.decode_delta("req", state, is_final=False)
+
+    assert [call["frames"] for call in codec.inference.stream_calls] == [3, 3]

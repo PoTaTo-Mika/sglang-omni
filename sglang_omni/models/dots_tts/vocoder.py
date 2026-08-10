@@ -147,6 +147,7 @@ class DotsTTSStreamingVocoder(StreamingVocoderBase[_DotsStreamState, None]):
         self.codec = codec
         self.optimize = bool(optimize)
         self.merge_steps = int(merge_steps) if optimize else 1
+        self._warmup_steps = min(2, self.merge_steps)
         self._batch_vocoder = DotsTTSBatchVocoder(codec)
         super().__init__(
             self._batch_vocoder.decode_payload,
@@ -199,8 +200,10 @@ class DotsTTSStreamingVocoder(StreamingVocoderBase[_DotsStreamState, None]):
     def should_decode(self, state: _DotsStreamState, *, is_final: bool) -> bool:
         if is_final:
             return bool(state.pending)
-        if state.received_patches <= 2:
+        if state.received_patches == 1:
             return bool(state.pending)
+        if state.received_patches <= 1 + self._warmup_steps:
+            return len(state.pending) >= self._warmup_steps
         return len(state.pending) >= self.merge_steps
 
     def decode_delta(
@@ -212,7 +215,15 @@ class DotsTTSStreamingVocoder(StreamingVocoderBase[_DotsStreamState, None]):
             take = (
                 len(state.pending)
                 if is_final
-                else (1 if state.received_patches <= 2 else self.merge_steps)
+                else (
+                    1
+                    if state.received_patches == 1
+                    else (
+                        self._warmup_steps
+                        if state.received_patches <= 1 + self._warmup_steps
+                        else self.merge_steps
+                    )
+                )
             )
             patches, state.pending = state.pending[:take], state.pending[take:]
             # note (db-ol): compiled stream step cudagraph trees corrupt the
