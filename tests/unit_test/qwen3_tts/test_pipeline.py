@@ -1309,7 +1309,7 @@ def test_qwen3_tts_vocoder_batches_decode_requests(
         max_batch_size=2,
         max_batch_wait_ms=3,
     )
-    assert scheduler.create_stream_state("request").initial_chunk_frames == 1
+    assert scheduler.create_stream_state("request").initial_chunk_frames == 8
     assert scheduler._stream_left_context_frames == 16
     assert scheduler._stream_followup_stride == 8
     assert scheduler._stream_initial_followup_stride == 8
@@ -1393,13 +1393,17 @@ def test_qwen3_tts_initial_decode_graphs_noop_on_cpu() -> None:
     assert decoder.decode_inputs == []
 
 
-def test_qwen3_tts_streaming_vocoder_buffers_one_initial_frame() -> None:
+def test_qwen3_tts_streaming_vocoder_default_initial_chunk_is_continuity_safe() -> None:
     scheduler = Qwen3TTSStreamingVocoderScheduler(
         _FakeQwen3TTSTokenizer(),
         device="cpu",
     )
 
-    assert scheduler.create_stream_state("request").initial_chunk_frames == 1
+    assert scheduler.create_stream_state("request").initial_chunk_frames == 8
+    assert (
+        scheduler._initial_decode_graphs._input_frames
+        == scheduler._stream_left_context_frames + 8
+    )
 
 
 def _qwen3_tts_stream_item(
