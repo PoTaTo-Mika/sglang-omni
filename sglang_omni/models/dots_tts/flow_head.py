@@ -645,12 +645,17 @@ class DotsTTSFlowHead(nn.Module):
             slots,
             fm_hidden_rows=self.hidden_proj(hidden),
         )
+        latent_patches = self.io.denormalize(normalized)
+        patch_encoder_input = (
+            normalized
+            if self.patch_encoder.expects_normalized_input
+            else latent_patches
+        ).to(dtype=next(self.patch_encoder.parameters()).dtype)
         feedback = self._tail.encode_feedback(
             slots,
-            self._patch_encoder_input(normalized, already_normalized=True),
+            patch_encoder_input,
         )
         self._stage_batched_eos(eos_hits)
-        latent_patches = self.io.denormalize(normalized)
         results = []
         for row, state in enumerate(states):
             emit = not state.drop_regenerated_prompt_patch
