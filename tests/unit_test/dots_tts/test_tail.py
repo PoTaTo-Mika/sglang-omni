@@ -189,7 +189,7 @@ def test_kv_cached_tail_matches_full_recompute(slots: int) -> None:
     actual = acoustic_tail.sample_patches([slot], fm_hidden_rows=hidden)
 
     torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-4)
-    assert acoustic_tail._dit_contiguous_view_steps == (NFE if slots == 1 else 0)
+    assert acoustic_tail._dit_contiguous_view_steps == NFE
 
 
 def test_tail_slots_are_bounded_and_reusable() -> None:
@@ -317,9 +317,9 @@ def test_validate_acoustic_pool_memory_releases_cached_blocks_before_sampling_fr
     )
 
 
-def test_permuted_full_pool_matches_fragmented_gather_fallback() -> None:
+def test_permuted_prefix_matches_fragmented_gather_fallback() -> None:
     torch.manual_seed(1234)
-    direct = _build_tail(_TailModel().eval(), slots=2)
+    direct = _build_tail(_TailModel().eval(), slots=3)
     torch.manual_seed(1234)
     fallback = _build_tail(_TailModel().eval(), slots=3)
     direct_slots = [direct.acquire_slot(), direct.acquire_slot()][::-1]
@@ -389,7 +389,7 @@ def test_batched_tail_cuda_graph_matches_eager_for_dynamic_slot_order() -> None:
     torch.manual_seed(9)
     eager = _build_tail(
         eager_model,
-        slots=8,
+        slots=16,
         device=device,
         dtype=dtype,
         patch_capacity=33,
@@ -397,7 +397,7 @@ def test_batched_tail_cuda_graph_matches_eager_for_dynamic_slot_order() -> None:
     torch.manual_seed(9)
     graph = _build_tail(
         graph_model,
-        slots=8,
+        slots=16,
         device=device,
         dtype=dtype,
         patch_capacity=33,

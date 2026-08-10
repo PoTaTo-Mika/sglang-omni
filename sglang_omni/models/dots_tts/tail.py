@@ -744,12 +744,10 @@ class DotsTtsAcousticTail:
             persistent, device=self.device, dtype=torch.long
         )
         noise = self._sample_noise(slots)
-        direct_kv = len(slots) == spec.num_slots and sorted(slots) == list(
-            range(spec.num_slots)
-        )
+        direct_kv = sorted(slots) == list(range(len(slots)))
         if direct_kv:
             order = torch.argsort(slot_index)
-            work_slots = torch.arange(spec.num_slots, device=self.device)
+            work_slots = torch.arange(len(slots), device=self.device)
             work_persistent = persistent_index.index_select(0, order)
             work_hidden = fm_hidden_rows.index_select(0, order)
             work_noise = noise.index_select(0, order)
@@ -761,7 +759,11 @@ class DotsTtsAcousticTail:
             work_persistent = persistent_index
             work_hidden = fm_hidden_rows
             work_noise = noise
-        graph = self._select_graph(self._meanflow_graphs, len(slots), capacity)
+        graph = (
+            self._select_graph(self._meanflow_graphs, len(slots), capacity)
+            if direct_kv
+            else None
+        )
         if graph is None:
             self._graph_misses["meanflow"] += 1
             latent = self._sample_patches_core(
@@ -800,7 +802,9 @@ class DotsTtsAcousticTail:
     ) -> torch.Tensor:
         spec = self.spec
         window = (
-            self._window[: spec.num_slots] if direct_kv else self._window[slot_index]
+            self._window[: slot_index.numel()]
+            if direct_kv
+            else self._window[slot_index]
         )
         window[:, spec.unit_len :] = fm_hidden_rows.unsqueeze(1).to(self.dtype)
         if not direct_kv:
@@ -813,7 +817,9 @@ class DotsTtsAcousticTail:
             direct_kv=direct_kv,
         )
         window = (
-            self._window[: spec.num_slots] if direct_kv else self._window[slot_index]
+            self._window[: slot_index.numel()]
+            if direct_kv
+            else self._window[slot_index]
         )
         carry = window[:, spec.unit_len :]
         window[:, : spec.hidden_patch_size] = carry
@@ -964,19 +970,34 @@ class DotsTtsAcousticTail:
         if capacity + block > int(self._encoder_k.size(3)):
             raise RuntimeError("dots.tts patch-encoder cache overflow")
         start_index = torch.tensor(starts, device=self.device, dtype=torch.long)
-        graph = self._select_graph(self._encoder_graphs, rows, capacity)
+        direct_kv = sorted(slots) == list(range(rows))
+        if direct_kv:
+            order = torch.argsort(slot_index)
+            work_slots = torch.arange(rows, device=self.device)
+            work_starts = start_index.index_select(0, order)
+            work_latent = latent_patches.index_select(0, order)
+        else:
+            work_slots = slot_index
+            work_starts = start_index
+            work_latent = latent_patches
+        graph = (
+            self._select_graph(self._encoder_graphs, rows, capacity)
+            if direct_kv
+            else None
+        )
         if graph is None:
             self._graph_misses["semantic_encoder"] += 1
             embeddings = self._encode_feedback_core(
-                slot_index,
-                start_index,
+                work_slots,
+                work_starts,
                 capacity,
-                latent_patches,
+                work_latent,
+                direct_kv=direct_kv,
             )
         else:
-            graph.inputs["slots"].copy_(slot_index)
-            graph.inputs["starts"].copy_(start_index)
-            graph.inputs["latent"].copy_(latent_patches)
+            graph.inputs["slots"].copy_(work_slots)
+            graph.inputs["starts"].copy_(work_starts)
+            graph.inputs["latent"].copy_(work_latent)
             graph.graph.replay()
             embeddings = graph.output.clone()
             self._graph_replays["semantic_encoder"] += 1
@@ -984,6 +1005,8 @@ class DotsTtsAcousticTail:
                 logger.info(
                     "dots.tts batched semantic-encoder CUDA graph replay is active"
                 )
+        if direct_kv:
+            embeddings = embeddings.index_select(0, slot_index)
         for slot in slots:
             self._encoder_seq_len[slot] += block
         return embeddings
@@ -994,6 +1017,8 @@ class DotsTtsAcousticTail:
         start_index: torch.Tensor,
         capacity: int,
         latent_patches: torch.Tensor,
+        *,
+        direct_kv: bool = False,
     ) -> torch.Tensor:
         rows = int(slot_index.numel())
         block = self._encoder_block
@@ -1003,24 +1028,30 @@ class DotsTtsAcousticTail:
             cos = sin = torch.empty(0, device=self.device)
         else:
             cos, sin = _rotary_cos_sin(self._encoder_rotary, start_index, block)
-        keys = self._encoder_scratch_k[:, :rows, :, : capacity + block]
-        values = self._encoder_scratch_v[:, :rows, :, : capacity + block]
-        torch.index_select(
-            self._encoder_k[:, :, :, :capacity],
-            1,
-            slot_index,
-            out=keys[:, :, :, :capacity],
-        )
-        torch.index_select(
-            self._encoder_v[:, :, :, :capacity],
-            1,
-            slot_index,
-            out=values[:, :, :, :capacity],
-        )
+        if direct_kv:
+            keys = self._encoder_k[:, :rows, :, : capacity + block]
+            values = self._encoder_v[:, :rows, :, : capacity + block]
+            conv_tail = self._encoder_conv_tail[:rows]
+        else:
+            keys = self._encoder_scratch_k[:, :rows, :, : capacity + block]
+            values = self._encoder_scratch_v[:, :rows, :, : capacity + block]
+            torch.index_select(
+                self._encoder_k[:, :, :, :capacity],
+                1,
+                slot_index,
+                out=keys[:, :, :, :capacity],
+            )
+            torch.index_select(
+                self._encoder_v[:, :, :, :capacity],
+                1,
+                slot_index,
+                out=values[:, :, :, :capacity],
+            )
+            conv_tail = self._encoder_conv_tail.index_select(0, slot_index)
         with sdpa_kernel(_TAIL_SDPA_BACKENDS):
             embeddings, conv_tail = self._encoder_step(
                 latent_patches.to(self.dtype),
-                self._encoder_conv_tail.index_select(0, slot_index),
+                conv_tail,
                 (keys, values),
                 capacity,
                 mask,
@@ -1138,7 +1169,7 @@ class DotsTtsAcousticTail:
                 capacity,
                 inputs["hidden"],
                 inputs["noise"],
-                direct_kv=batch_size == self.spec.num_slots,
+                direct_kv=True,
             )
         else:
             inputs = {
@@ -1157,6 +1188,7 @@ class DotsTtsAcousticTail:
                 inputs["starts"],
                 capacity,
                 inputs["latent"],
+                direct_kv=True,
             )
 
         graph = torch.cuda.CUDAGraph()
