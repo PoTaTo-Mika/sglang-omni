@@ -21,6 +21,7 @@ class _DotsFlowLaunchBuf:
     data_rows: list[Any]
     steps: list[DotsFlowStep]
     batched: bool
+    eos_handle: Any | None
 
 
 class DotsTTSModelRunner(ModelRunner):
@@ -256,14 +257,13 @@ class DotsTTSModelRunner(ModelRunner):
             eos_thresholds=[data.state.eos_threshold for data in data_rows],
             append_hidden=append_hidden,
         )
+        batched = bool(self.model.flow.is_batched)
+        eos_handle = self.model.flow.claim_batched_eos() if batched else None
         next_token_ids = []
         for data, step in zip(data_rows, steps, strict=True):
             data.pending_feedback_queue.append(step.feedback_embedding.detach())
             decoded_latent = step.latent_patch.detach()
             data.decoded_latent_patches.append(decoded_latent)
-            if step.emit:
-                data.latest_latent_patch = decoded_latent
-                data.latent_patches.append(decoded_latent)
             next_token_ids.append(data.control_token_id)
         result.next_token_ids = torch.tensor(
             next_token_ids,
@@ -273,14 +273,15 @@ class DotsTTSModelRunner(ModelRunner):
         return _DotsFlowLaunchBuf(
             data_rows=data_rows,
             steps=steps,
-            batched=bool(self.model.flow.is_batched),
+            batched=batched,
+            eos_handle=eos_handle,
         )
 
     def _resolve_flow_finish(self, launch_buf: _DotsFlowLaunchBuf | None) -> None:
         if launch_buf is None:
             return
         if launch_buf.batched:
-            finished_flags = self.model.flow.resolve_batched_eos()
+            finished_flags = self.model.flow.resolve_batched_eos(launch_buf.eos_handle)
             if len(finished_flags) != len(launch_buf.data_rows):
                 raise RuntimeError(
                     "dots.tts batched EOS resolve size mismatch: "
@@ -288,7 +289,15 @@ class DotsTTSModelRunner(ModelRunner):
                 )
         else:
             finished_flags = [bool(step.finished) for step in launch_buf.steps]
-        for data, finished in zip(launch_buf.data_rows, finished_flags, strict=True):
+        for data, step, finished in zip(
+            launch_buf.data_rows, launch_buf.steps, finished_flags, strict=True
+        ):
+            if data.req.finished() or data.req.is_retracted:
+                continue
+            if step.emit:
+                decoded_latent = step.latent_patch.detach()
+                data.latest_latent_patch = decoded_latent
+                data.latent_patches.append(decoded_latent)
             if finished:
                 data.req.finished_reason = FINISH_MATCHED_TOKEN(data.control_token_id)
 

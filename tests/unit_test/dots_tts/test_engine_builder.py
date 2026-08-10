@@ -14,6 +14,7 @@ def test_dots_engine_uses_shared_tts_builder() -> None:
     assert isinstance(builder, TtsEngineBuilder)
     assert builder.optimize is True
     assert builder.generation_defaults(dtype="bfloat16")["max_running_requests"] == 16
+    assert builder.extra_scheduler_kwargs()["enable_async_decode"] is True
 
 
 def test_dots_engine_accepts_continuous_batching() -> None:

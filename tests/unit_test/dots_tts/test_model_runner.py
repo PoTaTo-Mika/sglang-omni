@@ -255,8 +255,19 @@ def test_dots_post_decode_resolve_applies_batched_eos_finish() -> None:
                 ),
             ]
 
-        def resolve_batched_eos(self):
+        def claim_batched_eos(self):
+            return "eos-handle"
+
+        def resolve_batched_eos(self, handle):
+            assert handle == "eos-handle"
             return [False, True]
+
+    class _Req:
+        finished_reason = None
+        is_retracted = False
+
+        def finished(self):
+            return self.finished_reason is not None
 
     runner = object.__new__(DotsTTSModelRunner)
     runner.model = SimpleNamespace(flow=_Flow())
@@ -277,7 +288,7 @@ def test_dots_post_decode_resolve_applies_batched_eos_finish() -> None:
                     guidance_scale=1.0,
                     eos_threshold=0.5,
                 ),
-                req=SimpleNamespace(finished_reason=None),
+                req=_Req(),
             ),
         )
 
@@ -292,12 +303,19 @@ def test_dots_post_decode_resolve_applies_batched_eos_finish() -> None:
             "sglang_omni.models.dots_tts.model_runner.FINISH_MATCHED_TOKEN",
             lambda token_id: (finished_token, token_id),
         )
-        runner.post_decode(result, object(), object(), requests)
+        launch_buf = runner.post_decode_launch(result, object(), requests)
+        assert all(not request.data.latent_patches for request in requests)
+        runner.post_decode_resolve(launch_buf, result, object(), object(), requests)
 
     assert requests[0].data.req.finished_reason is None
     assert requests[1].data.req.finished_reason == (finished_token, 9)
     assert result.next_token_ids.tolist() == [7, 9]
     assert len(requests[0].data.pending_feedback_queue) == 1
+    assert len(requests[1].data.latent_patches) == 1
+
+    overrun = runner.post_decode_launch(result, object(), requests)
+    runner.post_decode_resolve(overrun, result, object(), object(), requests)
+    assert len(requests[0].data.latent_patches) == 2
     assert len(requests[1].data.latent_patches) == 1
 
 
@@ -317,8 +335,15 @@ def test_dots_post_decode_resolve_uses_step_finished_for_single_request() -> Non
                 )
             ]
 
-        def resolve_batched_eos(self):
+        def resolve_batched_eos(self, _handle=None):
             raise AssertionError("single-request path must not resolve batched EOS")
+
+    class _Req:
+        finished_reason = None
+        is_retracted = False
+
+        def finished(self):
+            return self.finished_reason is not None
 
     runner = object.__new__(DotsTTSModelRunner)
     runner.model = SimpleNamespace(flow=_Flow())
@@ -337,7 +362,7 @@ def test_dots_post_decode_resolve_uses_step_finished_for_single_request() -> Non
                 guidance_scale=1.0,
                 eos_threshold=0.5,
             ),
-            req=SimpleNamespace(finished_reason=None),
+            req=_Req(),
         ),
     )
     result = SimpleNamespace(

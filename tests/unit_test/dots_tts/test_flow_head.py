@@ -511,6 +511,23 @@ def test_batched_eos_staging_requires_resolve_before_reuse(tmp_path) -> None:
     assert state.decoded_patches == decoded_patches
     assert flow.resolve_batched_eos() == [False]
 
+    kwargs = dict(
+        hidden_states=torch.randn(1, LLM_HIDDEN),
+        num_steps=[NFE],
+        ode_methods=["euler"],
+        guidance_scales=[1.0],
+        eos_thresholds=[2.0],
+        append_hidden=True,
+    )
+    flow.decode_batch([state], **kwargs)
+    first = flow.claim_batched_eos()
+    flow.decode_batch([state], **kwargs)
+    second = flow.claim_batched_eos()
+    with pytest.raises(RuntimeError, match="before resolve_batched_eos"):
+        flow.decode_batch([state], **kwargs)
+    assert flow.resolve_batched_eos(first) == [False]
+    assert flow.resolve_batched_eos(second) == [False]
+
 
 def test_batched_eos_suppresses_first_check_until_resolve(tmp_path) -> None:
     torch.manual_seed(9)

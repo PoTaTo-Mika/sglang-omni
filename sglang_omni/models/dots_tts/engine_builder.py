@@ -179,7 +179,7 @@ class DotsTTSEngineBuilder(TtsEngineBuilder):
 
         return {
             "stream_output_builder": build_stream_output,
-            "enable_async_decode": False,
+            "enable_async_decode": True,
         }
 
 
