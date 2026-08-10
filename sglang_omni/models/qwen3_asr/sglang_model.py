@@ -26,6 +26,29 @@ from .configuration_qwen3_asr import Qwen3ASRConfig
 
 logger = logging.getLogger(__name__)
 
+_MROPE_ONLY_KEYS = frozenset(
+    {"interleaved", "mrope_interleaved", "mrope_section"}
+)
+
+
+def _normalize_asr_text_rope(text_config: Any) -> None:
+    # note (luojiaxuan): ASR has no spatial axes: all three MRoPE position
+    # rows are identical, so ordinary text RoPE is numerically equivalent and
+    # avoids the multimodal permutation/copy path on every decoder layer.
+    for attr in ("rope_parameters", "rope_scaling"):
+        parameters = getattr(text_config, attr, None)
+        if not isinstance(parameters, dict) or "mrope_section" not in parameters:
+            continue
+        setattr(
+            text_config,
+            attr,
+            {
+                key: value
+                for key, value in parameters.items()
+                if key not in _MROPE_ONLY_KEYS
+            },
+        )
+
 
 class Qwen3ASRForConditionalGeneration(nn.Module):
     default_bitsandbytes_target_modules = [
@@ -57,6 +80,8 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
 
         if getattr(thinker_config, "audio_config", None) is None:
             thinker_config.audio_config = Qwen3OmniMoeAudioEncoderConfig()
+
+        _normalize_asr_text_rope(thinker_config.text_config)
 
         self.audio_tower = Qwen3OmniMoeAudioEncoder(thinker_config.audio_config)
         self.language_model = Qwen3ForCausalLM(
@@ -145,7 +170,7 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
         **kwargs: Any,
     ) -> torch.Tensor:
         if forward_batch.mrope_positions is not None:
-            positions = forward_batch.mrope_positions
+            positions = forward_batch.mrope_positions[0]
 
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,

@@ -60,9 +60,30 @@ def test_forward_uses_available_mrope_positions(
         forward_batch=forward_batch,
     )
 
-    expected_positions = mrope_positions if use_mrope_positions else positions
-    assert seen_positions is expected_positions
+    expected_positions = mrope_positions[0] if use_mrope_positions else positions
+    assert torch.equal(seen_positions, expected_positions)
     assert actual is output
+
+
+def test_asr_text_rope_drops_only_multimodal_parameters() -> None:
+    original = {
+        "rope_type": "default",
+        "rope_theta": 1_000_000,
+        "interleaved": True,
+        "mrope_interleaved": True,
+        "mrope_section": [24, 20, 20],
+    }
+    config = SimpleNamespace(
+        rope_parameters=original,
+        rope_scaling=original,
+    )
+
+    sglang_model._normalize_asr_text_rope(config)
+
+    expected = {"rope_type": "default", "rope_theta": 1_000_000}
+    assert config.rope_parameters == expected
+    assert config.rope_scaling == expected
+    assert original["mrope_section"] == [24, 20, 20]
 
 
 def test_get_audio_feature_preserves_masks_in_mixed_batch() -> None:
