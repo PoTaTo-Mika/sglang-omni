@@ -53,7 +53,7 @@ class DotsTTSBatchVocoder(BatchVocoderBase):
             )
             self._logged_batch = True
 
-        with self.codec.lock:
+        with self.codec.vocoder_lock:
             for bucket_items in buckets.values():
                 max_frames = max(int(latents.shape[1]) for _, latents in bucket_items)
                 padded = bucket_items[0][1].new_zeros(
@@ -164,7 +164,7 @@ class DotsTTSStreamingVocoder(StreamingVocoderBase[_DotsStreamState, None]):
 
     def create_stream_state(self, request_id: str) -> _DotsStreamState:
         del request_id
-        with self.codec.lock:
+        with self.codec.vocoder_lock:
             codec_state = self.codec.inference.init_stream_state(
                 batch_size=1,
                 chunk_size=self.codec.patch_size * self.merge_steps,
@@ -217,7 +217,7 @@ class DotsTTSStreamingVocoder(StreamingVocoderBase[_DotsStreamState, None]):
             patches, state.pending = state.pending[:take], state.pending[take:]
             # note (db-ol): compiled stream step cudagraph trees corrupt the
             # backbone decode graph replay in this process, see issue 1392.
-            with self.codec.lock:
+            with self.codec.vocoder_lock:
                 chunk = self.codec.inference.stream_step(
                     torch.cat(patches, dim=1),
                     stream_state=state.codec_state,
@@ -227,7 +227,7 @@ class DotsTTSStreamingVocoder(StreamingVocoderBase[_DotsStreamState, None]):
             if chunk.numel():
                 chunks.append(chunk)
         if is_final:
-            with self.codec.lock:
+            with self.codec.vocoder_lock:
                 tail = self.codec.inference.flush(state.codec_state)
             if tail.numel():
                 chunks.append(tail)
@@ -256,7 +256,7 @@ class DotsTTSStreamingVocoder(StreamingVocoderBase[_DotsStreamState, None]):
         tts_state = load_dots_tts_state(payload)
         if tts_state.generated_latents is None:
             return None
-        with self.codec.lock:
+        with self.codec.vocoder_lock:
             return self.codec.inference.decode_latents(
                 tts_state.generated_latents.to(self.codec.device)
             )
