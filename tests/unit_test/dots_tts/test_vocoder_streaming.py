@@ -68,6 +68,18 @@ def test_streaming_never_uses_the_compiled_stream_step() -> None:
     assert all(call["optimize"] for call in codec.inference.stream_calls)
 
 
+def test_streaming_audio_vae_cuda_graph_is_explicit_opt_in() -> None:
+    default_vocoder = DotsTTSStreamingVocoder(_FakeCodec(), optimize=True)
+    graph_vocoder = DotsTTSStreamingVocoder(
+        _FakeCodec(),
+        optimize=True,
+        enable_streaming_audio_vae_cuda_graph=True,
+    )
+
+    assert default_vocoder._cuda_graphs is None
+    assert graph_vocoder._cuda_graphs is not None
+
+
 def test_streaming_prefers_native_cuda_graph() -> None:
     codec = _FakeCodec()
     vocoder = DotsTTSStreamingVocoder(codec, optimize=True, merge_steps=2)

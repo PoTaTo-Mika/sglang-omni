@@ -263,6 +263,7 @@ class DotsTTSStreamingVocoder(StreamingVocoderBase[_DotsStreamState, None]):
         codec: DotsAudioCodec,
         *,
         optimize: bool,
+        enable_streaming_audio_vae_cuda_graph: bool = False,
         merge_steps: int = 4,
         max_batch_size: int = 4,
         max_batch_wait_ms: int = 2,
@@ -281,7 +282,7 @@ class DotsTTSStreamingVocoder(StreamingVocoderBase[_DotsStreamState, None]):
             _DotsVocoderCudaGraphs(
                 codec, chunk_size=codec.patch_size * self.merge_steps
             )
-            if self.optimize
+            if self.optimize and enable_streaming_audio_vae_cuda_graph
             else None
         )
         super().__init__(

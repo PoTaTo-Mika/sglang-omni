@@ -419,6 +419,7 @@ def create_vocoder_executor(
     device: str | None = "cuda",
     gpu_id: int | None = None,
     optimize: bool = True,
+    enable_streaming_audio_vae_cuda_graph: bool = False,
     vocoder_merge_steps: int = 4,
     max_batch_size: int = 4,
     max_batch_wait_ms: int = 2,
@@ -428,6 +429,7 @@ def create_vocoder_executor(
     vocoder = DotsTTSStreamingVocoder(
         codec,
         optimize=optimize,
+        enable_streaming_audio_vae_cuda_graph=(enable_streaming_audio_vae_cuda_graph),
         merge_steps=vocoder_merge_steps,
         max_batch_size=max_batch_size,
         max_batch_wait_ms=max_batch_wait_ms,
