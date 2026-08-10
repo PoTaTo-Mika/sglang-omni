@@ -42,6 +42,9 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder):
     ) -> dict[str, Any]:
         return {
             "max_running_requests": 16,
+            # note (guozhihao): must be >=1 (every req enters waiting first);
+            # match max_running_requests to bound past-ceiling overload.
+            "max_queued_requests": 16,
             "cuda_graph_max_bs": 32,
             "torch_compile_max_bs": 32,
             "dtype": dtype,

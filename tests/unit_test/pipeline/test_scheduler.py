@@ -393,6 +393,76 @@ def test_upstream_queue_limit_abort_is_translated_to_omni_output() -> None:
     assert scheduler.waiting_queue == []
 
 
+def test_enqueue_built_request_honors_max_queued_requests(monkeypatch) -> None:
+    from sglang.srt.disaggregation.utils import DisaggregationMode
+
+    events: list[str] = []
+    monkeypatch.setattr(
+        omni_scheduler_module,
+        "_emit_event",
+        lambda **kwargs: events.append(kwargs["event_name"]),
+    )
+
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.outbox = Queue()
+    scheduler.is_entry_rank = True
+    scheduler.disaggregation_mode = DisaggregationMode.NULL
+    scheduler.enable_priority_scheduling = False
+    scheduler.abort_on_priority_when_disabled = False
+    scheduler.max_queued_requests = 1
+    scheduler.waiting_queue = []
+    scheduler.enable_hicache_storage = False
+    scheduler.enable_hierarchical_cache = False
+    scheduler._aborted_request_ids = set()
+    scheduler._aborted_request_id_order = deque()
+    scheduler._deferred_request_payloads = {}
+    scheduler._pending_stream_ingress = {}
+    scheduler._request_admission_lock = threading.RLock()
+    scheduler._abort_callback = None
+    aborts: list[str] = []
+    scheduler.abort = lambda rid, *, defer_running_cleanup=True: aborts.append(rid)
+    scheduler.send_to_detokenizer = omni_scheduler_module._NoOpSender()
+    scheduler.ipc_channels = omni_scheduler_module._OmniIpcChannels(scheduler)
+    scheduler._request_kv_capacity_error = lambda req: None
+    scheduler._initialize_request_stream_state = lambda req_data, payload: None
+    scheduler._append_stream_chunk = lambda *args, **kwargs: None
+    scheduler._mark_stream_done = lambda *args, **kwargs: None
+
+    def _make_req(rid: str):
+        return SimpleNamespace(
+            rid=rid,
+            priority=None,
+            origin_input_ids=array("q", [1]),
+            origin_input_ids_unpadded=array("q", [1]),
+            time_stats=SimpleNamespace(
+                trace_ctx=SimpleNamespace(abort=lambda *, abort_info: None),
+            ),
+        )
+
+    first = _make_req("req-ok")
+    second = _make_req("req-reject")
+    OmniScheduler._enqueue_built_request(
+        scheduler,
+        SimpleNamespace(request_id=first.rid),
+        False,
+        SimpleNamespace(req=first, enforce_request_limits=False),
+    )
+    OmniScheduler._enqueue_built_request(
+        scheduler,
+        SimpleNamespace(request_id=second.rid),
+        False,
+        SimpleNamespace(req=second, enforce_request_limits=False),
+    )
+
+    assert [req.rid for req in scheduler.waiting_queue] == ["req-ok"]
+    assert events.count("scheduler_queue_enter") == 1
+    reject = scheduler.outbox.get_nowait()
+    assert reject.request_id == "req-reject"
+    assert reject.type == "error"
+    assert "queue is full" in str(reject.data)
+    assert aborts == ["req-reject"]
+
+
 def test_upstream_kv_exhaustion_abort_is_translated_to_omni_output() -> None:
     scheduler = object.__new__(OmniScheduler)
     scheduler.outbox = Queue()

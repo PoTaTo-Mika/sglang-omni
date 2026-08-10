@@ -1045,6 +1045,17 @@ class OmniScheduler:
         def enqueue_if_live() -> None:
             if req_id in self._aborted_request_ids:
                 return
+            # note (guozhihao): normal Omni admission bypasses
+            # _add_request_to_queue; enforce max_queued_requests here.
+            if self._abort_on_queued_limit(req):
+                logger.warning(
+                    "Rejecting request %s: waiting queue is full "
+                    "(max_queued_requests=%s, waiting=%s)",
+                    req_id,
+                    self.max_queued_requests,
+                    len(self.waiting_queue),
+                )
+                return
             _emit_event(
                 request_id=req_id,
                 stage=None,

@@ -115,3 +115,11 @@ def service_unavailable(message: str, *, param: str | None = None) -> SpeechAPIE
         param=param,
         code=None,
     )
+
+
+def speech_generation_error(exc: BaseException) -> SpeechAPIError:
+    """Map pipeline failures to speech HTTP errors (queue-full → 503)."""
+    message = str(exc)
+    if "queue is full" in message.lower():
+        return service_unavailable(message)
+    return internal_error(message)

@@ -104,6 +104,7 @@ from sglang_omni.serve.speech_errors import (
     internal_error,
     openai_error_payload,
     speech_error_response,
+    speech_generation_error,
 )
 from sglang_omni.serve.speech_limits import (
     MAX_VOICE_UPLOAD_BODY_BYTES,
@@ -1228,13 +1229,13 @@ def _register_speech(app: FastAPI) -> None:
                     speed=req.speed,
                 )
             except ClientError as exc:
-                return speech_error_response(internal_error(str(exc)))
+                return speech_error_response(speech_generation_error(exc))
             except Exception as exc:
                 logger.exception(
                     "Error preparing raw PCM speech stream for request %s",
                     request_id,
                 )
-                return speech_error_response(internal_error(str(exc)))
+                return speech_error_response(speech_generation_error(exc))
 
         try:
             result = await _await_speech_response(
@@ -1246,10 +1247,10 @@ def _register_speech(app: FastAPI) -> None:
                 speed=req.speed,
             )
         except ClientError as exc:
-            return speech_error_response(internal_error(str(exc)))
+            return speech_error_response(speech_generation_error(exc))
         except Exception as exc:
             logger.exception("Error generating speech for request %s", request_id)
-            return speech_error_response(internal_error(str(exc)))
+            return speech_error_response(speech_generation_error(exc))
 
         headers = {
             "Content-Disposition": f'attachment; filename="speech.{result.format}"',
