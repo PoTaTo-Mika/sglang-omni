@@ -650,6 +650,7 @@ class DotsTTSFlowHead(nn.Module):
             self._patch_encoder_input(normalized, already_normalized=True),
         )
         self._stage_batched_eos(eos_hits)
+        latent_patches = self.io.denormalize(normalized)
         results = []
         for row, state in enumerate(states):
             emit = not state.drop_regenerated_prompt_patch
@@ -657,7 +658,7 @@ class DotsTTSFlowHead(nn.Module):
             state.decoded_patches += 1
             results.append(
                 DotsFlowStep(
-                    latent_patch=self.io.denormalize(normalized[row : row + 1]),
+                    latent_patch=latent_patches[row : row + 1],
                     feedback_embedding=feedback[row],
                     finished=False,
                     emit=emit,
