@@ -18,10 +18,10 @@ or throughput claims.
 
 | Optimization | Pull request | Head commit | Status |
 | --- | --- | --- | --- |
-| Reuse one batched latent denormalization | [#1438](https://github.com/sgl-project/sglang-omni/pull/1438) | `17e9ffe4` | Draft |
-| Stack feedback directly into the CUDA Graph buffer | [#1439](https://github.com/sgl-project/sglang-omni/pull/1439) | `c230a111` | Draft |
-| Bypass redundant vocoder staging | [#1440](https://github.com/sgl-project/sglang-omni/pull/1440) | `a544e4bf` | Draft |
-| Reuse the CFG null-projection bias | [#1441](https://github.com/sgl-project/sglang-omni/pull/1441) | `2b1ab3da` | Draft |
+| Reuse one batched latent denormalization | [#1438](https://github.com/sgl-project/sglang-omni/pull/1438) | `17e9ffe4` | Open, ready for review |
+| Stack feedback directly into the CUDA Graph buffer | [#1439](https://github.com/sgl-project/sglang-omni/pull/1439) | `c230a111` | Open, ready for review |
+| Bypass redundant vocoder staging | [#1440](https://github.com/sgl-project/sglang-omni/pull/1440) | `a544e4bf` | Open, ready for review |
+| Reuse the CFG null-projection bias | [#1441](https://github.com/sgl-project/sglang-omni/pull/1441) | `2b1ab3da` | Open, ready for review |
 
 No dataset, checkpoint, adapter, or model artifact was produced. The PR
 branches and this log are the complete reusable state; raw benchmark logs are
