@@ -55,9 +55,7 @@ class DotsTTSBatchVocoder(BatchVocoderBase):
 
         with self.codec.lock:
             for bucket_items in buckets.values():
-                frame_counts = [
-                    int(latents.shape[1]) for _, latents in bucket_items
-                ]
+                frame_counts = [int(latents.shape[1]) for _, latents in bucket_items]
                 max_frames = max(frame_counts)
                 if len(bucket_items) == 1:
                     padded = bucket_items[0][1].to(self.codec.device)
