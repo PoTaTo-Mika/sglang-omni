@@ -182,6 +182,7 @@ def test_non_streaming_batch_isolates_invalid_payload() -> None:
     [
         ({"max_batch_size": 0}, "max_batch_size"),
         ({"max_batch_wait_ms": -1}, "max_batch_wait_ms"),
+        ({"stream_slots": 0}, "stream_slots"),
     ],
 )
 def test_invalid_batch_config_is_rejected(kwargs: dict, message: str) -> None:
