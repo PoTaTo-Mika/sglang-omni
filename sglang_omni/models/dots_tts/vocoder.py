@@ -250,9 +250,7 @@ class DotsTTSStreamingVocoder(
                 # note (db-ol): compiled stream_step cudagraph trees corrupt the
                 # backbone decode graph replay in this process, see issue 1392;
                 # the slot pool stays on the eager kernels (#1395).
-                chunk = pool.step(
-                    {state.slot: torch.cat(patches, dim=1)}
-                )[state.slot]
+                chunk = pool.step({state.slot: torch.cat(patches, dim=1)})[state.slot]
                 if chunk.numel():
                     chunks.append(chunk)
             if state.slot is not None:
@@ -326,9 +324,7 @@ class DotsTTSStreamingVocoder(
             if state.slot is None:
                 raise RuntimeError("dots.tts coalesced step is missing a vocoder slot")
             if self._take_patches(state) != take_patches:
-                raise RuntimeError(
-                    "dots.tts coalesced step mixed unequal patch counts"
-                )
+                raise RuntimeError("dots.tts coalesced step mixed unequal patch counts")
             patches = state.pending[:take_patches]
             latents = torch.cat(patches, dim=1)
             if int(latents.shape[1]) != take_patches * self.codec.patch_size:

@@ -88,9 +88,7 @@ class DotsVocoderSlotPool:
         self.chunk_size = int(chunk_size)
         # note (guozhihao-224): probe shapes through the public stream-state
         # constructor so we stay aligned with upstream window/LSTM layout.
-        probe = inference.init_stream_state(
-            batch_size=1, chunk_size=self.chunk_size
-        )
+        probe = inference.init_stream_state(batch_size=1, chunk_size=self.chunk_size)
         hidden_h, hidden_c = probe.lstm_hidden
         window = probe.decoder.window
         layers, _, hidden = hidden_h.shape
@@ -161,9 +159,7 @@ class DotsVocoderSlotPool:
                     f"got {tuple(latents.shape)} for slot {slot}"
                 )
 
-        slot_index = torch.tensor(
-            slots, device=self._window.device, dtype=torch.long
-        )
+        slot_index = torch.tensor(slots, device=self._window.device, dtype=torch.long)
         # note (guozhihao-224): upstream stream kernels take channel-major
         # latents [B, C, T]; Omni chunks arrive as [1, T, C].
         packed = torch.cat(
@@ -174,10 +170,7 @@ class DotsVocoderSlotPool:
         hidden_c = self._lstm_c.index_select(1, slot_index).contiguous()
         window = self._window.index_select(0, slot_index).contiguous()
         valid = torch.tensor(
-            [
-                min(self._total_frames[slot], self._window_size)
-                for slot in slots
-            ],
+            [min(self._total_frames[slot], self._window_size) for slot in slots],
             device=window.device,
             dtype=torch.int64,
         )

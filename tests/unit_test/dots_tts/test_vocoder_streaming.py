@@ -45,10 +45,7 @@ class _RecordingSlotPool:
         self.steps.append(
             {slot: latents.clone() for slot, latents in slot_latents.items()}
         )
-        return {
-            slot: torch.full((1, 1, 8), float(slot + 1))
-            for slot in slot_latents
-        }
+        return {slot: torch.full((1, 1, 8), float(slot + 1)) for slot in slot_latents}
 
     def flush(self, slot: int) -> torch.Tensor:
         self.flushes.append(int(slot))
