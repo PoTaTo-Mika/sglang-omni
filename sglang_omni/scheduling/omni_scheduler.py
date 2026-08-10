@@ -829,10 +829,6 @@ class OmniScheduler:
 
     def process_input_requests(self, recv_reqs):
         """Convert incoming payloads to SGLang Reqs and enqueue."""
-        arrival_t = time.perf_counter()
-        for payload in recv_reqs:
-            if getattr(payload, "_coalesce_arrival_t", None) is None:
-                payload._coalesce_arrival_t = arrival_t
         self._drain_request_build_results()
         recv_reqs, rejected_reqs = self._stage_request_build_payloads(recv_reqs)
         build_inline = self._should_build_requests_inline(recv_reqs)
@@ -1070,15 +1066,7 @@ class OmniScheduler:
                 stage=None,
                 event_name="scheduler_queue_enter",
             )
-            # note (luojiaxuan): request construction already consumes part of
-            # the admission window, so do not restart the coalescing deadline
-            # after a worker finishes building the request.
-            coalesce_arrival_t = getattr(payload, "_coalesce_arrival_t", None)
-            req._coalesce_enqueue_t = (
-                coalesce_arrival_t
-                if coalesce_arrival_t is not None
-                else time.perf_counter()
-            )
+            req._coalesce_enqueue_t = time.perf_counter()
             req._omni_terminal_claimed = False
             req._omni_data = req_data
             self.waiting_queue.append(req)
