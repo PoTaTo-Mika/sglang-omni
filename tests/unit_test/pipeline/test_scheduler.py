@@ -1639,6 +1639,44 @@ def test_omni_scheduler_distinguishes_queue_enter_from_prefill_start(
     assert model_path_starts == ["req-delayed"]
 
 
+def test_request_build_time_counts_toward_prefill_coalescing(monkeypatch) -> None:
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.outbox = Queue()
+    scheduler.waiting_queue = []
+    scheduler._pending_stream_ingress = {}
+    scheduler._deferred_request_payloads = {}
+    scheduler._dirty_deferred_request_ids = set()
+    scheduler._aborted_request_ids = set()
+    scheduler._aborted_request_id_order = deque()
+    scheduler.max_req_len = 16
+    scheduler.max_req_input_len = 16
+    _init_sync_request_build_state(scheduler)
+
+    req = SimpleNamespace(
+        rid="req-coalesce-arrival",
+        origin_input_ids=[1],
+        origin_input_ids_unpadded=[1],
+        sampling_params=SimpleNamespace(max_new_tokens=1, min_new_tokens=0),
+        output_ids=[],
+    )
+
+    def build(payload):
+        assert payload._coalesce_arrival_t == 100.0
+        monkeypatch.setattr(omni_scheduler_module.time, "perf_counter", lambda: 110.0)
+        return SimpleNamespace(
+            req=req,
+            enforce_request_limits=False,
+            max_new_tokens=1,
+        )
+
+    scheduler._request_builder = build
+    monkeypatch.setattr(omni_scheduler_module.time, "perf_counter", lambda: 100.0)
+
+    scheduler.process_input_requests([_new_stage_payload(req.rid)])
+
+    assert req._coalesce_enqueue_t == 100.0
+
+
 def test_omni_scheduler_normalizes_req_token_arrays() -> None:
     origin = [1, 2, 3]
     req = SimpleNamespace(
