@@ -103,7 +103,7 @@ def test_qwen3_asr_config_uses_batched_stage_with_64_running_requests() -> None:
     assert config.stages[0].factory_args["device"] == "cuda:0"
     assert config.stages[0].factory_args["max_running_requests"] == 64
     assert config.stages[0].factory_args["enable_torch_compile"] is True
-    assert config.stages[0].factory_args["torch_compile_max_bs"] == 1
+    assert config.stages[0].factory_args["torch_compile_max_bs"] == 2
     assert config.stages[0].factory_args["request_build_max_workers"] == 8
     assert config.stages[0].factory_args["request_build_max_pending"] == 32
     assert config.stages[0].factory_args["request_build_inline_when_idle"] is False
