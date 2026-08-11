@@ -253,3 +253,43 @@ for both revisions.
 - Cleanup: the verified raw results remain on personal persistent storage; the
   task container and its host map entry were removed.
 - Status: `COMPLETE`.
+
+## 2026-08-11 Current-Main H100 Complete Concurrency Ladder
+
+- Hypothesis: the apparent regression against #1393 should disappear when
+  current main is measured on the same H100 hardware class.
+- Contract:
+  [contract.json](runs/2026-08-11-main-h100-remaining-sweep/contract.json)
+- Summary:
+  [results-summary.json](runs/2026-08-11-main-h100-remaining-sweep/results-summary.json)
+- Source: current main `2b45073c`, the same base commit used by the PR #1445
+  H100 crossover run. Runtime image, model, dataset revision, server config,
+  seed, warmups, and generation-only measurement are identical across all six
+  concurrency levels.
+- Execution: H100 physical GPUs 0 and 1 ran the same concurrency at the same
+  time. C=1 used the first 50 samples; c=2/4/8 used the full 1,088-sample set.
+  The earlier PR #1445 run supplies c=16 and c=32. Every row is a two-GPU mean,
+  except c=32 which has four base runs from the crossover contract.
+- Validation: all eight new runs completed with zero failed requests and the
+  expected 50 or 1,088 result rows. WER was not rerun because these runs isolate
+  generation performance.
+
+| Concurrency | Samples | Repeats | Request QPS | Audio s/s | Mean latency | Mean RTF | QPS vs user #1393 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 50 | 2 | 0.935 | 3.726 | 1.070 s | 0.2751 | +5.65% |
+| 2 | 1,088 | 2 | 1.556 | 6.493 | 1.286 s | 0.3138 | +3.18% |
+| 4 | 1,088 | 2 | 2.493 | 10.407 | 1.603 s | 0.3902 | +5.41% |
+| 8 | 1,088 | 2 | 3.875 | 16.173 | 2.062 s | 0.5021 | -0.54% |
+| 16 | 1,088 | 2 | 4.760 | 19.859 | 3.344 s | 0.8125 | +4.72% |
+| 32 | 1,088 | 4 | 4.988 | 20.818 | 6.344 s | 1.5961 | +7.83% |
+
+- Conclusion: current main improves five of the six user-provided #1393 rows.
+  C=8 is effectively flat at -0.54%. C=32 is now the throughput peak at 4.988
+  req/s, but c=16 remains the better latency/throughput operating point because
+  c=32 adds only 4.8% throughput while latency rises about 90%.
+- Attribution: the previous H200 numbers cannot be used to claim a code
+  regression against the H100 cookbook. On matching H100 hardware, current
+  main is healthy and generally faster than #1393.
+- Cleanup: the verified 3.7 GB raw result tree remains on personal persistent
+  storage. The task container and its host map entry were removed.
+- Status: `COMPLETE`.
