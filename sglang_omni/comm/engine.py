@@ -340,7 +340,6 @@ class CommEngine:
         source_page_indices: tuple[int, ...],
         target_pool_id: str,
         to_stage: str,
-        target_endpoint: str,
         metadata: dict[str, Any] | None = None,
         transfer_id: str | None = None,
         lease: KVPageLease | None = None,
@@ -379,7 +378,7 @@ class CommEngine:
             self._outbound_kv_requests[transfer_id] = request_id
             await send_to_endpoint(
                 self._rank_send_sockets,
-                target_endpoint,
+                self.rank_endpoints[to_stage][self.tp_rank],
                 KVTransferPrepareMessage(
                     request_id=request_id,
                     transfer_id=transfer_id,
@@ -426,7 +425,7 @@ class CommEngine:
             try:
                 await send_to_endpoint(
                     self._rank_send_sockets,
-                    target_endpoint,
+                    self.rank_endpoints[to_stage][self.tp_rank],
                     DataReadyMessage(
                         request_id=request_id,
                         from_stage=from_stage,

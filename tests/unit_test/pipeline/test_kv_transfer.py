@@ -29,10 +29,12 @@ from tests.unit_test.fixtures.pipeline_fakes import FakeOp, FakeRelay
 
 
 class _PagedRelay(FakeRelay):
-    def __init__(self) -> None:
+    def __init__(self, *, tp_rank: int = 0) -> None:
         super().__init__()
+        self.tp_rank = tp_rank
         self.put_ops: list[FakeOp] = []
         self.get_calls: list[tuple[str, tuple[int, ...], tuple[int, ...]]] = []
+        self.received_source_tp_ranks: list[int] = []
 
     def register_kv_pool(self, pool: KVPool) -> None:
         del pool
@@ -53,6 +55,7 @@ class _PagedRelay(FakeRelay):
                 "transfer_info": {"size": len(source_page_indices)},
                 "fake_kv": True,
                 "key": "kv-put",
+                "source_tp_rank": self.tp_rank,
             },
             self.log,
         )
@@ -69,6 +72,7 @@ class _PagedRelay(FakeRelay):
         request_id: str,
     ) -> FakeOp:
         assert metadata["fake_kv"] is True
+        self.received_source_tp_ranks.append(metadata["source_tp_rank"])
         self.get_calls.append(
             (destination_pool_id, source_page_indices, destination_page_indices)
         )
@@ -199,7 +203,7 @@ async def _start_pair(
     relay: _PagedRelay | None = None,
     endpoints: dict[str, tuple[str, ...]] | None = None,
 ) -> tuple[_PagedRelay, CommEngine, CommEngine]:
-    relay = relay or _PagedRelay()
+    relay = relay or _PagedRelay(tp_rank=tp_rank)
     endpoints = endpoints or _kv_endpoints(tp_size)
     source = _engine(
         "source",
@@ -283,7 +287,6 @@ def test_kv_transfer_requires_cuda_ipc_topology() -> None:
                 source_page_indices=(0,),
                 target_pool_id="destination_pool",
                 to_stage="destination",
-                target_endpoint="unused",
                 lease=lease,
             )
         lease.release.assert_called_once_with()
@@ -316,7 +319,6 @@ def test_kv_transfer_requires_matching_tp_endpoint_counts() -> None:
                 source_page_indices=(0,),
                 target_pool_id="destination_pool",
                 to_stage="destination",
-                target_endpoint=endpoints["destination"][0],
             )
 
     asyncio.run(_run())
@@ -339,7 +341,6 @@ def test_kv_transfer_uses_rank_endpoint_for_full_lifecycle() -> None:
                 source_page_indices=(1, 4),
                 target_pool_id="destination_pool",
                 to_stage="destination",
-                target_endpoint=source.rank_endpoints["destination"][source.tp_rank],
                 lease=lease,
             )
 
@@ -387,9 +388,6 @@ def test_equal_tp_transfer_copies_each_shard_over_its_peer_endpoint() -> None:
                         source_page_indices=(1, 4),
                         target_pool_id="destination_pool",
                         to_stage="destination",
-                        target_endpoint=source.rank_endpoints["destination"][
-                            source.tp_rank
-                        ],
                         lease=lease,
                     )
                     for _, source, _, _, lease in rank_state
@@ -408,6 +406,7 @@ def test_equal_tp_transfer_copies_each_shard_over_its_peer_endpoint() -> None:
                 assert relay.get_calls == [
                     ("destination_pool", (1, 4), (tp_rank, tp_rank + 2))
                 ]
+                assert relay.received_source_tp_ranks == [tp_rank]
                 assert receiver.committed == ["request"]
                 lease.release.assert_called_once_with()
         finally:
@@ -435,9 +434,6 @@ def test_rank_local_prepare_failure_returns_to_same_source_rank() -> None:
                     source_page_indices=(1, 4),
                     target_pool_id="destination_pool",
                     to_stage="destination",
-                    target_endpoint=source.rank_endpoints["destination"][
-                        source.tp_rank
-                    ],
                     lease=lease,
                 )
 
@@ -469,9 +465,6 @@ def test_kv_transfer_rejects_layout_mismatch() -> None:
                     source_page_indices=(1,),
                     target_pool_id="destination_pool",
                     to_stage="destination",
-                    target_endpoint=source.rank_endpoints["destination"][
-                        source.tp_rank
-                    ],
                     lease=lease,
                 )
 
@@ -517,9 +510,6 @@ def test_kv_ack_timeout_retains_pending_sender_resources(
                     source_page_indices=(1,),
                     target_pool_id="destination_pool",
                     to_stage="destination",
-                    target_endpoint=source.rank_endpoints["destination"][
-                        source.tp_rank
-                    ],
                     lease=lease,
                 )
 
@@ -553,9 +543,6 @@ def test_rank_endpoint_dispatches_concurrent_kv_copies_and_aborts_once() -> None
                     source_page_indices=(index,),
                     target_pool_id="destination_pool",
                     to_stage="destination",
-                    target_endpoint=source.rank_endpoints["destination"][
-                        source.tp_rank
-                    ],
                     lease=Mock(),
                 )
             )
