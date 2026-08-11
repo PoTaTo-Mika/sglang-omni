@@ -93,4 +93,11 @@ for both revisions.
 - Failure: the reused hyper01 image lacked the declared `jiwer` dependency, so
   its first workers exited during module import. The launch script now installs
   `jiwer` before starting workers; no request ran in that attempt.
+- Failure: the previous reusable containers used an older runtime that lacked
+  `dots_tts` and `msgpack`. Both canonical containers were recreated with the
+  current H200 profile image, preserving their persistent `/data` mount. The
+  launcher now pins `dots.tts`, `jiwer`, and `openai-whisper`; no request ran in
+  the incompatible-runtime attempts.
+- Allocation correction: use only high-numbered GPUs: hyper00 GPUs 7,6,5,4 for
+  c=1,2,4,8 and hyper01 GPUs 7,6 for c=16,32.
 - Status: `RUNNING`.
