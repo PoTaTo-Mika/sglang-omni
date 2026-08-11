@@ -32,9 +32,12 @@ if [[ -z "${host}" || -z "${run_root}" || ${#workers[@]} -eq 0 ]]; then
 fi
 
 expected_code_base="7f5529ad8f8b0e3baff3391946b51474eec45832"
-actual_commit="$(git rev-parse HEAD)"
-git merge-base --is-ancestor "${expected_code_base}" "${actual_commit}"
-git diff --quiet "${expected_code_base}" "${actual_commit}" -- \
+repo_root="$(pwd -P)"
+actual_commit="$(git -c safe.directory="${repo_root}" rev-parse HEAD)"
+git -c safe.directory="${repo_root}" merge-base --is-ancestor \
+  "${expected_code_base}" "${actual_commit}"
+git -c safe.directory="${repo_root}" diff --quiet \
+  "${expected_code_base}" "${actual_commit}" -- \
   sglang_omni benchmarks examples/configs
 
 host_root="${run_root}/${host}"

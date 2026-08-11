@@ -86,4 +86,8 @@ for both revisions.
 - Allocation: [rollout-plan.json](runs/2026-08-11-streaming-seedtts-sweep/rollout-plan.json)
 - Execution: hyper00 and hyper01, exclusive H200 access; c=1 uses the first 50
   samples, all other concurrency levels use all 1,088 English samples.
+- Failure: the first detached coordinators exited before model setup because
+  the bind-mounted checkout tripped Git's `safe.directory` ownership check.
+  The launcher now scopes `safe.directory` to its three read-only Git commands;
+  no benchmark request ran in the failed attempt.
 - Status: `RUNNING`.
