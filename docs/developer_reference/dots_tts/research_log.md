@@ -204,3 +204,52 @@ for both revisions.
   runs were removed after persistent outputs were checked. No other container
   or process was touched.
 - Status: `COMPLETE`.
+
+## 2026-08-11 PR #1445 H100 Split-Lock A/B
+
+- Hypothesis: splitting reference-encode and vocoder locks should recover the
+  non-streaming loss attributed to shared-lock contention without relying on a
+  cross-device H100/H200 comparison.
+- Contract:
+  [contract.json](runs/2026-08-11-pr1445-h100-ab/contract.json)
+- Summary:
+  [results-summary.json](runs/2026-08-11-pr1445-h100-ab/results-summary.json)
+- Source: current main `2b45073c` versus the #1445 patch ported onto current
+  main as `6d54e21a`. The port includes #1444 and changes only codec lock
+  ownership plus focused tests.
+- Execution: H100 physical GPUs 0 and 1, full 1,088-sample SeedTTS EN set,
+  non-streaming, seed 42, 10 warmups, `max_running_requests=16`, CUDA Graph max
+  batch 16, and generate-only measurement. Base and candidate ran concurrently
+  and swapped GPUs between rounds. C=16 used two rounds per revision; c=32 used
+  four after the first two showed contradictory card-level deltas.
+- Validation: the candidate passed 42 focused unit tests. All 12 benchmark runs
+  completed 1,088/1,088 requests with zero failures. WER was not rerun because
+  this contract isolated generation performance and the lock split does not
+  change model math.
+
+| Concurrency | Base req/s | Split req/s | Throughput delta | Base latency | Split latency | Base RTF | Split RTF |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 16 | 4.760 | 4.783 | +0.49% | 3.344 s | 3.327 s | 0.8125 | 0.8059 |
+| 32 | 4.988 | 4.947 | -0.82% | 6.344 s | 6.401 s | 1.5961 | 1.6084 |
+
+- C=16 card control: GPU 0 improved 0.47% and GPU 1 improved 0.52%, so the
+  approximately 0.5% gain is repeatable but below the normal threshold for a
+  material serving optimization.
+- C=32 variance: base/split throughput medians are 4.973/4.973 req/s even
+  though means differ by -0.82%. One split run on GPU 1 measured 4.812 req/s;
+  the next on the same GPU measured 4.964 req/s. The change is effectively
+  neutral at the median and increases observed run variance.
+- Historical correction: current-main H100 baseline is 4.760 req/s at c=16
+  and 4.988 req/s at c=32, respectively 2.6% and 12.6% above the official
+  #1393 H100 reference. The earlier apparent regression came from comparing
+  H200 runs with this H100 reference, not from #1438/#1439/#1440/#1441/#1444.
+- Decision: #1445 should be evaluated and described as a streaming
+  optimization. Its non-streaming +3.91% result does not generalize to c=16 or
+  c=32. Do not spend more H100 time trying to make the c=32 mean positive; if
+  the existing streaming throughput/TTFC versus ITL tradeoff is acceptable,
+  rebase the patch and rerun the streaming c=8 contract.
+- GitHub: the H100 result and current-main port were posted on
+  [#1445](https://github.com/sgl-project/sglang-omni/pull/1445#issuecomment-5250903451).
+- Cleanup: the verified raw results remain on personal persistent storage; the
+  task container and its host map entry were removed.
+- Status: `COMPLETE`.
