@@ -84,8 +84,8 @@ for both revisions.
   point across c=1,2,4,8,16,32.
 - Contract: [contract.json](runs/2026-08-11-streaming-seedtts-sweep/contract.json)
 - Allocation: [rollout-plan.json](runs/2026-08-11-streaming-seedtts-sweep/rollout-plan.json)
-- Execution: hyper00 and hyper01, exclusive H200 access; c=1 uses the first 50
-  samples, all other concurrency levels use all 1,088 English samples.
+- Execution: hyper00 and hyper01 H200 GPUs selected only when free; c=1 uses the
+  first 50 samples, all other concurrency levels use all 1,088 English samples.
 - Failure: the first detached coordinators exited before model setup because
   the bind-mounted checkout tripped Git's `safe.directory` ownership check.
   The launcher now scopes `safe.directory` to its three read-only Git commands;
@@ -109,4 +109,24 @@ for both revisions.
   It uses only GPUs reported free immediately before launch, ordered from high
   to low: hyper00 7,6,5 for c=2,4,8 and hyper01 7,6 for c=16,32. Each host uses
   a new task-scoped timestamp container exposing only its selected GPUs.
-- Status: `RUNNING`.
+- Canonical summary:
+  [results-summary.json](runs/2026-08-11-streaming-seedtts-sweep/results-summary.json).
+  Raw per-request logs remain transient artifacts on the persistent host paths
+  recorded there; no reusable dataset or model artifact was produced.
+
+| Concurrency | Samples | Success | Request QPS | Audio s/s | Mean latency (s) | Mean TTFP (s) | Mean inter-chunk (s) | Corpus WER |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 50 | 50/50 | 0.589 | 2.327 | 1.698 | 0.355 | 0.1829 | 1.241% |
+| 2 | 1,088 | 1,088/1,088 | 0.904 | 3.768 | 2.212 | 0.4405 | 0.2324 | 1.281% |
+| 4 | 1,088 | 1,088/1,088 | 1.342 | 5.596 | 2.978 | 0.6114 | 0.3104 | 1.231% |
+| 8 | 1,088 | 1,088/1,088 | 1.479 | 6.171 | 5.406 | 2.3405 | 0.4018 | 1.264% |
+| 16 | 1,088 | 1,088/1,088 | 1.489 | 6.210 | 10.719 | 7.6436 | 0.4034 | 1.231% |
+| 32 | 1,088 | 1,088/1,088 | 1.443 | 6.017 | 22.038 | 18.7227 | 0.4344 | 1.315% |
+
+- Conclusion: throughput saturates at c=8-c=16. C=16 improves audio
+  throughput by only 0.63% over c=8 while mean latency nearly doubles and mean
+  TTFP increases from 2.34 s to 7.64 s. C=32 reduces throughput by 3.11% versus
+  c=16 while latency and TTFP worsen sharply. Use c=8 as the default
+  latency/throughput tradeoff; c=16 is only useful when maximizing aggregate
+  throughput regardless of per-request latency.
+- Status: `COMPLETE`.
