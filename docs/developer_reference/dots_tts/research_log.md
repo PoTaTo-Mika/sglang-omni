@@ -1,6 +1,6 @@
 # dots.tts Low-Fruit Optimization Research Log
 
-Last updated: 2026-08-10.
+Last updated: 2026-08-11.
 
 This log records bounded, math-preserving serving optimizations found after the
 larger dots.tts CUDA Graph, batching, and KV-cache work had landed. The local
@@ -18,10 +18,11 @@ or throughput claims.
 
 | Optimization | Pull request | Head commit | Status |
 | --- | --- | --- | --- |
-| Reuse one batched latent denormalization | [#1438](https://github.com/sgl-project/sglang-omni/pull/1438) | `17e9ffe4` | Open, ready for review |
-| Stack feedback directly into the CUDA Graph buffer | [#1439](https://github.com/sgl-project/sglang-omni/pull/1439) | `c230a111` | Open, ready for review |
-| Bypass redundant vocoder staging | [#1440](https://github.com/sgl-project/sglang-omni/pull/1440) | `a544e4bf` | Open, ready for review |
-| Reuse the CFG null-projection bias | [#1441](https://github.com/sgl-project/sglang-omni/pull/1441) | `2b1ab3da` | Open, ready for review |
+| Reuse one batched latent denormalization | [#1438](https://github.com/sgl-project/sglang-omni/pull/1438) | `76d0816d` | Merged |
+| Stack feedback directly into the CUDA Graph buffer | [#1439](https://github.com/sgl-project/sglang-omni/pull/1439) | `eede6786` | Merged |
+| Bypass redundant vocoder staging | [#1440](https://github.com/sgl-project/sglang-omni/pull/1440) | `25ae3d95` | Merged |
+| Reuse the CFG null-projection bias | [#1441](https://github.com/sgl-project/sglang-omni/pull/1441) | `5f530dc5` | Merged |
+| Batch compatible streaming AudioVAE steps | [#1444](https://github.com/sgl-project/sglang-omni/pull/1444) | `7f5529ad` | Merged |
 
 No dataset, checkpoint, adapter, or model artifact was produced. The PR
 branches and this log are the complete reusable state; raw benchmark logs are
@@ -75,3 +76,14 @@ python -m pytest -q \
 Before quoting serving-level gains, run the canonical Seed-TTS benchmark from
 the [dots.tts cookbook](../../cookbook/dots_tts.md#performance) on the same GPU
 for both revisions.
+
+## 2026-08-11 Streaming SeedTTS Concurrency Sweep
+
+- Hypothesis: the merged cross-request AudioVAE batching in #1444 should retain
+  its c=8 streaming gain on the full SeedTTS EN set and reveal the saturation
+  point across c=1,2,4,8,16,32.
+- Contract: [contract.json](runs/2026-08-11-streaming-seedtts-sweep/contract.json)
+- Allocation: [rollout-plan.json](runs/2026-08-11-streaming-seedtts-sweep/rollout-plan.json)
+- Execution: hyper00 and hyper01, exclusive H200 access; c=1 uses the first 50
+  samples, all other concurrency levels use all 1,088 English samples.
+- Status: `RUNNING`.
