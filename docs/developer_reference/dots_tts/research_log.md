@@ -100,4 +100,13 @@ for both revisions.
   the incompatible-runtime attempts.
 - Allocation correction: use only high-numbered GPUs: hyper00 GPUs 7,6,5,4 for
   c=1,2,4,8 and hyper01 GPUs 7,6 for c=16,32.
+- Pause: the first valid sweep was stopped on request after c=1 had completed
+  both synthesis and ASR. The retained c=1 artifacts contain 50/50 successful
+  requests and 50/50 evaluated WER samples; the other concurrency runs were
+  incomplete and are not used as results.
+- Resume allocation:
+  [resume-rollout-plan.json](runs/2026-08-11-streaming-seedtts-sweep/resume-rollout-plan.json).
+  It uses only GPUs reported free immediately before launch, ordered from high
+  to low: hyper00 7,6,5 for c=2,4,8 and hyper01 7,6 for c=16,32. Each host uses
+  a new task-scoped timestamp container exposing only its selected GPUs.
 - Status: `RUNNING`.
