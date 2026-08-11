@@ -9,7 +9,7 @@ from typing import Any
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from transformers import AutoFeatureExtractor, AutoTokenizer
 
-from sglang_omni.models.qwen3_asr import request_builders
+from sglang_omni.models.qwen3_asr import mrope_fast_path, request_builders
 from sglang_omni.models.qwen3_asr.audio_lengths import (
     qwen3_asr_max_audio_tokens,
     qwen3_asr_max_output_tokens,
@@ -142,6 +142,9 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
 
     def validate_before_infrastructure(self, server_args: Any) -> None:
         super().validate_before_infrastructure(server_args)
+        # Replace the per-request decode mrope-position loop with a vectorized
+        # equivalent before any forward runs.
+        mrope_fast_path.apply_asr_mrope_fast_path()
         logger.info(
             "Qwen3-ASR runtime profile: dtype=%s attention_backend=%s "
             "mm_attention_backend=%s cuda_graph=%s cuda_graph_bs=%s "
