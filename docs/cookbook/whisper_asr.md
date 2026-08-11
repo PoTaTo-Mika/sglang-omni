@@ -13,10 +13,23 @@ hf download openai/whisper-large-v3
 ## Server Configuration
 
 Whisper ASR runs a single ASR stage on one GPU.
+Async decode is enabled by default for all decode batch sizes, allowing the
+shared one-step-lookahead path to overlap host-side result processing with the
+next GPU decode forward even for a single request. Use `--decode-mode sync` to
+disable it, or tune the crossover with `--async-lookahead-min-batch-size`.
 
 ```bash
 sgl-omni serve \
   --model-path openai/whisper-large-v3 \
+  --port 8000
+```
+
+For example, force synchronous decode when comparing modes:
+
+```bash
+sgl-omni serve \
+  --model-path openai/whisper-large-v3 \
+  --decode-mode sync \
   --port 8000
 ```
 
@@ -62,6 +75,75 @@ The request builder also supports `task` (`transcribe` by default) and
 the fields above. The route uses the ASR stage default unless the pipeline is
 configured another way. For smoke tests, keep the request minimal and use
 `response_format=json`.
+
+## Async Decode A/B Comparison
+
+Compare sync decode against the default async lookahead path with the shared
+SeedTTS ASR concurrency benchmark. Keep the model, dataset revision, sample
+subset, concurrency list, and repeat count identical across arms.
+
+Higher concurrency currently needs atomic encoder-prefix admission
+(`chunked_prefill_size=0`) until W-PR1 lands; otherwise concurrent prefills can
+crash the Whisper stage. The A/B profile below sets that override via
+`runtime_overrides`.
+
+```bash
+MODEL_PATH=$(hf download openai/whisper-base)
+cat > /tmp/whisper_async_ab.yaml <<EOF
+config_cls: WhisperASRPipelineConfig
+name: whisper-async-ab
+model_path: ${MODEL_PATH}
+runtime_overrides:
+  asr:
+    server_args_overrides:
+      chunked_prefill_size: 0
+EOF
+
+PORT_SYNC=8101
+PORT_ASYNC=8102
+
+# Arm A: sync decode (baseline)
+CUDA_VISIBLE_DEVICES=0 sgl-omni serve \
+  --config /tmp/whisper_async_ab.yaml \
+  --model-name openai/whisper-base \
+  --decode-mode sync \
+  --port "${PORT_SYNC}"
+
+# Arm B: async decode with min batch size 1 (candidate / default)
+CUDA_VISIBLE_DEVICES=1 sgl-omni serve \
+  --config /tmp/whisper_async_ab.yaml \
+  --model-name openai/whisper-base \
+  --decode-mode async \
+  --async-lookahead-min-batch-size 1 \
+  --port "${PORT_ASYNC}"
+
+# Same client workload against each arm:
+for PORT in "${PORT_SYNC}" "${PORT_ASYNC}"; do
+  python -m benchmarks.eval.benchmark_asr_seedtts \
+    --port "${PORT}" \
+    --model-path openai/whisper-base \
+    --max-samples 20 \
+    --concurrencies 1,2,4,8 \
+    --repeats 3 --warmup \
+    --output "whisper_async_ab_port${PORT}.json"
+done
+```
+
+### Measured H200 result (`openai/whisper-base`, 20 SeedTTS EN clips)
+
+Both arms evaluated 60/60 requests at every concurrency with identical corpus
+WER `0.0415`. Async lookahead (`min_batch_size=1`) improved throughput at every
+measured level:
+
+| Concurrency | Sync req/s | Async req/s | Throughput gain | Sync mean latency (s) | Async mean latency (s) |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 20.440 | 21.592 | +5.6% | 0.049 | 0.046 |
+| 2 | 28.827 | 29.314 | +1.7% | 0.069 | 0.068 |
+| 4 | 36.177 | 38.154 | +5.5% | 0.109 | 0.104 |
+| 8 | 42.686 | 44.550 | +4.4% | 0.182 | 0.174 |
+
+Accept the async default only when corpus WER matches the sync arm and
+throughput or latency improves on the target concurrency (especially c=1).
 
 ## Known Limitations
 

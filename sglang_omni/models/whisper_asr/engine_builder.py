@@ -18,10 +18,14 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
         max_running_requests: int,
         max_new_tokens: int,
         mem_fraction_static: float,
+        enable_async_decode: bool,
+        async_decode_min_batch_size: int,
     ) -> None:
         self.max_running_requests = max_running_requests
         self.max_new_tokens = max_new_tokens
         self.mem_fraction_static = mem_fraction_static
+        self.enable_async_decode = enable_async_decode
+        self.async_decode_min_batch_size = async_decode_min_batch_size
         self.processor: Any = None
         self.tokenizer: Any = None
         self.generation_config: Any = None
@@ -65,3 +69,9 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
             encoder_token_count=self.encoder_token_count,
             max_new_tokens=self.max_new_tokens,
         )
+
+    def extra_scheduler_kwargs(self) -> dict[str, Any]:
+        return {
+            "enable_async_decode": self.enable_async_decode,
+            "async_decode_min_batch_size": self.async_decode_min_batch_size,
+        }
