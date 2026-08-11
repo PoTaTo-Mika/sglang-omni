@@ -95,6 +95,8 @@ sgl-omni serve \
 
 Tracking issue: [#1466](https://github.com/sgl-project/sglang-omni/issues/1466)
 
+English version: [Configuration Interface Refactoring Design Proposal](./configuration_interface_refactor_proposal_en.md)
+
 重构目标是：
 
 1. **统一配置处理代码**：同一个用户语义只有一个 canonical config path；YAML、CLI 和 Router 全部进入同一个解析、类型转换、优先级、校验和冲突处理流程。
@@ -531,7 +533,7 @@ sgl-omni serve \
   --set pipeline.stages.thinker.placement.tp=2
 ```
 
-value 使用 YAML scalar/flow value 解析，因此 bool、None、number、list 和 dict 具有同一类型规则。path 必须存在于 public schema；不能写 runtime-derived 或 deprecated internal path。
+value 使用 YAML scalar/flow value 解析，因此 bool、null、number、list 和 dict 具有同一类型规则。path 必须存在于 public schema；不能写 runtime-derived 或 deprecated internal path。
 
 ## 6.3 专用 CLI 的最终定位
 
@@ -601,14 +603,14 @@ class ConfigPatch(BaseModel):
     layer: int
 ```
 
-V1 操作只包含 `set` 和 `declare_stage`：
+初版 patch protocol 的操作只包含 `set` 和 `declare_stage`：
 
 - `set` 设置一个 typed value；`null` 始终是普通值，用于清空允许为 null 的 optional field；
 - `declare_stage` 只由 `document_mode: full` 的 YAML adapter 产生，用于声明 stage name 和 stage type。
 
-full document 从空 topology 开始，可以声明 stage；partial document 和 CLI `--set` 只能修改已经存在的 stage，不能创建或删除 stage。`stage_order` 中的名称必须与最终声明的 stages 一一对应，不能缺失、重复或引用未知 stage。V1 不提供删除继承 stage/map entry 的 patch；需要改变 stage membership 时使用 full document。
+full document 从空 topology 开始，可以声明 stage；partial document 和 CLI `--set` 只能修改已经存在的 stage，不能创建或删除 stage。`stage_order` 中的名称必须与最终声明的 stages 一一对应，不能缺失、重复或引用未知 stage。初版 patch protocol 不提供删除继承 stage/map entry 的操作；需要改变 stage membership 时使用 full document。
 
-list 在 V1 中始终整体替换，不增加 append/remove item 等顺序敏感操作。复杂 list 应优先写 YAML。
+初版 patch protocol 始终整体替换 list，不增加 append/remove item 等顺序敏感操作。复杂 list 应优先写 YAML。
 
 `ConfigPath` 不是任意字符串遍历器，而是由 public schema 编译的 path：
 
@@ -679,7 +681,7 @@ resolved config 与用户 document 分开：
 
 只能在模型加载或 worker 初始化后确定的值进入独立的 `WorkerRuntimeDerivation`，例如依赖实际 loaded backend 的兼容调整。它通过 worker startup diagnostic 和带 source 的 `ServerArgs.override()` 记录 provenance，不反向补写 `DerivedRuntimePlan` 或 `ResolvedPipelineConfig`。
 
-`config explain` 解释用户配置和输入 provenance；`runtime explain` 或 worker startup diagnostic 联合展示 `DerivedRuntimePlan` 与 `WorkerRuntimeDerivation`，解释最终 effective value。
+`config explain` 解释用户配置和输入 provenance；runtime planner diagnostic 展示 `DerivedRuntimePlan`，worker startup diagnostic 展示 `WorkerRuntimeDerivation`，共同解释最终 effective value。
 
 ## 7.5 canonical runtime namespace
 
@@ -818,7 +820,7 @@ launcher:
 
 ## 9.2 worker 传递方式
 
-V1 可以继续生成 argv，但只生成机器接口：
+初版结构化 Router 实现可以继续生成 argv，但只生成机器接口：
 
 ```text
 sgl-omni serve
@@ -863,7 +865,7 @@ managed worker 的 layer 固定：
 | 同 source 重复 | 两个 `--set` 写同 path | 启动前报错 |
 | alias/canonical 重复 | typed CLI 与 `--set` 写同 path | 启动前报错 |
 | typed/extension 重叠 | extension 试图设置公共 SGLang 字段 | schema 注册失败 |
-| parent/child 重叠 | YAML 设置 `runtime.sglang`，CLI 同层设置其 child | 同层报错；跨层允许并记录 |
+| parent/child 重叠 | 两个同层 patch source 分别设置 `runtime.sglang` 及其 child | 同层报错；跨层允许并记录 |
 | owner 违规 | 用户设置 `gpu_id` 或 endpoint | path 不公开，解析失败 |
 | capability 不支持 | 非 SGLang stage 设置 `runtime.sglang` | model validation 失败 |
 | cross-field 不一致 | TP=2 但只有一个 GPU | resolved model validation 失败 |
