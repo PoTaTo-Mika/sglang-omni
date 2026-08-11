@@ -91,7 +91,7 @@ The remainder of this document uses three technical names for the simple flow ab
 
 These three names are not three new interfaces, but three stages in the same configuration processing pipeline.
 
-This document discusses only startup-time configuration. It does not change the request protocol, Stage payloads, scheduling algorithms, or field definitions in SGLang's internal `ServerArgs`. The code revision checked for the "current implementation" in this document is `42a124cd`; see `docs/developer_reference/configuration.md` for the complete current state.
+This document discusses only startup-time configuration. It does not change the request protocol, Stage payloads, scheduling algorithms, or field definitions in SGLang's internal `ServerArgs`. The code revision checked for the "current implementation" in this document is `2b45073c`; see `docs/developer_reference/configuration.md` for the complete current state.
 
 Tracking issue: [#1466](https://github.com/sgl-project/sglang-omni/issues/1466)
 
@@ -111,7 +111,7 @@ This document does not require all model configuration to be rewritten at once. 
 
 ## 2.1 Configuration Sources
 
-The current public configuration sources can be divided into six categories:
+The current public configuration sources can be divided into seven categories:
 
 | Source | Current entry point | Main implementation |
 |---|---|---|
@@ -120,9 +120,12 @@ The current public configuration sources can be divided into six categories:
 | Compact YAML overrides | `stage_overrides`, `runtime_overrides` | `config/manager.py`, `config/runtime.py` |
 | Dynamic CLI | `--stages.thinker... VALUE` | `ConfigManager.parse_extra_args()` |
 | Dedicated CLI | `--mem-fraction-static`, etc. | `apply_*_cli_overrides()` in `cli/serve.py` |
+| Configured environment defaults | Pipeline `env_defaults`, per-stage `StageConfig.env` | `config/schema.py`, `pipeline/mp_runner.py`, `pipeline/stage_workers.py` |
 | Router launcher | `--launcher-config`, `worker_extra_args` | `sglang_omni_router/launcher/*` |
 
 `sgl-omni serve` enables `ignore_unknown_options` for unknown options, so Typer first parses 41 dedicated parameters, after which the remaining tokens are parsed by `ConfigManager` as dotted overrides. The two types of CLI options are applied at different stages.
+
+Configured environment values have a narrower contract than the configuration layers below. Pipeline `env_defaults` are canonical configured defaults; `StageConfig.env` overlays them for that stage. At spawn, these defaults fill only variables absent from the inherited process environment and therefore never override `os.environ`. The resulting `ResolvedProcessEnv` is a derived process artifact that combines the inherited environment, configured defaults, and runner-owned additions such as rank/device variables; it is not another user precedence layer. Direct `os.environ` reads in libraries or runtime code remain external inputs and must be surfaced by environment diagnostics where relevant, not collected into one generic configuration layer.
 
 ## 2.2 Current Merge Order
 
@@ -135,7 +138,8 @@ The current main process constructs the final `PipelineConfig` in the following 
 5. `serve.py` runs the memory, TP/GPU, process, CUDA graph, compile, decode, prefill, and generation batch helpers in sequence;
 6. `launch_server()` passes HTTP/API parameters separately from `PipelineConfig`;
 7. Runtime preparation constructs placement, process topology, endpoints, and worker specs;
-8. Worker subprocesses merge factory args, then construct `ServerArgs` and `ModelConfig` inside the factory.
+8. Before spawn, the parent resolves signature-independent factory arguments (`factory_args`, `runtime_overrides`, and typed runtime mappings) into the worker spec;
+9. In the child, the worker imports the factory, injects only missing defaults whose applicability depends on its signature, and then the factory constructs `ServerArgs` and `ModelConfig`.
 
 | Order | Processing stage | Input and output |
 |---|---|---|
@@ -143,25 +147,26 @@ The current main process constructs the final `PipelineConfig` in the following 
 | 2 | Apply compact YAML overrides | `stage_overrides` → typed runtime |
 | 3 | Apply dynamic CLI | dotted CLI → rebuilt `PipelineConfig` |
 | 4 | Apply dedicated CLI | typed CLI helpers → in-place modification of `PipelineConfig` |
-| 5 | Runtime planning | `PipelineConfig` → placement, process topology, worker spec |
-| 6 | Worker construction | worker spec → stage factory → `ServerArgs` |
+| 5 | Runtime planning | `PipelineConfig` → placement, process topology, parent-resolved static factory args and worker spec |
+| 6 | Worker construction | worker spec → import factory → inject missing signature-dependent defaults → `ServerArgs` |
 
 This order appears to provide precedence, but precedence is not a single unified rule. Different helpers choose to "override," "reject," "synchronize two aliases," "write both `factory_args` and `runtime_overrides`," or "wait until the worker to report a conflict."
 
 ## 2.3 Current Factory Parameter Path
 
-Stage factory kwargs are combined from the following sources:
+Stage factory kwargs are combined across an explicit parent/child boundary:
 
 ```text
 factory_args
 < runtime_overrides
 < typed runtime mapping
-+ signature-dependent defaults
+→ parent-resolved static factory args in worker spec
++ child-injected missing signature-dependent defaults
 ```
 
 Here, `server_args_overrides` performs an additional dict merge between `factory_args` and `runtime_overrides`; typed `runtime.max_seq_len` and `runtime.video_fps` are renamed through `runtime_arg_map`; typed `mem_fraction_static` is ultimately written back to `server_args_overrides`.
 
-`model_path`, `gpu_id`, and `total_gpu_memory_fraction` are not ordinary user factory args. After importing the factory, the worker injects them as needed based on the function signature. `gpu_id`, the cumulative process budget, NCCL port, and IPC endpoints are derived by the planner/runner.
+The parent performs all merges that do not require inspecting the factory signature before spawn. `model_path`, `gpu_id`, and `total_gpu_memory_fraction` are not ordinary user factory args: the parent computes their candidate values, and after importing the factory the child injects a candidate only when the signature declares that parameter and the resolved static args did not already contain it. `gpu_id`, the cumulative process budget, NCCL port, and concrete IPC/socket endpoints are derived by the planner/runner.
 
 # 3. Problems with the Current Design
 
@@ -347,8 +352,8 @@ All subsequent data structures, migration steps, and tests must serve these thre
 1. **One semantic, one canonical path**: The same runtime feature must not expose both typed and untyped public paths.
 2. **Input adapters contain no business logic**: YAML, CLI, and Router only produce typed assignments/patches.
 3. **Resolve once, validate fully once**: Configuration is frozen after entering the runtime planner.
-4. **Separate user configuration from derived plans**: GPU logical placement can be configured; runtime values such as `gpu_id`, endpoint, and NCCL port cannot.
-5. **Explicit overrides with retained sources**: Cross-layer overrides are allowed but must be explainable; duplicate definitions within the same layer fail immediately.
+4. **Separate user configuration from derived plans**: GPU logical placement and the endpoint allocation root `endpoints.base_path` can be configured; runtime values such as `gpu_id`, a concrete socket endpoint, and NCCL port cannot.
+5. **Explicit overrides with retained sources**: Cross-layer overrides are allowed but must be explainable; equal-specificity duplicate definitions within the same layer fail immediately.
 6. **The compatibility layer has an explicit removal point**: Old interfaces may be adapted, but cannot permanently become a second canonical schema.
 
 ## 4.3 Non-Goals
@@ -412,11 +417,13 @@ pipeline:
 
   stages:
     preprocessing:
+      kind: python
       factory: example.create_preprocessing
       process: pipeline
       next: thinker
 
     thinker:
+      kind: sglang
       factory: example.create_thinker
       process: pipeline
       next: decode
@@ -427,6 +434,7 @@ pipeline:
           max_running_requests: 32
 
     decode:
+      kind: python
       factory: example.create_decode
       process: pipeline
       terminal: true
@@ -533,7 +541,37 @@ sgl-omni serve \
   --set pipeline.stages.thinker.placement.tp=2
 ```
 
-The value is parsed as a YAML scalar/flow value, so booleans, nulls, numbers, lists, and mappings share the same type rules. The path must exist in the public schema; runtime-derived or deprecated internal paths cannot be written.
+The value is parsed as a YAML scalar/flow value, so booleans, nulls, numbers, and atomic list values share the same type rules. `--set` targets configurable leaves only; a list is one leaf and cannot be patched by index. Generic `--set` cannot replace a mapping/subtree; subtree replacement is available only in a `full` YAML document. The path must exist in the public schema; runtime-derived or deprecated internal paths cannot be written.
+
+General stage arguments also support selector-based broadcast patches:
+
+```yaml
+pipeline:
+  stage_defaults:
+    - select:
+        capability: sglang
+      runtime:
+        sglang:
+          max_running_requests: 32
+    - select:
+        roles: [thinker, generation]
+        exclude: [talker_ar]
+      placement:
+        tp: 2
+```
+
+Selectors may use `capability`, `roles`, `stages`, and `exclude`; all supplied positive selectors must match, and `exclude` removes matches. The resolver expands each broadcast into concrete stage-leaf patches before duplicate checking and validation. Resolved storage remains only at `pipeline.stages.<stage>...`; no broadcast object survives in `ResolvedPipelineConfig`. Within one source, specificity is `capability broadcast < role/group selector < concrete stage`. Across different sources, the source layer always dominates specificity. Equal-specificity assignments to the same expanded leaf are errors.
+
+The CLI equivalent is:
+
+```bash
+sgl-omni serve \
+  --config qwen.yaml \
+  --set-for capability=sglang runtime.sglang.max_running_requests=32 \
+  --set pipeline.stages.thinker.runtime.sglang.max_running_requests=48
+```
+
+Here the concrete CLI assignment overrides the capability broadcast in the same CLI source. `config explain` shows every selector expansion and shadowed value; full export emits the expanded stage-local values, not selectors.
 
 ## 6.3 Final Role of Dedicated CLI Options
 
@@ -546,7 +584,7 @@ CliAlias(
 )
 ```
 
-Parsing produces an ordinary `ConfigPatch`. If the same startup command uses both an alias and `--set` to write the same path, it immediately reports a duplicate assignment.
+Parsing produces ordinary patches. Migration aliases have explicit specificity within the CLI source: broadcast/global alias < role alias < explicit concrete `--set`. A role alias overriding a broadcast alias is compatibility-preserving, not a duplicate; the shadowed broadcast value remains in provenance. Two assignments of the same specificity to the same canonical leaf remain errors. Source-layer precedence still dominates this rule.
 
 After V2 stabilizes, dedicated runtime CLI options are removed in batches, leaving only `--set` and service process parameters. This prevents the final interface from permanently maintaining two definitions—"YAML field + dedicated CLI field." If the project decides to retain a very small number of frequently used aliases, their help, types, and patches must be generated automatically from schema metadata; they may not have independent business logic.
 
@@ -559,6 +597,7 @@ sgl-omni config schema
 sgl-omni config validate --config FILE
 sgl-omni config resolve --config FILE [--set ...]
 sgl-omni config explain --config FILE PATH [--set ...]
+sgl-omni config export --config FILE --format full
 sgl-omni config migrate --input v1.yaml --output v2.yaml
 ```
 
@@ -595,10 +634,18 @@ class ConfigSource(BaseModel):
     deprecated: bool = False
 
 
+class StageDeclaration(BaseModel):
+    name: str
+    kind: Literal["sglang", "python", "external"]
+    factory: str
+    extension_schema_id: str | None = None
+
+
 class ConfigPatch(BaseModel):
     op: Literal["set", "declare_stage"]
     path: ConfigPath
     value: object | None = None
+    declaration: StageDeclaration | None = None
     source: ConfigSource
     layer: int
 ```
@@ -606,7 +653,7 @@ class ConfigPatch(BaseModel):
 The initial patch protocol includes only `set` and `declare_stage`:
 
 - `set` sets a typed value; `null` is always an ordinary value used to clear an optional field that permits null;
-- `declare_stage` is produced only by the YAML adapter for `document_mode: full` and declares the stage name and stage type.
+- `declare_stage` is produced only by the YAML adapter for `document_mode: full` and carries a typed declaration payload. `name`, `kind`, and `factory` are required; `extension_schema_id` is present when the stage uses a model extension. `kind` selects the legal runtime namespace and capability rules, so a declaration cannot first create an untyped stage and attach backend fields later.
 
 A full document starts from an empty topology and can declare stages; a partial document and CLI `--set` can only modify existing stages and cannot create or delete stages. The names in `stage_order` must correspond one-to-one with the finally declared stages; none may be missing, duplicated, or reference an unknown stage. The initial patch protocol does not provide an operation for deleting inherited stages or mapping entries; use a full document to change stage membership.
 
@@ -635,15 +682,17 @@ Adapters output an ordered patch set. Layers are fixed as:
 
 Layers resolve only cross-source precedence, not ambiguity within a layer:
 
-- The same path appears repeatedly in one document/CLI: error;
-- Multiple sources in the same layer write the same path: error, requiring the caller to define an explicit order or merge the documents;
+- The same normalized path appears repeatedly at the same specificity in one document/CLI: error;
+- Multiple sources in the same layer and at the same specificity write the same path: error, requiring the caller to define an explicit order or merge the documents;
 - A higher layer overrides a lower layer: allowed and recorded in provenance;
-- A deprecated path and canonical path both target the same leaf: error;
+- Compatibility aliases in one CLI source follow broadcast < role < explicit concrete `--set`; a more-specific value shadows a less-specific value with provenance, while equal-specificity duplicates are errors;
+- Within one Router source, `worker_defaults` < a concrete per-worker entry; an entry may shadow a default with provenance, while duplicates within the same scope remain errors;
 - Parent subtree and child leaf assignments overlap in the same layer: error;
 - Across layers, apply the lower layer first: a higher-layer child can override the corresponding leaf of a lower-layer parent, while a higher-layer parent replaces the lower-layer subtree as a whole;
-- A list is always treated as a leaf and is not merged by index.
+- A list is always treated as a leaf and is not merged by index;
+- Generic `--set` can address only configurable leaves; mapping/subtree replacement requires full YAML.
 
-The YAML parser must enable duplicate-key rejection and retain file, line, and column information for every mapping/scalar. Duplicate YAML keys, paths that duplicate after normalization, and alias/canonical duplicates must be reported while generating the `ConfigPatchSet`; they must not first be read into an ordinary dict where a later value silently overwrites an earlier one.
+The YAML parser must enable duplicate-key rejection and retain file, line, and column information for every mapping/scalar. Duplicate YAML keys, paths that duplicate after normalization at equal specificity, and same-specificity alias/canonical duplicates must be reported while generating the `ConfigPatchSet`; they must not first be read into an ordinary dict where a later value silently overwrites an earlier one.
 
 ## 7.3 `ConfigResolver`
 
@@ -651,12 +700,13 @@ The resolver order is fixed:
 
 1. Collect adapter patches;
 2. Normalize V1 paths/aliases into canonical paths;
-3. Perform duplicate and subtree overlap checks with layers taken into account;
-4. Parse values according to the target schema;
-5. Apply them to an immutable base tree by layer;
-6. Construct the complete `ResolvedPipelineConfig`;
-7. Perform cross-field and model capability validation;
-8. Freeze the configuration and output the provenance map.
+3. Expand selector broadcasts into concrete stage-leaf patches and record expansion provenance;
+4. Perform specificity, duplicate, and subtree overlap checks with layers taken into account;
+5. Parse values according to the target schema;
+6. Apply them to an immutable base tree by layer;
+7. Construct the complete `ResolvedPipelineConfig`;
+8. Perform cross-field and model capability validation;
+9. Freeze the configuration and output the provenance map.
 
 The resolver does not perform GPU topology probes, import stage factories, or construct `ServerArgs`. These belong to subsequent planners/workers, which can only read already-resolved typed fields.
 
@@ -693,11 +743,17 @@ pipeline.stages.<stage>.runtime.video_fps
 pipeline.stages.<stage>.runtime.sglang.mem_fraction_static
 pipeline.stages.<stage>.runtime.sglang.max_running_requests
 pipeline.stages.<stage>.runtime.sglang.max_total_tokens
+pipeline.stages.<stage>.runtime.sglang.encoder_mem_reserve
 pipeline.stages.<stage>.runtime.sglang.cuda_graph.*
+pipeline.stages.<stage>.runtime.sglang.upstream_args.<field>
 pipeline.stages.<stage>.runtime.compile.*
 pipeline.stages.<stage>.runtime.decode.*
 pipeline.stages.<stage>.runtime.prefill_coalesce.*
+pipeline.env_defaults.<NAME>
+pipeline.stages.<stage>.env.<NAME>
 ```
+
+The two environment paths store configured defaults only. Stage values override Pipeline defaults during configured-default resolution, while the inherited process environment still wins when `ResolvedProcessEnv` is derived at spawn. They do not absorb arbitrary `os.environ` reads into configuration precedence.
 
 The following fields are no longer part of the public user interface:
 
@@ -708,8 +764,14 @@ runtime_arg_map
 gpu_id
 process_total_gpu_memory_fraction
 nccl_port
-endpoints
+concrete socket/IPC endpoints
 ```
+
+`pipeline.endpoints.base_path` remains a user-configurable allocation policy input. The planner derives concrete socket paths/endpoints beneath it; only those concrete derived values are forbidden as user input.
+
+`runtime.sglang.upstream_args` is a stage-local, validated escape hatch for SGLang fields not yet promoted into Omni's typed schema. Its schema is generated from the exact pinned upstream `ServerArgs` dataclass/schema and carries both the upstream version and a deterministic schema fingerprint. It rejects unknown fields and a maintained denylist of Omni-owned, derived, or unsafe fields (including device/process/port/endpoint ownership). A field already exposed as a typed Omni field is also rejected under `upstream_args`, preventing duplicate paths. Every accepted leaf retains provenance, and the fully assembled object still runs final upstream `ServerArgs` validation. Thus the escape hatch preserves **one semantic, one path** rather than creating an unvalidated second override dict. A stage whose `kind`/capabilities are not SGLang-backed rejects `runtime.sglang` entirely.
+
+`encoder_mem_reserve` is a canonical SGLang-stage policy field rather than a factory argument. It is valid only when the effective thinker `mem_fraction_static` remains `auto`/unset and has not been pinned through that typed canonical path by any user source, including YAML, Router, selector expansion, or an alias. Because `mem_fraction_static` is already an Omni typed field, it is forbidden under `upstream_args` in the first place. The resolver uses provenance—not merely the final numeric value—to enforce this constraint. Runtime derivation then subtracts the reserve from the automatic thinker budget and applies the existing safety floor; it does not mutate the frozen policy or silently override a pinned fraction.
 
 Model-specific parameters that have not yet entered the public schema are placed under:
 
@@ -723,6 +785,8 @@ pipeline:
 ```
 
 An extension model must still register a Pydantic schema through the model package; a bare `dict[str, Any]` may not override public fields. Mature cross-model features are later promoted from extensions into the public runtime namespace.
+
+Full export must materialize every effective behavior-defining typed or extension value, including values currently hidden in `factory_args` or Python factory defaults. For example, Qwen's effective `talker_max_seq_len` is `32768` in the model configuration even though the factory signature defaults to `4096`; the exported V2 document must contain `32768`. A model cannot opt in to V2 until all such behavior-defining factory defaults are represented in a public or registered extension schema and therefore survive export/import without consulting hidden Python defaults.
 
 ## 7.6 Relationship Between Roles and Stages
 
@@ -778,7 +842,8 @@ The new interface establishes the following rules:
 | GPU/TP/process placement | canonical source | Can be temporarily overridden with `--set` | Belongs to the Pipeline and requires unified validation |
 | SGLang/runtime parameters | canonical source | Can be temporarily overridden with `--set` | Same path, same type, same validation |
 | HTTP bind/log/API policy | Not included in Pipeline YAML | Dedicated CLI | Belongs to the service process, not the model Pipeline |
-| runtime-derived endpoint/port/gpu id | Not settable | Not settable | Owned by planner/runner |
+| Endpoint allocation policy (`endpoints.base_path`) | canonical source | Can be temporarily overridden with `--set` | User-configurable root for allocation |
+| Concrete runtime-derived endpoint/port/gpu id | Not settable | Not settable | Owned by planner/runner |
 | Router worker pool | Router YAML | Router CLI only selects source/routing parameters | Layered separately from the worker Pipeline |
 
 CLI and YAML therefore still have two syntaxes, but only one set of Pipeline semantics:
@@ -795,28 +860,42 @@ CLI --set
 
 ## 9.1 Structured Worker Config
 
-Launcher YAML removes the free-form string `worker_extra_args` and changes to:
+Launcher YAML removes the free-form string `worker_extra_args` and uses shared defaults plus explicit per-worker entries:
 
 ```yaml
 schema_version: 2
 
 launcher:
   backend: local
-  num_workers: 2
-  num_gpus_per_worker: 1
+  num_workers: 4
   worker_host: 127.0.0.1
   worker_base_port: 8011
   wait_timeout: 600
 
-  worker:
+  worker_defaults:
     config: examples/configs/qwen3_omni_colocated_h20_v2.yaml
     service:
       model_name: qwen3-omni
+    capabilities: [speech]
     patches:
       pipeline.stages.thinker.runtime.sglang.max_running_requests: 32
+
+  workers:
+    - index: 0
+      gpus: ["0"]
+      capabilities: [speech, streaming]
+      patches:
+        pipeline.stages.thinker.runtime.sglang.max_running_requests: 48
+    - index: 1
+      gpus: ["0"]  # Intentional overlap with worker 0.
+    - range: "2-3"
+      gpus: ["GPU-3b6e...", "MIG-GPU-7d2a.../1/0"]
+      capabilities: [chat]
 ```
 
-Exactly one of `worker.config` and `worker.model` is selected, corresponding to the worker `--config` and `--model-path` modes. `worker.patches` has paths/values validated by the Router schema and is passed as structured patches.
+`worker_defaults` supplies `config` or `model` (exactly one), service values, capabilities, and patches shared by workers. Each `workers` entry selects one worker with `index` or an inclusive set with `range`, and may override `gpus`, capabilities, and patches. Within one Router source, defaults are expanded first and then the concrete entry is applied; an entry patch may shadow the same path from defaults with provenance rather than being treated as a same-scope duplicate. Repetition within the entry itself remains an error. Repeated physical GPU sets are valid: the example deliberately gives workers 0 and 1 physical GPU `0`. Physical identifiers are preserved as written, including integer-like strings, UUIDs, and MIG identifiers; Router does not coerce them into logical IDs. Entries must cover each worker exactly once and overlapping index/range selectors are errors.
+
+`num_gpus_per_worker` remains only as a fallback when no explicit worker `gpus` is provided; in that mode Router automatically and exclusively splits the available devices. It must not be combined with explicit per-worker GPU sets. After assigning a worker's actual visible set, Router validates Pipeline logical GPU IDs against `0..len(worker.gpus)-1`, not against a global count.
 
 ## 9.2 Worker Transport
 
@@ -832,19 +911,19 @@ The patch file contains a serialized `ConfigPatchSet`, not a shell fragment. Aft
 
 If Router and workers later switch to a Python API or supervisor protocol, they still reuse `ConfigPatchSet` without changing configuration semantics. GPU visibility continues to be managed by Router through the subprocess environment because it is a process resource boundary, not a Pipeline patch.
 
-Router and workers use the same version of the schema registry and `ConfigResolver`. Before creating a subprocess, Router performs a complete dry-run resolve of `worker.config/model + worker.patches`:
+Router and workers use the same version of the schema registry and `ConfigResolver`. Before creating a subprocess, Router performs a complete dry-run resolve of each selected worker's `defaults + entry + config/model + patches`:
 
 - Relative configuration paths are resolved relative to the directory containing the launcher YAML;
-- Router must be able to load the model config and extension schemas required by the worker;
+- Router must first resolve the selected model/config identity and load exactly the extension schemas referenced by that worker; inability to perform this lookup is a startup error;
 - If a path, type, role, or extension cannot be resolved, fail before starting any worker;
 - After receiving the patch file, the worker validates the schema version and content again, but may not use different merge rules.
 
 GPU uses two explicit coordinate systems:
 
-- Router has exclusive authority over physical GPU allocation and establishes each worker's visible device set through `CUDA_VISIBLE_DEVICES`;
+- Router is the sole component authorized to assign physical GPUs and establishes each worker's visible device set through `CUDA_VISIBLE_DEVICES`; explicit assignments may intentionally overlap across workers;
 - Pipeline `placement.gpus` always uses worker-local logical GPU IDs, namely `0..N-1` after visible devices are renumbered.
 
-Router dry-run must validate that every logical GPU ID is within `[0, num_gpus_per_worker)` and that TP size, GPU list, and worker allocation are consistent. Pipeline may not directly reference host physical GPU IDs.
+Router dry-run must validate that every logical GPU ID is within `[0, len(actual worker visible GPU set))` and that TP size, GPU list, and worker allocation are consistent. Pipeline may not directly reference host physical GPU IDs. This prerequisite does not require Router to import or load every registered model—only the selected worker model and referenced extensions.
 
 ## 9.3 Precedence Between Router and Worker
 
@@ -863,13 +942,14 @@ model defaults < worker Pipeline YAML < Router worker.patches < worker CLI emerg
 | Conflict type | Example | V2 behavior |
 |---|---|---|
 | Duplicate in the same source | Two `--set` options write the same path | Error before startup |
-| alias/canonical duplicate | typed CLI and `--set` write the same path | Error before startup |
+| alias specificity | broadcast alias and role alias target the same leaf | More-specific role value wins and shadowed value is recorded |
+| same-specificity alias/canonical duplicate | two role aliases, or two explicit `--set` values, write the same leaf | Error before startup |
 | typed/extension overlap | An extension attempts to set a public SGLang field | Schema registration fails |
 | parent/child overlap | Two patch sources in the same layer set `runtime.sglang` and one of its children | Error in the same layer; allowed and recorded across layers |
-| Ownership violation | User sets `gpu_id` or endpoint | Path is not public; parsing fails |
+| Ownership violation | User sets `gpu_id` or a concrete endpoint | Path is not public; parsing fails; `endpoints.base_path` remains configurable |
 | Unsupported capability | A non-SGLang stage sets `runtime.sglang` | Model validation fails |
 | Cross-field inconsistency | TP=2 but only one GPU exists | Resolved model validation fails |
-| deprecated/canonical duplicate | V1 `runtime_overrides` and a V2 field | Migration error; do not guess precedence |
+| deprecated-document/canonical duplicate | V1 `runtime_overrides` and a V2 field in the same document layer | Migration error; CLI aliases instead follow the explicit specificity rule |
 
 ## 10.2 Atomicity
 
@@ -889,11 +969,11 @@ For example:
 duplicate configuration for
 pipeline.stages.thinker.runtime.sglang.mem_fraction_static
 
-file:qwen.yaml:42 = 0.70
-cli:--thinker-mem-fraction-static = 0.65
+cli:--thinker-mem-fraction-static = 0.70
+cli:--generation-mem-fraction-static = 0.65
 
-The CLI alias and canonical field target the same setting.
-Remove one source or use `config explain` to inspect precedence.
+The two role aliases have equal specificity and resolve to the same stage.
+Remove one alias or use an explicit concrete `--set`.
 ```
 
 # 11. Configuration Compilation and Runtime Boundary
@@ -916,8 +996,8 @@ Read it strictly as **① → ② → ③ → ④ → ⑤ → ⑥ → ⑦**:
 - ③ is the last step that modifies user configuration;
 - ④ only generates derived plans and does not write back to the Pipeline;
 - ⑤ stores effective runtime values determinable by main-process topology/hardware probes;
-- ⑥ only assembles cross-process DTOs;
-- ⑦ is when factories are imported and `ServerArgs` and `ModelConfig` are constructed; adjustments determinable only at this stage are recorded in `WorkerRuntimeDerivation`.
+- ⑥ resolves signature-independent factory arguments in the parent and assembles them into cross-process DTOs;
+- ⑦ imports the factory, injects only missing signature-dependent defaults, and then constructs `ServerArgs` and `ModelConfig`; adjustments determinable only at this stage are recorded in `WorkerRuntimeDerivation`.
 
 The current `_apply_tensor_parallel_server_args_overrides()` modifies stage server args based on a topology probe. V2 splits this into:
 
@@ -937,9 +1017,10 @@ Other topology-dependent parameters follow the same pattern.
 |---|---|
 | `sglang_omni/config/schema.py` | Add V2 public schema, name-keyed stages, typed runtime namespaces, frozen resolved model |
 | `sglang_omni/config/patch.py` (new) | `ConfigPath`, `ConfigSource`, `ConfigPatch`, duplicate/overlap checks |
-| `sglang_omni/config/resolver.py` (new) | layer merge, type conversion, provenance, full validation |
+| `sglang_omni/config/resolver.py` (new) | selector expansion, specificity/layer merge, type conversion, provenance, full validation |
 | `sglang_omni/config/compat.py` (new) | Time-limited adapter from V1 YAML/dotted/typed CLI to V2 patches |
-| `sglang_omni/models/registry.py` | Register V2 model defaults, roles, and extension schemas |
+| `sglang_omni/config/sglang_schema.py` (new) | Generate and fingerprint the exact pinned `ServerArgs` passthrough schema and enforce the ownership/unsafe denylist |
+| `sglang_omni/models/registry.py` | Register V2 model defaults, roles, stage kinds/capabilities, and extension schemas |
 
 The file-loading responsibility of `ConfigManager` is moved into the adapter/resolver. The old class remains as a facade during migration, and its custom dotted merge is ultimately removed.
 
@@ -948,7 +1029,7 @@ The file-loading responsibility of `ConfigManager` is moved into the adapter/res
 | Module | Change |
 |---|---|
 | `sglang_omni/cli/serve.py` | After parsing parameters, construct only `ServerLaunchConfig` and patches; remove business mutation helpers |
-| `sglang_omni/cli/config.py` | Add schema/validate/resolve/explain/migrate |
+| `sglang_omni/cli/config.py` | Add schema/validate/resolve/explain/migrate/export, selector expansion display, and environment diagnostics |
 | `sglang_omni/cli/__init__.py` | Disable unknown options; all open-ended overrides use explicit `--set` |
 
 During migration, typed CLI aliases may continue to appear in the `serve()` signature, but the alias registry automatically generates their patch implementation.
@@ -957,9 +1038,10 @@ During migration, typed CLI aliases may continue to appear in the `serve()` sign
 
 | Module | Change |
 |---|---|
-| `sglang_omni/config/runtime.py` | Only convert typed resolved runtime into factory kwargs; no longer resolve conflicts between user sources |
+| `sglang_omni/config/runtime.py` | Convert typed resolved runtime into parent-resolved static factory kwargs; no longer resolve conflicts between user sources |
 | `sglang_omni/pipeline/runtime_config.py` | Read only frozen resolved config and output placement/process and `DerivedRuntimePlan` |
-| `sglang_omni/pipeline/mp_runner.py` | Construct specs from resolved config/plans; do not receive compatibility fields |
+| `sglang_omni/pipeline/mp_runner.py` | Construct specs and `ResolvedProcessEnv` from resolved config/plans; preserve the static-args/signature-injection boundary |
+| `sglang_omni/pipeline/stage_workers.py` | Apply configured environment defaults without overriding inherited values and emit process-environment diagnostics |
 | `sglang_omni/scheduling/sglang_backend/server_args_builder.py` | Construct `ServerArgs` from typed SGLang config, retaining explicit derived runtime overrides |
 
 Model factories may temporarily continue receiving `server_args_overrides`, but this dict can only be generated internally by the typed runtime adapter and is no longer a public YAML/CLI entry point.
@@ -968,7 +1050,7 @@ Model factories may temporarily continue receiving `server_args_overrides`, but 
 
 | Module | Change |
 |---|---|
-| `sglang_omni_router/launcher/config.py` | `worker.config/model/service/patches` schema |
+| `sglang_omni_router/launcher/config.py` | `worker_defaults` and index/range-selected `workers` schema, capabilities, physical GPU identifiers, and patches |
 | `sglang_omni_router/launcher/local.py` | Generate patch files instead of concatenating `worker_extra_args` |
 | `sglang_omni_router/serve.py` | Worker source validation and structured launcher integration |
 
@@ -978,9 +1060,11 @@ V2 uses a phased migration. It does not require all configuration to be modified
 
 ## 13.1 Phase 0: Establish the Resolver Without Changing Default Behavior
 
+- First freeze an independent oracle by running the untouched latest-main V1 implementation at `2b45073c` and recording its final outputs: resolved Pipeline shape, factory kwargs, placement/process plans, worker specs, and user-controlled `ServerArgs` fields. These legacy goldens are captured before routing V1 through any new adapter or resolver;
+- Add read-only provenance reconstruction plus `config resolve/explain` around current behavior, without making the new resolver authoritative;
 - Introduce `ConfigPatch`, provenance, and `config resolve/explain`;
-- Current model defaults, V1 YAML, dotted CLI, and typed CLI all produce patches through compatibility adapters;
-- Use golden tests to lock down final resolved values and success/failure behavior;
+- In shadow mode, current model defaults, V1 YAML, dotted CLI, and typed CLI also produce patches through compatibility adapters, without replacing the V1 execution path;
+- Compare adapter/resolver output against the independent untouched-V1 oracle; V1-adapter-versus-V2-through-the-same-resolver equivalence is supplementary and cannot replace that oracle;
 - Runtime continues consuming the existing `PipelineConfig` shape;
 - Duplicate V1 sources newly discovered by the resolver initially record diagnostics without changing current success/failure outcomes;
 - V2 inputs in internal tests follow strict duplicate/overlap rules from the beginning.
@@ -997,6 +1081,7 @@ The goal of this phase is to first obtain a single merge engine, not immediately
 
 V2 documents may not contain V1 `stage_overrides`, `runtime_overrides`, or public `factory_args.server_args_overrides`.
 V1 inputs retain their current final-value semantics, but newly discovered duplicate sources produce warnings.
+A model is not eligible for V2 opt-in until all behavior-defining values hidden in its `factory_args` or factory defaults are represented by public or registered extension schema and round-trip through full export.
 
 ## 13.3 Phase 2: V2 by Default
 
@@ -1045,14 +1130,17 @@ Validation is divided into resolver and runtime planning layers. The former prov
 | path | Valid field, unknown field, private/derived field, stage name |
 | type | scalar, null, list, dict, enum, invalid coercion |
 | document structure | duplicate YAML key, full/partial mode, stage declaration, `stage_order` completeness |
-| precedence | defaults, profile, YAML, Router patch, CLI |
-| duplicates | same source, same layer, alias/canonical, parent/child |
+| precedence | defaults, profile, YAML, Router patch, CLI, source layer dominating selector specificity |
+| selectors | capability/role/stage/exclude matching, expansion, empty selection, concrete stage storage/export |
+| duplicates | same source/specificity, same layer, alias specificity, parent/child |
 | cross-layer subtree | higher-layer child overrides lower-layer parent, higher-layer parent replaces lower-layer subtree, whole-list replacement |
 | provenance | previous value, source, location, and deprecated marker for each override |
 | atomicity | No partial resolved config is produced if any patch fails |
 | frozen config | Assignment is prohibited after the resolver returns |
 | role | Unique role-to-stage resolution, unknown/unsupported role |
-| extension | Registered schema, unknown key, prohibition on overriding public namespace |
+| extension | Registered schema, unknown key, prohibition on overriding public namespace, full-export round trip of hidden defaults |
+| upstream args | exact pinned `ServerArgs` version/fingerprint, unknown fields, denylist, typed-field duplication, per-leaf provenance, final `ServerArgs` validation |
+| environment | `env_defaults`/stage `env` merge, inherited-environment non-override, derived `ResolvedProcessEnv`, external-read diagnostics |
 
 ## 14.2 CLI/YAML Equivalence
 
@@ -1079,7 +1167,7 @@ Select official examples:
 - Ming full-stages YAML;
 - TP and process isolation configurations.
 
-Run the V1 adapter and migrated V2 document separately, comparing:
+For each case, first capture the output of the untouched latest-main V1 implementation as an independent golden. Then compare both the V1 adapter and migrated V2 document against that oracle:
 
 - Stage topology and order;
 - placement/TP/process;
@@ -1097,6 +1185,8 @@ The following must be covered:
 
 - typed `mem_fraction_static` and old `server_args_overrides`;
 - global and per-role CLI;
+- broadcast alias, role alias, and explicit `--set` specificity, including shadowed provenance;
+- selector broadcast and concrete-stage override;
 - `--encoder-mem-reserve` and explicit fraction;
 - `tp_size` and GPU list;
 - generation role and thinker role targeting the same/different stages;
@@ -1116,7 +1206,7 @@ Verify:
 - Worker-only effective values enter only `WorkerRuntimeDerivation` and retain their sources;
 - Child processes do not resolve user configuration again;
 - Factory signature injection supplies only missing derived defaults;
-- Users cannot set `gpu_id`, cumulative process budget, NCCL port, or endpoint;
+- Users cannot set `gpu_id`, cumulative process budget, NCCL port, or a concrete endpoint, while `endpoints.base_path` remains configurable;
 - TP environment mapping matches current behavior;
 - Worker specs for the no-config/default model path match golden files;
 - `ServerArgs.override()` continues recording the source of worker-internal derived mutations.
@@ -1133,7 +1223,12 @@ Verify:
 - Router YAML path/type/role/extension failures occur before starting subprocesses;
 - GPUs continue to be passed through the environment;
 - Physical GPU assignment is correctly converted to worker-local logical GPU IDs;
-- Out-of-range logical GPUs and inconsistencies between TP and worker allocation fail before startup;
+- Index/range coverage, per-worker capabilities/patches, and selected-model/extension lookup are validated;
+- `worker_defaults` < per-worker entry shadowing retains provenance, while duplicates within each scope are rejected;
+- Repeated physical GPU sets across workers are preserved, including two workers sharing GPU `0`;
+- Integer-like, UUID, and MIG physical identifiers round-trip unchanged;
+- Out-of-range logical GPUs are checked against each actual visible set, and TP/allocation inconsistencies fail before startup;
+- Exclusive `num_gpus_per_worker` splitting is used only when explicit `gpus` are absent;
 - V1 `worker_extra_args` migration recognizes `--config`, typed aliases, and `--set`;
 - Arbitrary shell tokens that cannot be migrated safely fail explicitly and are not silently discarded.
 
@@ -1151,9 +1246,12 @@ Before entering the next Phase, all of the following must be satisfied:
 1. All official Pipeline and Router examples pass migration golden tests;
 2. Structured Router has completed at least one multi-worker E2E;
 3. Runtime no longer directly reads public compatibility fields;
-4. The warning/error matrix for the current Phase is fixed in CI;
-5. Usage of deprecated entry points has reached the migration threshold announced in advance by the project;
-6. Release notes specify the target version and removals for the next Phase.
+4. The warning/error and full compatibility matrices for the current Phase are fixed in CI;
+5. All official examples, documentation, tests, and CI invocations have migrated;
+6. Release notes have announced the removal for a predetermined `N` releases;
+7. Those `N` announced releases have shipped before advancing to the removal Phase.
+
+Repository state and release history are the decidable gates. Local or explicitly opt-in telemetry may diagnose remaining use, but no unobservable global deprecated-usage threshold can block or authorize a Phase transition.
 
 # 15. Release and Documentation
 

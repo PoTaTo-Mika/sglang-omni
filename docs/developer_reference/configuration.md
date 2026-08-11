@@ -7,14 +7,14 @@
 - 配置怎样从主进程传到 stage worker 和 SGLang；
 - 哪些值由用户设置，哪些值由 placement、process planner 或 worker 派生。
 
-字段和拓扑的逐项定义参见 [Config](./config.md)。本文描述的是配置如何进入这些字段并最终被运行时消费。结论基于当前 `sgl-omni serve`、Router 和对应单元测试，不覆盖 benchmark、CI 配置或模型内部 Hugging Face/Hydra 配置。
+字段和拓扑的逐项定义参见 [Config](./config.md)。本文描述的是配置如何进入这些字段并最终被运行时消费。结论核对到 `origin/main@2b45073c` 的 `sgl-omni serve`、Router 和对应单元测试，不覆盖 benchmark、CI 配置或模型内部 Hugging Face/Hydra 配置。
 
 ## 1. 总体心智模型
 
 配置不是一次 `CLI dict` 与 `YAML dict` 的简单合并。当前系统有三条相互衔接但 owner 不同的链路：
 
-1. **Pipeline 声明链路**：模型 Python 默认、Pipeline YAML、动态 dotted CLI 和专用 CLI 最终形成一个 `PipelineConfig`。
-2. **Worker 构造链路**：主进程把 `PipelineConfig` 编译为 placement、process topology 和可 pickle 的 worker spec；子进程再构造 factory kwargs、`ServerArgs` 和 `ModelConfig`。
+1. **Pipeline 声明链路**：模型 Python 默认、Pipeline YAML、动态 dotted CLI、专用 CLI 和配置中的环境默认值最终形成一个 `PipelineConfig`。
+2. **Worker 构造链路**：主进程把 `PipelineConfig` 编译为 placement、process topology、静态 factory kwargs 和可 pickle 的 worker spec；子进程导入 factory、补充签名相关的派生默认值，再构造 `ServerArgs` 和 `ModelConfig`。
 3. **Router 管理链路**：Router YAML 描述完整 worker 副本，Router 将其转换为多个 `sgl-omni serve` 命令和各自的环境变量。
 
 ```mermaid
@@ -24,9 +24,10 @@ flowchart LR
   DottedCli["dotted CLI"] --> PipelineConfig
   TypedCli["专用 typed CLI"] --> PipelineConfig
   PipelineConfig --> RuntimePlan["fusion / placement / topology / endpoints"]
-  RuntimePlan --> WorkerSpec[StageWorkerProcessSpec]
-  WorkerSpec --> FactoryArgs["子进程 factory kwargs"]
-  FactoryArgs --> ServerArgs[SGLang ServerArgs]
+  RuntimePlan --> FactoryArgs["主进程静态 factory kwargs"]
+  FactoryArgs --> WorkerSpec[StageWorkerProcessSpec]
+  WorkerSpec --> SignatureDefaults["子进程 signature defaults"]
+  SignatureDefaults --> ServerArgs[SGLang ServerArgs]
   ServerArgs --> ModelConfig[ModelConfig]
   RouterYaml["Router launcher YAML"] --> WorkerArgv["sgl-omni serve argv + env"]
   WorkerArgv --> PipelineYaml
@@ -84,13 +85,29 @@ config_cls: Qwen3OmniSpeechColocatedPipelineConfig
 model_path: Qwen/Qwen3-Omni-30B-A3B-Instruct
 
 stage_overrides:
+  image_encoder:
+    runtime:
+      resources:
+        total_gpu_memory_fraction: 0.025
+  audio_encoder:
+    runtime:
+      resources:
+        total_gpu_memory_fraction: 0.025
   thinker:
     runtime:
       resources:
         total_gpu_memory_fraction: 0.75
+  talker_ar:
+    runtime:
+      resources:
+        total_gpu_memory_fraction: 0.12
+  code2wav:
+    runtime:
+      resources:
+        total_gpu_memory_fraction: 0.02
 ```
 
-它不能设置 `gpu`、`process` 或 `factory_args`。这些字段应写入完整 `stages`，或使用对应 CLI。未知 stage、非 mapping 值、`runtime` 之外的 key 都会在加载时失败。
+它不能设置 `gpu`、`process` 或 `factory_args`。这些字段应写入完整 `stages`，或使用对应 CLI。未知 stage、非 mapping 值、`runtime` 之外的 key 都会在加载时失败。这个 colocated 配置必须为同 GPU 上的五个 GPU stage 全部提供预算；只设置 thinker 会触发 Qwen placement validation。
 
 `runtime_overrides` 则是兼容性更强的 per-stage factory 参数通道：
 
@@ -228,6 +245,9 @@ TP worker 还会在 spawn 周围由主进程临时设置：
 - `CUDA_VISIBLE_DEVICES`
 - `SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS=true`
 - `SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=false`
+- `SGLANG_OMNI_PLATFORM_SPEC`
+
+受影响 GPU 还会通过同一 worker env 路径补充 compatibility default，例如当前的 `FLASHINFER_USE_CUDA_NORM=1`。这些 derived/platform 变量与用户声明的 `env_defaults`/`StageConfig.env` 不是同一种 source。
 
 子进程因此只看到分配给本 rank 的设备，并把逻辑 `gpu_id` 规范化为本地设备 0。主进程在 `proc.start()` 后恢复自己的环境。
 
@@ -342,6 +362,7 @@ typed runtime 当前包括：
 - `model_path`
 - `gpu_id`
 - `total_gpu_memory_fraction`
+- `process_total_gpu_memory_fraction`
 
 仅当 factory 声明该参数且用户/前序合并尚未设置时才注入。这些是 fallback，不会覆盖显式 factory kwargs。
 
@@ -353,7 +374,8 @@ typed runtime 当前包括：
 | stage GPU | placement planner | `StageLaunchConfig.gpu_id` |
 | TP rank/size | stage config + runner | 每 rank spec |
 | NCCL port | 主进程 `_NcclPortAllocator` | factory arg |
-| IPC endpoints | runtime preparation | spec 中的字符串 |
+| IPC base path | `PipelineConfig.endpoints.base_path` | 用户配置随 Pipeline 进入 planner |
+| 具体 IPC socket endpoints | runtime preparation | spec 中的派生字符串 |
 | `total_gpu_memory_fraction` | typed stage resources | factory default |
 | cumulative process memory fraction | process 构造顺序 | `process_total_gpu_memory_fraction` factory default |
 | factory implementation | `StageConfig.factory` | dotted path，子进程 import |
@@ -434,7 +456,7 @@ Qwen colocated 示例只在 `stage_overrides.*.runtime.resources` 中声明物�
 
 ## 8. Router 的独立配置体系
 
-Router 不是 Pipeline 的另一种 YAML loader。它是独立 HTTP process，前置于多个完整 `sgl-omni serve` worker。
+Router 不是 Pipeline 的另一种 YAML loader。默认 `--router-processes=1` 时，它是一个独立 HTTP process，前置于多个完整 `sgl-omni serve` worker。`--router-processes>=2` 时，supervisor 复用同一 public listening socket 启动多个 data-plane process，并由独立 control-plane process 管理 registry、admin 和持久状态；对外 API 保持一致。
 
 ### 8.1 三种 worker source
 
@@ -461,16 +483,20 @@ Router worker 来源三选一：
 | `--max-payload-size` | `512 MiB` | Router request body 上限 |
 | `--max-connections` | auto | admission/pool 基准，默认 `128 × workers`，上限 4096 |
 | `--max-inflight` | `None` | 可选独立 admission cap；默认跟随 connections |
+| `--router-processes` | `1` | `1` 为单进程；`>=2` 启用 x86-64 Linux control-plane/data-plane split |
+| `--shutdown-drain-secs` | request timeout | multiprocess shutdown 等待 in-flight request 的时间 |
+| `--router-state-dir` | env/XDG/home | durable control-plane state 目录 |
 | `--health-failure-threshold` | `3` | 标记 unhealthy 前连续失败数 |
 | `--health-success-threshold` | `2` | 恢复 healthy 前连续成功数 |
 | `--health-check-timeout-secs` | `5` | 单次 health check 超时 |
 | `--health-check-interval-secs` | `10` | health check 间隔 |
 | `--health-check-endpoint` | `/health` | worker 健康端点 |
+| `--voice-owner-worker-url` | auto | 单进程模式 uploaded-voice owner；multiprocess 模式禁止 |
 | `--log-level` | `info` | Router/Uvicorn 日志；非法值当前回退为 `INFO` |
 | `--strict-limits` | `False` | nofile 不足时从 warning 改为启动失败 |
 | `--admin-api-key` | `None` | 直接传给 Router app，也可来自环境变量 |
 
-Router 自身的 host、port、policy、health 和连接参数只来自 CLI，不与 launcher YAML 合并。
+Router 自身的 host、port、policy、health、process count 和连接参数只来自 CLI，不与 launcher YAML 合并。multiprocess 模式下 `max_connections`/`max_inflight` 是全局 admission 与 shared upstream-pool 约束，并由 control/data plane 共同执行；不能按“每个独立 Uvicorn process 各有一份上限”理解。
 
 ### 8.3 Launcher YAML 到 worker argv
 
@@ -483,13 +509,15 @@ launcher:
   model_name: qwen3-omni
   num_workers: 2
   num_gpus_per_worker: 1
+  worker_gpu_ids: ["0", "0"]
+  worker_capabilities: [text, speech, audio_input, audio_output]
   worker_host: 127.0.0.1
   worker_base_port: 8011
   worker_extra_args: "--config examples/configs/qwen3_omni_colocated_h20.yaml --colocate"
   wait_timeout: 600
 ```
 
-`LocalLauncherConfig` 使用 `extra="forbid"`，校验 worker 数量、端口范围、GPU assignments 和 capabilities。每个 worker 的命令由 Router 重建：
+`LocalLauncherConfig` 使用 `extra="forbid"`，校验 worker 数量、端口范围、GPU assignments 和 capabilities。显式 `worker_gpu_ids` 必须与 worker 数量一致，但不同 worker 可以重复同一物理 GPU；上例表示两个 worker 都通过 `CUDA_VISIBLE_DEVICES=0` 使用 GPU 0。只有未提供该字段时，Router 才按 `num_workers * num_gpus_per_worker` 从可见设备中连续、互斥地自动切分。每个 worker 的命令由 Router 重建：
 
 ```text
 sgl-omni serve
