@@ -282,8 +282,6 @@ class StageControlPlane:
         AdminMessage
         | DataAckMessage
         | DataReadyMessage
-        | KVTransferPrepareMessage
-        | KVTransferReadyMessage
         | SubmitMessage
         | ShutdownMessage
         | ProfilerStartMessage
@@ -298,8 +296,6 @@ class StageControlPlane:
             (
                 DataReadyMessage,
                 DataAckMessage,
-                KVTransferPrepareMessage,
-                KVTransferReadyMessage,
                 SubmitMessage,
                 ShutdownMessage,
                 ProfilerStartMessage,
@@ -314,12 +310,7 @@ class StageControlPlane:
         self,
         next_stage: str,
         next_stage_endpoint: str,
-        msg: (
-            DataReadyMessage
-            | DataAckMessage
-            | KVTransferPrepareMessage
-            | KVTransferReadyMessage
-        ),
+        msg: DataReadyMessage | DataAckMessage,
     ) -> None:
         """Send a stage-to-stage control message."""
         await send_to_endpoint(self._next_stage_sockets, next_stage_endpoint, msg)
