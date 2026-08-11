@@ -7,6 +7,10 @@ runtime overrides. `StageConfig` describes one logical stage: how to construct
 it, where it runs, where its normal results go, and whether it participates in
 fan-in or streaming edges.
 
+This page is the schema and topology reference. For how Python defaults,
+Pipeline YAML, command-line overrides, Router launcher YAML, and worker runtime
+arguments compose, see [Configuration Sources and Argument Flow](./configuration.md).
+
 The config layer is intentionally static. It should make topology, placement,
 and stage construction visible before the runtime starts; request-time behavior
 belongs in stages, schedulers, model runners, and model-local payload logic.

@@ -19,6 +19,7 @@ HTTP API -> Client -> Coordinator -> Stage -> Scheduler -> ModelRunner -> model 
 | [Stage](./pipeline.md)            | Control-plane IO, relay IO, fan-in, stream routing, scheduler inbox/outbox bridging    |
 | [Scheduler](./pipeline.md)        | Per-stage execution loop and failure propagation to stage outbox                       |
 | [ModelRunner](./pipeline.md)      | AR forward preparation, model forward dispatch, output extraction                      |
+| [Configuration](./configuration.md) | CLI/YAML sources, precedence, runtime argument ownership, and Router worker configuration |
 | [Communication](./communication.md) | Control-plane messages and relay data transfer between stages                         |
 | [TTS Integration](./tts_model_integration.md) | Checklist and lifecycle rules for adding TTS model families                         |
 
