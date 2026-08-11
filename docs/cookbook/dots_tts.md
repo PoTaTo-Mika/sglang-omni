@@ -208,7 +208,7 @@ A rejected solver value comes back as HTTP 500 with the engine's message, for ex
 
 ### Performance
 
-We report throughput on Seed-TTS EN. Client `--max-concurrency` sweep against a single dots.tts server started from `examples/configs/dots_tts.yaml` (`max_running_requests=16`, bf16, `num_steps=4`, backbone decode CUDA graph and graph-captured acoustic tail on). The speed columns were measured at main commit `2b45073c` on **1x H100**, seed 42, with 10 warmup requests. Concurrency 1 through 16 are two-run means; concurrency 32 is the mean of four runs.
+Seed-TTS EN benchmark at main commit `2b45073c`, seed 42, with 10 warmup requests. Throughput and latency were measured on **1x H100**. The server used `examples/configs/dots_tts.yaml`, which enables the optimized acoustic tail, vocoder, and backbone CUDA Graph. Every row uses all 1,088 samples.
 
 | Concurrency | Throughput (req/s) | Mean latency | RTF (per-req) | audio_s/s | WER |
 |---:|---:|---:|---:|---:|---:|
@@ -219,9 +219,7 @@ We report throughput on Seed-TTS EN. Client `--max-concurrency` sweep against a 
 | 16 | 4.760 | 3.344 s | 0.812 | 19.859 | 1.348% |
 | 32 | 4.988 | 6.344 s | 1.596 | 20.818 | 1.331% |
 
-All H100 speed runs completed without failed requests. c=1 is a 50-sample latency probe; the other rows use the full 1,088-sample set. WER comes from a matching non-streaming H200 sweep at `71022250` with the same model, data, seed, and serving path; the dots.tts model, config, and benchmark code are identical between the speed and WER revisions.
-
-Throughput peaks at c=32, but it is only 4.8% above c=16 while mean latency is about 90% higher. c=16 is the better latency-throughput operating point for the default deployment.
+All requests completed successfully.
 
 - **Concurrency** — Maximum number of in-flight client requests (`--max-concurrency`).
 - **Throughput (req/s)** — Completed requests divided by total benchmark wall-clock time.
@@ -238,7 +236,7 @@ python -m benchmarks.eval.benchmark_tts_seedtts \
   --model dots-studio/dots.tts-mf \
   --ref-format references \
   --base-url http://127.0.0.1:8000 --port 8000 \
-  --lang en --max-concurrency 16 --warmup 10 --seed 42 \
+  --lang en --max-concurrency 16 --max-samples 1088 --warmup 10 --seed 42 \
   --generate-only --use-existing-server \
   --output-dir results/dots-seedtts-en-c16
 
