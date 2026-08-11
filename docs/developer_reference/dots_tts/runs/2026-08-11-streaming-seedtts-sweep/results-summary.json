@@ -124,6 +124,7 @@
   "raw_artifacts": {
     "status": "LOCAL_PERSISTENT_TRANSIENT",
     "c1_host_path": "/data04/jaxan/dots_seedtts_runs/dots-seedtts-stream-1444-20260811/hyper00/c1",
-    "resume_host_root": "/data04/jaxan/dots_seedtts_runs/dots-seedtts-stream-1444-20260811/resume-20260811-022527-944075000"
+    "resume_host_root": "/data04/jaxan/dots_seedtts_runs/dots-seedtts-stream-1444-20260811/resume-20260811-022527-944075000",
+    "task_containers_removed_after_verification": true
   }
 }

@@ -129,4 +129,8 @@ for both revisions.
   c=16 while latency and TTFP worsen sharply. Use c=8 as the default
   latency/throughput tradeoff; c=16 is only useful when maximizing aggregate
   throughput regardless of per-request latency.
+- Cleanup: after both hosts exited with code 0 and all summary/WER files were
+  revalidated on persistent storage, the two timestamp task containers and
+  their host map entries were removed. The raw results remain intact under the
+  paths recorded in `results-summary.json`.
 - Status: `COMPLETE`.
