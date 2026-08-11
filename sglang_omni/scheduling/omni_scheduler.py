@@ -40,6 +40,12 @@ from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.utils import broadcast_pyobj
 
 from sglang_omni.profiler.event_recorder import emit as _emit_event
+from sglang_omni.profiler.event_recorder import (
+    emit_model_path_end as _emit_model_path_end,
+)
+from sglang_omni.profiler.event_recorder import (
+    emit_model_path_start as _emit_model_path_start,
+)
 from sglang_omni.profiler.event_recorder import get_active_stage as _get_active_stage
 from sglang_omni.proto.admin import (
     ADMIN_CONTINUE_GENERATION,
@@ -53,6 +59,10 @@ from sglang_omni.proto.admin import (
     ADMIN_WEIGHTS_CHECKER,
 )
 from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
+from sglang_omni.scheduling.prefill_coalesce import (
+    validate_prefill_coalesce_requests,
+    validate_prefill_coalesce_wait_ms,
+)
 from sglang_omni.vendor.sglang.server_args import override_server_args
 
 logger = logging.getLogger(__name__)
@@ -185,6 +195,8 @@ class OmniScheduler:
         prefill_coalesce_requests: int = 0,
         prefill_coalesce_wait_ms: float = 60.0,
         prefill_coalesce_when_idle: bool = False,
+        prefill_coalesce_requires_pending_builds: bool = False,
+        prefill_coalesce_after_builds_during_decode: bool = False,
         request_build_max_workers: int = 1,
         request_build_max_pending: int | None = None,
         shutdown_callback: Callable[[], None] | None = None,
@@ -273,19 +285,27 @@ class OmniScheduler:
                 "requests"
             )
 
-        # Note: (maydomine) coalescing gate: hold prefill until K requests wait
-        # or the oldest has waited T ms; 0 disables.
-        if int(prefill_coalesce_requests) > 1 and int(server_args.tp_size) > 1:
+        # Note: (maydomine) Validate here as well as in the CLI because per-stage
+        # YAML reaches the scheduler through factory_args.
+        requests = validate_prefill_coalesce_requests(prefill_coalesce_requests)
+        wait_ms = validate_prefill_coalesce_wait_ms(prefill_coalesce_wait_ms)
+        if requests > 1 and int(server_args.tp_size) > 1:
             logger.warning(
                 "Prefill admission coalescing is disabled for "
                 f"tp_size={server_args.tp_size}: the wait deadline reads each "
                 "rank's local clock, so ranks could disagree on expiry and "
                 "break lockstep scheduling"
             )
-            prefill_coalesce_requests = 0
-        self.prefill_coalesce_requests = int(prefill_coalesce_requests)
-        self.prefill_coalesce_wait_s = float(prefill_coalesce_wait_ms) / 1e3
+            requests = 0
+        self.prefill_coalesce_requests = requests
+        self.prefill_coalesce_wait_s = wait_ms / 1e3
         self.prefill_coalesce_when_idle = bool(prefill_coalesce_when_idle)
+        self.prefill_coalesce_requires_pending_builds = bool(
+            prefill_coalesce_requires_pending_builds
+        )
+        self.prefill_coalesce_after_builds_during_decode = bool(
+            prefill_coalesce_after_builds_during_decode
+        )
 
         # Token / memory info (upstream reads from tp_worker.get_worker_info)
         mr = tp_worker.model_runner
@@ -483,6 +503,7 @@ class OmniScheduler:
         self._dirty_deferred_request_ids: set[str] = set()
         self._first_emit_done: set[str] = set()
         self._prefill_start_done: set[str] = set()
+        self._prefill_end_done: set[str] = set()
 
     def bind_model_runner(self, model_runner: Any) -> None:
         """Attach a custom runner and its SGLang execution-contract bridge.
@@ -887,6 +908,11 @@ class OmniScheduler:
         )
         return req_data
 
+    def _sleep_during_idle(self) -> None:
+        with self._request_admission_lock:
+            request_build_pending = bool(self._pending_request_builds)
+        time.sleep(0.0001 if request_build_pending else 0.001)
+
     def _stage_request_build_payloads(
         self, recv_reqs: list[Any]
     ) -> tuple[list[Any], list[Any]]:
@@ -1145,10 +1171,19 @@ class OmniScheduler:
         # so the coalesce hold-off returns an empty plan rather than None.
         if self.prefill_coalesce_requests <= 1 or self.chunked_req is not None:
             return _Upstream.get_new_batch_prefill(self, running_batch)
-        if not self.prefill_coalesce_when_idle and (
-            running_batch is None or running_batch.is_empty()
-        ):
+        decode_is_idle = running_batch is None or running_batch.is_empty()
+        if not self.prefill_coalesce_when_idle and decode_is_idle:
             return _Upstream.get_new_batch_prefill(self, running_batch)
+        if self.prefill_coalesce_requires_pending_builds:
+            with self._request_admission_lock:
+                build_work_pending = bool(
+                    self._pending_request_builds
+                    or self._backlogged_request_build_payloads
+                )
+            if not build_work_pending and not (
+                self.prefill_coalesce_after_builds_during_decode and not decode_is_idle
+            ):
+                return _Upstream.get_new_batch_prefill(self, running_batch)
         waiting = self.waiting_queue
         if not waiting or len(waiting) >= self.prefill_coalesce_requests:
             return _Upstream.get_new_batch_prefill(self, running_batch)
@@ -1188,6 +1223,7 @@ class OmniScheduler:
         batch.forward_iter = self.forward_ct
         sched_output = self._build_sched_output(batch)
         mr_output = self._model_runner.execute(sched_output)
+        self._emit_prefill_end_for_batch(batch)
         self._emit_stream_output(sched_output, mr_output)
         return self._make_batch_result(mr_output)
 
@@ -1303,6 +1339,7 @@ class OmniScheduler:
         logger.exception("OmniScheduler batch failed for requests=%s", request_ids)
         for req in reqs:
             self._emit_request_error(req.rid, error)
+            self._emit_model_path_end_once(req.rid, status="error")
             self.abort(req.rid, defer_running_cleanup=False)
 
     def _emit_prefill_start_for_batch(self, batch: ScheduleBatch) -> None:
@@ -1316,12 +1353,54 @@ class OmniScheduler:
             if rid in self._prefill_start_done:
                 continue
             self._prefill_start_done.add(rid)
+            _emit_model_path_start(rid)
             _emit_event(
                 request_id=rid,
                 stage=None,
                 event_name="scheduler_prefill_start",
                 metadata=metadata,
             )
+
+    def _emit_prefill_end_for_batch(self, batch: ScheduleBatch) -> None:
+        """Emit once after a request's first executed batch returns.
+
+        Paired with ``scheduler_prefill_start`` this frames the request's
+        first model forward — for multimodal models that is encoder plus
+        prefill — for streaming and non-streaming requests alike. The
+        metadata carries the realized batch size (issue #1324 Q-PR2).
+        """
+        # note (luojiaxuan): steady-state decode reaches here after every
+        # step. _prefill_end_done only ever holds rids present in
+        # _prefill_start_done and both are discarded together, so equal sizes
+        # mean every started request already emitted -- skip before building
+        # metadata or scanning the batch.
+        if len(self._prefill_end_done) == len(self._prefill_start_done):
+            return
+        metadata = {
+            "batch_size": len(batch.reqs),
+            "is_extend_in_batch": bool(batch.is_extend_in_batch),
+        }
+        for req in batch.reqs:
+            rid = req.rid
+            if rid in self._prefill_end_done or rid not in self._prefill_start_done:
+                continue
+            self._prefill_end_done.add(rid)
+            _emit_event(
+                request_id=rid,
+                stage=None,
+                event_name="scheduler_prefill_end",
+                metadata=metadata,
+            )
+
+    def _emit_model_path_end_once(self, request_id: str, *, status: str) -> None:
+        if request_id not in self._prefill_start_done:
+            return
+        self._prefill_start_done.discard(request_id)
+        _emit_model_path_end(request_id, status=status)
+
+    def _emit_remaining_model_path_ends(self, *, status: str) -> None:
+        for request_id in tuple(self._prefill_start_done):
+            self._emit_model_path_end_once(request_id, status=status)
 
     def stream_output(self, reqs, return_logprob=False, skip_req=None):
         """Intercept finished requests and emit to outbox.
@@ -1366,7 +1445,7 @@ class OmniScheduler:
                 # resurrect the request downstream.
                 self._run_abort_callback(rid)
                 self._first_emit_done.discard(rid)
-                self._prefill_start_done.discard(rid)
+                self._emit_model_path_end_once(rid, status="aborted")
                 _detach_request_data(req)
                 continue
 
@@ -1407,14 +1486,25 @@ class OmniScheduler:
                             terminal_error = exc
                 data.prefill_input_embeds = None
                 data.decode_input_embeds = None
+                # Note: (Jiaxin Deng) close the model-path interval before
+                # _close_completed_request, which discards the same rid that
+                # _emit_model_path_end_once dedups on. Emitting afterwards
+                # silently drops every terminal event on the success path.
+                self._emit_model_path_end_once(
+                    rid,
+                    status="error" if terminal_error is not None else "success",
+                )
                 abort_cleanup_needed = self._close_completed_request(req)
 
             if abort_cleanup_needed:
                 self._run_abort_callback(rid)
 
             if terminal_error is not None:
+                self._first_emit_done.discard(rid)
                 self._emit_request_error(rid, terminal_error)
                 continue
+
+            self._first_emit_done.discard(rid)
             self.outbox.put(
                 OutgoingMessage(
                     request_id=rid,
@@ -1457,6 +1547,7 @@ class OmniScheduler:
     def start(self) -> None:
         self._scheduler_thread_id = threading.get_ident()
         self._running = True
+        model_path_status = "error"
         try:
             if self.enable_async_decode:
                 self._event_loop_async_decode()
@@ -1464,7 +1555,9 @@ class OmniScheduler:
                 self._event_loop_overlap()
             else:
                 self._event_loop_normal()
+            model_path_status = "aborted"
         finally:
+            self._emit_remaining_model_path_ends(status=model_path_status)
             self._scheduler_thread_id = None
             try:
                 self._shutdown_request_build_executor()
@@ -1535,7 +1628,14 @@ class OmniScheduler:
         self._deferred_request_payloads.pop(request_id, None)
         self._dirty_deferred_request_ids.discard(request_id)
         self._first_emit_done.discard(request_id)
+        # Note: (Jiaxin Deng) emit before discarding, and discard whether or
+        # not the request is still in a running batch. A running abort that
+        # never reaches stream_output used to leave its rid here forever,
+        # which grew unbounded on a long-lived server and then swallowed a
+        # later prefill_start for the same id.
+        self._emit_model_path_end_once(request_id, status="aborted")
         self._prefill_start_done.discard(request_id)
+        self._prefill_end_done.discard(request_id)
         if not running_abort:
             self._release_immediate_request_resources(request_id)
             _remove_from_batch(self.running_batch, request_id)
@@ -2053,7 +2153,7 @@ class OmniScheduler:
                     self.process_batch_result(batch, result)
             else:
                 self.self_check_during_idle()
-                time.sleep(0.001)
+                self._sleep_during_idle()
 
             self.last_batch = batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
@@ -2346,7 +2446,7 @@ class OmniScheduler:
                         self.process_batch_result(batch, result)
                 else:
                     self.self_check_during_idle()
-                    time.sleep(0.001)
+                    self._sleep_during_idle()
 
             self.last_batch = batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
@@ -2399,6 +2499,7 @@ class OmniScheduler:
             abort_cleanup_needed = request_id in self._aborted_request_ids
         self._first_emit_done.discard(request_id)
         self._prefill_start_done.discard(request_id)
+        self._prefill_end_done.discard(request_id)
         return abort_cleanup_needed
 
     def _find_request_data(self, request_id: str) -> Any | None:

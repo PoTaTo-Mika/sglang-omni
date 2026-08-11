@@ -99,24 +99,40 @@ def launch_managed_router(
     wait_timeout: int = 900,
     startup_timeout: int | None = None,
     log_prefix: str = "omni_router_logs",
+    force_log: bool = False,
+    external_worker_urls: list[str] | None = None,
+    process_env: dict[str, str] | None = None,
 ) -> Iterator[ManagedRouterHandle]:
-    worker_base_port = _find_available_port_range(num_workers)
-    worker_ports = [worker_base_port + offset for offset in range(num_workers)]
+    if external_worker_urls is None:
+        worker_base_port = _find_available_port_range(num_workers)
+        worker_ports = [worker_base_port + offset for offset in range(num_workers)]
+        launcher_config = _write_launcher_config(
+            tmp_path_factory,
+            model_path=model_path,
+            model_name=model_name,
+            num_workers=num_workers,
+            num_gpus_per_worker=num_gpus_per_worker,
+            worker_base_port=worker_base_port,
+            worker_extra_args=worker_extra_args,
+            wait_timeout=wait_timeout,
+        )
+    else:
+        if len(external_worker_urls) != num_workers:
+            raise ValueError(
+                f"expected {num_workers} external workers, got "
+                f"{len(external_worker_urls)}"
+            )
+        worker_ports = [int(url.rsplit(":", 1)[-1]) for url in external_worker_urls]
+        launcher_config = None
     router_port = _find_available_port_excluding(worker_ports)
     cleanup_manifest = (
         tmp_path_factory.mktemp("omni_router_cleanup") / "router_pgids.txt"
     )
-    launcher_config = _write_launcher_config(
-        tmp_path_factory,
-        model_path=model_path,
-        model_name=model_name,
-        num_workers=num_workers,
-        num_gpus_per_worker=num_gpus_per_worker,
-        worker_base_port=worker_base_port,
-        worker_extra_args=worker_extra_args,
-        wait_timeout=wait_timeout,
+    router_log = (
+        tmp_path_factory.mktemp(log_prefix) / "server.log"
+        if force_log
+        else server_log_file(tmp_path_factory, log_prefix)
     )
-    router_log = server_log_file(tmp_path_factory, log_prefix)
     router_proc: subprocess.Popen | None = None
     handle: ManagedRouterHandle | None = None
 
@@ -130,25 +146,41 @@ def launch_managed_router(
             "0.0.0.0",
             "--port",
             str(router_port),
-            "--launcher-config",
-            str(launcher_config),
-            "--policy",
-            ROUTER_POLICY,
-            "--health-success-threshold",
-            "1",
-            "--health-failure-threshold",
-            "2",
-            "--health-check-interval-secs",
-            "2",
-            "--log-level",
-            "info",
         ]
+        if external_worker_urls is None:
+            router_cmd.extend(["--launcher-config", str(launcher_config)])
+        else:
+            router_cmd.extend(
+                ["--worker-urls", *external_worker_urls, "--model", model_name]
+            )
+        router_cmd.extend(
+            [
+                "--policy",
+                ROUTER_POLICY,
+                "--health-success-threshold",
+                "1",
+                "--health-failure-threshold",
+                "2",
+                "--health-check-interval-secs",
+                "2",
+                "--log-level",
+                "info",
+            ]
+        )
         router_proc = start_server_from_cmd(
             router_cmd,
             router_log,
             router_port,
-            timeout=startup_timeout or wait_timeout + 60,
-            env={ROUTER_CLEANUP_MANIFEST_ENV: str(cleanup_manifest)},
+            timeout=(
+                wait_timeout
+                if external_worker_urls is not None
+                else startup_timeout or wait_timeout + 60
+            ),
+            env={
+                **(process_env or {}),
+                ROUTER_CLEANUP_MANIFEST_ENV: str(cleanup_manifest),
+            },
+            tee=force_log,
         )
         _record_process_group(cleanup_manifest, os.getpgid(router_proc.pid))
         wait_for_all_router_workers(
