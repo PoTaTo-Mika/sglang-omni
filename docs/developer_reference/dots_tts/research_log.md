@@ -134,3 +134,73 @@ for both revisions.
   their host map entries were removed. The raw results remain intact under the
   paths recorded in `results-summary.json`.
 - Status: `COMPLETE`.
+
+## 2026-08-11 Non-Streaming SeedTTS Concurrency Sweep
+
+- Hypothesis: running the same current dots.tts deployment without `--stream`
+  should establish whether the high streaming RTF values came from streaming
+  semantics or from the current serving stack more generally.
+- Contract:
+  [contract.json](runs/2026-08-11-nonstreaming-seedtts-sweep/contract.json)
+- Allocation:
+  [rollout-plan.json](runs/2026-08-11-nonstreaming-seedtts-sweep/rollout-plan.json)
+- Canonical summary:
+  [results-summary.json](runs/2026-08-11-nonstreaming-seedtts-sweep/results-summary.json)
+- Execution: commit `71022250` on free H200 GPUs, selected from high to low.
+  Hyper00 used GPUs 7 and 5; hyper01 used GPUs 7 and 6. C=1 used the first 50
+  samples, and c=2,4,8,16,32 each used all 1,088 English samples. The server
+  used `examples/configs/dots_tts.yaml`, `max_running_requests=16`, seed 42,
+  and 10 warmup requests. No c=64 run was launched.
+- Failure: the first task containers used `jaxanluo/sglang-omni:dev`, whose
+  bundled SGLang checkout lacked `sglang.srt.platforms.cpu`. All shards exited
+  during import before any benchmark request. The failed logs remain under the
+  prior persistent run root. The retry used the current H200 profile image
+  `hongccc/sglang-omni:dev` with image id `374d0b1c30b2`; no failed-attempt data
+  was mixed into the summary.
+
+| Concurrency | Samples | Success | Request QPS | Audio s/s | Mean latency (s) | Mean RTF | Corpus WER |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 50 | 50/50 | 0.679 | 2.682 | 1.473 | 0.3818 | 1.241% |
+| 2 | 1,088 | 1,088/1,088 | 1.162 | 4.843 | 1.721 | 0.4200 | 1.256% |
+| 4 | 1,088 | 1,088/1,088 | 1.778 | 7.415 | 2.248 | 0.5471 | 1.264% |
+| 8 | 1,088 | 1,088/1,088 | 3.019 | 12.587 | 2.645 | 0.6462 | 1.323% |
+| 16 | 1,088 | 1,088/1,088 | 3.618 | 15.096 | 4.401 | 1.0704 | 1.348% |
+| 32 | 1,088 | 1,088/1,088 | 4.271 | 17.836 | 7.410 | 1.8638 | 1.331% |
+
+- Comparison: against the user-provided PR #1393 H100 table, request
+  throughput is lower by 23.3%, 22.9%, 24.8%, 22.5%, 20.4%, and 7.7% at
+  c=1,2,4,8,16,32 respectively. Mean RTF is higher by 31.7%, 30.4%, 33.8%,
+  30.0%, 26.5%, and 8.3%.
+- Serial check: a one-at-a-time rerun of c=1 on hyper00 GPU 7 measured 0.680
+  req/s, 1.472 s latency, and 0.3812 RTF, effectively identical to the first
+  sweep's 0.679 req/s, 1.473 s, and 0.3818. The c=2 continuation was interrupted
+  before completion and is excluded. This rules out concurrent benchmark
+  workers and host CPU pressure as the main cause of the c=1 gap.
+- Two-level check: a requested c=16/c=32 priority rerun on two hyper00 GPUs
+  measured 3.902/4.123 req/s, 4.080/7.675 s latency, and 0.9924/1.9343 RTF.
+  Relative to the first sweep, c=16 improved 7.9% while c=32 declined 3.5%, so
+  allocation/run variance exists but does not recover the historical H100
+  result. A subsequent c=4/c=8 pair was stopped before valid results and is
+  excluded.
+- Attribution: #1393's 4.64 req/s c=16 number was measured on H100. PR #1374,
+  opened from the same `525d41e3` base and merged eight minutes later, already
+  measured the H200 mixed-length SeedTTS c=16 baseline at 3.694 req/s. The
+  roughly 20% H100/H200 gap therefore predates #1438/#1439/#1440/#1441/#1444.
+  In addition, PR #1445's `2e607bc` H200 baseline predates all five low-fruit
+  PRs and measured non-streaming c=8 at 3.072 req/s; this sweep's 3.019 req/s is
+  only 1.7% lower, within the documented run-to-run noise range.
+- Smaller real issue: #1420 raised reference-encode `max_concurrency` to 8 while
+  shipping `max_batch_size: 1`; reference encode and vocoder still serialize on
+  one codec lock. #1434 measured the contention, and #1445's split-lock H200
+  A/B recovers 3.91% non-streaming throughput. This is a real but partial loss,
+  not an explanation for the apparent 20% regression. It also cannot explain
+  c=1, whose reference path has no concurrent request to contend with.
+- Decision: do not revert the low-fruit PRs based on this sweep. Treat the large
+  delta as a baseline mismatch. If a new benchmark is authorized, compare
+  pre-#1420, `2e607bc`, and current main sequentially on one H200 with the same
+  image and dataset slice. Without more testing, continue #1445 as the bounded
+  fix for the confirmed shared-lock cost.
+- Cleanup: all task containers created for the initial, serial, and priority
+  runs were removed after persistent outputs were checked. No other container
+  or process was touched.
+- Status: `COMPLETE`.
