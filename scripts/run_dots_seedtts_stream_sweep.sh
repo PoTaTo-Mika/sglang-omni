@@ -46,6 +46,7 @@ printf '%s\n' "${actual_commit}" >"${host_root}/git_commit.txt"
 nvidia-smi --query-gpu=index,uuid,name,memory.total,memory.used,utilization.gpu \
   --format=csv,noheader >"${host_root}/launch_nvidia_smi.csv"
 python -m pip install -e . --no-deps
+python -m pip install jiwer
 python -m benchmarks.dataset.prepare --dataset seedtts
 python -c 'from huggingface_hub import snapshot_download; snapshot_download("dots-studio/dots.tts-mf"); snapshot_download("Qwen/Qwen3-ASR-1.7B")'
 

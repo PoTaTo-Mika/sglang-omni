@@ -27,12 +27,12 @@
   "cuda_graph_max_bs": 16,
   "asr_model": "Qwen/Qwen3-ASR-1.7B",
   "workers": [
-    {"host": "hyper00", "gpu": 0, "port": 28763, "concurrency": 1, "samples": 50},
-    {"host": "hyper00", "gpu": 1, "port": 31847, "concurrency": 2, "samples": 1088},
-    {"host": "hyper00", "gpu": 2, "port": 35611, "concurrency": 4, "samples": 1088},
-    {"host": "hyper00", "gpu": 3, "port": 40127, "concurrency": 8, "samples": 1088},
-    {"host": "hyper01", "gpu": 0, "port": 43781, "concurrency": 16, "samples": 1088},
-    {"host": "hyper01", "gpu": 1, "port": 48619, "concurrency": 32, "samples": 1088}
+    {"host": "hyper00", "gpu": 7, "port": 28763, "concurrency": 1, "samples": 50},
+    {"host": "hyper00", "gpu": 6, "port": 31847, "concurrency": 2, "samples": 1088},
+    {"host": "hyper00", "gpu": 5, "port": 35611, "concurrency": 4, "samples": 1088},
+    {"host": "hyper00", "gpu": 4, "port": 40127, "concurrency": 8, "samples": 1088},
+    {"host": "hyper01", "gpu": 7, "port": 43781, "concurrency": 16, "samples": 1088},
+    {"host": "hyper01", "gpu": 6, "port": 48619, "concurrency": 32, "samples": 1088}
   ],
   "persistent_run_root": "/data/dots_seedtts_runs/dots-seedtts-stream-1444-20260811"
 }

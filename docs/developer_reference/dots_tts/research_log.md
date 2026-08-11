@@ -90,4 +90,7 @@ for both revisions.
   the bind-mounted checkout tripped Git's `safe.directory` ownership check.
   The launcher now scopes `safe.directory` to its three read-only Git commands;
   no benchmark request ran in the failed attempt.
+- Failure: the reused hyper01 image lacked the declared `jiwer` dependency, so
+  its first workers exited during module import. The launch script now installs
+  `jiwer` before starting workers; no request ran in that attempt.
 - Status: `RUNNING`.
