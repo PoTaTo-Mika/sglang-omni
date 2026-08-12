@@ -22,7 +22,7 @@ sgl-omni serve \
 
 ## Encoder CUDA Graph
 
-The encoder CUDA Graph is enabled by default for the pipeline. The final bucket set is resolved from the serving prefill budget and the checkpoint's encoder prefix length; with the default 4,096-token budget and 1,500-token Whisper encoder prefix, only batches 1 and 2 are captured. To use eager encoder execution, override the pipeline configuration:
+The encoder CUDA Graph is enabled by default for the pipeline. The final bucket set is resolved from the serving prefill budget and the checkpoint's encoder prefix length. The default prefill budget is **4,096** tokens (`4096 // 1500 = 2`), so LM-side encoder graph batches **1/2** are captured when the encoder still runs inside prefill. With the default pre-LM path, high-concurrency encoder batching uses `pre_lm_max_batch_size` instead. To use eager encoder execution, override the pipeline configuration:
 
 ```yaml
 config_cls: WhisperASRPipelineConfig
@@ -34,7 +34,23 @@ runtime_overrides:
     enable_encoder_cuda_graph: false
 ```
 
-The graph is captured after SGLang's generation graphs. Raise `max_prefill_tokens` before configuring larger buckets. Each request uses the smallest captured bucket that fits its batch. Requests larger than every captured bucket, with a different feature shape, or without a successful capture run eagerly. Startup and first-replay logs identify the captured and executed buckets.
+The graph is captured after SGLang's generation graphs. Raise `max_prefill_tokens` further before configuring larger buckets (12/16). Each request uses the smallest captured bucket that fits its batch. Requests larger than every captured bucket, with a different feature shape, or without a successful capture run eagerly. Startup and first-replay logs identify the captured and executed buckets.
+
+## Pre-LM Encoder (W-PR7)
+
+By default Whisper runs the audio encoder on a dedicated pre-LM worker thread/stream **before** LM admission (same pattern as Qwen3-ASR / Fun-ASR). Encoder hidden states are attached as `precomputed_embeddings`; the scheduler prefill only writes cross-attention KV and still requires **atomic** encoder-prefix admission (`chunked_prefill_size=0`).
+
+```yaml
+runtime_overrides:
+  asr:
+    enable_pre_lm_encoder: true   # default
+    pre_lm_max_batch_size: 8
+    pre_lm_cache_max_entries: 4096
+    pre_lm_cache_size_bytes: 2147483648
+    pre_lm_max_batch_wait_ms: 0
+```
+
+Disable with `enable_pre_lm_encoder: false` to fall back to encoder-inside-prefill. Warm repeats of the same audio hit the CPU LRU and skip mel + encode. Raise `max_prefill_tokens` via `server_args_overrides` only if you need larger LM-side encoder CUDA Graph buckets without pre-LM.
 
 ## Transcribe Audio
 
@@ -108,9 +124,15 @@ All 480 measured requests completed successfully. Corpus WER was unchanged acros
 
 - This path is experimental and not yet correctness-validated. Prefer Qwen3-ASR
   for validated ASR serving.
-- Encoder CUDA Graph is opt-in and requires SGLang generation CUDA Graph to be
-  enabled. Validate the selected buckets before production use.
-- Chunked prefill is disabled because the Whisper encoder prefix must be
+- Encoder CUDA Graph is enabled by default and requires SGLang generation CUDA
+  Graph. Validate the selected buckets before production use.
+- Prefill budget defaults to 4,096 tokens (`⌊4096/1500⌋=2`) under atomic
+  admission (`chunked_prefill_size=0`). Raise `max_prefill_tokens` via
+  `server_args_overrides` only when you need larger LM-side encoder CUDA Graph
+  buckets without pre-LM.
+- Pre-LM encoder is enabled by default (`pre_lm_max_batch_size=8`); set
+  `enable_pre_lm_encoder: false` to run the encoder inside prefill again.
+- Chunked prefill stays disabled because the Whisper encoder prefix must be
   admitted atomically. Requests that exceed the current prefill budget wait
   for the next batch instead of splitting the encoder prefix.
 - Use `response_format=json`; other response formats are not validated for this
