@@ -63,9 +63,7 @@ _PREFILL_COALESCE_SUPPORTED_MODELS = (
 _QWEN_PARTIAL_START_TALKER_FACTORY = (
     "sglang_omni.models.qwen3_omni.stages.create_talker_ar_executor_from_config"
 )
-_MING_TALKER_FACTORY = (
-    "sglang_omni.models.ming_omni.stages.create_talker_executor"
-)
+_MING_TALKER_FACTORY = "sglang_omni.models.ming_omni.stages.create_talker_executor"
 
 
 def launch_server(*args: object, **kwargs: object) -> object:

@@ -88,7 +88,9 @@ def _install_talker_executor_fake(
         async def get_result(self):
             return SimpleNamespace(request_id="req")
 
-    talker_module = ModuleType("sglang_omni.models.ming_omni.components.talker_executor")
+    talker_module = ModuleType(
+        "sglang_omni.models.ming_omni.components.talker_executor"
+    )
     talker_module.MingTalkerExecutor = FakeMingTalkerExecutor
     monkeypatch.setitem(
         sys.modules,
