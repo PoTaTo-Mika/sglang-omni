@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Locality classification and relay ownership for Omni communication."""
+
 from __future__ import annotations
 
+import logging
 from contextlib import suppress
 from typing import Any
 
@@ -10,6 +12,10 @@ import torch
 from sglang_omni.comm.data_ref import TransportKind
 from sglang_omni.platforms import current_platform
 from sglang_omni.relay.base import Relay, create_relay
+
+logger = logging.getLogger(__name__)
+
+_CUDA_IPC_FALLBACK_WARNED: set[tuple[str, str, int | None, int | None, str]] = set()
 
 
 class CommRouter:
@@ -53,6 +59,70 @@ class CommRouter:
         self.comm_config = dict(comm_config or {})
         self.injected_relay = injected_relay
         self._relays: dict[TransportKind, Relay] = {}
+        self._cuda_ipc_peer_cache: dict[str, bool] = {}
+
+    def _cuda_ipc_peer_available(self, target: str) -> bool:
+        """Return whether a GPU edge can use CUDA IPC peer copies."""
+        cached = self._cuda_ipc_peer_cache.get(target)
+        if cached is not None:
+            return cached
+        if target not in self.stage_gpu_ids:
+            return True
+        target_gpu_ids = self.stage_gpu_ids[target]
+        if not target_gpu_ids or self.placement_gpu_id is None:
+            return True
+
+        source_gpu = int(self.placement_gpu_id)
+        target_gpu = int(target_gpu_ids[0])
+        if source_gpu == target_gpu:
+            self._cuda_ipc_peer_cache[target] = True
+            return True
+
+        if self.gpu_id is None or int(self.gpu_id) != source_gpu:
+            self._warn_cuda_ipc_fallback(
+                target, source_gpu, target_gpu, "source process uses a remapped GPU"
+            )
+            self._cuda_ipc_peer_cache[target] = False
+            return False
+        try:
+            source_local = int(self.gpu_id)
+            target_local = target_gpu
+            if (
+                source_local >= torch.cuda.device_count()
+                or target_local >= torch.cuda.device_count()
+            ):
+                raise RuntimeError("GPU is outside this process's visible CUDA range")
+            available = bool(
+                torch.cuda.can_device_access_peer(target_local, source_local)
+            )
+        except Exception as exc:
+            self._warn_cuda_ipc_fallback(
+                target, source_gpu, target_gpu, f"peer query failed: {exc}"
+            )
+            self._cuda_ipc_peer_cache[target] = False
+            return False
+        if not available:
+            self._warn_cuda_ipc_fallback(
+                target, source_gpu, target_gpu, "peer access is unsupported"
+            )
+        self._cuda_ipc_peer_cache[target] = available
+        return available
+
+    def _warn_cuda_ipc_fallback(
+        self, target: str, source_gpu: int, target_gpu: int, reason: str
+    ) -> None:
+        key = (self.stage_name, target, source_gpu, target_gpu, reason)
+        if key in _CUDA_IPC_FALLBACK_WARNED:
+            return
+        _CUDA_IPC_FALLBACK_WARNED.add(key)
+        logger.warning(
+            "CommRouter: using SHM for CUDA edge %s(gpu=%d) -> %s(gpu=%d): %s",
+            self.stage_name,
+            source_gpu,
+            target,
+            target_gpu,
+            reason,
+        )
 
     @property
     def self_is_gpu(self) -> bool:
@@ -73,14 +143,11 @@ class CommRouter:
         return self._physical_outbound(target)
 
     def _physical_outbound(self, target: str) -> TransportKind:
-        # Invariant: anything not in remote_stage_names is assumed same-node, so a
-        # future placement pass MUST populate remote_stage_names for every
-        # cross-node edge -- otherwise a cross-node target silently falls through
-        # to cuda_ipc/shm here. A hard assertion needs the Phase-1 node config,
-        # which does not exist yet.
         if target in self.remote_stage_names:
             return TransportKind.MOONCAKE
         if self.self_is_gpu and target in self.gpu_stage_names:
+            if not self._cuda_ipc_peer_available(target):
+                return TransportKind.SHM
             return current_platform.get_intra_node_transport()
         return TransportKind.SHM
 
@@ -95,6 +162,8 @@ class CommRouter:
         if not data.is_cuda:
             return TransportKind.SHM
         if self.self_is_gpu and target in self.gpu_stage_names:
+            if not self._cuda_ipc_peer_available(target):
+                return TransportKind.SHM
             return current_platform.get_intra_node_transport()
         raise ValueError(
             f"cuda stream chunk cannot be sent from {self.stage_name!r} to "
@@ -147,6 +216,8 @@ class CommRouter:
             current_platform.device_type,
         }:
             if self.self_is_gpu and target in self.gpu_stage_names:
+                if not self._cuda_ipc_peer_available(target):
+                    return TransportKind.SHM
                 return current_platform.get_intra_node_transport()
             return TransportKind.SHM
         raise ValueError(f"mixed or unsupported tensor devices in payload: {devices}")
@@ -181,8 +252,7 @@ class CommRouter:
         if kind is TransportKind.CUDA_IPC:
             if self.gpu_id is None:
                 raise ValueError(
-                    f"cuda_ipc relay requested for non-GPU stage "
-                    f"{self.stage_name!r}"
+                    f"cuda_ipc relay requested for non-GPU stage {self.stage_name!r}"
                 )
             return create_relay(
                 "cuda_ipc",

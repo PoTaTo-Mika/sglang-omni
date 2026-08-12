@@ -47,3 +47,4 @@ benchmarks/eval/*.edit.lock
 asr_seedtts_results.json
 .claude/*
 !.claude/skills/
+/core

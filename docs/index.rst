@@ -98,6 +98,7 @@ Supported Models
    cookbook/moss_tts.md
    cookbook/moss_tts_local.md
    cookbook/dots_tts.md
+   cookbook/minimax_music3.md
    cookbook/zonos2.md
    cookbook/qwen3_asr.md
    cookbook/fun_asr.md
