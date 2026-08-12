@@ -48,3 +48,7 @@ asr_seedtts_results.json
 .claude/*
 !.claude/skills/
 /core
+
+/task.md
+/test_minimax_music3.py
+/test_minimax_music3_acoustic.py

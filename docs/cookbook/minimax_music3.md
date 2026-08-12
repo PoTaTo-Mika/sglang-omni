@@ -21,7 +21,7 @@ It is not a TTS model with a music voice. Generation runs in two stages. A Qwen3
 
 Install `sglang-omni` by following [Installation](../get_started/installation.md). From a checkout, `uv pip install .` is enough. No pipeline config file is required.
 
-The topology follows the GPUs the process can see: one visible device colocates both stages with a BF16 acoustic stage; two or more put DIT/DAV on the second device in FP32.
+The topology follows the GPUs the process can see: one visible device colocates both stages, two or more put DIT/DAV on the second device. Only the placement differs — both layouts run the acoustic stage in FP32, so a single card gives up throughput but not audio quality.
 
 **Single GPU** (colocate both stages):
 
