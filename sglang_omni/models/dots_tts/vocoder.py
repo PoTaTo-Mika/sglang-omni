@@ -177,7 +177,9 @@ class DotsTTSStreamingVocoder(
         self.stream_slots = int(stream_slots)
         self._batch_vocoder = DotsTTSBatchVocoder(codec)
         self._slot_pool = slot_pool
-        self._stream_chunk_batch_max = self.stream_slots
+        # note (guozhihao-224): coalesce width follows max_batch_size only;
+        # stream_slots is admission capacity and must not redefine the batch cap.
+        self._stream_chunk_batch_max = int(max_batch_size)
         super().__init__(
             self._batch_vocoder.decode_payload,
             batch_compute_fn=self._batch_vocoder.decode_payloads,
@@ -187,6 +189,11 @@ class DotsTTSStreamingVocoder(
             stream_source_hint="dots.tts",
             stream_input_modality="audio_latents",
         )
+
+    def ensure_slot_pool(self) -> DotsVocoderSlotPool:
+        """Allocate the slot pool at executor setup (not the first live chunk)."""
+        with self.codec.lock:
+            return self._get_or_create_pool_locked()
 
     def validate_non_streaming_payload(self, payload: StagePayload) -> None:
         _state, latents = self._batch_vocoder.prepare_item(payload)
@@ -308,12 +315,13 @@ class DotsTTSStreamingVocoder(
         if not slotted:
             return []
         # note (guozhihao-224): exact-T groups only; padding would change AudioVAE
-        # convolution boundaries.
+        # convolution boundaries. Cap with max_batch_size so one pool.step does
+        # not grow to stream_slots under high concurrency.
         by_frames: dict[int, list[tuple[str, _DotsStreamState]]] = {}
         for entry in slotted:
             frames = self._step_frames(entry[1])
             by_frames.setdefault(frames, []).append(entry)
-        return max(by_frames.values(), key=len)
+        return max(by_frames.values(), key=len)[: self._stream_chunk_batch_max]
 
     def build_step_plan(
         self, participants: list[tuple[str, _DotsStreamState]]

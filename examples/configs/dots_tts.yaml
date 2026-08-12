@@ -19,6 +19,5 @@ runtime_overrides:
       cuda_graph_max_bs: 16
   vocoder:
     optimize: true
-    stream_slots: 16
     max_batch_size: 4
     max_batch_wait_ms: 2

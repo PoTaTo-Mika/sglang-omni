@@ -137,7 +137,8 @@ def test_slot_pool_batches_equal_t_and_preserves_independent_counters() -> None:
     older = torch.ones(1, 3, 5)
     newer = torch.full((1, 3, 5), 2.0)
 
-    # Age s0 alone so total_frames diverge before the shared step.
+    # note (guozhihao-224): age s0 alone so total_frames diverge before the
+    # shared step.
     pool.step({s0: older})
     assert inference.batch_steps == [(1, 3)]
 
@@ -166,10 +167,12 @@ def test_streaming_coalesces_equal_t_requests_into_one_pool_step() -> None:
         _codec(),
         optimize=True,
         merge_steps=2,
+        max_batch_size=4,
         stream_slots=4,
         slot_pool=pool,
     )
     assert vocoder._can_batch_stream_chunks is True
+    assert vocoder._stream_chunk_batch_max == 4
 
     for request_id in ("a", "b"):
         state = vocoder.create_stream_state(request_id)
@@ -188,6 +191,46 @@ def test_streaming_coalesces_equal_t_requests_into_one_pool_step() -> None:
     assert set(decoded) == {"a", "b"}
 
 
+def test_select_step_participants_respects_max_batch_size() -> None:
+    pool = _RecordingSlotPool(num_slots=8)
+    vocoder = DotsTTSStreamingVocoder(
+        _codec(),
+        optimize=True,
+        merge_steps=2,
+        max_batch_size=2,
+        stream_slots=8,
+        slot_pool=pool,
+    )
+    assert vocoder._stream_chunk_batch_max == 2
+
+    for request_id in ("a", "b", "c", "d"):
+        state = vocoder.create_stream_state(request_id)
+        vocoder._stream_states[request_id] = state
+        vocoder.ingest(request_id, state, _patch(float(ord(request_id))))
+
+    participants = vocoder.select_step_participants()
+    assert len(participants) == 2
+    plan = vocoder.build_step_plan(participants)
+    vocoder.run_step(participants, plan)
+    assert len(pool.steps[0]) == 2
+
+    # note (guozhihao-224): pump drains the backlog across capped steps.
+    remaining = vocoder.select_step_participants()
+    assert len(remaining) == 2
+
+
+def test_stream_chunk_batch_cap_follows_max_batch_size_not_slots() -> None:
+    vocoder = DotsTTSStreamingVocoder(
+        _codec(),
+        optimize=True,
+        max_batch_size=8,
+        stream_slots=1,
+        slot_pool=_RecordingSlotPool(num_slots=1),
+    )
+    assert vocoder._stream_chunk_batch_max == 8
+    assert vocoder.stream_slots == 1
+
+
 def test_streaming_groups_by_exact_frame_count() -> None:
     pool = _RecordingSlotPool()
     vocoder = DotsTTSStreamingVocoder(
@@ -203,7 +246,8 @@ def test_streaming_groups_by_exact_frame_count() -> None:
     vocoder._stream_states["steady"] = steady
 
     vocoder.ingest("early", early, _patch(1.0))
-    # Past the first-two-patch fast path so take_patches diverges from early.
+    # note (guozhihao-224): past the first-two-patch fast path so take_patches
+    # diverges from early.
     steady.received_patches = 3
     steady.pending = [_patch(2.0), _patch(3.0)]
     steady.slot = pool.acquire()

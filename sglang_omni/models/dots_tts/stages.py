@@ -434,13 +434,18 @@ def create_vocoder_executor(
         max_batch_wait_ms=max_batch_wait_ms,
         stream_slots=stream_slots,
     )
+    # note (guozhihao-224): allocate the slot pool at setup so OOM / shape
+    # mismatch surface before readiness, not on the first live chunk.
+    vocoder.ensure_slot_pool()
     logging.getLogger(__name__).info(
         "dots.tts vocoder backend: slot-pooled eager streaming "
-        "(optimize=%s, merge_steps=%d, stream_slots=%d, batch_size=%d, wait_ms=%d)",
+        "(optimize=%s, merge_steps=%d, stream_slots=%d, batch_size=%d, "
+        "stream_batch_cap=%d, wait_ms=%d)",
         optimize,
         vocoder.merge_steps,
         vocoder.stream_slots,
         max_batch_size,
+        vocoder._stream_chunk_batch_max,
         max_batch_wait_ms,
     )
     return vocoder
