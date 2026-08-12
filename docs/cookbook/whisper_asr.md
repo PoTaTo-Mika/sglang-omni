@@ -163,8 +163,17 @@ done
 ```
 
 Standalone async-decode A/B (without pre-LM) previously showed only a small
-c1 gain and regressions at high concurrency; re-run the recipe above on top of
-pre-LM before treating async as a default win.
+c1 gain and regressions at high concurrency. Stacked on pre-LM (same SeedTTS
+EN 20-clip setup, H200, `openai/whisper-base`, FP16), async lookahead
+(`min_batch_size=1`) improved throughput at every measured concurrency with
+unchanged corpus WER `0.0415`:
+
+| Concurrency | Sync+preLM req/s | Async+preLM req/s | Throughput gain | Sync mean latency (s) | Async mean latency (s) |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 22.627 | 24.431 | +8.0% | 0.044 | 0.041 |
+| 2 | 40.258 | 43.586 | +8.3% | 0.049 | 0.046 |
+| 4 | 62.413 | 66.391 | +6.4% | 0.063 | 0.060 |
+| 8 | 81.039 | 86.206 | +6.4% | 0.094 | 0.087 |
 
 ## Known Limitations
 
