@@ -36,6 +36,8 @@ def test_whisper_encoder_cuda_graph_is_opt_in() -> None:
         signature.parameters["prefill_coalesce_after_builds_during_decode"].default
         is False
     )
+    assert signature.parameters["enable_pre_lm_encoder"].default is True
+    assert signature.parameters["pre_lm_max_batch_size"].default == 8
 
 
 def test_whisper_encoder_cuda_graph_setup_is_ordered_after_generation_graphs() -> None:
@@ -143,6 +145,25 @@ def test_whisper_prefill_coalescing_defaults_are_forwarded() -> None:
     }
 
 
+def test_whisper_rejects_invalid_pre_lm_batch_knobs() -> None:
+    from sglang_omni.models.whisper_asr.engine_builder import WhisperASREngineBuilder
+
+    with pytest.raises(ValueError, match="pre_lm_max_batch_size must be >= 1"):
+        WhisperASREngineBuilder(
+            max_running_requests=4,
+            max_new_tokens=32,
+            mem_fraction_static=0.2,
+            pre_lm_max_batch_size=0,
+        )
+    with pytest.raises(ValueError, match="pre_lm_max_batch_wait_ms must be >= 0"):
+        WhisperASREngineBuilder(
+            max_running_requests=4,
+            max_new_tokens=32,
+            mem_fraction_static=0.2,
+            pre_lm_max_batch_wait_ms=-1,
+        )
+
+
 def test_whisper_asr_config_uses_single_batched_stage() -> None:
     config = WhisperASRPipelineConfig(model_path="openai/whisper-large-v3")
 
@@ -166,6 +187,12 @@ def test_whisper_asr_config_uses_single_batched_stage() -> None:
         config.stages[0].factory_args["prefill_coalesce_after_builds_during_decode"]
         is False
     )
+    assert config.stages[0].factory_args["enable_pre_lm_encoder"] is True
+    assert config.stages[0].factory_args["pre_lm_cache_max_entries"] == 4096
+    assert config.stages[0].factory_args["pre_lm_cache_size_bytes"] == 2 * 1024**3
+    assert config.stages[0].factory_args["pre_lm_max_batch_size"] == 8
+    assert config.stages[0].factory_args["pre_lm_max_batch_wait_ms"] == 0
+    assert "max_prefill_tokens" not in config.stages[0].factory_args
     assert (
         PIPELINE_CONFIG_REGISTRY.get_config("WhisperForConditionalGeneration")
         is WhisperASRPipelineConfig
@@ -252,10 +279,13 @@ def test_whisper_asr_threads_explicit_cuda_graph_bs(monkeypatch) -> None:
         _fake_create_infrastructure,
     )
 
-    whisper_asr_stages.create_sglang_whisper_asr_executor("dummy")
+    whisper_asr_stages.create_sglang_whisper_asr_executor(
+        "dummy", enable_pre_lm_encoder=False
+    )
 
     assert build_kwargs["cuda_graph_max_bs"] == 16
     assert build_kwargs["cuda_graph_bs"] == [1, 2, 4, 8, 12, 16]
     # note (jiannan-17): context_length = encoder_token_count + max_prev_tokens + max_new_tokens + 8
     assert build_kwargs["context_length"] == 1500 + 224 + 256 + 8
     assert build_kwargs["chunked_prefill_size"] == 0
+    assert build_kwargs["max_prefill_tokens"] == 4096
