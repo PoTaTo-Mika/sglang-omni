@@ -708,6 +708,13 @@
 <span class="w">  </span>--mem-fraction-static<span class="w"> </span><span class="m">0</span>.80
 </pre></div>
 </div>
+<p>MOSS-TD briefly holds newly built LM requests to admit larger prefills. The
+default target is 4 requests with a 12 ms oldest-request deadline. While more
+request builds are pending, the scheduler waits for either limit; after build
+work drains, it releases immediately only when decode is idle. During active
+decode, it continues coalescing until the target or deadline. Override the two
+limits with <code class="docutils literal notranslate"><span class="pre">--prefill-coalesce-requests</span></code> and <code class="docutils literal notranslate"><span class="pre">--prefill-coalesce-wait-ms</span></code>, or
+set the request target to <code class="docutils literal notranslate"><span class="pre">0</span></code> to disable coalescing.</p>
 </section>
 <section id="sending-requests">
 <h3>Sending Requests<a class="headerlink" href="#sending-requests" title="Link to this heading">#</a></h3>
