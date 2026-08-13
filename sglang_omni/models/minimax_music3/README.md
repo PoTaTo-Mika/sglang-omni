@@ -11,8 +11,16 @@ CUDA_VISIBLE_DEVICES=0 sgl-omni serve --model-path MiniMaxAI/MiniMax-Music3 --po
 CUDA_VISIBLE_DEVICES=0,1 sgl-omni serve --model-path MiniMaxAI/MiniMax-Music3 --port 8000
 ```
 
-One visible device colocates both stages in BF16; two or more put DIT/DAV on
-the second in FP32. Defaults that are on without further flags: backbone decode
+Install from a checkout with `uv pip uninstall -y flashinfer-cubin && uv pip install -e .`.
+MiniMax Music 3's DIT imports `sglang.multimodal_gen`; those packages are pinned
+in `pyproject.toml`. A leftover `flashinfer-cubin` wheel cannot match
+`flashinfer-python==0.6.14` (no cubin 0.6.14 exists on PyPI) and will fail the
+import. See [the cookbook](../../../docs/cookbook/minimax_music3.md)
+for the full request contract.
+
+One visible device colocates both stages; two or more put DIT/DAV on the
+second. Only the placement differs — both layouts run the acoustic stage
+in FP32. Defaults that are on without further flags: backbone decode
 CUDA graph, RVQ depth CUDA graph, compiled DIT blocks, compiled DAV decoder,
 and batched seeded sampling.
 

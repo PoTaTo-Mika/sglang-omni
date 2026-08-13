@@ -26,6 +26,7 @@ seedtts_testset/
 .pytest_cache/
 .coverage
 htmlcov/
+*.wav
 
 # Logs
 *.log

@@ -19,9 +19,17 @@ It is not a TTS model with a music voice. Generation runs in two stages. A Qwen3
 
 ## Prerequisites
 
-Install `sglang-omni` by following [Installation](../get_started/installation.md). From a checkout, `uv pip install .` is enough. No pipeline config file is required.
+Install `sglang-omni` from source as in [Installation](../get_started/installation.md).
 
-The topology follows the GPUs the process can see: one visible device colocates both stages, two or more put DIT/DAV on the second device. Only the placement differs — both layouts run the acoustic stage in FP32, so a single card gives up throughput but not audio quality.
+```bash
+git clone git@github.com:sgl-project/sglang-omni.git
+cd sglang-omni
+
+uv venv .venv -p 3.12
+source .venv/bin/activate
+
+uv pip install -v -e .   # drop -e for a non-editable install
+```
 
 **Single GPU** (colocate both stages):
 
@@ -73,7 +81,7 @@ curl -X POST http://localhost:8000/v1/audio/speech \
   <source src="https://github.com/user-attachments/files/30964122/song_1.wav" type="audio/wav">
 </audio>
 
-`max_new_tokens` counts audio frames at 25 frames per second, so 750 frames is **at most** 30 seconds. It is a cap, not a target: the model ends the song itself when it emits the audio-end token. The request above typically fills the cap (~30 seconds, `finish_reason="length"`). Raise the cap when you want room for an earlier natural ending; a response that stops short of the cap is the model finishing, not a truncation.
+`max_new_tokens` counts audio frames at 25 frames per second, so 750 frames is **at most** 30 seconds. It is a cap, not a target: the model ends the song itself when it emits the audio-end token. The request above typically fills the cap (~30 seconds). Raise the cap when you want room for an earlier natural ending; a response that stops short of the cap is the model finishing, not a truncation.
 
 The response body is a 32 kHz stereo WAV.
 
@@ -204,7 +212,7 @@ curl -X POST http://localhost:8000/v1/audio/speech \
   <source src="https://github.com/user-attachments/files/30964363/ambient_1.wav" type="audio/wav">
 </audio>
 
-250 frames caps the clip at 10 seconds, which is the fastest way to audition a caption before committing to a full-length render. Short caps are usually reached rather than ended early, so these come back at the full length with `finish_reason="length"`.
+250 frames caps the clip at 10 seconds, which is the fastest way to audition a caption before committing to a full-length render. Short caps are usually reached rather than ended early, so these come back at the full length.
 
 ### Reproducibility and variations
 
@@ -247,7 +255,7 @@ Omitting `seed` uses `0`, which is still deterministic — it is a fixed seed, n
 
 Five captions across five genres, rendered on a single H200 with the defaults this page documents and nothing else set. Each request is given in full, so pasting one back reproduces its clip.
 
-Four of the five fill the 750-frame cap at 30.0 seconds. The J-pop one stops itself at 26.2 seconds, which is `max_new_tokens` behaving as a cap rather than a target — the model ended the song and reported `finish_reason="stop"`.
+Four of the five fill the 750-frame cap at 30.0 seconds. The J-pop one stops itself at 26.2 seconds, which is `max_new_tokens` behaving as a cap rather than a target — the model ended the song.
 
 **Lo-fi hip-hop**
 
@@ -370,7 +378,7 @@ EOF
 </audio>
 
 
-## Engineer guidance
+## Guidance
 
 Both stages run classifier-free guidance, and neither is optional. There is no request field and no serve flag for it: the scale, the mask width and the solver's own scale are fixed in the model, because this is how the reference implementation samples this checkpoint, and dropping guidance makes the model follow your caption and lyrics noticeably less closely.
 
@@ -381,7 +389,7 @@ The two halves are separate mechanisms that happen to share a name:
 
 The consequence you have to plan for is on the AR side: **one request occupies two rows in the engine, not one.** Both rows hold their own KV cache for the whole song, so a request costs twice the KV it would unguided. The visible follow-on is in [Concurrency](#concurrency).
 
-What it does *not* change is the request contract or where the randomness comes from: the guided draw is still keyed by the same per-request seed and frame position, so seeding behaves as described above, and `finish_reason` still reports where the song ended. Guidance does shift *which* codes get drawn, so audio from a build without it is not comparable take-for-take — expect a different arrangement and a different length from the same seed, not a cleaned-up version of the same song.
+What it does *not* change is the request contract or where the randomness comes from: the guided draw is still keyed by the same per-request seed and frame position, so seeding behaves as described above. Guidance does shift *which* codes get drawn, so audio from a build without it is not comparable take-for-take — expect a different arrangement and a different length from the same seed, not a cleaned-up version of the same song.
 
 ## Concurrency
 
@@ -446,7 +454,7 @@ That flatness is also why guidance is cheap in time and expensive in memory. The
 | `response_format` | string | `"wav"` | Output container |
 | `stream` | bool | `false` | Must be `false`; this model's external API is non-streaming |
 
-Reaching the cap returns the audio generated so far with `finish_reason="length"`. Ending on the audio-end token instead reports `finish_reason="stop"`.
+Reaching the cap returns the audio generated so far. Ending on the audio-end token stops the song early.
 
 ## Parameters That The Model Rejects
 

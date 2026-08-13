@@ -112,14 +112,14 @@ class MiniMaxMusic3PipelineConfig(PipelineConfig):
 
 
 class MiniMaxMusic3SingleGPUPipelineConfig(MiniMaxMusic3PipelineConfig):
-    """Both stages on one GPU with BF16 DIT/DAV, whatever the machine has."""
+    """Both stages on one GPU. Acoustic DIT/DAV is FP32, same as dual-GPU."""
 
     placement: PlacementConfig = Field(default_factory=_colocated_placement)
     stages: list[StageConfig] = Field(default_factory=_colocated_stages)
 
 
 class MiniMaxMusic3DualGPUPipelineConfig(MiniMaxMusic3PipelineConfig):
-    """DIT/DAV on a second GPU in FP32, whatever the machine has."""
+    """DIT/DAV on a second GPU. Acoustic DIT/DAV is FP32, same as single-GPU."""
 
     placement: PlacementConfig = Field(default_factory=PlacementConfig)
     stages: list[StageConfig] = Field(default_factory=_two_gpu_stages)
