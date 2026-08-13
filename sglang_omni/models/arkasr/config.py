@@ -27,8 +27,19 @@ class ArkasrPipelineConfig(PipelineConfig):
                 "max_running_requests": 32,
                 "encoder_max_batch_size": 8,
                 "max_new_tokens": 256,
-                "request_build_max_workers": 2,
-                "request_build_max_pending": 16,
+                # encode_item blocks its request-build worker until the
+                # embedding is attached, so the encoder only ever sees as many
+                # concurrent items as there are build workers; two workers
+                # would cap pre-LM encode groups at two (Qwen3-ASR #1341).
+                "request_build_max_workers": 8,
+                "request_build_max_pending": 32,
+                "enable_pre_lm_encoder": True,
+                "pre_lm_cache_max_entries": 4096,
+                "pre_lm_cache_size_bytes": 2 * 1024**3,
+                # one drained group maps to exactly one encoder microbatch at
+                # the matching encoder_max_batch_size default.
+                "pre_lm_max_batch_size": 8,
+                "pre_lm_max_batch_wait_ms": 0,
             },
             gpu=0,
             terminal=True,
