@@ -48,12 +48,6 @@ def _stages(*, acoustic_gpu: int) -> list[StageConfig]:
             process="minimax_music3_dit_dav",
             factory=f"{_PKG}.stages.create_dit_dav_executor",
             factory_args={
-                # note (chenyang): float32 whichever layout runs. The DIT is a
-                # 30-step Euler solve and a 7-bit mantissa does not survive it:
-                # bfloat16 measures 6.88 LTAS L1 and 9.3 dB of loudness from the
-                # d6169737 baseline, which is audible as heavy digital noise,
-                # against float32's 0.02. The decoder enables TF32 matmuls for
-                # this dtype, so the accuracy costs a fraction of plain float32.
                 "dtype": "float32",
                 "dit_steps": DEFAULT_DIT_STEPS,
                 "dit_cfg_scale": DEFAULT_DIT_CFG_SCALE,
