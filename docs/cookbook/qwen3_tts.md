@@ -88,11 +88,11 @@ Two SGLang generation-stage knobs bound how the server behaves past saturation:
 | `--max-running-requests` | Concurrent running slots | `16` |
 | `--max-queued-requests` | Waiting-queue depth before fast-reject | `16` |
 
-Every request enters the waiting queue before it can run, so
-`--max-queued-requests` must be **≥ 1**. Rough capacity is about
-`max_running_requests + max_queued_requests`. Additional arrivals are rejected
-immediately with HTTP **503** and message `The request queue is full.` instead
-of being admitted into an unbounded FIFO that blows up TTFA.
+Every request enters the waiting queue first, so `--max-queued-requests`
+must be **≥ 1**. Capacity is about `running + queued`. Extra arrivals get
+HTTP **503** (`The request queue is full.`) before preprocessing, or later
+if the AR waiting queue or request-build backlog is full. Qwen3-TTS
+defaults to 4 request-build workers with pending depth 16.
 
 Raising `--max-running-requests` does **not** automatically raise the waiting
 bound. For a ceiling-32 experiment:
@@ -106,8 +106,10 @@ sgl-omni serve \
   --port 8000
 ```
 
-For realtime serving keep `max_queued_requests` ≤ `max_running_requests` unless
-you intentionally want a longer buffered spike. Sweep past the ceiling with:
+Stepped `--concurrencies` is a closed-loop client: it never holds more than
+N in-flight requests, so past-ceiling load is a burst that drains. Keep
+offered load above `max_running_requests + max_queued_requests` for a
+duration with open-loop sustained overshoot:
 
 ```bash
 python -m benchmarks.eval.benchmark_tts_seedtts \
@@ -116,9 +118,17 @@ python -m benchmarks.eval.benchmark_tts_seedtts \
   --port 8000 \
   --max-running-requests 32 \
   --max-queued-requests 16 \
-  --concurrencies 16,32,48,64 \
+  --sustained-overshoot \
+  --overshoot-duration-s 10 \
   --max-samples 64
 ```
+
+Arrivals default to `2 × capacity` (`--request-rate` overrides). Stats are
+on successes only; artifacts land in `<output-dir>/overshoot/`.
+
+A closed-loop `--concurrencies 16,32,48,64` sweep is still available for
+comparing healthy vs past-ceiling points, but it does not hold overshoot. Each
+concurrency writes inspectable artifacts under `<output-dir>/c<N>/`.
 
 ## Synthesizing Speech
 

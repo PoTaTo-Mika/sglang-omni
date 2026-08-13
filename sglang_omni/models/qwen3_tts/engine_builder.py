@@ -42,8 +42,6 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder):
     ) -> dict[str, Any]:
         return {
             "max_running_requests": 16,
-            # note (guozhihao): must be >=1 (every req enters waiting first);
-            # match max_running_requests to bound past-ceiling overload.
             "max_queued_requests": 16,
             "cuda_graph_max_bs": 32,
             "torch_compile_max_bs": 32,
@@ -120,7 +118,11 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder):
         return request_builder, result_adapter
 
     def extra_scheduler_kwargs(self) -> dict[str, Any]:
-        return {"stream_output_builder": self._stream_output_builder}
+        return {
+            "stream_output_builder": self._stream_output_builder,
+            "request_build_max_workers": 4,
+            "request_build_max_pending": 16,
+        }
 
     def make_abort_callback(self) -> Any | None:
         return request_builders.cleanup_prepared_qwen3_tts_request
