@@ -16,9 +16,16 @@ from sglang_omni.config.schema import StageConfig
 from sglang_omni.models.fishaudio_s2_pro.config import S2ProPipelineConfig
 from sglang_omni.pipeline.stage.runtime import Stage
 from sglang_omni.pipeline.stage.stream_queue import StreamQueue
-from sglang_omni.proto import DataReadyMessage, OmniRequest, StagePayload
+from sglang_omni.proto import (
+    DataAckMessage,
+    DataReadyMessage,
+    OmniRequest,
+    ShutdownMessage,
+    StagePayload,
+)
 from sglang_omni.relay.shm import ShmRelay
 from sglang_omni.scheduling.messages import OutgoingMessage
+from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 
 
 class _FakeControlPlane:
@@ -28,6 +35,9 @@ class _FakeControlPlane:
         self.streams = []
         self.stage_messages = []
         self.completions = []
+        self.messages = asyncio.Queue()
+        self.aborts = asyncio.Queue()
+        self.auto_ack = False
 
     async def start(self) -> None:
         pass
@@ -38,8 +48,24 @@ class _FakeControlPlane:
     async def send_stream(self, msg) -> None:
         self.streams.append(msg)
 
+    async def recv(self):
+        return await self.messages.get()
+
+    async def recv_abort(self):
+        return await self.aborts.get()
+
     async def send_to_stage(self, target, endpoint, msg) -> None:
         self.stage_messages.append((target, endpoint, msg))
+        if self.auto_ack and isinstance(msg, DataReadyMessage):
+            data_ref = DataRef.from_dict(msg.data_ref)
+            self.messages.put_nowait(
+                DataAckMessage(
+                    request_id=msg.request_id,
+                    from_stage=target,
+                    to_stage=msg.from_stage,
+                    object_id=data_ref.object_id,
+                )
+            )
 
     async def send_complete(self, msg) -> None:
         self.completions.append(msg)
@@ -72,7 +98,8 @@ class _DoneOp:
     def __init__(self, size: int = 1) -> None:
         self.metadata = {"transfer_info": {"size": size}}
 
-    async def wait_for_completion(self) -> None:
+    async def wait_for_completion(self, timeout=None) -> None:
+        del timeout
         pass
 
     def mark_receiver_done(self) -> None:
@@ -98,7 +125,8 @@ class _CallbackOp:
     def __init__(self, on_wait) -> None:
         self._on_wait = on_wait
 
-    async def wait_for_completion(self) -> None:
+    async def wait_for_completion(self, timeout=None) -> None:
+        del timeout
         self._on_wait()
 
     def mark_receiver_done(self) -> None:
@@ -757,5 +785,62 @@ def test_stage_drops_payload_after_abort_during_relay_read() -> None:
         await stage._on_data_ready(await _make_relay_payload(relay, payload))
 
         assert scheduler.inbox.empty()
+
+    asyncio.run(_run())
+
+
+def test_stage_keeps_request_active_until_all_payload_work_finishes() -> None:
+    async def _run() -> None:
+        control_plane = _FakeControlPlane()
+        control_plane.auto_ack = True
+        computed_frames = []
+
+        def _compute(payload):
+            computed_frames.append(payload.data["frame_index"])
+            return payload
+
+        scheduler = SimpleScheduler(
+            _compute,
+            allow_multiple_inflight_per_request=True,
+        )
+        stage = Stage(
+            name="image_decode",
+            role="single",
+            get_next=lambda request_id, output: "collector",
+            gpu_id=None,
+            endpoints={"collector": "inproc://collector"},
+            control_plane=control_plane,
+            relay=_FakeRelay(),
+            scheduler=scheduler,
+        )
+        run_task = asyncio.create_task(stage.run())
+
+        for frame_index in (1, 2):
+            payload = StagePayload(
+                request_id="req",
+                request=OmniRequest(inputs="hello"),
+                data={"frame_index": frame_index},
+            )
+            await stage.receive_local_payload("req", "thinker", payload)
+
+        async def _wait_for_outputs() -> None:
+            while len(control_plane.stage_messages) < 2:
+                await asyncio.sleep(0.01)
+
+        try:
+            await asyncio.wait_for(_wait_for_outputs(), timeout=2.0)
+        finally:
+            control_plane.messages.put_nowait(ShutdownMessage())
+            await asyncio.wait_for(run_task, timeout=2.0)
+
+        assert computed_frames == [1, 2]
+        assert [target for target, _, _ in control_plane.stage_messages] == [
+            "collector",
+            "collector",
+        ]
+        assert all(
+            isinstance(message, DataReadyMessage)
+            for _, _, message in control_plane.stage_messages
+        )
 
     asyncio.run(_run())

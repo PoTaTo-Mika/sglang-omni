@@ -40,10 +40,14 @@ def _reference_argmax_confidence(
     *,
     force_image_only: bool = False,
     image_token_offset: int = 0,
+    allowed_token_ids: tuple[int, ...] = (),
 ) -> tuple[torch.Tensor, torch.Tensor]:
     work = logits.float().clone()
     if force_image_only:
         work[:, :image_token_offset] = float("-inf")
+        if allowed_token_ids:
+            allowed = list(allowed_token_ids)
+            work[:, allowed] = logits.float()[:, allowed]
     token_ids = work.argmax(dim=-1)
     probs = torch.softmax(work, dim=-1).gather(1, token_ids[:, None]).squeeze(1)
     return token_ids, probs
@@ -99,6 +103,34 @@ def test_argmax_confidence_respects_image_token_offset() -> None:
     torch.testing.assert_close(actual_probs, expected_probs, rtol=3e-5, atol=1e-7)
 
 
+@pytest.mark.parametrize("allowed_token_ids", [(17,), (17, 23)])
+def test_argmax_confidence_allows_configured_stop_tokens(
+    allowed_token_ids: tuple[int, ...],
+) -> None:
+    """Configured stop tokens remain eligible in image-only Triton decode."""
+    rows, vocab, image_token_offset = 4, 4097, 3072
+    logits = _make_logits(rows, vocab, noncontiguous=False)
+    logits[:, 7] = 200.0
+    logits[:, allowed_token_ids[0]] = 100.0
+
+    expected_ids, expected_probs = _reference_argmax_confidence(
+        logits,
+        force_image_only=True,
+        image_token_offset=image_token_offset,
+        allowed_token_ids=allowed_token_ids,
+    )
+    actual_ids, actual_probs = triton_decode.argmax_confidence_triton(
+        logits,
+        force_image_only=True,
+        image_token_offset=image_token_offset,
+        allowed_token_ids=allowed_token_ids,
+    )
+
+    assert torch.all(actual_ids == allowed_token_ids[0])
+    assert torch.equal(actual_ids, expected_ids)
+    torch.testing.assert_close(actual_probs, expected_probs, rtol=3e-5, atol=1e-7)
+
+
 def test_cfg_argmax_confidence_matches_pytorch() -> None:
     rows, vocab, cfg_scale = 13, 2053, 4.0
     cond = _make_logits(rows, vocab, noncontiguous=True)
@@ -116,6 +148,36 @@ def test_cfg_argmax_confidence_matches_pytorch() -> None:
     torch.testing.assert_close(actual_probs, expected_probs, rtol=3e-5, atol=1e-7)
 
 
+def test_cfg_argmax_confidence_allows_configured_stop_token() -> None:
+    """CFG Triton decode applies the same stop-token vocabulary mask as PyTorch."""
+    rows, vocab, cfg_scale, image_token_offset = 4, 4097, 4.0, 3072
+    allowed_token_ids = (17,)
+    cond = _make_logits(rows, vocab, noncontiguous=False)
+    uncond = _make_logits(rows, vocab, noncontiguous=False)
+    cond[:, 7] = uncond[:, 7] = 200.0
+    cond[:, 17] = uncond[:, 17] = 100.0
+    guided = uncond.float() + cfg_scale * (cond.float() - uncond.float())
+    expected_ids, expected_probs = _reference_argmax_confidence(
+        guided,
+        force_image_only=True,
+        image_token_offset=image_token_offset,
+        allowed_token_ids=allowed_token_ids,
+    )
+
+    actual_ids, actual_probs = triton_decode.cfg_argmax_confidence_triton(
+        cond,
+        uncond,
+        cfg_scale=cfg_scale,
+        force_image_only=True,
+        image_token_offset=image_token_offset,
+        allowed_token_ids=allowed_token_ids,
+    )
+
+    assert torch.all(actual_ids == allowed_token_ids[0])
+    assert torch.equal(actual_ids, expected_ids)
+    torch.testing.assert_close(actual_probs, expected_probs, rtol=3e-5, atol=1e-7)
+
+
 def _reference_low_confidence_update(
     logits: torch.Tensor,
     input_ids: torch.Tensor,
@@ -126,6 +188,7 @@ def _reference_low_confidence_update(
     num_to_transfer: int,
     force_image_only: bool = False,
     image_token_offset: int = 0,
+    allowed_token_ids: tuple[int, ...] = (),
 ) -> tuple[torch.Tensor, int]:
     rows = logits.shape[0]
     segment = input_ids[input_start : input_start + rows]
@@ -133,6 +196,7 @@ def _reference_low_confidence_update(
         logits,
         force_image_only=force_image_only,
         image_token_offset=image_token_offset,
+        allowed_token_ids=allowed_token_ids,
     )
     masked = segment == mask_id
     confidence = torch.where(masked, probs, -torch.inf)
@@ -190,6 +254,82 @@ def test_low_confidence_update_matches_pytorch(threshold: float) -> None:
 
     assert actual_tpf == expected_tpf
     assert torch.equal(actual, expected)
+
+
+def test_low_confidence_update_allows_configured_stop_token() -> None:
+    """The fused update can select an allowed stop token below the image offset."""
+    rows, vocab, image_token_offset = 32, 4097, 3072
+    input_start = 3
+    mask_id = 156895
+    allowed_token_ids = (17,)
+    logits = _make_logits(rows, vocab, noncontiguous=False)
+    logits[:, 7] = 200.0
+    logits[:, 17] = 100.0
+    input_ids = torch.full(
+        (rows + input_start,), mask_id, device="cuda", dtype=torch.int64
+    )
+    expected, expected_tpf = _reference_low_confidence_update(
+        logits,
+        input_ids,
+        input_start=input_start,
+        mask_id=mask_id,
+        threshold=1.1,
+        num_to_transfer=4,
+        force_image_only=True,
+        image_token_offset=image_token_offset,
+        allowed_token_ids=allowed_token_ids,
+    )
+    actual = input_ids.clone()
+
+    actual_tpf = triton_decode.low_confidence_update_triton(
+        logits,
+        actual,
+        input_start=input_start,
+        mask_id=mask_id,
+        threshold=1.1,
+        num_to_transfer=4,
+        force_image_only=True,
+        image_token_offset=image_token_offset,
+        allowed_token_ids=allowed_token_ids,
+    )
+
+    assert actual_tpf == expected_tpf
+    assert torch.equal(actual, expected)
+    assert torch.count_nonzero(actual == allowed_token_ids[0]).item() == 4
+
+
+def test_argmax_wrapper_forwards_allowed_stop_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The image stop-token set reaches Triton instead of forcing softmax fallback."""
+    logits = _make_logits(2, 257, noncontiguous=False)
+    expected_ids = torch.tensor([17, 17], device="cuda")
+    expected_probs = torch.tensor([0.75, 0.75], device="cuda")
+    observed: dict[str, object] = {}
+
+    def fake_triton(input_logits, **kwargs):
+        observed["logits"] = input_logits
+        observed.update(kwargs)
+        return expected_ids, expected_probs
+
+    monkeypatch.setattr(triton_decode, "argmax_confidence_triton", fake_triton)
+
+    actual_ids, actual_probs = _argmax_confidence_from_logits(
+        logits,
+        use_triton=True,
+        force_image_only=True,
+        image_token_offset=128,
+        allowed_token_ids=(17,),
+    )
+
+    assert observed == {
+        "logits": logits,
+        "force_image_only": True,
+        "image_token_offset": 128,
+        "allowed_token_ids": (17,),
+    }
+    assert actual_ids is expected_ids
+    assert actual_probs is expected_probs
 
 
 def test_argmax_wrapper_falls_back_when_triton_fails(

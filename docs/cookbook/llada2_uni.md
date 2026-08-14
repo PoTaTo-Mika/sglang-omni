@@ -156,11 +156,26 @@ curl -X POST http://localhost:8000/v1/chat/completions \
   }'
 ```
 
-The PNG is returned as base64 in
-`choices[0].message.image.data`. In `normal` mode, message text is normally
-`null`; in `thinking` mode it contains the Phase 1 text. Thinking mode
-requires the model to generate `<boi>`; the request fails explicitly if that
-boundary token is absent.
+Image-generating responses use ordered content parts. The PNG is returned as
+base64 in the `image.data` field of an image part under
+`choices[0].message.content`. In `normal` mode the response normally contains
+only an image part; in `thinking` mode a text part precedes the image part.
+Thinking mode requires the model to generate `<boi>`; the request fails
+explicitly if that boundary token is absent.
+
+```json
+{
+  "choices": [{
+    "message": {
+      "role": "assistant",
+      "content": [{
+        "type": "image",
+        "image": {"data": "<base64 PNG>", "format": "png"}
+      }]
+    }
+  }]
+}
+```
 
 The response also includes a `timings` object with per-stage and end-to-end
 latencies. Run the checked-in reproduction script to print text and timings and
@@ -176,6 +191,50 @@ examples/llada2_uni/validate_t2t_t2i.sh t2i-thinking
 Set `BASE_URL`, `MODEL`, `OUT_DIR`, or `TIMEOUT` to override the script
 defaults.
 
+## Interleaved Text and Image Generation
+
+Interleaved generation uses a dedicated pipeline that isolates the thinker and
+image decoder on separate GPUs:
+
+```bash
+sgl-omni serve \
+  --config examples/configs/llada2_uni_interleaved.yaml \
+  --port 8000
+```
+
+The request must be non-streaming and text-only. The response uses the same
+ordered content-part schema as text-to-image generation, so text and images
+remain in their generated order.
+
+```bash
+curl -X POST http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "inclusionAI/LLaDA2.0-Uni",
+    "messages": [{
+      "role": "user",
+      "content": "Explain how a seed grows, with an illustration for each step."
+    }],
+    "modalities": ["text", "image"],
+    "stream": false,
+    "interleaved_generation": {
+      "max_frames": 3,
+      "dllm_steps": 32,
+      "cfg_scale": 0.0,
+      "cfg_text_scale": 7.5,
+      "cfg_image_scale": 1.5,
+      "decode_mode": "decoder-turbo",
+      "decoder_steps": 8,
+      "seed": 42
+    }
+  }'
+```
+
+Each image part includes `data`, `format`, `frame_index`, `grid_h`, and
+`grid_w`. Set all three CFG scales to `0` to disable CFG and run only the
+conditional branch. The default scales use one conditional, one no-text, and,
+for later editing-style frames, one no-image branch.
+
 ## Request Parameters
 
 The table below lists all parameters accepted by the `/v1/chat/completions` endpoint for LLaDA2.0-Uni.
@@ -188,11 +247,14 @@ The table below lists all parameters accepted by the `/v1/chat/completions` endp
 | `images` | list | `null` | List of image file paths (local paths or URLs) |
 | `max_tokens` | int | `null` | Maximum number of tokens to generate |
 | `image_generation` | object | `null` | Image mode, decoder, CFG, resolution, seed, and dLLM settings |
+| `interleaved_generation` | object | `null` | Interleaved frame limit, text/image dLLM settings, CFG, decoder, and seed settings |
 
 ## Known Limitations
 
-- Image-generation requests with `stream=true` are rejected with HTTP 400. Use
-  `stream=false`.
+- Image and interleaved-generation requests with `stream=true` are rejected
+  with HTTP 400. Use `stream=false`.
+- Interleaved generation currently accepts text-only input. Requests containing
+  images, audio, video, or other non-text input are rejected with HTTP 400.
 - Decoder output size follows the VQ token grid emitted by the thinker and can
   differ from the requested conditioning size when the token count differs.
 - Thinking T2I fails if Phase 1 does not generate the required `<boi>` token.

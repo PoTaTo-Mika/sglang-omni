@@ -32,6 +32,8 @@ def _partial_argmax_sumexp_kernel(
     BLOCK_V: tl.constexpr,
     FORCE_IMAGE_ONLY: tl.constexpr,
     IMAGE_TOKEN_OFFSET: tl.constexpr,
+    ALLOWED_TOKEN_IDS: tl.constexpr,
+    NUM_ALLOWED_TOKENS: tl.constexpr,
 ):
     row = tl.program_id(0)
     tile = tl.program_id(1)
@@ -39,6 +41,8 @@ def _partial_argmax_sumexp_kernel(
     valid = offs < V
     if FORCE_IMAGE_ONLY:
         valid = valid & (offs >= IMAGE_TOKEN_OFFSET)
+        for i in tl.static_range(0, NUM_ALLOWED_TOKENS):
+            valid = valid | (offs == ALLOWED_TOKEN_IDS[i])
 
     vals = tl.load(
         logits_ptr + row * stride_n + offs * stride_v,
@@ -75,6 +79,8 @@ def _partial_cfg_argmax_sumexp_kernel(
     BLOCK_V: tl.constexpr,
     FORCE_IMAGE_ONLY: tl.constexpr,
     IMAGE_TOKEN_OFFSET: tl.constexpr,
+    ALLOWED_TOKEN_IDS: tl.constexpr,
+    NUM_ALLOWED_TOKENS: tl.constexpr,
 ):
     row = tl.program_id(0)
     tile = tl.program_id(1)
@@ -82,6 +88,8 @@ def _partial_cfg_argmax_sumexp_kernel(
     valid = offs < V
     if FORCE_IMAGE_ONLY:
         valid = valid & (offs >= IMAGE_TOKEN_OFFSET)
+        for i in tl.static_range(0, NUM_ALLOWED_TOKENS):
+            valid = valid | (offs == ALLOWED_TOKEN_IDS[i])
 
     cond = tl.load(
         cond_ptr + row * cond_stride_n + offs * cond_stride_v,
@@ -141,6 +149,15 @@ def _next_power_of_2(x: int) -> int:
     return 1 << (x - 1).bit_length()
 
 
+def _normalize_allowed_token_ids(
+    allowed_token_ids: tuple[int, ...], vocab_size: int
+) -> tuple[int, ...]:
+    normalized = tuple(sorted({int(token_id) for token_id in allowed_token_ids}))
+    if any(token_id < 0 or token_id >= vocab_size for token_id in normalized):
+        raise ValueError("allowed token IDs must be within the model vocabulary")
+    return normalized
+
+
 def _alloc_partials(rows: int, num_tiles: int, device: torch.device):
     partial_max = torch.empty((rows, num_tiles), device=device, dtype=torch.float32)
     partial_sum = torch.empty((rows, num_tiles), device=device, dtype=torch.float32)
@@ -155,6 +172,7 @@ def argmax_confidence_triton(
     *,
     force_image_only: bool = False,
     image_token_offset: int = 0,
+    allowed_token_ids: tuple[int, ...] = (),
     block_v: int = 1024,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Return ``argmax(logits)`` and winning softmax probability per row."""
@@ -162,6 +180,7 @@ def argmax_confidence_triton(
     assert logits.dim() == 2
     logits = logits.contiguous()
     rows, vocab = logits.shape
+    allowed_token_ids = _normalize_allowed_token_ids(allowed_token_ids, vocab)
     num_tiles = triton.cdiv(vocab, block_v)
     block_t = _next_power_of_2(num_tiles)
     partial_max, partial_sum, partial_arg, token_ids, probs = _alloc_partials(
@@ -180,6 +199,8 @@ def argmax_confidence_triton(
         BLOCK_V=block_v,
         FORCE_IMAGE_ONLY=force_image_only,
         IMAGE_TOKEN_OFFSET=image_token_offset,
+        ALLOWED_TOKEN_IDS=allowed_token_ids,
+        NUM_ALLOWED_TOKENS=len(allowed_token_ids),
         num_warps=4,
     )
     _finalize_argmax_conf_kernel[(rows,)](
@@ -202,6 +223,7 @@ def cfg_argmax_confidence_triton(
     cfg_scale: float,
     force_image_only: bool = False,
     image_token_offset: int = 0,
+    allowed_token_ids: tuple[int, ...] = (),
     block_v: int = 1024,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Argmax/confidence for ``uncond + cfg_scale * (cond - uncond)``.
@@ -216,6 +238,7 @@ def cfg_argmax_confidence_triton(
     cond_logits = cond_logits.contiguous()
     uncond_logits = uncond_logits.contiguous()
     rows, vocab = cond_logits.shape
+    allowed_token_ids = _normalize_allowed_token_ids(allowed_token_ids, vocab)
     num_tiles = triton.cdiv(vocab, block_v)
     block_t = _next_power_of_2(num_tiles)
     partial_max, partial_sum, partial_arg, token_ids, probs = _alloc_partials(
@@ -238,6 +261,8 @@ def cfg_argmax_confidence_triton(
         BLOCK_V=block_v,
         FORCE_IMAGE_ONLY=force_image_only,
         IMAGE_TOKEN_OFFSET=image_token_offset,
+        ALLOWED_TOKEN_IDS=allowed_token_ids,
+        NUM_ALLOWED_TOKENS=len(allowed_token_ids),
         num_warps=4,
     )
     _finalize_argmax_conf_kernel[(rows,)](
@@ -329,6 +354,7 @@ def low_confidence_update_triton(
     num_to_transfer: int,
     force_image_only: bool = False,
     image_token_offset: int = 0,
+    allowed_token_ids: tuple[int, ...] = (),
     block_v: int = 1024,
 ) -> int:
     """Run one standard LowConfidence block update with two Triton kernels.
@@ -341,6 +367,7 @@ def low_confidence_update_triton(
     assert logits.dim() == 2
     logits = logits.contiguous()
     rows, vocab = logits.shape
+    allowed_token_ids = _normalize_allowed_token_ids(allowed_token_ids, vocab)
     assert rows > 0
     assert 1 <= num_to_transfer <= rows
 
@@ -369,6 +396,8 @@ def low_confidence_update_triton(
         BLOCK_V=block_v,
         FORCE_IMAGE_ONLY=force_image_only,
         IMAGE_TOKEN_OFFSET=image_token_offset,
+        ALLOWED_TOKEN_IDS=allowed_token_ids,
+        NUM_ALLOWED_TOKENS=len(allowed_token_ids),
         num_warps=4,
     )
     block_b = _next_power_of_2(rows)

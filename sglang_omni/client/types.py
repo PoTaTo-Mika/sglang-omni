@@ -141,6 +141,7 @@ class GenerateChunk:
     audio_data: Any = None
     sample_rate: int | None = None
     image: str | None = None
+    content: list[dict[str, Any]] | None = None
     timings: dict[str, float] | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -161,6 +162,7 @@ class GenerateChunk:
             "audio_data": self.audio_data,
             "sample_rate": self.sample_rate,
             "image": self.image,
+            "content": self.content,
             "timings": self.timings,
         }
 
@@ -204,6 +206,7 @@ class CompletionResult:
     audio: CompletionAudio | None = None
     image: str | None = None
     finish_reason: str = "stop"
+    content: list[dict[str, Any]] | None = None
     usage: UsageInfo | None = None
     output_token_logprobs: list[Any] | None = None
     omni_rollout: dict[str, Any] | None = None
@@ -222,6 +225,8 @@ class CompletionStreamChunk:
     image_b64: str | None = None
     finish_reason: str | None = None
     usage: UsageInfo | None = None
+    content: list[dict[str, Any]] | None = None
+    timings: dict[str, float] | None = None
     stage_name: str | None = None
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import threading
 from collections import deque
 from queue import Queue
@@ -17,6 +18,26 @@ from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 from sglang_omni.scheduling.stage_cache import StageOutputCache
 from sglang_omni.scheduling.threaded_simple_scheduler import ThreadedSimpleScheduler
 from tests.unit_test.pipeline.helpers import run_scheduler
+
+
+def test_simple_scheduler_abort_suppresses_all_queued_work_for_request() -> None:
+    computed: list[str] = []
+    scheduler = SimpleScheduler(lambda payload: computed.append(payload) or payload)
+    scheduler.abort("req-abort")
+    loop = asyncio.new_event_loop()
+
+    try:
+        scheduler._run_single(
+            IncomingMessage("req-abort", "new_request", "first"), loop
+        )
+        scheduler._run_single(
+            IncomingMessage("req-abort", "new_request", "second"), loop
+        )
+    finally:
+        loop.close()
+
+    assert computed == []
+    assert scheduler.outbox.empty()
 
 
 def test_simple_scheduler_abort_drain_runs_fanned_work() -> None:

@@ -191,6 +191,7 @@ class Stage:
         self._active_requests: set[str] = set()
         self._stream_queue: StreamQueue | None = None
         self._stream_chunk_counters: dict[tuple[str, str], int] = {}
+        self._inflight_work_pending: dict[str, int] = {}
         self._first_stream_chunk_seen: set[str] = set()
         self._local_stream_targets: dict[str, set[str]] = {}
         self._nonlocal_stream_targets: dict[str, set[str]] = {}
@@ -582,7 +583,16 @@ class Stage:
                 event_name="stage_aggregate_ready",
                 metadata={"from_stage": from_stage},
             )
-            await self._execute(merged)
+            await self._execute(
+                merged,
+                track_inflight_work=bool(
+                    getattr(
+                        self.scheduler,
+                        "allow_multiple_inflight_per_request",
+                        False,
+                    )
+                ),
+            )
 
     async def _on_stream_chunk(
         self,
@@ -684,7 +694,12 @@ class Stage:
         self, request_id: str, item: StreamItem
     ) -> None:
         if self._open_pre_payload_stream_if_allowed(request_id):
-            self._route_stream_item(request_id, item)
+            try:
+                self._route_stream_item(request_id, item)
+            except Exception as exc:
+                with suppress(Exception):
+                    self.scheduler.abort(request_id)
+                await self._send_failure(request_id, str(exc))
             return
         with suppress(Exception):
             self.scheduler.abort(request_id)
@@ -879,8 +894,17 @@ class Stage:
             key = f"{key}.{pass_index}"
         timing[key] = time.perf_counter_ns()
 
-    async def _execute(self, payload: Any) -> None:
+    async def _execute(
+        self,
+        payload: Any,
+        *,
+        track_inflight_work: bool = False,
+    ) -> None:
         request_id = payload.request_id
+        if track_inflight_work:
+            self._inflight_work_pending[request_id] = (
+                self._inflight_work_pending.get(request_id, 0) + 1
+            )
         _emit_event(
             request_id=request_id,
             stage=self.name,
@@ -1087,6 +1111,14 @@ class Stage:
             elif out.type == "error":
                 await self._send_failure(out.request_id, str(out.data))
 
+    def _complete_inflight_work(self, request_id: str) -> bool:
+        pending = self._inflight_work_pending.get(request_id, 0)
+        if pending <= 1:
+            self._inflight_work_pending.pop(request_id, None)
+            return False
+        self._inflight_work_pending[request_id] = pending - 1
+        return True
+
     async def _drain_outbox_follower(self) -> None:
         """Drain follower outbox without emitting external stage traffic."""
         loop = asyncio.get_running_loop()
@@ -1101,7 +1133,8 @@ class Stage:
             if out.type in {"result", "error"}:
                 self._acknowledge_scheduler_terminal(out.request_id)
             if out.type == "result":
-                self._clear_request_state(out.request_id)
+                if not self._complete_inflight_work(out.request_id):
+                    self._clear_request_state(out.request_id)
             elif out.type == "stream":
                 continue
             elif out.type == "error":
@@ -1129,8 +1162,10 @@ class Stage:
         timing = getattr(result, "timing", None)
         if timing is not None:
             self._stamp_timing(timing, "done")
+        has_pending_inflight_work = self._complete_inflight_work(request_id)
         if not self._owns_external_io:
-            self._clear_request_state(request_id)
+            if not has_pending_inflight_work:
+                self._clear_request_state(request_id)
             return
         # Send stream done to the active stream targets for this request.
         stream_targets = self._stream_targets
@@ -1168,6 +1203,9 @@ class Stage:
                     timing=getattr(result, "timing", None),
                 )
             )
+            if not has_pending_inflight_work:
+                self._clear_request_state(request_id)
+            return
         else:
             if isinstance(next_stages, str):
                 next_stages = [next_stages]
@@ -1176,16 +1214,26 @@ class Stage:
             # before dispatch so the new pass can register the same request ID
             # without being removed by the cleanup below.
             routes_to_self = self.name in next_stages
-            if routes_to_self:
+            if routes_to_self and not has_pending_inflight_work:
                 self._clear_request_state(request_id)
 
             is_single_target = len(next_stages) == 1
+            local_stream_targets_for_request = set(
+                self._local_stream_targets.get(request_id, set())
+            )
+            nonlocal_stream_targets_for_request = set(
+                self._nonlocal_stream_targets.get(request_id, set())
+            )
             _emit_event(
                 request_id=request_id,
                 stage=self.name,
                 event_name="stage_complete",
                 metadata={"terminal": False, "next": list(next_stages)},
             )
+            # End the current stage generation before dispatching the next one.
+            # A self-loop registers the same request as a fresh generation.
+            if not has_pending_inflight_work:
+                self._clear_request_state(request_id)
             for target in next_stages:
                 await self._send_to_stage(
                     request_id,
@@ -1194,9 +1242,15 @@ class Stage:
                     allow_local_object=is_single_target,
                     allow_projected_local_object=not is_single_target,
                     stream_targets_for_request=stream_targets_for_request,
+                    local_stream_targets_for_request=(local_stream_targets_for_request),
+                    nonlocal_stream_targets_for_request=(
+                        nonlocal_stream_targets_for_request
+                    ),
                 )
 
-        if next_stages is None or not routes_to_self:
+        if (
+            next_stages is None or not routes_to_self
+        ) and not has_pending_inflight_work:
             self._clear_request_state(request_id)
 
     async def _send_to_stage(
@@ -1208,6 +1262,8 @@ class Stage:
         allow_local_object: bool = False,
         allow_projected_local_object: bool = False,
         stream_targets_for_request: set[str] | None = None,
+        local_stream_targets_for_request: set[str] | None = None,
+        nonlocal_stream_targets_for_request: set[str] | None = None,
     ) -> None:
         if not self._owns_external_io:
             raise RuntimeError(
@@ -1240,6 +1296,8 @@ class Stage:
                     if stream_targets_for_request is None
                     else stream_targets_for_request
                 ),
+                local_stream_targets_for_request,
+                nonlocal_stream_targets_for_request,
             )
         ):
             if self._local_dispatcher is None:
@@ -1394,12 +1452,24 @@ class Stage:
         request_id: str,
         target: str,
         stream_targets_for_request: set[str],
+        local_stream_targets_for_request: set[str] | None = None,
+        nonlocal_stream_targets_for_request: set[str] | None = None,
     ) -> bool:
-        if target in self._nonlocal_stream_targets.get(request_id, set()):
+        local_targets = (
+            self._local_stream_targets.get(request_id, set())
+            if local_stream_targets_for_request is None
+            else local_stream_targets_for_request
+        )
+        nonlocal_targets = (
+            self._nonlocal_stream_targets.get(request_id, set())
+            if nonlocal_stream_targets_for_request is None
+            else nonlocal_stream_targets_for_request
+        )
+        if target in nonlocal_targets:
             return False
         if target not in stream_targets_for_request:
             return True
-        return target in self._local_stream_targets.get(request_id, set())
+        return target in local_targets
 
     def _record_local_stream_target(self, request_id: str, target: str) -> None:
         self._local_stream_targets.setdefault(request_id, set()).add(target)
@@ -1633,6 +1703,7 @@ class Stage:
 
     def _clear_request_state(self, request_id: str) -> None:
         self._active_requests.discard(request_id)
+        self._inflight_work_pending.pop(request_id, None)
         self.input_handler.cancel(request_id)
         if self._stream_queue is not None:
             self._stream_queue.close(request_id)

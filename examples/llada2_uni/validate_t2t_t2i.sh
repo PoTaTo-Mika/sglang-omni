@@ -41,7 +41,15 @@ print_result() {
   local response="$OUT_DIR/$name.json"
 
   printf 'text: '
-  jq -r '.choices[0].message.content // "<null>"' "$response"
+  jq -r '
+    .choices[0].message.content as $content
+    | if ($content | type) == "array" then
+        ([$content[] | select(.type == "text") | .text]
+          | if length == 0 then "<null>" else join("") end)
+      else
+        ($content // "<null>")
+      end
+  ' "$response"
   printf 'finish_reason: '
   jq -r '.choices[0].finish_reason // "<null>"' "$response"
   printf 'timings:\n'
@@ -101,7 +109,11 @@ run_t2i() {
 
   post_request "$name" "$payload"
   print_result "$name"
-  jq -er '.choices[0].message.image.data' "$response" | base64 -d > "$image"
+  jq -er '
+    .choices[0].message.content[]
+    | select(.type == "image")
+    | .image.data
+  ' "$response" | base64 -d > "$image"
   printf 'image: %s\n' "$image"
   file "$image"
 }

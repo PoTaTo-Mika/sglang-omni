@@ -11,7 +11,11 @@ import torch
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
-from sglang_omni.models.llada2_uni.algorithm.low_confidence_cfg import LowConfidenceCFG
+from sglang_omni.models.llada2_uni.algorithm.low_confidence_cfg import (
+    LowConfidenceCFG,
+    _should_force_image_only,
+    _slice_cfg_output_ids,
+)
 from sglang_omni.models.llada2_uni.cfg_attention_backend import (
     LLaDA2CFGFlashInferAttnBackend,
 )
@@ -283,6 +287,29 @@ def test_cfg_in_query_left_pad_temporarily_disables_cuda_graph() -> None:
 
     assert algorithm.run(model_runner, forward_batch) is expected_result
     assert model_runner.graph_runner is graph_runner
+
+
+def test_cfg_output_slice_uses_conditional_generation_start() -> None:
+    output_ids = torch.tensor([[10, 11, 12, 13], [20, 21, 22, 23]], dtype=torch.int64)
+
+    sliced = _slice_cfg_output_ids(
+        output_ids, [2, 0], cond_idx=0, is_dllm_prefill=False
+    )
+    assert [ids.tolist() for ids in sliced] == [[12, 13], [22, 23]]
+
+
+def test_image_only_vocab_gate_includes_interleaved_image_phase() -> None:
+    assert _should_force_image_only(SimpleNamespace(_task_kind="t2i"))
+    assert _should_force_image_only(SimpleNamespace(_task_kind="edit"))
+    assert not _should_force_image_only(
+        SimpleNamespace(_task_kind="t2i", _is_thinking_phase1=True)
+    )
+    assert not _should_force_image_only(
+        SimpleNamespace(_task_kind="interleaved", _interleaved_phase="text")
+    )
+    assert _should_force_image_only(
+        SimpleNamespace(_task_kind="interleaved", _interleaved_phase="image")
+    )
 
 
 def test_cfg_phases_follow_conditional_request() -> None:

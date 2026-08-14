@@ -328,6 +328,34 @@ def create_image_decode_executor(
             image_bytes = buf.getvalue()
             image_b64 = base64.b64encode(image_bytes).decode("ascii")
 
+            if state.task_kind == "interleaved":
+                frame_index = int(state.stream_state.get("interleaved_frame_index", 0))
+                segments = state.stream_state.get("interleaved_segments", [])
+                segment = (
+                    segments[frame_index - 1]
+                    if frame_index > 0 and frame_index <= len(segments)
+                    else {}
+                )
+                payload.data = {
+                    "kind": "interleaved_frame",
+                    "frame": {
+                        "index": frame_index,
+                        "text": segment.get("text", ""),
+                        "grid_h": h,
+                        "grid_w": w,
+                        "image": image_b64,
+                        "format": "png",
+                    },
+                }
+                logger.debug(
+                    "Interleaved image decode completed request=%s frame=%d grid=%dx%d",
+                    payload.request_id,
+                    frame_index,
+                    h,
+                    w,
+                )
+                return payload
+
             event = LLaDA2UniEvent(
                 type="image_final",
                 modality="image",
@@ -349,4 +377,7 @@ def create_image_decode_executor(
 
         return payload
 
-    return SimpleScheduler(_decode_image)
+    return SimpleScheduler(
+        _decode_image,
+        allow_multiple_inflight_per_request=True,
+    )

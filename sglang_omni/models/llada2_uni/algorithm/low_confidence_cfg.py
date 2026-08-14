@@ -28,6 +28,36 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 logger = logging.getLogger(__name__)
 
 
+def _should_force_image_only(req: object) -> bool:
+    task_kind = getattr(req, "_task_kind", "chat")
+    if task_kind == "interleaved":
+        return getattr(req, "_interleaved_phase", None) == "image"
+
+    is_thinking_phase1 = getattr(req, "_is_thinking_phase1", False)
+    return task_kind in ("t2i", "edit") and not is_thinking_phase1
+
+
+def _allowed_image_stop_token_ids(
+    req: object | None,
+    *,
+    image_token_offset: int,
+) -> tuple[int, ...]:
+    """Return text-vocabulary stop tokens allowed during image generation."""
+    if (
+        req is None
+        or getattr(req, "_task_kind", None) != "interleaved"
+        or getattr(req, "_interleaved_phase", None) != "image"
+    ):
+        return ()
+    return tuple(
+        sorted(
+            int(token_id)
+            for token_id in getattr(req, "eos_token_ids", ())
+            if 0 <= int(token_id) < image_token_offset
+        )
+    )
+
+
 def _get_num_transfer_tokens(block_length: int, steps: int) -> torch.Tensor:
     """Compute per-step minimum transfer count schedule."""
     steps = min(max(steps, 1), block_length)
@@ -62,6 +92,7 @@ def _argmax_confidence_from_logits(
     use_triton: bool = False,
     force_image_only: bool = False,
     image_token_offset: int = 0,
+    allowed_token_ids: tuple[int, ...] = (),
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Return argmax token ids and their softmax probabilities.
 
@@ -78,6 +109,7 @@ def _argmax_confidence_from_logits(
                 logits,
                 force_image_only=force_image_only,
                 image_token_offset=image_token_offset,
+                allowed_token_ids=allowed_token_ids,
             )
         except Exception:  # pragma: no cover - serving safety fallback
             logger.exception(
@@ -88,6 +120,9 @@ def _argmax_confidence_from_logits(
     if force_image_only:
         work = logits.clone()
         work[:, :image_token_offset] = float("-inf")
+        if allowed_token_ids:
+            allowed = torch.tensor(allowed_token_ids, device=logits.device)
+            work[:, allowed] = logits[:, allowed]
     token_ids = torch.argmax(work, dim=-1)
     probs = torch.gather(
         F.softmax(work, dim=-1), dim=-1, index=token_ids.unsqueeze(-1)
@@ -155,11 +190,13 @@ class LowConfidenceCFG(DllmAlgorithm):
         reqs = getattr(forward_batch, "reqs", None)
         dllm_steps = self.block_size
         force_image_only = False
+        allowed_token_ids: tuple[int, ...] = ()
         if reqs:
             dllm_steps = getattr(reqs[0], "_dllm_steps", self.block_size)
-            task_kind = getattr(reqs[0], "_task_kind", "chat")
-            is_thinking_p1 = getattr(reqs[0], "_is_thinking_phase1", False)
-            force_image_only = task_kind in ("t2i", "edit") and not is_thinking_p1
+            force_image_only = _should_force_image_only(reqs[0])
+            allowed_token_ids = _allowed_image_stop_token_ids(
+                reqs[0], image_token_offset=self.image_token_offset
+            )
         schedule = _get_num_transfer_tokens(self.block_size, dllm_steps)
 
         for num_to_transfer_tensor in schedule:
@@ -196,6 +233,7 @@ class LowConfidenceCFG(DllmAlgorithm):
                             num_to_transfer=num_to_transfer,
                             force_image_only=force_image_only,
                             image_token_offset=self.image_token_offset,
+                            allowed_token_ids=allowed_token_ids,
                         )
                     except Exception:  # pragma: no cover - serving safety fallback
                         logger.exception(
@@ -209,6 +247,7 @@ class LowConfidenceCFG(DllmAlgorithm):
                         use_triton=self.use_triton_decode,
                         force_image_only=force_image_only,
                         image_token_offset=self.image_token_offset,
+                        allowed_token_ids=allowed_token_ids,
                     )
                     x = torch.where(blk_mask, x, blk_ids)
                     conf = torch.where(blk_mask, p, -np.inf)
@@ -277,11 +316,13 @@ class LowConfidenceCFG(DllmAlgorithm):
         # Determine steps, schedule, and task kind from cond Req
         dllm_steps = bs
         force_image_only = False
+        allowed_token_ids: tuple[int, ...] = ()
         if reqs and len(reqs) > cond_idx:
             dllm_steps = getattr(reqs[cond_idx], "_dllm_steps", bs)
-            task_kind = getattr(reqs[cond_idx], "_task_kind", "chat")
-            is_thinking_p1 = getattr(reqs[cond_idx], "_is_thinking_phase1", False)
-            force_image_only = task_kind in ("t2i", "edit") and not is_thinking_p1
+            force_image_only = _should_force_image_only(reqs[cond_idx])
+            allowed_token_ids = _allowed_image_stop_token_ids(
+                reqs[cond_idx], image_token_offset=self.image_token_offset
+            )
         schedule = _get_num_transfer_tokens(bs, dllm_steps)
 
         for num_to_transfer_tensor in schedule:
@@ -308,10 +349,6 @@ class LowConfidenceCFG(DllmAlgorithm):
                 rescaled = guided * (std_c / (std_g + 1e-6))
                 guided = cfg_rescale * rescaled + (1.0 - cfg_rescale) * guided
 
-            # Force image-only tokens for T2I/edit tasks, except thinking phase 1.
-            if force_image_only:
-                guided[:, : self.image_token_offset] = float("-inf")
-
             # Confidence-based unmasking with the fixed transfer schedule.
             blk_ids = forward_batch.input_ids[cs:ce]
             x, p = _argmax_confidence_from_logits(
@@ -319,6 +356,7 @@ class LowConfidenceCFG(DllmAlgorithm):
                 use_triton=self.use_triton_decode,
                 force_image_only=force_image_only,
                 image_token_offset=self.image_token_offset,
+                allowed_token_ids=allowed_token_ids,
             )
             x = torch.where(cond_mask, x, blk_ids)
             conf = torch.where(cond_mask, p, -np.inf)
@@ -399,11 +437,13 @@ class LowConfidenceCFG(DllmAlgorithm):
         # Determine steps, schedule, and task kind from cond Req
         dllm_steps = bs
         force_image_only = False
+        allowed_token_ids: tuple[int, ...] = ()
         if reqs and len(reqs) > cond_idx:
             dllm_steps = getattr(reqs[cond_idx], "_dllm_steps", bs)
-            task_kind = getattr(reqs[cond_idx], "_task_kind", "chat")
-            is_thinking_p1 = getattr(reqs[cond_idx], "_is_thinking_phase1", False)
-            force_image_only = task_kind in ("t2i", "edit") and not is_thinking_p1
+            force_image_only = _should_force_image_only(reqs[cond_idx])
+            allowed_token_ids = _allowed_image_stop_token_ids(
+                reqs[cond_idx], image_token_offset=self.image_token_offset
+            )
         schedule = _get_num_transfer_tokens(bs, dllm_steps)
 
         for num_to_transfer_tensor in schedule:
@@ -435,10 +475,6 @@ class LowConfidenceCFG(DllmAlgorithm):
                 rescaled = guided * (std_c / (std_g + 1e-6))
                 guided = cfg_rescale * rescaled + (1.0 - cfg_rescale) * guided
 
-            # Force image-only tokens for T2I/edit tasks, except thinking phase 1.
-            if force_image_only:
-                guided[:, : self.image_token_offset] = float("-inf")
-
             # Confidence-based unmasking with the fixed transfer schedule.
             blk_ids = forward_batch.input_ids[cs:ce]
             x, p = _argmax_confidence_from_logits(
@@ -446,6 +482,7 @@ class LowConfidenceCFG(DllmAlgorithm):
                 use_triton=self.use_triton_decode,
                 force_image_only=force_image_only,
                 image_token_offset=self.image_token_offset,
+                allowed_token_ids=allowed_token_ids,
             )
             x = torch.where(cond_mask, x, blk_ids)
             conf = torch.where(cond_mask, p, -np.inf)

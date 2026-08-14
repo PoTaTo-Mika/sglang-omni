@@ -55,6 +55,26 @@ class ImageGenerationParams(BaseModel):
     dllm_steps: int | None = Field(default=None, ge=1)
 
 
+class InterleavedGenerationParams(BaseModel):
+    """Per-request controls for LLaDA2-Uni interleaved generation."""
+
+    max_frames: int = Field(default=10, ge=1)
+    text_max_new_tokens: int = Field(default=8192, ge=1)
+    dllm_steps: int = Field(
+        default=32,
+        ge=1,
+        description="Denoising steps per image-VQ block; text uses the scheduler default",
+    )
+    cfg_scale: float = Field(default=0.0, ge=0.0)
+    cfg_text_scale: float = Field(default=7.5, ge=0.0)
+    cfg_image_scale: float = Field(default=1.5, ge=0.0)
+    cfg_rescale: float = Field(default=0.7, ge=0.0, le=1.0)
+    decode_mode: Literal["normal", "decoder-turbo"] = "decoder-turbo"
+    decoder_steps: int = Field(default=8, ge=1)
+    seed: int | None = None
+    max_image_tokens: int = Field(default=4096, ge=1)
+
+
 class ChatCompletionRequest(BaseModel):
     """OpenAI-compatible chat completion request."""
 
@@ -93,6 +113,9 @@ class ChatCompletionRequest(BaseModel):
 
     # Image generation config (sglang-omni extension)
     image_generation: ImageGenerationParams | None = None
+
+    # Interleaved text/image generation config (sglang-omni extension)
+    interleaved_generation: InterleavedGenerationParams | None = None
 
     # Video input (sglang-omni extension)
     # Can be a list of video file paths (local paths or URLs)
@@ -146,9 +169,8 @@ class ChatCompletionStreamDelta(BaseModel):
     """Delta content in a streaming chunk."""
 
     role: str | None = None
-    content: str | None = None
+    content: str | list[dict[str, Any]] | None = None
     audio: ChatCompletionAudio | None = None
-    image: dict[str, Any] | None = None
 
 
 class ChatCompletionStreamChoice(BaseModel):

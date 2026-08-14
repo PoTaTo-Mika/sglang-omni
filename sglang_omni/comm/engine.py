@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Omni communication engine facade used by pipeline stages."""
+
 from __future__ import annotations
 
 import asyncio
 import logging
 from contextlib import suppress
+from itertools import count
 from typing import Any, Callable
 
 import msgspec
@@ -81,6 +83,7 @@ class CommEngine:
         ] = {}
         self._send_workers: dict[str, asyncio.Task] = {}
         self._pending: dict[str, _PendingTransfer] = {}
+        self._payload_send_sequence = count()
         self._task_done_callback = task_done_callback
         self._closed = False
 
@@ -301,6 +304,11 @@ class CommEngine:
         control_ms = -1.0
         try:
             write_start = _comm_now_ns()
+            payload_index = next(self._payload_send_sequence)
+            payload_object_id = (
+                f"{job.request_id}:payload:{job.from_stage}:{job.to_stage}:"
+                f"{payload_index}"
+            )
             data_ref, op = await stage_io.write_payload(
                 job.relay,
                 job.request_id,
@@ -308,6 +316,7 @@ class CommEngine:
                 transport=job.transport,
                 from_stage=job.from_stage,
                 to_stage=job.to_stage,
+                object_id=payload_object_id,
             )
             write_ms = _comm_elapsed_ms(write_start)
             object_id = data_ref.object_id

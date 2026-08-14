@@ -97,6 +97,7 @@ class Client:
         omni_rollout: dict[str, Any] | None = None
         weight_version: str | None = None
         image_b64: str | None = None
+        content: list[dict[str, Any]] | None = None
 
         async for chunk in self.generate(request, request_id=request_id):
             last_chunk = chunk
@@ -108,6 +109,8 @@ class Client:
                 sample_rate = chunk.sample_rate
             if chunk.image is not None:
                 image_b64 = chunk.image
+            if chunk.content is not None:
+                content = chunk.content
             if chunk.finish_reason is not None:
                 finish_reason = chunk.finish_reason
             if chunk.output_token_logprobs is not None:
@@ -154,6 +157,7 @@ class Client:
             ),
             omni_rollout=omni_rollout,
             weight_version=weight_version,
+            content=content,
             timings=last_chunk.timings,
         )
 
@@ -190,6 +194,8 @@ class Client:
                 image_b64=chunk.image,
                 finish_reason=chunk.finish_reason,
                 usage=chunk.usage,
+                content=chunk.content,
+                timings=chunk.timings,
                 stage_name=chunk.stage_name,
             )
 
@@ -549,6 +555,10 @@ class Client:
                 chunk.modality = modality
             Client._set_audio_data(chunk, result)
             chunk.usage = Client._build_usage_info(result)
+            chunk.timings = result.get("timings")
+            content = result.get("content")
+            if isinstance(content, list):
+                chunk.content = content
             return chunk
         if isinstance(result, str):
             chunk.text = result

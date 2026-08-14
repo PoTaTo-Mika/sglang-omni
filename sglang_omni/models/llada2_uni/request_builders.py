@@ -17,6 +17,12 @@ from sglang_omni.models.llada2_uni.config import (
     IMAGE_STAGE,
     THINKER_STAGE,
 )
+from sglang_omni.models.llada2_uni.interleaved import (
+    CFGBranchPlan,
+    InterleavedGenerationConfig,
+    build_cfg_plan,
+    parse_image_header,
+)
 from sglang_omni.models.llada2_uni.payload_types import (
     LLaDA2UniPipelineState,
     ThinkerOutput,
@@ -229,10 +235,17 @@ def build_dllm_thinker_request(
 
     input_ids_list = input_ids.to(dtype=torch.long).flatten().tolist()
 
-    # Override max_new_tokens for t2i/edit based on output image grid size.
+    # Override max_new_tokens for model-controlled image and interleaved phases.
     max_new_tokens = params.get("max_new_tokens", DEFAULT_THINKER_MAX_NEW_TOKENS)
     ss = state.stream_state if isinstance(state.stream_state, dict) else {}
     is_thinking_phase1 = ss.get("thinking_mode") and ss.get("thinking_phase") == 1
+    interleaved_config = None
+    interleaved_phase = None
+    if state.task_kind == "interleaved":
+        interleaved_config = InterleavedGenerationConfig.from_metadata(
+            state.request_metadata
+        )
+        interleaved_phase = ss.get("interleaved_phase", "text")
 
     if is_thinking_phase1:
         max_new_tokens = 2048
@@ -243,6 +256,20 @@ def build_dllm_thinker_request(
             gw = int(image_info[0].get("grid_w", 0))
             if gh > 0 and gw > 0:
                 max_new_tokens = gh * gw
+    elif interleaved_phase == "text":
+        max_seq_len = int(ss.get("interleaved_max_seq_len", 8192))
+        available = max_seq_len - len(input_ids_list)
+        if available <= 0:
+            raise ValueError("interleaved thinker exhausted its context before EOS")
+        max_new_tokens = min(interleaved_config.text_max_new_tokens, available)
+    elif interleaved_phase == "image":
+        current_frame = ss.get("interleaved_current_frame", {})
+        remaining = int(current_frame.get("remaining_image_tokens", 0))
+        if remaining <= 0:
+            raise ValueError("interleaved image phase has no remaining tokens")
+        # The reference image path reserves room for EOI and terminates only
+        # after the model emits it.
+        max_new_tokens = remaining + 1
 
     sampling_params = SamplingParams(
         max_new_tokens=max_new_tokens,
@@ -266,6 +293,12 @@ def build_dllm_thinker_request(
             boi_id = tokenizer.convert_tokens_to_ids("<boi>")
         if boi_id is not None:
             eos_token_ids = (eos_token_ids or set()) | {boi_id}
+    elif interleaved_phase == "text":
+        boi_id = tokenizer.convert_tokens_to_ids("<boi>")
+        eos_token_ids = (eos_token_ids or set()) | {int(boi_id)}
+    elif interleaved_phase == "image":
+        eoi_id = tokenizer.convert_tokens_to_ids("<|/image|>")
+        eos_token_ids = {int(eoi_id)}
 
     rid = request_id or "req-0"
     req = Req(
@@ -319,11 +352,54 @@ def build_dllm_thinker_request(
             ),
         )
 
+    if interleaved_phase == "image":
+        raw_plan = ss.get("interleaved_cfg_plan")
+        if not isinstance(raw_plan, dict):
+            raise TypeError("interleaved image phase is missing its CFG plan")
+        branches = raw_plan.get("branches", {})
+        mode = raw_plan.get("mode")
+        if mode == "simple":
+            _attach_cfg_branches(
+                req,
+                tokenizer=tokenizer,
+                conditional_input_ids=input_ids_list,
+                uncond_input_ids=list(branches["uncond"]),
+                cfg_scale=float(raw_plan["cfg_scale"]),
+                cfg_rescale=float(raw_plan["cfg_rescale"]),
+            )
+        elif mode == "editing":
+            _attach_cfg_branches(
+                req,
+                tokenizer=tokenizer,
+                conditional_input_ids=input_ids_list,
+                uncond_input_ids=list(branches["no_text"]),
+                cfg_scale=float(raw_plan["cfg_text_scale"]),
+                cfg_rescale=float(raw_plan["cfg_rescale"]),
+                uncond_img_input_ids=list(branches["no_image"]),
+                cfg_image_scale=float(raw_plan["cfg_image_scale"]),
+            )
+        elif mode == "none":
+            pass
+        else:
+            raise ValueError(f"unsupported interleaved CFG mode: {mode!r}")
+
     # Attach task metadata for algorithm-level decisions.
     req._task_kind = state.task_kind
     if is_thinking_phase1:
         req._is_thinking_phase1 = True
-    dllm_steps = ss.get("dllm_steps")
+    if interleaved_phase is not None:
+        req._interleaved_phase = interleaved_phase
+    if state.task_kind == "interleaved":
+        if interleaved_phase == "image":
+            dllm_steps = ss.get(
+                "interleaved_image_dllm_steps",
+                ss.get("interleaved_dllm_steps"),
+            )
+        else:
+            # Match i2t: text uses the scheduler's default block schedule.
+            dllm_steps = None
+    else:
+        dllm_steps = ss.get("dllm_steps")
     if dllm_steps is not None:
         req._dllm_steps = int(dllm_steps)
 
@@ -422,6 +498,286 @@ def _thinking_phase1_to_phase2(
     state.engine_outputs.pop(THINKER_STAGE, None)
 
 
+def _serialize_cfg_plan(plan: CFGBranchPlan) -> dict[str, Any]:
+    return {
+        "mode": plan.mode,
+        "branches": {name: list(ids) for name, ids in plan.branches.items()},
+        "cfg_scale": plan.cfg_scale,
+        "cfg_text_scale": plan.cfg_text_scale,
+        "cfg_image_scale": plan.cfg_image_scale,
+        "cfg_rescale": plan.cfg_rescale,
+    }
+
+
+def _mark_interleaved_done(
+    state: LLaDA2UniPipelineState,
+    *,
+    finish_reason: str,
+) -> None:
+    stream_state = state.stream_state
+    stream_state["interleaved_phase"] = "done"
+    stream_state["interleaved_done"] = True
+    stream_state["interleaved_finish_reason"] = finish_reason
+    stream_state.pop("interleaved_needs_reentry", None)
+    prompt = state.prompt or {}
+    input_ids = prompt.get("input_ids")
+    final_length = int(input_ids.numel()) if isinstance(input_ids, torch.Tensor) else 0
+    prompt_length = int(stream_state.get("interleaved_prompt_length", 0))
+    completion_tokens = max(final_length - prompt_length, 0)
+    stream_state["interleaved_usage"] = {
+        "prompt_tokens": prompt_length,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_length + completion_tokens,
+    }
+
+
+def _reject_image_tokens_in_text(
+    token_ids: list[int],
+    tokenizer: Any,
+    *,
+    frame_index: int,
+) -> None:
+    offenders = [
+        (index, token_id)
+        for index, token_id in enumerate(token_ids)
+        if token_id >= IMAGE_TOKEN_OFFSET
+    ]
+    if not offenders:
+        return
+
+    details = ", ".join(
+        f"offset={index} id={token_id} token={tokenizer.convert_ids_to_tokens(token_id)!r}"
+        for index, token_id in offenders[:8]
+    )
+    logger.error(
+        "Interleaved text phase emitted image token(s): frame=%d %s",
+        frame_index,
+        details,
+    )
+    raise ValueError(
+        f"interleaved text phase emitted image token(s) for frame {frame_index}: "
+        f"{details}"
+    )
+
+
+def _interleaved_text_to_image_or_done(
+    state: LLaDA2UniPipelineState,
+    tokenizer: Any,
+    *,
+    finish_reason: str | None = None,
+) -> None:
+    """Consume a text phase ending in BOI or EOS and prepare the next phase."""
+
+    thinker_out = state.thinker_out or {}
+    output_ids = [int(token_id) for token_id in thinker_out.get("output_ids", [])]
+    if not output_ids:
+        raise ValueError("interleaved text phase produced no tokens")
+    prompt = state.prompt or {}
+    prompt_tensor = prompt.get("input_ids")
+    if not isinstance(prompt_tensor, torch.Tensor):
+        raise TypeError("interleaved thinker prompt must be a tensor")
+    prompt_ids = prompt_tensor.flatten().tolist()
+    boi_id = int(tokenizer.convert_tokens_to_ids("<boi>"))
+    stream_state = state.stream_state
+    full_ids = prompt_ids + output_ids
+    if output_ids[-1] != boi_id:
+        state.prompt = {"input_ids": torch.tensor([full_ids], dtype=torch.long)}
+        segment_start = int(
+            stream_state.get("interleaved_segment_start", len(prompt_ids))
+        )
+        trailing_ids = full_ids[segment_start:]
+        _reject_image_tokens_in_text(
+            trailing_ids,
+            tokenizer,
+            frame_index=int(stream_state.get("interleaved_frame_index", 0)) + 1,
+        )
+        stream_state["interleaved_trailing_text"] = tokenizer.decode(
+            trailing_ids, skip_special_tokens=True
+        )
+        _mark_interleaved_done(state, finish_reason=finish_reason or "stop")
+        return
+
+    header = parse_image_header(output_ids, tokenizer)
+    config = InterleavedGenerationConfig.from_metadata(state.request_metadata)
+    if (
+        header.image_token_count <= 0
+        or header.image_token_count > config.max_image_tokens
+    ):
+        raise ValueError(
+            f"interleaved image grid {header.grid_h}x{header.grid_w} requires "
+            f"{header.image_token_count} tokens; limit is {config.max_image_tokens}"
+        )
+
+    max_seq_len = int(state.stream_state.get("interleaved_max_seq_len", 8192))
+    required_length = len(full_ids) + header.image_token_count + 1
+    if required_length > max_seq_len:
+        raise ValueError(
+            "interleaved frame would exceed thinker context: "
+            f"required={required_length}, max={max_seq_len}"
+        )
+    frame_index = int(state.stream_state.get("interleaved_frame_index", 0))
+    plan = build_cfg_plan(
+        full_ids=full_ids,
+        header=header,
+        frame_index=frame_index,
+        tokenizer=tokenizer,
+        config=config,
+    )
+    segment_start = int(stream_state.get("interleaved_segment_start", len(prompt_ids)))
+    header_start = len(full_ids) - len(header.token_ids)
+    current_text_ids = full_ids[segment_start:header_start]
+    _reject_image_tokens_in_text(
+        current_text_ids,
+        tokenizer,
+        frame_index=frame_index + 1,
+    )
+    current_text = tokenizer.decode(current_text_ids, skip_special_tokens=True)
+    state.stream_state["interleaved_current_frame"] = {
+        "index": frame_index + 1,
+        "text": current_text,
+        "text_ids": current_text_ids,
+        "grid_h": header.grid_h,
+        "grid_w": header.grid_w,
+        "image_token_count": header.image_token_count,
+        "remaining_image_tokens": header.image_token_count,
+        "vq_tokens": [],
+        "cfg_mode": plan.mode,
+    }
+    state.stream_state["interleaved_cfg_plan"] = _serialize_cfg_plan(plan)
+    state.stream_state["interleaved_phase"] = "image"
+    state.stream_state["image_info"] = [
+        {"grid_h": header.grid_h, "grid_w": header.grid_w}
+    ]
+    state.stream_state["interleaved_needs_reentry"] = True
+    state.prompt = {"input_ids": torch.tensor([full_ids], dtype=torch.long)}
+    state.thinker_out = None
+    state.engine_outputs.pop(THINKER_STAGE, None)
+
+
+def _interleaved_image_to_text_or_done(
+    state: LLaDA2UniPipelineState,
+    tokenizer: Any,
+) -> None:
+    """Validate the VQ result and emit the completed frame."""
+
+    stream_state = state.stream_state
+    thinker_out = state.thinker_out or {}
+    output_ids = [int(token_id) for token_id in thinker_out.get("output_ids", [])]
+    current_frame = stream_state.get("interleaved_current_frame", {})
+    remaining = int(current_frame.get("remaining_image_tokens", 0))
+    eoi_id = int(tokenizer.convert_tokens_to_ids("<|/image|>"))
+
+    if not output_ids:
+        raise ValueError("interleaved image phase produced no tokens")
+
+    eoi_positions = [
+        index for index, token_id in enumerate(output_ids) if token_id == eoi_id
+    ]
+    if len(eoi_positions) > 1:
+        raise ValueError("interleaved image phase produced multiple EOI tokens")
+    has_eoi = bool(eoi_positions)
+    if has_eoi and eoi_positions[0] != len(output_ids) - 1:
+        raise ValueError("interleaved image phase produced tokens after EOI")
+
+    image_output_ids = output_ids[: eoi_positions[0]] if has_eoi else output_ids
+    if len(image_output_ids) > remaining:
+        raise ValueError(
+            f"interleaved frame {current_frame.get('index')} produced "
+            f"{len(image_output_ids)} VQ tokens with {remaining} remaining"
+        )
+    if any(token_id < IMAGE_TOKEN_OFFSET for token_id in image_output_ids):
+        raise ValueError(
+            "interleaved image phase produced a non-image token before EOI"
+        )
+
+    prompt = state.prompt or {}
+    prompt_tensor = prompt.get("input_ids")
+    if not isinstance(prompt_tensor, torch.Tensor):
+        raise TypeError("interleaved thinker prompt must be a tensor")
+    prompt_ids = prompt_tensor.flatten().tolist()
+    accumulated = list(current_frame.get("vq_tokens", []))
+    accumulated.extend(image_output_ids)
+    remaining -= len(image_output_ids)
+    current_frame["vq_tokens"] = accumulated
+    current_frame["remaining_image_tokens"] = remaining
+
+    raw_plan = stream_state.get("interleaved_cfg_plan", {})
+    branches = raw_plan.get("branches", {}) if isinstance(raw_plan, dict) else {}
+    for branch_ids in branches.values():
+        branch_ids.extend(image_output_ids)
+
+    state.prompt = {
+        "input_ids": torch.tensor([prompt_ids + image_output_ids], dtype=torch.long)
+    }
+    if not has_eoi:
+        if remaining <= 0:
+            raise ValueError("interleaved image phase completed VQ tokens without EOI")
+        state.thinker_out = None
+        state.engine_outputs.pop(THINKER_STAGE, None)
+        stream_state["interleaved_needs_reentry"] = True
+        return
+
+    if remaining != 0:
+        raise ValueError(
+            f"interleaved image phase emitted EOI with {remaining} VQ tokens remaining"
+        )
+
+    expected = int(current_frame.get("image_token_count", 0))
+    if len(accumulated) != expected:
+        raise ValueError(
+            f"interleaved frame {current_frame.get('index')} produced "
+            f"{len(accumulated)} VQ tokens; expected {expected}"
+        )
+
+    full_ids = prompt_ids + image_output_ids + [eoi_id]
+    state.prompt = {"input_ids": torch.tensor([full_ids], dtype=torch.long)}
+    final_thinker_out = dict(thinker_out)
+    final_thinker_out["output_ids"] = accumulated
+    state.thinker_out = final_thinker_out
+    state.engine_outputs[THINKER_STAGE] = final_thinker_out
+
+    frame_index = int(current_frame["index"])
+    stream_state["interleaved_frame_index"] = frame_index
+    segments = stream_state.setdefault("interleaved_segments", [])
+    segments.append(
+        {
+            "frame_index": frame_index,
+            "text": current_frame.get("text", ""),
+            "grid_h": current_frame.get("grid_h"),
+            "grid_w": current_frame.get("grid_w"),
+            "cfg_mode": current_frame.get("cfg_mode"),
+        }
+    )
+    stream_state["interleaved_phase"] = "text"
+    stream_state["interleaved_segment_start"] = len(full_ids)
+    stream_state["interleaved_emit_frame"] = True
+    stream_state.pop("interleaved_cfg_plan", None)
+    stream_state.pop("interleaved_current_frame", None)
+
+    max_frames = int(stream_state.get("interleaved_max_frames", 10))
+    if frame_index >= max_frames:
+        _mark_interleaved_done(state, finish_reason="max_frames")
+    else:
+        stream_state["interleaved_needs_reentry"] = True
+
+
+def _advance_interleaved_state(
+    state: LLaDA2UniPipelineState,
+    tokenizer: Any,
+    *,
+    completed_phase: str,
+    finish_reason: str | None = None,
+) -> None:
+    if completed_phase == "text":
+        _interleaved_text_to_image_or_done(
+            state, tokenizer, finish_reason=finish_reason
+        )
+    elif completed_phase == "image":
+        _interleaved_image_to_text_or_done(state, tokenizer)
+    else:
+        raise ValueError(f"unsupported interleaved phase: {completed_phase!r}")
+
+
 def make_dllm_thinker_scheduler_adapters(
     *,
     tokenizer: Any,
@@ -433,9 +789,12 @@ def make_dllm_thinker_scheduler_adapters(
 
     def request_builder(payload: StagePayload) -> SGLangDLLMRequestData:
         state = LLaDA2UniPipelineState.from_dict(payload.data)
-        # Clear re-entry flag so Phase 2 result routes to terminal stages
+        # Route flags describe the previous result and must not leak into the
+        # next self-loop pass.
         if isinstance(state.stream_state, dict):
             state.stream_state.pop("thinking_needs_reentry", None)
+            state.stream_state.pop("interleaved_needs_reentry", None)
+            state.stream_state.pop("interleaved_emit_frame", None)
             # Update payload data with cleared flag
             payload = StagePayload(
                 request_id=payload.request_id,
@@ -457,6 +816,11 @@ def make_dllm_thinker_scheduler_adapters(
     def result_adapter(data: SGLangDLLMRequestData) -> StagePayload:
         payload = data.stage_payload
         state = LLaDA2UniPipelineState.from_dict(payload.data)
+        completed_interleaved_phase = (
+            state.stream_state.get("interleaved_phase")
+            if state.task_kind == "interleaved"
+            else None
+        )
         apply_dllm_thinker_result(
             state,
             stage_name=stage_name,
@@ -468,6 +832,13 @@ def make_dllm_thinker_scheduler_adapters(
         ss = state.stream_state if isinstance(state.stream_state, dict) else {}
         if ss.get("thinking_mode") and ss.get("thinking_phase") == 1:
             _thinking_phase1_to_phase2(state, tokenizer)
+        elif completed_interleaved_phase is not None:
+            _advance_interleaved_state(
+                state,
+                tokenizer,
+                completed_phase=str(completed_interleaved_phase),
+                finish_reason=data.finish_reason,
+            )
 
         return StagePayload(
             request_id=payload.request_id,

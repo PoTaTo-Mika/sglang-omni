@@ -8,6 +8,7 @@ from typing import ClassVar
 
 from sglang_omni.config import (
     PipelineConfig,
+    PlacementConfig,
     SequenceParallelPolicy,
     SGLangServerArgsConfig,
     StageConfig,
@@ -22,6 +23,7 @@ IMAGE_STAGE = "image_encoder"
 THINKER_STAGE = "thinker"
 DECODE_STAGE = "decode"
 IMAGE_DECODE_STAGE = "image_decode"
+INTERLEAVED_COLLECT_STAGE = "interleaved_collect"
 
 DEFAULT_THINKER_MAX_NEW_TOKENS = 2048
 LLADA2_IMAGE_DECODER_ATTENTION_HEADS = 30
@@ -237,9 +239,77 @@ class LLaDA2UniOmniPipelineConfig(PipelineConfig):
     ]
 
 
+class LLaDA2UniInterleavedPipelineConfig(PipelineConfig):
+    """Text-only interleaved input with thinker/image-decoder isolation."""
+
+    architecture: ClassVar[str] = "LLaDA2MoeModelLM"
+
+    @classmethod
+    def mem_fraction_role_to_stage(cls) -> dict[str, str]:
+        return {THINKER_STAGE: THINKER_STAGE}
+
+    @classmethod
+    def sequence_parallel_policy(
+        cls, *, stage_name: str
+    ) -> SequenceParallelPolicy | None:
+        if stage_name == IMAGE_DECODE_STAGE:
+            return LLADA2_IMAGE_DECODER_SP_POLICY
+        return super().sequence_parallel_policy(stage_name=stage_name)
+
+    model_path: str
+    placement: PlacementConfig = PlacementConfig(
+        require_memory_fraction_for_colocation=False
+    )
+    stages: list[StageConfig] = [
+        StageConfig(
+            name=PREPROCESSING_STAGE,
+            process="pipeline",
+            factory=f"{_PKG}.stages.create_preprocessing_executor",
+            factory_args={"thinker_max_seq_len": 8192},
+            runtime_arg_map={"max_seq_len": "thinker_max_seq_len"},
+            next=THINKER_STAGE,
+        ),
+        StageConfig(
+            name=THINKER_STAGE,
+            process="thinker",
+            factory=f"{_PKG}.stages.create_sglang_dllm_thinker_executor_from_config",
+            factory_args={"thinker_max_seq_len": 8192},
+            gpu=0,
+            next=[THINKER_STAGE, IMAGE_DECODE_STAGE, INTERLEAVED_COLLECT_STAGE],
+            route_fn=f"{_PKG}.routing.thinker_next",
+            runtime=StageRuntimeConfig(
+                sglang_server_args=SGLangServerArgsConfig(
+                    mem_fraction_static=0.75,
+                ),
+                resources=StageResourceConfig(total_gpu_memory_fraction=0.75),
+            ),
+        ),
+        StageConfig(
+            name=IMAGE_DECODE_STAGE,
+            process="image_decoder",
+            factory=f"{_PKG}.stages.create_image_decode_executor",
+            factory_args={
+                "device": "cuda",
+                "dtype": None,
+                "resolution_multiplier": 2,
+                "png_compress_level": 1,
+            },
+            gpu=1,
+            next=INTERLEAVED_COLLECT_STAGE,
+        ),
+        StageConfig(
+            name=INTERLEAVED_COLLECT_STAGE,
+            process="pipeline",
+            factory=f"{_PKG}.interleaved.create_interleaved_collector_executor",
+            terminal=True,
+        ),
+    ]
+
+
 EntryClass = LLaDA2UniOmniPipelineConfig
 
 Variants = {
     "text": LLaDA2UniPipelineConfig,
     "omni": LLaDA2UniOmniPipelineConfig,
+    "interleaved": LLaDA2UniInterleavedPipelineConfig,
 }

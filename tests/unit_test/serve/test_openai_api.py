@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
+import logging
 from typing import Any
 
 import pytest
@@ -11,7 +13,10 @@ from fastapi.testclient import TestClient
 
 from sglang_omni.client import Client, GenerateChunk
 from sglang_omni.client.audio import encode_pcm
-from sglang_omni.client.types import GenerateRequest
+from sglang_omni.client.types import (
+    CompletionResult,
+    GenerateRequest,
+)
 from sglang_omni.pipeline.coordinator import Coordinator
 from sglang_omni.proto import (
     EXPLICIT_GENERATION_PARAMS_KEY,
@@ -23,6 +28,7 @@ from sglang_omni.serve import create_app
 from sglang_omni.serve.openai_api import (
     _await_speech_response,
     _build_chat_generate_request,
+    _chat_non_stream,
     _chat_stream,
     _speech_audio_response,
     build_transcription_generate_request,
@@ -643,6 +649,301 @@ def test_chat_stream_failure_closes_without_done_sentinel() -> None:
 
     assert chunks
     assert all(chunk != "data: [DONE]\n\n" for chunk in chunks)
+
+
+def test_chat_non_stream_uses_content_as_the_only_interleaved_result() -> None:
+    content = [
+        {"type": "text", "text": "frame"},
+        {
+            "type": "image",
+            "image": {"data": "base64-image", "format": "png"},
+        },
+    ]
+
+    class InterleavedClient:
+        async def completion(self, *args, **kwargs):
+            del args, kwargs
+            return CompletionResult(
+                request_id="req-1",
+                text="",
+                content=content,
+            )
+
+    req = ChatCompletionRequest(
+        model="LLaDA2.0-Uni",
+        messages=[{"role": "user", "content": "one frame"}],
+        interleaved_generation={},
+    )
+    response = asyncio.run(
+        _chat_non_stream(
+            client=InterleavedClient(),
+            gen_req=GenerateRequest(model="LLaDA2.0-Uni", prompt="one frame"),
+            request_id="req-1",
+            response_id="chatcmpl-req-1",
+            created=0,
+            model="LLaDA2.0-Uni",
+            req=req,
+            audio_format="wav",
+        )
+    )
+
+    message = json.loads(response.body)["choices"][0]["message"]
+    assert message["content"] == content
+    assert "image" not in message
+    assert "images" not in message
+    assert "interleaved_content" not in message
+
+
+def test_interleaved_generation_accepts_more_than_64_frames() -> None:
+    req = ChatCompletionRequest(
+        messages=[{"role": "user", "content": "Draw a long sequence."}],
+        interleaved_generation={"max_frames": 128},
+    )
+
+    gen_req = _build_chat_generate_request(req)
+
+    assert gen_req.metadata["interleaved_generation"]["max_frames"] == 128
+
+
+@pytest.mark.parametrize(
+    "modalities",
+    [
+        ["text"],
+        ["image"],
+        ["audio"],
+        ["text", "image", "audio"],
+        ["text", "text", "image"],
+    ],
+)
+def test_chat_endpoint_rejects_interleaved_modality_override(
+    modalities: list[str], caplog: pytest.LogCaptureFixture
+) -> None:
+    class UnexpectedCompletionClient:
+        async def completion(self, *args, **kwargs):
+            pytest.fail("invalid interleaved request reached the completion client")
+
+    client = TestClient(
+        create_app(UnexpectedCompletionClient(), model_name="llada2-uni")
+    )
+    with caplog.at_level(logging.WARNING):
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "Draw two frames."}],
+                "interleaved_generation": {},
+                "modalities": modalities,
+            },
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        "interleaved_generation requires text and image output; "
+        "omit modalities or specify exactly ['text', 'image']"
+    )
+    assert "incompatible modalities" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "request_fields",
+    [
+        {"interleaved_generation": {}},
+        {
+            "interleaved_generation": {},
+            "modalities": ["text", "image"],
+        },
+    ],
+)
+def test_chat_endpoint_rejects_streaming_interleaved_generation(
+    request_fields: dict[str, Any],
+) -> None:
+    class UnexpectedCompletionClient:
+        async def completion_stream(self, *args, **kwargs):
+            pytest.fail("invalid interleaved request reached the completion client")
+            yield
+
+    client = TestClient(
+        create_app(UnexpectedCompletionClient(), model_name="llada2-uni")
+    )
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "Draw two frames."}],
+            "stream": True,
+            **request_fields,
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        "Image generation does not support streaming; set stream=false"
+    )
+
+
+def test_chat_endpoint_rejects_multiple_image_generation_modes() -> None:
+    class UnexpectedCompletionClient:
+        async def completion(self, *args, **kwargs):
+            pytest.fail("invalid image request reached the completion client")
+
+    client = TestClient(
+        create_app(UnexpectedCompletionClient(), model_name="llada2-uni")
+    )
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "Draw two frames."}],
+            "image_generation": {},
+            "interleaved_generation": {},
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        "image_generation and interleaved_generation are mutually exclusive"
+    )
+
+
+@pytest.mark.parametrize(
+    "input_fields",
+    [
+        {"images": ["image.png"]},
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "image.png"},
+                        },
+                        {"type": "text", "text": "Continue this scene."},
+                    ],
+                }
+            ]
+        },
+        {"audios": ["audio.wav"]},
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "video_url", "video_url": {"url": "video.mp4"}},
+                        {"type": "text", "text": "Draw two frames."},
+                    ],
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"image_url": {"url": "image.png"}}],
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": 123}],
+                }
+            ]
+        },
+        {"messages": [{"role": "user", "content": None}]},
+    ],
+)
+def test_chat_endpoint_rejects_non_text_input_for_interleaved_generation(
+    input_fields: dict[str, Any],
+) -> None:
+    class UnexpectedCompletionClient:
+        async def completion(self, *args, **kwargs):
+            pytest.fail("invalid interleaved request reached the completion client")
+
+    client = TestClient(
+        create_app(UnexpectedCompletionClient(), model_name="llada2-uni")
+    )
+    request = {
+        "messages": [{"role": "user", "content": "Continue this scene."}],
+        "interleaved_generation": {},
+        **input_fields,
+    }
+    response = client.post("/v1/chat/completions", json=request)
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        "interleaved_generation requires text-only input"
+    )
+
+
+def test_chat_endpoint_accepts_structured_text_for_interleaved_generation() -> None:
+    completion_calls: list[GenerateRequest] = []
+
+    class InterleavedClient:
+        async def completion(self, request, *args, **kwargs):
+            del args, kwargs
+            completion_calls.append(request)
+            return CompletionResult(
+                request_id="structured-text",
+                text="",
+                content=[{"type": "text", "text": "result"}],
+            )
+
+    client = TestClient(create_app(InterleavedClient(), model_name="llada2-uni"))
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "Draw two frames."}],
+                }
+            ],
+            "interleaved_generation": {},
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(completion_calls) == 1
+    assert completion_calls[0].messages[0].content == [
+        {"type": "text", "text": "Draw two frames."}
+    ]
+
+
+def test_chat_non_stream_wraps_single_image_in_content() -> None:
+    class ImageClient:
+        async def completion(self, *args, **kwargs):
+            del args, kwargs
+            return CompletionResult(
+                request_id="req-1",
+                text="",
+                image="base64-image",
+            )
+
+    req = ChatCompletionRequest(
+        model="LLaDA2.0-Uni",
+        messages=[{"role": "user", "content": "a spoon"}],
+        modalities=["image"],
+    )
+    response = asyncio.run(
+        _chat_non_stream(
+            client=ImageClient(),
+            gen_req=GenerateRequest(model="LLaDA2.0-Uni", prompt="a spoon"),
+            request_id="req-1",
+            response_id="chatcmpl-req-1",
+            created=0,
+            model="LLaDA2.0-Uni",
+            req=req,
+            audio_format="wav",
+        )
+    )
+
+    message = json.loads(response.body)["choices"][0]["message"]
+    assert message["content"] == [
+        {
+            "type": "image",
+            "image": {"data": "base64-image", "format": "png"},
+        }
+    ]
+    assert "image" not in message
 
 
 def test_chat_request_omits_explicit_params_when_sampling_omitted() -> None:

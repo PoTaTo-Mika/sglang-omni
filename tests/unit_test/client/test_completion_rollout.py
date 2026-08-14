@@ -164,3 +164,50 @@ def test_completion_concatenates_streamed_logprobs() -> None:
     assert out.output_token_logprobs == [[-0.1, 11], [-0.2, 22], [-0.3, 33]]
     assert out.weight_version == "v7"
     assert out.omni_rollout == {"version": 1, "action_streams": []}
+
+
+def test_completion_stream_preserves_interleaved_aggregate() -> None:
+    from sglang_omni.client.types import GenerateChunk
+    from sglang_omni.proto import StreamMessage
+
+    content = [
+        {"type": "text", "text": "frame"},
+        {
+            "type": "image",
+            "image": {
+                "data": "base64-image",
+                "format": "png",
+                "frame_index": 1,
+            },
+        },
+    ]
+    messages = [
+        StreamMessage(
+            request_id="r1",
+            from_stage="collector",
+            chunk=GenerateChunk(
+                request_id="r1",
+                modality="interleaved",
+                content=content,
+                finish_reason="stop",
+                timings={"e2e_ms": 1.0},
+            ),
+            stage_name="collector",
+            modality="interleaved",
+        )
+    ]
+    client = Client(_StreamStubCoordinator(messages))
+
+    async def collect():
+        return [
+            chunk
+            async for chunk in client.completion_stream(
+                GenerateRequest(prompt="hi", stream=True), request_id="r1"
+            )
+        ]
+
+    chunks = asyncio.run(collect())
+    assert len(chunks) == 1
+    assert chunks[0].modality == "interleaved"
+    assert chunks[0].content == content
+    assert chunks[0].timings == {"e2e_ms": 1.0}

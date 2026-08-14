@@ -28,11 +28,11 @@ def extract_image_vq_tokens(
               2. square ``sqrt(N)`` fallback, truncated to fit
         - ``params`` is the request's ``image_generation`` dict (empty if absent)
 
-    Returns ``None`` if not a t2i/edit request, or if no VQ tokens are present.
+    Returns ``None`` if this request does not contain a decodable VQ frame.
     """
     # Skip cheaply when not a t2i / edit request — chat / mmu pipelines also
     # fan-out to image_decode but never produce VQ tokens.
-    if state.task_kind not in ("t2i", "edit"):
+    if state.task_kind not in ("t2i", "edit", "interleaved"):
         return None
 
     thinker_out = state.thinker_out or state.engine_outputs.get("thinker")
@@ -56,7 +56,12 @@ def extract_image_vq_tokens(
     params: dict[str, Any] = {}
     metadata = state.request_metadata or {}
     if isinstance(metadata, dict):
-        ig = metadata.get("image_generation")
+        metadata_key = (
+            "interleaved_generation"
+            if state.task_kind == "interleaved"
+            else "image_generation"
+        )
+        ig = metadata.get(metadata_key)
         if isinstance(ig, dict):
             params = ig
 

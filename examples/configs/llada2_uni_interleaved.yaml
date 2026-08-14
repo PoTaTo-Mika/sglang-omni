@@ -1,0 +1,2 @@
+config_cls: LLaDA2UniInterleavedPipelineConfig
+model_path: inclusionAI/LLaDA2.0-Uni

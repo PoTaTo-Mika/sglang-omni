@@ -688,6 +688,61 @@ def test_edit_rejects_empty_instruction_before_image_processing(
     )
 
 
+@pytest.mark.parametrize(
+    ("inputs", "metadata"),
+    [
+        (
+            [{"role": "user", "content": "Draw two frames."}],
+            {"interleaved_generation": {}, "audios": ["audio.wav"]},
+        ),
+        (
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "video_url",
+                                "video_url": {"url": "video.mp4"},
+                            },
+                            {"type": "text", "text": "Draw two frames."},
+                        ],
+                    }
+                ]
+            },
+            {"interleaved_generation": {}},
+        ),
+        (
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "text", "text": 123}],
+                    }
+                ]
+            },
+            {"interleaved_generation": {}},
+        ),
+    ],
+)
+def test_interleaved_preprocessor_rejects_non_text_input(
+    inputs: object,
+    metadata: dict,
+) -> None:
+    payload = StagePayload(
+        request_id="interleaved-non-text",
+        request=OmniRequest(
+            inputs=inputs,
+            metadata=metadata,
+        ),
+        data={},
+    )
+    preprocessor = object.__new__(LLaDA2Preprocessor)
+
+    with pytest.raises(ValueError, match="text-only input"):
+        asyncio.run(preprocessor(payload))
+
+
 @pytest.mark.parametrize("stream", [False, True])
 def test_chat_endpoint_rejects_empty_edit_instruction_with_400(stream: bool) -> None:
     class UnexpectedCompletionClient:
