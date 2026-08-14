@@ -40,6 +40,7 @@ def _init_sync_request_build_state(scheduler: OmniScheduler) -> None:
     scheduler._request_build_executor = None
     scheduler.request_build_max_pending = 0
     scheduler._pending_request_builds = {}
+    scheduler._pending_request_admissions = {}
     scheduler._backlogged_request_build_payloads = []
     scheduler._request_build_max_pending_observed = 0
     scheduler._async_pending = None
@@ -67,6 +68,7 @@ def test_scheduler_idle_sleep_yields_to_pending_request_builds(monkeypatch) -> N
     scheduler = object.__new__(OmniScheduler)
     scheduler._request_admission_lock = threading.RLock()
     scheduler._pending_request_builds = {}
+    scheduler._pending_request_admissions = {}
     sleep_calls: list[float] = []
     monkeypatch.setattr(omni_scheduler_module.time, "sleep", sleep_calls.append)
 
@@ -83,6 +85,7 @@ def test_normal_event_loop_uses_request_build_aware_idle_sleep(monkeypatch) -> N
     scheduler._engine_paused = False
     scheduler._request_admission_lock = threading.RLock()
     scheduler._pending_request_builds = {"req": object()}
+    scheduler._pending_request_admissions = {}
     scheduler._process_admin_requests = lambda: None
     scheduler.recv_requests = lambda: []
     scheduler._take_deferred_request_payloads = lambda: []
@@ -2475,6 +2478,7 @@ def test_omni_scheduler_running_abort_does_not_leak_prefill_dedup_state(
     scheduler._aborted_request_ids = set()
     scheduler._aborted_request_id_order = collections.deque()
     scheduler._pending_request_builds = {}
+    scheduler._pending_request_admissions = {}
     scheduler._backlogged_request_build_payloads = []
     scheduler.waiting_queue = []
     scheduler._abort_callback = None
