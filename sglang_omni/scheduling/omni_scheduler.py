@@ -63,6 +63,7 @@ from sglang_omni.scheduling.prefill_coalesce import (
     validate_prefill_coalesce_requests,
     validate_prefill_coalesce_wait_ms,
 )
+from sglang_omni.vendor.sglang.parallel_state import create_parallel_state
 from sglang_omni.vendor.sglang.server_args import override_server_args
 
 logger = logging.getLogger(__name__)
@@ -763,11 +764,13 @@ class OmniScheduler:
         self._refresh_upstream_parallel_state()
 
     def _refresh_upstream_parallel_state(self) -> None:
-        """Build the rank container expected by SGLang 0.5.15 methods."""
+        """Build the rank container expected by upstream scheduler methods."""
         from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 
-        self.ps = ParallelState(
+        self.ps = create_parallel_state(
+            ParallelState,
             tp_rank=self.tp_rank,
+            dcp_size=self.server_args.dcp_size,
             tp_size=self.tp_size,
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
@@ -783,8 +786,6 @@ class OmniScheduler:
             moe_ep_size=self.moe_ep_size,
             moe_dp_rank=self.moe_dp_rank,
             moe_dp_size=self.moe_dp_size,
-            # Added by 0.5.16; upstream sources it from server_args.
-            dcp_size=self.server_args.dcp_size,
             gpu_id=self.gpu_id,
         )
 
