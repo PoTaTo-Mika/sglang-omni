@@ -326,12 +326,13 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         # the same (their down_proj was built with reduce_results=False).
         # Sum both partials and issue a single allreduce for the whole layer.
         y = self.experts(hidden_states, topk_output)
+        output_dtype = y.dtype
         if self.shared_experts is not None:
-            y = y + self.shared_experts(identity)
+            y = y.to(torch.float32) + self.shared_experts(identity).to(torch.float32)
         tp_size = get_tensor_model_parallel_world_size()
         if tp_size > 1:
             y = tensor_model_parallel_all_reduce(y)
-        return y
+        return y.to(output_dtype)
 
     def _forward_dual_stream(
         self, hidden_states: torch.Tensor, identity: torch.Tensor
@@ -347,7 +348,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         # shared-expert full path (gate_up → silu → down) in parallel.
         self.alt_stream.wait_stream(current_stream)
         with torch.cuda.stream(self.alt_stream):
-            shared_output = self.shared_experts(identity)
+            shared_output = self.shared_experts(identity).to(torch.float32)
 
         topk_weights, topk_ids, router_logits = self._route(hidden_states)
         topk_output = StandardTopKOutput(
@@ -359,13 +360,15 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         # Phase 2: run routed experts on the main stream; the alt stream's
         # shared-expert output must be joined before we add and allreduce.
         y = self.experts(hidden_states, topk_output)
+        output_dtype = y.dtype
+        y = y.to(torch.float32)
         current_stream.wait_stream(self.alt_stream)
 
         y = y + shared_output
         tp_size = get_tensor_model_parallel_world_size()
         if tp_size > 1:
             y = tensor_model_parallel_all_reduce(y)
-        return y
+        return y.to(output_dtype)
 
     def _route(
         self, hidden_states: torch.Tensor
