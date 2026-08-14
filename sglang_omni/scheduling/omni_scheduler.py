@@ -13,7 +13,6 @@ inheriting from ``SGLangScheduler``.
 
 from __future__ import annotations
 
-import inspect
 import logging
 import queue as _queue_mod
 import threading
@@ -66,6 +65,7 @@ from sglang_omni.scheduling.prefill_coalesce import (
 )
 from sglang_omni.vendor.sglang.parallel_state import create_parallel_state
 from sglang_omni.vendor.sglang.server_args import override_server_args
+from sglang_omni.vendor.sglang.signature import supported_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -616,8 +616,12 @@ class OmniScheduler:
             spec_algorithm=self.spec_algorithm,
             get_require_mlp_sync=lambda: self.require_mlp_sync,
         )
-        if "model_runner" in inspect.signature(SchedulerDPAttnAdapter).parameters:
-            dp_attn_kwargs["model_runner"] = self._model_runner
+        dp_attn_kwargs.update(
+            supported_kwargs(
+                SchedulerDPAttnAdapter,
+                model_runner=self._model_runner,
+            )
+        )
         self.dp_attn_adapter = SchedulerDPAttnAdapter(**dp_attn_kwargs)
         self.pool_stats_observer = SchedulerPoolStatsObserver(
             tree_cache=self.tree_cache,
@@ -637,7 +641,12 @@ class OmniScheduler:
             get_running_batch=lambda: self.running_batch,
         )
         empty_queue = types.SimpleNamespace(queue=[], retracted_queue=[])
-        self.load_inquirer = SchedulerLoadInquirer(
+        self.total_prefill_uncached_tokens = 0
+        self.total_prefill_busy_us = 0
+        self.decode_moment_totals: list[float] = [0.0] * 6
+        self._prev_step = None
+        self._sched_idled = False
+        load_inquirer_kwargs = dict(
             disaggregation_mode=self.disaggregation_mode,
             ps=self.ps,
             server_args=self.server_args,
@@ -662,6 +671,17 @@ class OmniScheduler:
                 self.metrics_reporter.spec_total_num_forward_ct
             ),
         )
+        current_load_metrics = {
+            "get_total_prefill_uncached_tokens": (
+                lambda: self.total_prefill_uncached_tokens
+            ),
+            "get_total_prefill_busy_us": lambda: self.total_prefill_busy_us,
+            "get_decode_moment_totals": lambda: self.decode_moment_totals,
+        }
+        load_inquirer_kwargs.update(
+            supported_kwargs(SchedulerLoadInquirer, **current_load_metrics)
+        )
+        self.load_inquirer = SchedulerLoadInquirer(**load_inquirer_kwargs)
         self.output_streamer = types.SimpleNamespace(
             stream_output=self.stream_output,
             _stream_output_generation=lambda reqs, return_logprob, **_kwargs: self.stream_output(
@@ -685,8 +705,11 @@ class OmniScheduler:
             draft_worker=self.draft_worker,
             model_worker=self.model_worker,
             logprob_result_processor=SchedulerLogprobResultProcessor(
-                server_args=self.server_args,
-                model_config=self.model_config,
+                **supported_kwargs(
+                    SchedulerLogprobResultProcessor,
+                    server_args=self.server_args,
+                    model_config=self.model_config,
+                )
             ),
             output_streamer=self.output_streamer,
             abort_request=lambda request: self.abort(request.rid),
