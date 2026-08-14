@@ -263,11 +263,6 @@ class ArkasrPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.Ten
                     self._inflight[key] = future
                     leader = True
                     self._misses += 1
-                    try:
-                        self._submit(item, future)
-                    except Exception:
-                        del self._inflight[key]
-                        raise
             else:
                 self._merged += 1
                 follower_of = future
@@ -282,6 +277,12 @@ class ArkasrPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.Ten
             future.add_done_callback(
                 lambda done, cache_key=key: self._clear_inflight(cache_key, done)
             )
+            try:
+                self._submit(item, future)
+            except Exception as exc:
+                if not future.done():
+                    future.set_exception(exc)
+                raise
         if follower_of is None:
             return self._track_submission(future)
 
