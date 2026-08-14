@@ -134,6 +134,7 @@ class ArkasrPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.Ten
         cache_max_bytes: int = _CACHE_MAX_BYTES,
         max_batch_size: int = 8,
         max_batch_wait_ms: int = 0,
+        max_queue_size: int = 0,
     ) -> None:
         self._model = model
         reference = next(model.audio_encoder.parameters())
@@ -163,11 +164,18 @@ class ArkasrPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.Ten
         self._failed = 0
         self._batch_count = 0
         self._item_count = 0
+        self._submitted = 0
+        self._pending = 0
+        self._queue_full_waits = 0
+        self._queue_depth_max = 0
         self._queue_wait_count = 0
         self._queue_wait_total_s = 0.0
         self._queue_wait_max_s = 0.0
         self._encoder_time_s = 0.0
-        super().__init__(worker_name="arkasr-audio-encode")
+        super().__init__(
+            worker_name="arkasr-audio-encode",
+            max_queue_size=max_queue_size,
+        )
 
     def close(self) -> None:
         """Stop the encoder worker after all queued requests finish."""
@@ -183,24 +191,35 @@ class ArkasrPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.Ten
         item: Any,
         future: concurrent.futures.Future[torch.Tensor],
     ) -> None:
-        with self._lifecycle_lock:
-            if self._closed:
-                raise RuntimeError("ARK-ASR pre-LM encoder service is closed")
-            self._queue.put(
-                QueueEntry(
-                    item=item,
-                    future=future,
-                    enqueued_at=time.perf_counter(),
-                )
-            )
+        queue_was_full = False
+        entry = QueueEntry(
+            item=item,
+            future=future,
+            enqueued_at=time.perf_counter(),
+        )
+        while True:
+            with self._lifecycle_lock:
+                if self._closed:
+                    raise RuntimeError("ARK-ASR pre-LM encoder service is closed")
+                try:
+                    self._queue.put_nowait(entry)
+                    break
+                except queue.Full:
+                    queue_was_full = True
+            with self._worker_state_lock:
+                if self._worker_error is not None:
+                    raise RuntimeError(
+                        "pre-LM encoder worker has failed"
+                    ) from self._worker_error
+            time.sleep(0.01)
+        queue_depth = self._queue.qsize()
+        with self._lock:
+            if queue_was_full:
+                self._queue_full_waits += 1
+            self._queue_depth_max = max(self._queue_depth_max, queue_depth)
 
-    def encode_item(self, item: Any) -> None:
-        """Block until ``item.precomputed_embeddings`` holds the LM embedding.
-
-        On success ``item.feature`` is cleared to release the CPU mel tensor.
-        Raises on encode failure; the request must not be admitted without the
-        complete embedding.
-        """
+    def submit_item(self, item: Any) -> concurrent.futures.Future[torch.Tensor]:
+        """Return when the item has been queued for LM-ready encoding."""
         expected_tokens = _expected_audio_tokens(item)
         if expected_tokens is None:
             raise RuntimeError(
@@ -209,9 +228,7 @@ class ArkasrPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.Ten
         key = self._cache_key(item)
 
         if key is None:
-            future = self._submit(item)
-            future.result(timeout=self.ENCODE_TIMEOUT_S)
-            return
+            return self._track_submission(self._submit(item))
 
         cached = self._cache.get(key)
         if cached is not None:
@@ -219,7 +236,11 @@ class ArkasrPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.Ten
                 with self._lock:
                     self._hits += 1
                 self.attach_embedding(item, cached)
-                return
+                future: concurrent.futures.Future[torch.Tensor] = (
+                    concurrent.futures.Future()
+                )
+                future.set_result(cached)
+                return self._track_submission(future)
             logger.warning(
                 f"ARK-ASR pre-LM cache entry {key} failed validation "
                 f"(shape={tuple(cached.shape)}, dtype={cached.dtype}); "
@@ -228,12 +249,11 @@ class ArkasrPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.Ten
             self._cache.remove_if_same(key, cached)
             cached = None
 
+        follower_of: concurrent.futures.Future[torch.Tensor] | None = None
         leader = False
         with self._lock:
             future = self._inflight.get(key)
             if future is None:
-                # re-check under the single-flight lock so a stale miss cannot
-                # start work after the prior leader cached.
                 cached = self._cache.get(key)
                 if cached is not None and self._is_valid(cached, expected_tokens):
                     self._hits += 1
@@ -250,30 +270,79 @@ class ArkasrPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.Ten
                         raise
             else:
                 self._merged += 1
+                follower_of = future
         if cached is not None:
             self.attach_embedding(item, cached)
-            return
-        try:
-            embedding = future.result(timeout=self.ENCODE_TIMEOUT_S)
-        except Exception:
-            with self._lock:
-                self._failed += 1
-            raise
-        finally:
-            if leader:
-                with self._lock:
-                    if self._inflight.get(key) is future:
-                        del self._inflight[key]
-        if leader:
-            return
-        if not self._is_valid(embedding, expected_tokens):
-            with self._lock:
-                self._failed += 1
-            raise RuntimeError(
-                f"ARK-ASR pre-LM encode leader for {key} returned an invalid "
-                f"embedding"
+            completed: concurrent.futures.Future[torch.Tensor] = (
+                concurrent.futures.Future()
             )
-        self.attach_embedding(item, embedding)
+            completed.set_result(cached)
+            return self._track_submission(completed)
+        if leader:
+            future.add_done_callback(
+                lambda done, cache_key=key: self._clear_inflight(cache_key, done)
+            )
+        if follower_of is None:
+            return self._track_submission(future)
+
+        item.feature = None
+        completion: concurrent.futures.Future[torch.Tensor] = (
+            concurrent.futures.Future()
+        )
+
+        def attach_follower(done: concurrent.futures.Future[torch.Tensor]) -> None:
+            try:
+                embedding = done.result()
+                if not self._is_valid(embedding, expected_tokens):
+                    raise RuntimeError(
+                        f"ARK-ASR pre-LM encode leader for {key} returned an "
+                        "invalid embedding"
+                    )
+                self.attach_embedding(item, embedding)
+                completion.set_result(embedding)
+            except Exception as exc:
+                completion.set_exception(exc)
+
+        follower_of.add_done_callback(attach_follower)
+        return self._track_submission(completion)
+
+    def encode_item(self, item: Any) -> None:
+        """Block until ``item.precomputed_embeddings`` holds the LM embedding.
+
+        On success ``item.feature`` is cleared to release the CPU mel tensor.
+        Raises on encode failure; the request must not be admitted without the
+        complete embedding.
+        """
+        self.submit_item(item).result(timeout=self.ENCODE_TIMEOUT_S)
+
+    def _track_submission(
+        self, future: concurrent.futures.Future[torch.Tensor]
+    ) -> concurrent.futures.Future[torch.Tensor]:
+        with self._lock:
+            self._submitted += 1
+            self._pending += 1
+
+        def finish(done: concurrent.futures.Future[torch.Tensor]) -> None:
+            try:
+                failed = done.exception() is not None
+            except concurrent.futures.CancelledError:
+                failed = True
+            with self._lock:
+                self._pending -= 1
+                if failed:
+                    self._failed += 1
+
+        future.add_done_callback(finish)
+        return future
+
+    def _clear_inflight(
+        self,
+        key: str,
+        future: concurrent.futures.Future[torch.Tensor],
+    ) -> None:
+        with self._lock:
+            if self._inflight.get(key) is future:
+                del self._inflight[key]
 
     def stats(self) -> dict[str, int | float]:
         with self._lock:
@@ -283,6 +352,10 @@ class ArkasrPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.Ten
                 "misses": self._misses,
                 "merged": self._merged,
                 "failed": self._failed,
+                "submitted": self._submitted,
+                "pending": self._pending,
+                "queue_full_waits": self._queue_full_waits,
+                "queue_depth_max": self._queue_depth_max,
                 "cache_hit_rate": (
                     self._hits / cache_lookups if cache_lookups else 0.0
                 ),
