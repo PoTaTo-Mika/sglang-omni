@@ -31,7 +31,7 @@ from sglang_omni.proto import StagePayload
 ROLE_HUMAN = "<role>HUMAN</role>"
 ROLE_ASSISTANT = "<role>ASSISTANT</role>"
 ROLE_SYSTEM = "<role>SYSTEM</role>"
-DEFAULT_SYSTEM_PROMPT = "detailed thinking off"
+DEFAULT_SYSTEM_PROMPT = "You are a multimodal understanding assistant."
 
 # Image special token strings
 SOI_TOKEN = "<|image|>"  # id=156901
@@ -237,7 +237,6 @@ class LLaDA2Preprocessor:
                         last_user_idx = i
                 image_counts_per_msg = [(last_user_idx, len(images))]
 
-            merge_sq = self._merge_size**2
             img_idx = 0
             for msg_idx, count in image_counts_per_msg:
                 parts: list[str] = []
@@ -245,7 +244,10 @@ class LLaDA2Preprocessor:
                     t, h, w = image_grid_thw[img_idx].tolist()
                     h_token = f"<|reserved_token_{h}|>"
                     w_token = f"<|reserved_token_{w}|>"
-                    num_image_tokens = t * h * w // merge_sq
+                    # LLaDA2.0-Uni's VQ-VAE produces one token per patch (no
+                    # PatchMerger), so the placeholder count matches the
+                    # raw patch count regardless of merge_size.
+                    num_image_tokens = t * h * w
                     img_header = f"{SOI_TOKEN}{h_token}{w_token}{BOI_TOKEN}"
                     image_token_counts.append(num_image_tokens)
                     parts.extend([img_header, EOI_TOKEN])
