@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import threading
 import time
 from collections.abc import Iterator
@@ -38,6 +39,7 @@ class _StubModel(torch.nn.Module):
         self.config = SimpleNamespace(hidden_size=_HIDDEN_SIZE)
         self.dtype = dtype
         self.encode_calls = 0
+        self.encode_batch_sizes: list[int] = []
         self.fail = False
         self.fail_oom = False
         self.fail_multi_item = False
@@ -50,6 +52,7 @@ class _StubModel(torch.nn.Module):
     def get_audio_feature(self, items):  # noqa: ANN001
         self.grad_enabled_during_encode = torch.is_grad_enabled()
         self.encode_calls += 1
+        self.encode_batch_sizes.append(len(items))
         gate = self.encode_gate
         if gate is not None:
             self.encode_gate = None
@@ -81,12 +84,16 @@ def _make_service(
     *,
     cache_max_entries: int = 16,
     cache_max_bytes: int = 1 << 20,
+    max_batch_size: int = 8,
+    max_queue_size: int = 0,
 ) -> ArkasrPreLMEncoderService:
     service = ArkasrPreLMEncoderService(
         model or _StubModel(),
         cache_namespace=_NAMESPACE,
         cache_max_entries=cache_max_entries,
         cache_max_bytes=cache_max_bytes,
+        max_batch_size=max_batch_size,
+        max_queue_size=max_queue_size,
     )
     _SERVICES.append(service)
     return service
@@ -125,6 +132,90 @@ def test_encode_attaches_lm_ready_embedding_and_clears_feature() -> None:
     assert model.encode_calls == 1
     assert model.grad_enabled_during_encode is False
     assert service.stats()["misses"] == 1
+
+
+def test_submit_returns_before_encoding_completes() -> None:
+    model = _StubModel()
+    gate = threading.Event()
+    model.encode_gate = gate
+    service = _make_service(model)
+    item = _item(7, 3)
+
+    future = service.submit_item(item)
+
+    assert not future.done()
+    assert item.precomputed_embeddings is None
+    gate.set()
+    future.result(timeout=2)
+    assert item.precomputed_embeddings.shape == (3, _HIDDEN_SIZE)
+    assert service.stats()["pending"] == 0
+
+
+def test_async_submissions_form_full_batch_without_blocked_callers() -> None:
+    model = _StubModel()
+    gate = threading.Event()
+    model.encode_gate = gate
+    service = _make_service(model, max_batch_size=8)
+    items = [_item(audio_hash, 3) for audio_hash in range(9)]
+
+    futures = [service.submit_item(item) for item in items]
+    deadline = time.monotonic() + 2
+    while model.encode_calls == 0 and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert model.encode_calls == 1
+    gate.set()
+    for future in futures:
+        future.result(timeout=2)
+
+    assert model.encode_batch_sizes == [1, 8]
+
+
+def test_async_single_flight_completes_each_item_future() -> None:
+    model = _StubModel()
+    gate = threading.Event()
+    model.encode_gate = gate
+    service = _make_service(model)
+    items = [_item(123, 3) for _ in range(3)]
+
+    futures = [service.submit_item(item) for item in items]
+    assert all(not future.done() for future in futures)
+    gate.set()
+    for future in futures:
+        future.result(timeout=2)
+
+    assert model.encode_calls == 1
+    assert service.stats()["merged"] == 2
+    assert all(item.precomputed_embeddings is not None for item in items)
+
+
+def test_bounded_queue_applies_backpressure_and_records_saturation() -> None:
+    model = _StubModel()
+    gate = threading.Event()
+    model.encode_gate = gate
+    service = _make_service(model, max_queue_size=1)
+    futures = [service.submit_item(_item(1, 3))]
+    deadline = time.monotonic() + 2
+    while model.encode_calls == 0 and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert model.encode_calls == 1
+    futures.append(service.submit_item(_item(2, 3)))
+    submitted: list[concurrent.futures.Future[torch.Tensor]] = []
+
+    thread = threading.Thread(
+        target=lambda: submitted.append(service.submit_item(_item(3, 3)))
+    )
+    thread.start()
+    time.sleep(0.02)
+    assert thread.is_alive()
+
+    gate.set()
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    for future in [*futures, *submitted]:
+        future.result(timeout=2)
+    stats = service.stats()
+    assert stats["queue_full_waits"] == 1
+    assert stats["queue_depth_max"] == 1
 
 
 def test_close_stops_worker() -> None:

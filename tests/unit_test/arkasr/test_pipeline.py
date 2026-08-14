@@ -68,14 +68,12 @@ def test_arkasr_stage_defaults():
     signature = inspect.signature(create_sglang_arkasr_executor)
     assert signature.parameters["max_running_requests"].default == 32
     assert signature.parameters["encoder_max_batch_size"].default == 8
-    # encode_item blocks its request-build worker until the embedding is
-    # attached, so the encoder only ever sees as many concurrent items as there
-    # are build workers; two workers would cap pre-LM encode groups at two.
-    assert signature.parameters["request_build_max_workers"].default == 8
-    assert signature.parameters["request_build_max_pending"].default == 32
+    assert signature.parameters["request_build_max_workers"].default == 2
+    assert signature.parameters["request_build_max_pending"].default == 16
     assert signature.parameters["enable_pre_lm_encoder"].default is True
     assert signature.parameters["pre_lm_max_batch_size"].default == 8
     assert signature.parameters["pre_lm_max_batch_wait_ms"].default == 0
+    assert signature.parameters["pre_lm_max_pending"].default == 32
 
 
 def test_arkasr_pre_lm_group_matches_one_encoder_microbatch_by_default():
@@ -96,13 +94,14 @@ def test_arkasr_pre_lm_encoder_knobs_are_stage_configurable():
         ArkasrPipelineConfig(model_path="AutoArk-AI/ARK-ASR-3B").stages[0].factory_args
     )
 
-    assert factory_args["request_build_max_workers"] == 8
-    assert factory_args["request_build_max_pending"] == 32
+    assert factory_args["request_build_max_workers"] == 2
+    assert factory_args["request_build_max_pending"] == 16
     assert factory_args["enable_pre_lm_encoder"] is True
     assert factory_args["pre_lm_cache_max_entries"] == 4096
     assert factory_args["pre_lm_cache_size_bytes"] == 2 * 1024**3
     assert factory_args["pre_lm_max_batch_size"] == 8
     assert factory_args["pre_lm_max_batch_wait_ms"] == 0
+    assert factory_args["pre_lm_max_pending"] == 32
 
 
 def test_arkasr_rejects_invalid_pre_lm_batch_size():
@@ -120,6 +119,24 @@ def test_arkasr_rejects_invalid_pre_lm_batch_size():
             request_build_max_workers=8,
             request_build_max_pending=32,
             pre_lm_max_batch_size=0,
+        )
+
+
+def test_arkasr_rejects_invalid_pre_lm_pending_limit():
+    with pytest.raises(ValueError, match="pre_lm_max_pending"):
+        arkasr_builder.ArkasrEngineBuilder(
+            max_running_requests=32,
+            encoder_max_batch_size=8,
+            max_new_tokens=256,
+            enable_async_decode=True,
+            async_decode_min_batch_size=2,
+            mem_fraction_static=None,
+            mm_embedding_cache_size_bytes=0,
+            enable_torch_compile=False,
+            mm_attention_backend=None,
+            request_build_max_workers=2,
+            request_build_max_pending=16,
+            pre_lm_max_pending=0,
         )
 
 
@@ -144,6 +161,7 @@ def _stub_arkasr_engine_build(
     """
     graph_init_workers: list[object] = []
     adapter_kwargs: dict[str, object] = {}
+    encoder_service_kwargs: dict[str, object] = {}
 
     encoder_batch_sizes: list[int] = []
     model_worker = SimpleNamespace(
@@ -186,7 +204,9 @@ def _stub_arkasr_engine_build(
         arkasr_builder, "build_cache_namespace", lambda *a, **k: "testns"
     )
     monkeypatch.setattr(
-        arkasr_builder, "ArkasrPreLMEncoderService", lambda *a, **k: encoder_service
+        arkasr_builder,
+        "ArkasrPreLMEncoderService",
+        lambda *a, **k: (encoder_service_kwargs.update(k) or encoder_service),
     )
     monkeypatch.setattr(
         request_builders,
@@ -229,6 +249,7 @@ def _stub_arkasr_engine_build(
     return SimpleNamespace(
         graph_init_workers=graph_init_workers,
         adapter_kwargs=adapter_kwargs,
+        encoder_service_kwargs=encoder_service_kwargs,
         infra_kwargs_seen=infra_kwargs_seen,
         encoder_batch_sizes=encoder_batch_sizes,
         model_worker=model_worker,
@@ -257,8 +278,8 @@ def test_arkasr_factory_triggers_deferred_cuda_graph_capture(
     assert stub.graph_init_workers == ([stub.model_worker] if want_cuda_graph else [])
     # note (jiannan-17): the scheduler fake records its kwargs, proving the
     # builder forwards the stage knobs instead of dropping them.
-    assert scheduler.request_build_max_workers == 8
-    assert scheduler.request_build_max_pending == 32
+    assert scheduler.request_build_max_workers == 2
+    assert scheduler.request_build_max_pending == 16
     assert scheduler.enable_async_decode is False
     assert scheduler.async_decode_min_batch_size == 4
     assert stub.adapter_kwargs["merge_factor"] == 7
@@ -273,6 +294,7 @@ def test_arkasr_factory_triggers_deferred_cuda_graph_capture(
         == "ArkasrForConditionalGeneration"
     )
     assert stub.encoder_batch_sizes == [8]
+    assert stub.encoder_service_kwargs["max_queue_size"] == 32
 
 
 def test_arkasr_pre_lm_encoder_reaches_request_builder_and_shutdown(

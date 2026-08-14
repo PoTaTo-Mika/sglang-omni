@@ -174,6 +174,12 @@ backend). Changing any of those re-keys the cache rather than serving a stale
 embedding. Concurrent requests for identical audio are deduplicated
 single-flight, so the clip is encoded once.
 
+Request building submits encoder work without waiting for the GPU. The
+scheduler holds the built LM request outside its waiting queue until that
+request's encoder future completes, then performs normal admission on the
+scheduler thread. A bounded encoder queue applies backpressure before mel
+tensors can accumulate without limit.
+
 | knob | default | meaning |
 |---|---|---|
 | `enable_pre_lm_encoder` | `true` | Off falls back to encoding inside the LM forward. |
@@ -181,6 +187,7 @@ single-flight, so the clip is encoded once.
 | `pre_lm_cache_size_bytes` | `2 GiB` | Byte budget; LRU evicts past it. |
 | `pre_lm_max_batch_size` | `8` | Max queued requests drained into one `get_audio_feature` call. |
 | `pre_lm_max_batch_wait_ms` | `0` | Batch-formation window. `0` is a greedy drain: items queued while the previous group encoded are taken instantly, so an idle-arrival request pays no batching latency. |
+| `pre_lm_max_pending` | `32` | Max encoder items waiting behind the active batch. |
 
 ### How this relates to `encoder_max_batch_size`
 
@@ -197,11 +204,10 @@ Raising `pre_lm_max_batch_size` above `encoder_max_batch_size` turns a group
 into several bounded forwards; it never widens a single forward, so it does
 not change peak encoder activation memory.
 
-`request_build_max_workers` defaults to **8** because `encode_item` blocks its
-build worker until the embedding is attached — the encoder only ever sees as
-many concurrent items as there are build workers. These concurrency defaults
-are inherited from the Qwen3-ASR sweep (issue #1324 Q-PR5) and have not yet
-been re-measured on ARK.
+`request_build_max_workers` defaults to **2** and
+`request_build_max_pending` to **16**. These workers only perform CPU request
+construction; encoder concurrency and backpressure are owned by the separate
+pre-LM queue.
 
 ## Benchmarking
 
