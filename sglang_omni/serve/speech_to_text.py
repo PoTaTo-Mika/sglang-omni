@@ -220,7 +220,10 @@ def probe_audio_duration(audio_bytes: bytes) -> float:
             if info.samplerate:
                 return max(info.frames / float(info.samplerate), 0.0)
         except (RuntimeError, ValueError):
-            pass
+            logger.debug(
+                "WAV duration fast path failed; falling back to PyAV",
+                exc_info=True,
+            )
 
     try:
         import av
