@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import io
 import json
+import wave
 
 import pytest
 from fastapi import HTTPException
@@ -24,6 +26,16 @@ def _build_request(*, task: str = "transcribe"):
         temperature=None,
         task=task,
     )
+
+
+def _wav_bytes(*, duration_s: float = 0.25, sample_rate: int = 16_000) -> bytes:
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(b"\0\0" * int(duration_s * sample_rate))
+    return buffer.getvalue()
 
 
 def test_transcription_builder_import_keeps_shared_callable() -> None:
@@ -77,6 +89,69 @@ def test_assemble_uses_the_caller_probed_duration(monkeypatch) -> None:
     )
 
     assert json.loads(response.body)["usage"] == {"seconds": 3, "type": "duration"}
+
+
+def test_probe_audio_duration_uses_soundfile_fast_path_for_wav(monkeypatch) -> None:
+    import av
+
+    monkeypatch.setattr(
+        av,
+        "open",
+        lambda *args, **kwargs: pytest.fail("WAV duration probe fell back to PyAV"),
+    )
+
+    assert speech_to_text.probe_audio_duration(_wav_bytes()) == pytest.approx(0.25)
+
+
+def test_probe_audio_duration_uses_pyav_for_non_wav(monkeypatch) -> None:
+    import av
+    import soundfile as sf
+
+    class FakeContainer:
+        duration = 2_500_000
+        streams = ()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    monkeypatch.setattr(
+        sf,
+        "info",
+        lambda *args, **kwargs: pytest.fail(
+            "non-WAV duration probe used the soundfile fast path"
+        ),
+    )
+    monkeypatch.setattr(av, "open", lambda *args, **kwargs: FakeContainer())
+
+    assert speech_to_text.probe_audio_duration(b"not-a-wav") == pytest.approx(2.5)
+
+
+def test_probe_audio_duration_falls_back_when_wav_fast_path_fails(
+    monkeypatch,
+) -> None:
+    import av
+    import soundfile as sf
+
+    class FakeContainer:
+        duration = 1_500_000
+        streams = ()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    def fail_soundfile_probe(*args, **kwargs):
+        raise RuntimeError("bad WAV")
+
+    monkeypatch.setattr(sf, "info", fail_soundfile_probe)
+    monkeypatch.setattr(av, "open", lambda *args, **kwargs: FakeContainer())
+
+    assert speech_to_text.probe_audio_duration(_wav_bytes()) == pytest.approx(1.5)
 
 
 def test_verbose_response_uses_requested_task() -> None:

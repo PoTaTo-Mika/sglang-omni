@@ -200,11 +200,28 @@ def resolve_speech_to_text_adapter(
 def probe_audio_duration(audio_bytes: bytes) -> float:
     """Best-effort audio duration (seconds) from raw upload bytes.
 
-    Metadata-only: reads container headers, never decodes. PyAV wraps the
-    same FFmpeg demuxers load_audio decodes with, so any upload the engine
-    can read, this probe can measure (soundfile could not inspect M4A/WebM).
-    0.0 means unknown; callers treat that as "duration not available".
+    Metadata-only: reads container headers, never decodes. WAV uploads take a
+    libsndfile fast path; other formats and malformed WAV headers fall back to
+    the same PyAV/FFmpeg demuxers that ``load_audio`` uses. 0.0 means unknown;
+    callers treat that as "duration not available".
     """
+    # note (Xinyu): SeedTTS is entirely RIFF/WAVE, where opening FFmpeg through
+    # PyAV costs several milliseconds more per request than reading the header.
+    is_wav = (
+        len(audio_bytes) >= 12
+        and audio_bytes[:4] in {b"RIFF", b"RIFX", b"RF64"}
+        and audio_bytes[8:12] == b"WAVE"
+    )
+    if is_wav:
+        try:
+            import soundfile as sf
+
+            info = sf.info(io.BytesIO(audio_bytes))
+            if info.samplerate:
+                return max(info.frames / float(info.samplerate), 0.0)
+        except (RuntimeError, ValueError):
+            pass
+
     try:
         import av
 
