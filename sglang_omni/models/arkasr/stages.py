@@ -20,13 +20,14 @@ def create_sglang_arkasr_executor(
     enable_async_decode: bool = True,
     async_decode_min_batch_size: int = 2,
     mm_attention_backend: str | None = None,
-    request_build_max_workers: int = 8,
-    request_build_max_pending: int | None = 32,
+    request_build_max_workers: int = 2,
+    request_build_max_pending: int | None = 16,
     enable_pre_lm_encoder: bool = True,
     pre_lm_cache_max_entries: int = 4096,
     pre_lm_cache_size_bytes: int = 2 * 1024**3,
     pre_lm_max_batch_size: int = 8,
     pre_lm_max_batch_wait_ms: int = 0,
+    pre_lm_max_pending: int = 32,
     server_args_overrides: dict[str, Any] | None = None,
 ):
     from sglang_omni.models.arkasr.engine_builder import ArkasrEngineBuilder
@@ -48,6 +49,7 @@ def create_sglang_arkasr_executor(
         pre_lm_cache_size_bytes=pre_lm_cache_size_bytes,
         pre_lm_max_batch_size=pre_lm_max_batch_size,
         pre_lm_max_batch_wait_ms=pre_lm_max_batch_wait_ms,
+        pre_lm_max_pending=pre_lm_max_pending,
     ).build(
         model_path,
         device=device,

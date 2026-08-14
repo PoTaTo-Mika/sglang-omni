@@ -40,6 +40,7 @@ class ArkasrEngineBuilder(AsrEngineBuilder):
         pre_lm_cache_size_bytes: int = 2 * 1024**3,
         pre_lm_max_batch_size: int = 8,
         pre_lm_max_batch_wait_ms: int = 0,
+        pre_lm_max_pending: int = 32,
     ) -> None:
         if pre_lm_max_batch_size < 1:
             raise ValueError(
@@ -48,6 +49,10 @@ class ArkasrEngineBuilder(AsrEngineBuilder):
         if pre_lm_max_batch_wait_ms < 0:
             raise ValueError(
                 f"pre_lm_max_batch_wait_ms must be >= 0, got {pre_lm_max_batch_wait_ms}"
+            )
+        if pre_lm_max_pending < 1:
+            raise ValueError(
+                f"pre_lm_max_pending must be >= 1, got {pre_lm_max_pending}"
             )
         self.max_running_requests = max_running_requests
         self.encoder_max_batch_size = encoder_max_batch_size
@@ -65,6 +70,7 @@ class ArkasrEngineBuilder(AsrEngineBuilder):
         self.pre_lm_cache_size_bytes = pre_lm_cache_size_bytes
         self.pre_lm_max_batch_size = pre_lm_max_batch_size
         self.pre_lm_max_batch_wait_ms = pre_lm_max_batch_wait_ms
+        self.pre_lm_max_pending = pre_lm_max_pending
         self.tokenizer: Any = None
         self.feature_extractor: Any = None
         self.merge_factor = 4
@@ -134,6 +140,7 @@ class ArkasrEngineBuilder(AsrEngineBuilder):
                 cache_max_bytes=self.pre_lm_cache_size_bytes,
                 max_batch_size=self.pre_lm_max_batch_size,
                 max_batch_wait_ms=self.pre_lm_max_batch_wait_ms,
+                max_queue_size=self.pre_lm_max_pending,
             )
 
     def make_adapters(self, model: Any) -> tuple[Any, Any]:

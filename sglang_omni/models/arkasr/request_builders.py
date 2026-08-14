@@ -27,6 +27,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang_omni.preprocessing.transcription import prepare_audio
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
+from sglang_omni.scheduling.types import DeferredAdmission
 
 from .audio_lengths import arkasr_num_audio_tokens
 
@@ -95,7 +96,10 @@ def make_arkasr_scheduler_adapters(
     merge_factor: int = 4,
     audio_token_id: int = 151663,
     audio_encoder_service: Any = None,
-) -> tuple[Callable[[StagePayload], ArkASRRequestData], Callable[[Any], StagePayload]]:
+) -> tuple[
+    Callable[[StagePayload], ArkASRRequestData | DeferredAdmission],
+    Callable[[Any], StagePayload],
+]:
     if feature_extractor is None:
         raise ValueError("ARK-ASR processor is missing a feature_extractor")
 
@@ -119,7 +123,9 @@ def make_arkasr_scheduler_adapters(
         )
         return list(tokenizer(prompt, add_special_tokens=False).input_ids)
 
-    def request_builder(payload: StagePayload) -> ArkASRRequestData:
+    def request_builder(
+        payload: StagePayload,
+    ) -> ArkASRRequestData | DeferredAdmission:
         params = payload.request.params or {}
         prepared = prepare_audio(
             payload, source_name="ARK-ASR", target_sample_rate=_SAMPLE_RATE
@@ -191,12 +197,6 @@ def make_arkasr_scheduler_adapters(
         )
         sampling_params.normalize(tokenizer=None)
 
-        # encode before Req creation -- a request is only admitted with its
-        # complete LM-ready embedding, and a failed encode raises here instead
-        # of poisoning the waiting queue.
-        if audio_encoder_service is not None:
-            audio_encoder_service.encode_item(audio_item)
-
         req = Req(
             rid=payload.request_id,
             origin_input_text="",
@@ -208,7 +208,7 @@ def make_arkasr_scheduler_adapters(
         req.multimodal_inputs = mm_inputs
         req._codec_suppress_tokens = None
 
-        return ArkASRRequestData(
+        req_data = ArkASRRequestData(
             input_ids=torch.tensor(input_ids, dtype=torch.long),
             req=req,
             prompt_token_ids=input_ids,
@@ -218,6 +218,12 @@ def make_arkasr_scheduler_adapters(
             language=str(params.get("language") or "en"),
             engine_start_s=time.perf_counter(),
             stage_payload=payload,
+        )
+        if audio_encoder_service is None:
+            return req_data
+        return DeferredAdmission(
+            value=req_data,
+            ready=audio_encoder_service.submit_item(audio_item),
         )
 
     def result_adapter(data: ArkASRRequestData) -> StagePayload:
