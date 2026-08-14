@@ -13,7 +13,19 @@ from transformers import PretrainedConfig
 
 from sglang_omni.models.weight_loader import default_weight_loader
 from sglang_omni.vendor.sglang.core import ForwardBatch
-from sglang_omni.vendor.sglang.distributed import get_tensor_model_parallel_world_size
+from sglang_omni.vendor.sglang.distributed import (
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
+
+try:
+    from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+except ImportError:  # pragma: no cover
+
+    def get_is_capture_mode() -> bool:
+        return False
+
+
 from sglang_omni.vendor.sglang.layers import (
     AttentionType,
     MergedColumnParallelLinear,
@@ -104,6 +116,7 @@ class LLaDA2MoeAttention(nn.Module):
             self.num_kv_heads_per_tp,
             layer_id=layer_id,
             attn_type=AttentionType.ENCODER_ONLY,
+            quant_config=quant_config,
         )
 
     def forward(
@@ -166,6 +179,7 @@ class LLaDA2MoeMLP(nn.Module):
         config: PretrainedConfig,
         intermediate_size: int,
         quant_config: Optional[QuantizationConfig] = None,
+        reduce_results: bool = True,
     ):
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -179,6 +193,7 @@ class LLaDA2MoeMLP(nn.Module):
             config.hidden_size,
             bias=False,
             quant_config=quant_config,
+            reduce_results=reduce_results,
         )
         self.act_fn = SiluAndMul()
 
@@ -225,6 +240,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         config: PretrainedConfig,
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
         self.config = config
@@ -234,6 +250,9 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         self.n_group = config.n_group
         self.topk_group = config.topk_group
         self.routed_scaling_factor = config.routed_scaling_factor
+        # Alternate CUDA stream for shared-expert / router-expert overlap.
+        # Owned by the parent Block so it can be shared across layers.
+        self.alt_stream = alt_stream
 
         # Gate always runs at half / full precision for now.
         router_dtype = getattr(config, "router_dtype", None)
@@ -267,7 +286,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
                 config.moe_intermediate_size * config.num_shared_experts
             )
             self.shared_experts = LLaDA2MoeMLP(
-                config, shared_intermediate, quant_config
+                config, shared_intermediate, quant_config, reduce_results=False
             )
         else:
             self.shared_experts = None
@@ -279,6 +298,78 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             hidden_states.clone() if self.shared_experts is not None else hidden_states
         )
 
+        # Alt-stream fine-grained overlap: only during cuda-graph capture and
+        # only when shared experts exist (no shared → nothing to overlap).
+        # Bit-identical to the single-stream path — kernels run in the same
+        # arithmetic order, just scheduled on two streams concurrently.
+        can_dual_stream = (
+            self.alt_stream is not None
+            and self.shared_experts is not None
+            and hidden_states.shape[0] > 0
+            and get_is_capture_mode()
+        )
+        if can_dual_stream:
+            return self._forward_dual_stream(hidden_states, identity)
+        return self._forward_single_stream(hidden_states, identity)
+
+    def _forward_single_stream(
+        self, hidden_states: torch.Tensor, identity: torch.Tensor
+    ) -> torch.Tensor:
+        topk_weights, topk_ids, router_logits = self._route(hidden_states)
+        topk_output = StandardTopKOutput(
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            router_logits=router_logits,
+        )
+        # `experts(...)` returns a per-TP-rank partial sum because we
+        # constructed FusedMoE with reduce_results=False. Shared experts do
+        # the same (their down_proj was built with reduce_results=False).
+        # Sum both partials and issue a single allreduce for the whole layer.
+        y = self.experts(hidden_states, topk_output)
+        if self.shared_experts is not None:
+            y = y + self.shared_experts(identity)
+        tp_size = get_tensor_model_parallel_world_size()
+        if tp_size > 1:
+            y = tensor_model_parallel_all_reduce(y)
+        return y
+
+    def _forward_dual_stream(
+        self, hidden_states: torch.Tensor, identity: torch.Tensor
+    ) -> torch.Tensor:
+        """Overlap shared-expert path with router+experts on alt_stream.
+
+        Numerically bit-identical to _forward_single_stream: same operators
+        on same inputs, only kernel scheduling differs.
+        """
+        current_stream = torch.cuda.current_stream()
+
+        # Phase 1: main stream computes router logits + topk; alt stream runs
+        # shared-expert full path (gate_up → silu → down) in parallel.
+        self.alt_stream.wait_stream(current_stream)
+        with torch.cuda.stream(self.alt_stream):
+            shared_output = self.shared_experts(identity)
+
+        topk_weights, topk_ids, router_logits = self._route(hidden_states)
+        topk_output = StandardTopKOutput(
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            router_logits=router_logits,
+        )
+
+        # Phase 2: run routed experts on the main stream; the alt stream's
+        # shared-expert output must be joined before we add and allreduce.
+        y = self.experts(hidden_states, topk_output)
+        current_stream.wait_stream(self.alt_stream)
+
+        y = y + shared_output
+        tp_size = get_tensor_model_parallel_world_size()
+        if tp_size > 1:
+            y = tensor_model_parallel_all_reduce(y)
+        return y
+
+    def _route(
+        self, hidden_states: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # Router scores via sigmoid (not softmax like standard MoE)
         router_logits = self.gate(hidden_states)
         router_logits = router_logits.float()
@@ -290,7 +381,9 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         else:
             scores_for_routing = scores
 
-        # Group-limited top-k selection
+        # Group-limited top-k selection — kept unchanged from sglang-omni to
+        # preserve numerical parity (Triton fused topk here would slightly
+        # perturb LowConfidenceCFG's threshold triggers and shift tpf).
         topk_weights, topk_ids = self._group_limited_topk(scores_for_routing)
 
         # Gather actual scores (without bias) for the selected experts
@@ -302,52 +395,57 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
                 topk_weights.sum(dim=-1, keepdim=True) + 1e-20
             )
         topk_weights = topk_weights * self.routed_scaling_factor
-
-        topk_output = StandardTopKOutput(
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            router_logits=router_logits,
-        )
-        y = self.experts(hidden_states, topk_output)
-
-        # Add shared expert output
-        if self.shared_experts is not None:
-            y = y + self.shared_experts(identity)
-
-        return y
+        return topk_weights, topk_ids, router_logits
 
     def _group_limited_topk(
         self, scores: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Group-limited top-k expert selection."""
+        """Group-limited top-k expert selection.
+
+        Fused Triton kernel replaces the original 5-op PyTorch chain
+        (view → top-2 → sum → topk_group → mask → scatter → topk). Selects
+        the same experts as the reference; downstream code overwrites
+        `topk_weights` anyway so only `topk_ids` needs to match.
+        """
+        if scores.is_cuda:
+            try:
+                from sglang_omni.models.llada2_uni.components.triton_topk import (
+                    grouped_topk_triton,
+                )
+
+                return grouped_topk_triton(
+                    scores,
+                    num_experts_per_tok=self.num_experts_per_tok,
+                    n_group=self.n_group,
+                    topk_group=self.topk_group,
+                )
+            except Exception:
+                # Fall back to the original PyTorch implementation.
+                return self._group_limited_topk_fallback(scores)
+        return self._group_limited_topk_fallback(scores)
+
+    def _group_limited_topk_fallback(
+        self, scores: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         num_tokens = scores.shape[0]
         experts_per_group = self.num_experts // self.n_group
-
-        # Group scores: sum of top-2 experts per group
         group_scores = (
             scores.view(num_tokens, self.n_group, experts_per_group)
             .topk(2, dim=-1)[0]
             .sum(dim=-1)
         )
-
-        # Select top groups
         group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False)[1]
         group_mask = torch.zeros_like(group_scores)
         group_mask.scatter_(1, group_idx, 1)
-
-        # Expand group mask to expert-level
         score_mask = (
             group_mask.unsqueeze(-1)
             .expand(num_tokens, self.n_group, experts_per_group)
             .reshape(num_tokens, -1)
         )
-
-        # Mask and select top-k
         masked_scores = scores.masked_fill(~score_mask.bool(), float("-inf"))
         topk_weights, topk_ids = torch.topk(
             masked_scores, k=self.num_experts_per_tok, dim=-1, sorted=False
         )
-
         return topk_weights, topk_ids
 
 
@@ -359,6 +457,7 @@ class LLaDA2MoeBlock(nn.Module):
         config: PretrainedConfig,
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -376,7 +475,9 @@ class LLaDA2MoeBlock(nn.Module):
         if self.is_dense:
             self.mlp = LLaDA2MoeMLP(config, config.intermediate_size, quant_config)
         else:
-            self.mlp = LLaDA2MoeSparseMoeBlock(config, layer_id, quant_config)
+            self.mlp = LLaDA2MoeSparseMoeBlock(
+                config, layer_id, quant_config, alt_stream=alt_stream
+            )
 
     def forward(
         self,
@@ -411,11 +512,19 @@ class LLaDA2MoeTextModel(nn.Module):
         super().__init__()
         self.config = config
         self.word_embeddings = VocabParallelEmbedding(
-            config.vocab_size, config.hidden_size
+            config.vocab_size, config.hidden_size, quant_config=quant_config
+        )
+        # One alt CUDA stream shared across every MoE block. Used only inside
+        # CUDA-graph capture; outside capture, each layer falls back to the
+        # single-stream path. Cheap to allocate — a stream is just a handle.
+        self.alt_stream: Optional[torch.cuda.Stream] = (
+            torch.cuda.Stream() if torch.cuda.is_available() else None
         )
         self.layers = make_layers(
             config.num_hidden_layers,
-            lambda idx, prefix="": LLaDA2MoeBlock(config, idx, quant_config),
+            lambda idx, prefix="": LLaDA2MoeBlock(
+                config, idx, quant_config, alt_stream=self.alt_stream
+            ),
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 

@@ -83,16 +83,20 @@ def create_sglang_dllm_thinker_executor_from_config(
     model_path: str,
     *,
     gpu_id: int = 0,
+    tp_size: int = 1,
+    tp_rank: int = 0,
+    nccl_port: int | None = None,
     thinker_max_seq_len: int = 8192,
     dllm_algorithm: str = "LowConfidenceCFG",
     dllm_algorithm_config: str | None = None,
+    total_gpu_memory_fraction: float | None = None,
     server_args_overrides: dict[str, Any] | None = None,
 ):
     """Create an DllmScheduler for the LLaDA2-Uni thinker."""
     overrides: dict[str, Any] = {
         "attention_backend": "flashinfer",
-        "disable_cuda_graph": True,
         "sampling_backend": "pytorch",
+        "tp_size": tp_size,
     }
     overrides.update(server_args_overrides or {})
 
@@ -130,7 +134,13 @@ def create_sglang_dllm_thinker_executor_from_config(
         server_args.dllm_algorithm,
         server_args.mem_fraction_static,
     )
-    return create_dllm_thinker_scheduler(server_args, gpu_id)
+    return create_dllm_thinker_scheduler(
+        server_args,
+        gpu_id,
+        tp_rank=tp_rank,
+        nccl_port=nccl_port,
+        total_gpu_memory_fraction=total_gpu_memory_fraction,
+    )
 
 
 def create_decode_executor(model_path: str):

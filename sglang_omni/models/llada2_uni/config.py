@@ -9,6 +9,7 @@ from sglang_omni.config import (
     PipelineConfig,
     SGLangServerArgsConfig,
     StageConfig,
+    StageResourceConfig,
     StageRuntimeConfig,
 )
 
@@ -76,6 +77,11 @@ class LLaDA2UniOmniPipelineConfig(PipelineConfig):
     """
 
     architecture: ClassVar[str] = "LLaDA2MoeModelLM"
+    total_gpu_memory_fraction_dict: ClassVar[dict[str, float]] = {
+        IMAGE_STAGE: 0.1,
+        THINKER_STAGE: 0.7,
+        IMAGE_DECODE_STAGE: 0.2,
+    }
 
     @classmethod
     def mem_fraction_role_to_stage(cls) -> dict[str, str]:
@@ -97,6 +103,13 @@ class LLaDA2UniOmniPipelineConfig(PipelineConfig):
             factory=f"{_PKG}.stages.create_image_encoder_executor",
             factory_args={"device": "cuda", "dtype": None},
             gpu=0,
+            runtime=StageRuntimeConfig(
+                resources=StageResourceConfig(
+                    total_gpu_memory_fraction=total_gpu_memory_fraction_dict[
+                        IMAGE_STAGE
+                    ]
+                ),
+            ),
             next=THINKER_STAGE,
         ),
         StageConfig(
@@ -110,6 +123,11 @@ class LLaDA2UniOmniPipelineConfig(PipelineConfig):
             runtime=StageRuntimeConfig(
                 sglang_server_args=SGLangServerArgsConfig(
                     mem_fraction_static=0.75,
+                ),
+                resources=StageResourceConfig(
+                    total_gpu_memory_fraction=total_gpu_memory_fraction_dict[
+                        THINKER_STAGE
+                    ]
                 ),
             ),
         ),
@@ -129,6 +147,13 @@ class LLaDA2UniOmniPipelineConfig(PipelineConfig):
                 "resolution_multiplier": 2,
             },
             gpu=0,
+            runtime=StageRuntimeConfig(
+                resources=StageResourceConfig(
+                    total_gpu_memory_fraction=total_gpu_memory_fraction_dict[
+                        IMAGE_DECODE_STAGE
+                    ]
+                ),
+            ),
             terminal=True,
         ),
     ]

@@ -83,6 +83,11 @@ class DllmScheduler:
         self._uncond_rids: set[str] = set()
         self._orphaned_uncond_rids: set[str] = set()
 
+        # TP config
+        self.tp_rank = getattr(tp_worker, "tp_rank", 0)
+        self.tp_size = server_args.tp_size
+        self.requires_tp_work_fanout = True if self.tp_size > 1 else False
+
     def start(self) -> None:
         self._running = True
         self._event_loop()

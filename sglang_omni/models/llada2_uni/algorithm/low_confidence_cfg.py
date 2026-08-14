@@ -56,6 +56,61 @@ def _slice_cfg_output_ids(
     return [ids[i, generation_start:] for i in range(ids.shape[0])]
 
 
+def _argmax_confidence_from_logits(
+    logits: torch.Tensor,
+    *,
+    use_triton: bool = False,
+    force_image_only: bool = False,
+    image_token_offset: int = 0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return argmax token ids and their softmax probabilities.
+
+    The Triton path fuses the large-vocab argmax and winning-token confidence
+    computation and avoids materializing the full softmax tensor.
+    """
+    if use_triton and logits.is_cuda:
+        try:
+            from sglang_omni.models.llada2_uni.algorithm.triton_decode import (
+                argmax_confidence_triton,
+            )
+
+            return argmax_confidence_triton(
+                logits,
+                force_image_only=force_image_only,
+                image_token_offset=image_token_offset,
+            )
+        except Exception:  # pragma: no cover - serving safety fallback
+            logger.exception(
+                "Triton LowConfidence argmax/confidence failed; falling back"
+            )
+
+    work = logits
+    if force_image_only:
+        work = logits.clone()
+        work[:, :image_token_offset] = float("-inf")
+    token_ids = torch.argmax(work, dim=-1)
+    probs = torch.gather(
+        F.softmax(work, dim=-1), dim=-1, index=token_ids.unsqueeze(-1)
+    ).squeeze(-1)
+    return token_ids, probs
+
+
+def _select_keep_by_confidence(
+    conf: torch.Tensor,
+    threshold: float,
+    num_to_transfer: int,
+) -> torch.Tensor:
+    """Implement LowConfidence keep selection without a high_conf.sum().item sync."""
+    k = min(num_to_transfer, conf.numel())
+    _, idx = torch.topk(conf, k=k)
+    topk_keep = torch.zeros_like(conf, dtype=torch.bool)
+    topk_keep.scatter_(0, idx, True)
+
+    high_conf = conf > threshold
+    kth_conf = torch.gather(conf, 0, idx[-1:]).squeeze(0)
+    return torch.where(kth_conf > threshold, high_conf, topk_keep)
+
+
 class LowConfidenceCFG(DllmAlgorithm):
     """LowConfidence unmasking with per-step Classifier-Free Guidance."""
 
@@ -65,6 +120,7 @@ class LowConfidenceCFG(DllmAlgorithm):
         self.image_token_offset = config.algorithm_config.get(
             "image_token_offset", 157184
         )
+        self.use_triton_decode = True
 
     # ------------------------------------------------------------------
     # Standard (no-CFG) run — identical to upstream LowConfidence
@@ -83,11 +139,17 @@ class LowConfidenceCFG(DllmAlgorithm):
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
             return out.logits_output, [], out.can_run_graph
 
+        remaining_masked = 0
+        remaining_masked_by_block = []
         for block_id in range(batch_size):
             s = block_id * self.block_size
             e = s + self.block_size
             blk = forward_batch.input_ids[s:e]
-            start_list.append(self.block_size - int((blk == self.mask_id).sum().item()))
+            start = self.block_size - int((blk == self.mask_id).sum().item())
+            start_list.append(start)
+            block_remaining = self.block_size - start
+            remaining_masked_by_block.append(block_remaining)
+            remaining_masked += block_remaining
 
         # Determine steps, schedule, and task kind
         reqs = getattr(forward_batch, "reqs", None)
@@ -101,38 +163,66 @@ class LowConfidenceCFG(DllmAlgorithm):
         schedule = _get_num_transfer_tokens(self.block_size, dllm_steps)
 
         for num_to_transfer_tensor in schedule:
-            mask_index = forward_batch.input_ids == self.mask_id
-            if torch.sum(mask_index).item() == 0:
+            if remaining_masked <= 0:
                 break
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
             logits_output, _can_run_cuda_graph = out.logits_output, out.can_run_graph
             num_to_transfer = num_to_transfer_tensor.item()
             for bid in range(batch_size):
+                if remaining_masked_by_block[bid] <= 0:
+                    continue
                 cs = bid * self.block_size
                 ce = cs + self.block_size
                 blk_ids = forward_batch.input_ids[cs:ce]
                 blk_mask = blk_ids == self.mask_id
-                if blk_mask.sum().item() == 0:
-                    continue
                 logits = logits_output.full_logits[cs:ce]
-                if force_image_only:
-                    logits[:, : self.image_token_offset] = float("-inf")
-                x = torch.argmax(logits, dim=-1)
-                p = torch.gather(
-                    F.softmax(logits, dim=-1), dim=-1, index=x.unsqueeze(-1)
-                ).squeeze(-1)
-                x = torch.where(blk_mask, x, blk_ids)
-                conf = torch.where(blk_mask, p, -np.inf)
-                high_conf = conf > self.threshold
-                if high_conf.sum().item() >= num_to_transfer:
-                    keep = high_conf
-                else:
-                    _, idx = torch.topk(
-                        conf, k=min(num_to_transfer, blk_mask.sum().item())
+                block_tpf = 0
+                if (
+                    self.use_triton_decode
+                    and logits.is_cuda
+                    and logits.dtype == torch.float32
+                ):
+                    try:
+                        from sglang_omni.models.llada2_uni.algorithm.triton_decode import (
+                            low_confidence_update_triton,
+                        )
+
+                        block_tpf = low_confidence_update_triton(
+                            logits,
+                            forward_batch.input_ids,
+                            input_start=cs,
+                            mask_id=self.mask_id,
+                            threshold=self.threshold,
+                            num_to_transfer=num_to_transfer,
+                            force_image_only=force_image_only,
+                            image_token_offset=self.image_token_offset,
+                        )
+                    except Exception:  # pragma: no cover - serving safety fallback
+                        logger.exception(
+                            "Triton LowConfidence update failed; falling back"
+                        )
+                        block_tpf = 0
+
+                if block_tpf == 0:
+                    x, p = _argmax_confidence_from_logits(
+                        logits,
+                        use_triton=self.use_triton_decode,
+                        force_image_only=force_image_only,
+                        image_token_offset=self.image_token_offset,
                     )
-                    keep = torch.zeros_like(conf, dtype=torch.bool)
-                    keep[idx] = True
-                blk_ids[keep] = x[keep]
+                    x = torch.where(blk_mask, x, blk_ids)
+                    conf = torch.where(blk_mask, p, -np.inf)
+                    keep = (
+                        _select_keep_by_confidence(
+                            conf, self.threshold, num_to_transfer
+                        )
+                        & blk_mask
+                    )
+                    blk_ids[keep] = x[keep]
+                    block_tpf = int(keep.sum().item())
+
+                remaining_masked_by_block[bid] -= block_tpf
+                remaining_masked -= block_tpf
 
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
         ids = torch.reshape(forward_batch.input_ids, (batch_size, -1))
@@ -224,21 +314,20 @@ class LowConfidenceCFG(DllmAlgorithm):
 
             # Confidence-based unmasking with the fixed transfer schedule.
             blk_ids = forward_batch.input_ids[cs:ce]
-            x = torch.argmax(guided, dim=-1)
-            p = torch.gather(
-                F.softmax(guided, dim=-1), dim=-1, index=x.unsqueeze(-1)
-            ).squeeze(-1)
+            x, p = _argmax_confidence_from_logits(
+                guided,
+                use_triton=self.use_triton_decode,
+                force_image_only=force_image_only,
+                image_token_offset=self.image_token_offset,
+            )
             x = torch.where(cond_mask, x, blk_ids)
             conf = torch.where(cond_mask, p, -np.inf)
 
-            num_to_transfer = min(int(num_to_transfer_tensor.item()), num_masked_tokens)
-            high_conf = conf > self.threshold
-            if int(high_conf.sum().item()) >= num_to_transfer:
-                keep = high_conf
-            else:
-                _, idx = torch.topk(conf, k=num_to_transfer)
-                keep = torch.zeros_like(conf, dtype=torch.bool)
-                keep[idx] = True
+            num_to_transfer = num_to_transfer_tensor.item()
+            keep = (
+                _select_keep_by_confidence(conf, self.threshold, num_to_transfer)
+                & cond_mask
+            )
 
             # Write to cond block and mirror selected tokens to uncond block.
             blk_ids[keep] = x[keep]
@@ -352,23 +441,22 @@ class LowConfidenceCFG(DllmAlgorithm):
 
             # Confidence-based unmasking with the fixed transfer schedule.
             blk_ids = forward_batch.input_ids[cs:ce]
-            x = torch.argmax(guided, dim=-1)
-            p = torch.gather(
-                F.softmax(guided, dim=-1), dim=-1, index=x.unsqueeze(-1)
-            ).squeeze(-1)
+            x, p = _argmax_confidence_from_logits(
+                guided,
+                use_triton=self.use_triton_decode,
+                force_image_only=force_image_only,
+                image_token_offset=self.image_token_offset,
+            )
             x = torch.where(cond_mask, x, blk_ids)
             conf = torch.where(cond_mask, p, -np.inf)
 
-            num_to_transfer = min(int(num_to_transfer_tensor.item()), num_masked_tokens)
-            high_conf = conf > self.threshold
-            if int(high_conf.sum().item()) >= num_to_transfer:
-                keep = high_conf
-            else:
-                _, idx = torch.topk(conf, k=num_to_transfer)
-                keep = torch.zeros_like(conf, dtype=torch.bool)
-                keep[idx] = True
+            num_to_transfer = num_to_transfer_tensor.item()
+            keep = (
+                _select_keep_by_confidence(conf, self.threshold, num_to_transfer)
+                & cond_mask
+            )
 
-            # Write to cond block and mirror selected tokens to both uncond blocks.
+            # Write to cond block and mirror selected tokens to uncond block.
             blk_ids[keep] = x[keep]
             forward_batch.input_ids[nt_s:nt_e][keep] = x[keep]
             forward_batch.input_ids[ni_s:ni_e][keep] = x[keep]
