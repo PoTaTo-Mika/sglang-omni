@@ -614,7 +614,8 @@ Routing rule: exactly one of `next`, `route_fn`, or `terminal=True`. There is no
 | route_fn     | str              | None       | Dynamic routing: dotted path to fn(request_id, output) → str \| list[str] \| None  |
 | terminal     | bool             | FALSE      | Terminal stage — no downstream. Coordinator collects the result here               |
 | gpu          | int \| list[int] | None       | GPU id(s). None = CPU stage. List for TP (one GPU per rank)                        |
-| tp_size      | int              | 1          | Tensor parallelism ranks. Must match len(gpu) if gpu is a list                     |
+| tp_size      | int              | 1          | Compatibility alias for `parallelism.tp`                                           |
+| parallelism  | ParallelismConfig | default   | Structured TP/SP ranks and Ulysses/Ring decomposition                             |
 | wait_for     | list[str]        | None       | Fan-in: wait for these upstream stages before dispatching                          |
 | merge_fn     | str              | None       | Dotted path to fn(dict[str, StagePayload]) -> StagePayload. Required with wait_for |
 | stream_to    | list[str]        | []         | Stream hidden states / codes to these stages (parallel to normal routing)          |
@@ -697,11 +698,9 @@ The main process resolves all dotted strings, injects `model_path` / `gpu_id` in
 
 The subprocess entrypoint (`stage_process_main`) imports each stage factory, calls it, builds routing callables from `route_fn` or `next_stages`, builds input handlers from `wait_for` / `merge_fn`, constructs all `Stage` instances assigned to that process, and runs them on one event loop.
 
-#### Parallelism axes — TP today, extension path
+#### Parallelism axes — stable TP and opt-in SP
 
-`StageProcessSpec` exposes `tp_size` as a top-level field. This treats TP as a special axis, but it is only one of several plausible parallelism strategies — Qwen3-Omni's Thinker is MoE and could want EP, and throughput-oriented stages might want DP across replicas. If we add either later, we will accumulate `tp_size` / `ep_size` / `dp_size` at the top level.
-
-The cleaner long-term shape is to group them under a single `parallelism: ParallelismConfig` field — `ParallelismConfig(tp=N)` reads as clearly as `tp_size=N` and leaves room to add `ep` and `dp` without further schema churn. We are intentionally not making that change now: with only TP in use, a `ParallelismConfig` would have exactly one attribute and add visual weight without adding capability. The intended migration is to introduce the group field at the same time as the second parallelism axis lands.
+`StageConfig.parallelism: ParallelismConfig` stores the structured TP/SP settings (`tp`, `sp`, `ulysses_degree`, and `ring_degree`). The existing `tp_size` field remains a compatibility alias for `parallelism.tp`; schema construction, dotted overrides, and launchers keep them synchronized, and conflicting values are rejected. SP remains model-owned and opt-in through `SequenceParallelPolicy`. TP and SP are mutually exclusive for a stage. Placement and process startup resolve them into an internal `(kind, size)` description, which permits implementation reuse without implying unsupported TP × SP execution or multiplying the two rank counts.
 
 ### `StageGroup`
 

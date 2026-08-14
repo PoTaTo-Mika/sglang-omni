@@ -19,6 +19,61 @@ from sglang_omni.scheduling.threaded_simple_scheduler import ThreadedSimpleSched
 from tests.unit_test.pipeline.helpers import run_scheduler
 
 
+def test_simple_scheduler_abort_drain_runs_fanned_work() -> None:
+    """Collective ranks must execute and report work fanned out before abort."""
+    computed = threading.Event()
+
+    def compute(payload: str) -> str:
+        computed.set()
+        return payload.upper()
+
+    scheduler = SimpleScheduler(compute)
+    scheduler.inbox.put(IncomingMessage("req-abort", "new_request", "payload"))
+    scheduler.mark_request_aborted_for_drain("req-abort", dispatch_id=1)
+
+    thread = threading.Thread(target=scheduler.start, daemon=True)
+    thread.start()
+    try:
+        assert computed.wait(timeout=2.0)
+        output = scheduler.outbox.get(timeout=2.0)
+        assert output.request_id == "req-abort"
+        assert output.data == "PAYLOAD"
+    finally:
+        scheduler.stop()
+        thread.join(timeout=2.0)
+
+
+def test_simple_scheduler_abort_drain_defers_cleanup_until_terminal_ack() -> None:
+    events: list[str] = []
+
+    def compute(payload: str) -> str:
+        events.append("compute")
+        return payload
+
+    scheduler = SimpleScheduler(
+        compute,
+        abort_callback=lambda request_id: events.append(f"cleanup:{request_id}"),
+    )
+    scheduler.inbox.put(IncomingMessage("req-abort", "new_request", "payload"))
+    scheduler.mark_request_aborted_for_drain("req-abort", dispatch_id=2)
+
+    thread = threading.Thread(target=scheduler.start, daemon=True)
+    thread.start()
+    try:
+        output = scheduler.outbox.get(timeout=2.0)
+        assert output.request_id == "req-abort"
+        assert events == ["compute"]
+
+        scheduler.acknowledge_request_terminal("req-abort", dispatch_id=1)
+        assert events == ["compute"]
+
+        scheduler.acknowledge_request_terminal("req-abort", dispatch_id=2)
+        assert events == ["compute", "cleanup:req-abort"]
+    finally:
+        scheduler.stop()
+        thread.join(timeout=2.0)
+
+
 def _init_sync_request_build_state(scheduler: OmniScheduler) -> None:
     scheduler._request_admission_lock = threading.RLock()
     scheduler._request_build_executor = None
@@ -26,6 +81,37 @@ def _init_sync_request_build_state(scheduler: OmniScheduler) -> None:
     scheduler._pending_request_builds = {}
     scheduler._backlogged_request_build_payloads = []
     scheduler._request_build_max_pending_observed = 0
+
+
+def test_omni_scheduler_queues_external_abort_for_tp_broadcast() -> None:
+    scheduler = OmniScheduler.__new__(OmniScheduler)
+    scheduler.is_entry_rank = True
+    scheduler.inbox = Queue()
+
+    OmniScheduler.propagate_abort(scheduler, "req-abort")
+
+    message = scheduler.inbox.get_nowait()
+    assert message.request_id == "req-abort"
+    assert message.type == "abort"
+
+
+def test_omni_scheduler_applies_broadcast_abort_before_work() -> None:
+    scheduler = OmniScheduler.__new__(OmniScheduler)
+    scheduler._aborted_request_ids = set()
+    scheduler._recv_scheduler_messages = lambda: [
+        IncomingMessage("req-abort", "abort", None),
+        IncomingMessage("req-abort", "new_request", object()),
+    ]
+    aborted: list[str] = []
+
+    def abort(request_id: str) -> None:
+        aborted.append(request_id)
+        scheduler._aborted_request_ids.add(request_id)
+
+    scheduler.abort = abort
+
+    assert OmniScheduler.recv_requests(scheduler) == []
+    assert aborted == ["req-abort"]
 
 
 def test_simple_scheduler_batch_and_error_contracts() -> None:
@@ -87,8 +173,11 @@ def test_threaded_simple_scheduler_runs_requests_concurrently() -> None:
         finally:
             release.set()
 
+    scheduler = ThreadedSimpleScheduler(compute, max_concurrency=2)
+    assert scheduler.requires_tp_work_fanout is True
+
     outputs = run_scheduler(
-        ThreadedSimpleScheduler(compute, max_concurrency=2),
+        scheduler,
         [
             IncomingMessage("req-1", "new_request", "one"),
             IncomingMessage("req-2", "new_request", "two"),
@@ -760,6 +849,7 @@ def test_omni_scheduler_initializes_upstream_queue_limit(monkeypatch) -> None:
     )
 
     assert scheduler.max_queued_requests == 7
+    assert scheduler.requires_tp_work_fanout is False
     assert scheduler._abort_on_queued_limit(object()) is False
 
 

@@ -4,7 +4,9 @@ from __future__ import annotations
 import pytest
 
 from sglang_omni.config import (
+    ParallelismConfig,
     PipelineConfig,
+    SequenceParallelPolicy,
     StageConfig,
     StageResourceConfig,
     StageRuntimeConfig,
@@ -16,6 +18,14 @@ from sglang_omni.config.manager import ConfigManager
 _FACTORY = "tests.unit_test.fixtures.pipeline_fakes.dummy_factory"
 
 
+class _SequenceParallelPipelineConfig(PipelineConfig):
+    @classmethod
+    def sequence_parallel_policy(
+        cls, *, stage_name: str
+    ) -> SequenceParallelPolicy | None:
+        return SequenceParallelPolicy()
+
+
 def _stage(
     name: str,
     *,
@@ -23,6 +33,9 @@ def _stage(
     fraction: float | None = None,
     process: str | None = None,
     tp_size: int = 1,
+    sp_size: int = 1,
+    ulysses_degree: int | None = None,
+    ring_degree: int = 1,
     terminal: bool = False,
     next_stage: str | None = None,
 ) -> StageConfig:
@@ -32,6 +45,12 @@ def _stage(
         gpu=gpu,
         process=process,
         tp_size=tp_size,
+        parallelism=ParallelismConfig(
+            tp=tp_size,
+            sp=sp_size,
+            ulysses_degree=ulysses_degree,
+            ring_degree=ring_degree,
+        ),
         runtime=StageRuntimeConfig(
             resources=StageResourceConfig(total_gpu_memory_fraction=fraction)
         ),
@@ -62,7 +81,7 @@ def test_stage_process_parses_from_schema_and_dotted_overrides() -> None:
 
 
 def test_non_tp_stages_must_declare_process() -> None:
-    with pytest.raises(ValueError, match="Non-TP stages must declare process"):
+    with pytest.raises(ValueError, match="Non-parallel stages must declare process"):
         PipelineConfig(
             model_path="dummy",
             stages=[
@@ -73,7 +92,7 @@ def test_non_tp_stages_must_declare_process() -> None:
 
 
 def test_missing_non_tp_process_declaration_is_rejected() -> None:
-    with pytest.raises(ValueError, match="Non-TP stages must declare process"):
+    with pytest.raises(ValueError, match="Non-parallel stages must declare process"):
         PipelineConfig(
             model_path="dummy",
             stages=[_stage("a", next_stage="b"), _stage("b", terminal=True)],
@@ -109,6 +128,28 @@ def test_tp_process_field_is_used_as_rank_process_prefix() -> None:
     topology = _topology(config)
 
     assert topology.tp_stage_to_processes == {"thinker": ("model_tp0", "model_tp1")}
+
+
+def test_sp_processes_receive_sp_rank_names_and_roles() -> None:
+    config = _SequenceParallelPipelineConfig(
+        model_path="dummy",
+        stages=[
+            _stage(
+                "image_decode",
+                gpu=[0, 1],
+                sp_size=2,
+                ulysses_degree=2,
+                terminal=True,
+            )
+        ],
+    )
+
+    topology = _topology(config)
+
+    assert topology.groups == ()
+    assert topology.sp_stage_to_processes == {
+        "image_decode": ("image_decode_sp0", "image_decode_sp1")
+    }
 
 
 def test_same_process_same_gpu_does_not_require_memory_budgets() -> None:

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import sys
 from collections.abc import Iterable
@@ -513,26 +514,13 @@ def test_ming_bootstrap_aligns_server_args_tp_size_before_infra(
     assert scheduler.kwargs["server_args"] is server_args
 
 
-@pytest.mark.asyncio
-async def test_tp_leader_skips_fanout_work_for_omni_scheduler() -> None:
+def test_tp_leader_skips_fanout_work_for_omni_scheduler() -> None:
     """OmniScheduler-backed leaders must not call fanout_work()."""
     import queue as _queue_mod
     from unittest.mock import MagicMock
 
     importlib.import_module("sglang_omni.pipeline")
     before_import = set(sys.modules)
-    fake_torch = ModuleType("torch")
-    fake_torch.Tensor = object
-    fake_torch.uint8 = object()
-    fake_profiler = ModuleType("torch.profiler")
-    fake_profiler.ProfilerActivity = SimpleNamespace(CPU="cpu", CUDA="cuda")
-
-    class FakeProfile:
-        def __init__(self, *args, **kwargs):
-            pass
-
-    fake_profiler.profile = FakeProfile
-    fake_torch.profiler = fake_profiler
     fake_nixl = ModuleType("sglang_omni.relay.nixl")
 
     class FakeConnection:
@@ -549,8 +537,6 @@ async def test_tp_leader_skips_fanout_work_for_omni_scheduler() -> None:
     fake_nixl.NixlOperation = FakeNixlOperation
     fake_nixl.NixlRelay = FakeNixlRelay
     fake_refs = (
-        fake_torch,
-        fake_profiler,
         fake_nixl,
         FakeConnection,
         FakeNixlOperation,
@@ -559,22 +545,28 @@ async def test_tp_leader_skips_fanout_work_for_omni_scheduler() -> None:
 
     try:
         with pytest.MonkeyPatch.context() as mp:
-            mp.setitem(sys.modules, "torch", fake_torch)
-            mp.setitem(sys.modules, "torch.profiler", fake_profiler)
             mp.setitem(sys.modules, "sglang_omni.relay.nixl", fake_nixl)
 
             from sglang_omni.pipeline.stage.runtime import Stage
+            from sglang_omni.pipeline.parallel_control import ParallelStageContext
             from sglang_omni.pipeline.tp_control import TPLeaderFanout
+            from sglang_omni.scheduling.types import ParallelSchedulerCapabilities
 
             fanout = MagicMock(spec=TPLeaderFanout)
+            fanout.fanout_work.return_value = 1
 
             omni_like = SimpleNamespace(
                 inbox=_queue_mod.Queue(),
-                requires_tp_work_fanout=False,
+                parallel_capabilities=ParallelSchedulerCapabilities(),
             )
             simple_like = SimpleNamespace(
                 inbox=_queue_mod.Queue(),
-                requires_tp_work_fanout=True,
+                parallel_capabilities=ParallelSchedulerCapabilities(
+                    fanout_work=True,
+                    drain_aborted_work=True,
+                ),
+                mark_request_aborted_for_drain=lambda request_id, dispatch_id: None,
+                acknowledge_request_terminal=lambda request_id, dispatch_id: None,
             )
 
             def _make_stage(scheduler):
@@ -587,24 +579,33 @@ async def test_tp_leader_skips_fanout_work_for_omni_scheduler() -> None:
                     control_plane=MagicMock(),
                     relay=MagicMock(),
                     scheduler=scheduler,
-                    tp_fanout=fanout,
+                    parallel_context=ParallelStageContext(
+                        kind="tp",
+                        rank=0,
+                        size=2,
+                        role="leader",
+                        fanout=fanout,
+                    ),
                 )
 
-            payload = SimpleNamespace(request_id="req-1")
+            payload = SimpleNamespace(request_id="req-1", timing={})
 
-            stage_omni = _make_stage(omni_like)
-            await stage_omni._execute(payload)
-            fanout.fanout_work.assert_not_called()
-            assert omni_like.inbox.get_nowait().request_id == "req-1"
+            async def run_assertions() -> None:
+                stage_omni = _make_stage(omni_like)
+                await stage_omni._execute(payload)
+                fanout.fanout_work.assert_not_called()
+                assert omni_like.inbox.get_nowait().request_id == "req-1"
 
-            fanout.reset_mock()
+                fanout.reset_mock()
 
-            stage_simple = _make_stage(simple_like)
-            await stage_simple._execute(payload)
-            fanout.fanout_work.assert_called_once_with(payload)
-            assert simple_like.inbox.get_nowait().request_id == "req-1"
+                stage_simple = _make_stage(simple_like)
+                await stage_simple._execute(payload)
+                fanout.fanout_work.assert_called_once_with(payload)
+                assert simple_like.inbox.get_nowait().request_id == "req-1"
+
+            asyncio.run(run_assertions())
     finally:
         _purge_project_modules_with_fake_refs(before_import, fake_refs)
 
-    assert _project_modules_with_ref(fake_torch) == []
+    assert _project_modules_with_ref(fake_nixl) == []
     assert _cached_attrs_from_missing_project_modules() == []

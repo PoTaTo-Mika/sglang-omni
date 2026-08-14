@@ -4,38 +4,32 @@ from __future__ import annotations
 
 import asyncio
 import json
-import threading
-from queue import Queue
+import os
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
 import torch
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 from sglang_omni.client.client import Client
 from sglang_omni.client.types import CompletionStreamChunk
 from sglang_omni.config.manager import ConfigManager
 from sglang_omni.models.llada2_uni import stages as llada2_stages
 from sglang_omni.models.llada2_uni.algorithm.low_confidence_cfg import (
-    LowConfidenceCFG,
     _get_num_transfer_tokens,
     _slice_cfg_output_ids,
 )
 from sglang_omni.models.llada2_uni.components import preprocessor as preprocessor_module
 from sglang_omni.models.llada2_uni.components.preprocessor import (
     LLaDA2Preprocessor,
-    align_cfg_unconditional_input_ids,
 )
 from sglang_omni.models.llada2_uni.config import LLaDA2UniOmniPipelineConfig
 from sglang_omni.models.llada2_uni.payload_types import LLaDA2UniPipelineState
 from sglang_omni.models.llada2_uni.request_builders import _thinking_phase1_to_phase2
 from sglang_omni.pipeline.coordinator import _compute_timings_ms
 from sglang_omni.proto import CompleteMessage, OmniRequest, StagePayload
-from sglang_omni.scheduling import dllm_scheduler as dllm_scheduler_module
-from sglang_omni.scheduling.dllm_scheduler import DllmScheduler
-from sglang_omni.scheduling.messages import IncomingMessage
 from sglang_omni.serve import create_app
 from sglang_omni.serve.openai_api import (
     _build_chat_generate_request,
@@ -100,6 +94,367 @@ def test_image_decoder_accepts_existing_local_model_path(tmp_path) -> None:
     decoder = LLaDA2ImageDecoder(str(tmp_path), device="cpu")
 
     assert decoder.model_path == str(tmp_path)
+
+
+def test_image_decoder_resolves_unindexed_cuda_to_current_stage_device(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    from sglang_omni.models.llada2_uni.components.image_decoder import (
+        LLaDA2ImageDecoder,
+    )
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
+
+    decoder = LLaDA2ImageDecoder(str(tmp_path), device="cuda")
+
+    assert decoder.device == torch.device("cuda:3")
+
+
+def test_sglang_image_decoder_defaults_to_flash_attention(tmp_path) -> None:
+    from sglang_omni.models.llada2_uni.components.image_decoder import (
+        LLaDA2ImageDecoder,
+    )
+
+    decoder = LLaDA2ImageDecoder(
+        str(tmp_path),
+        device="cpu",
+        backend="sglang",
+        attention_backend=None,
+    )
+
+    assert decoder.attention_backend == "fa"
+
+
+@pytest.mark.parametrize(
+    ("token_ids", "h", "w", "error"),
+    [
+        ([1, 2, 3], 2, 2, r"exactly h \* w"),
+        ([1, 2, 3, 16384], 2, 2, "between 0 and 16383"),
+        ([1], 0, 1, "positive"),
+    ],
+)
+def test_image_decoder_rejects_invalid_vq_inputs_before_model_work(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    token_ids: list[int],
+    h: int,
+    w: int,
+    error: str,
+) -> None:
+    from sglang_omni.models.llada2_uni.components.image_decoder import (
+        LLaDA2ImageDecoder,
+    )
+
+    decoder = LLaDA2ImageDecoder(str(tmp_path), device="cpu")
+    monkeypatch.setattr(
+        decoder,
+        "_ensure_diff_model",
+        lambda mode: pytest.fail("invalid input reached model loading"),
+    )
+
+    with pytest.raises(ValueError, match=error):
+        decoder.decode(token_ids, h, w)
+
+
+def test_sp_image_decoder_broadcasts_leader_conditioning_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    from sglang_omni.models.llada2_uni.components.image_decoder import (
+        LLaDA2ImageDecoder,
+    )
+
+    decoder = LLaDA2ImageDecoder(
+        str(tmp_path),
+        device="cpu",
+        backend="sglang",
+        stage_role="leader",
+        sp_size=2,
+        ulysses_degree=2,
+    )
+    monkeypatch.setattr(decoder, "_ensure_diff_model", lambda mode: None)
+    monkeypatch.setattr(
+        decoder,
+        "_ensure_sigvq",
+        lambda: (_ for _ in ()).throw(RuntimeError("bad SigVQ checkpoint")),
+    )
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    statuses: list[int] = []
+
+    def record_broadcast(tensor: torch.Tensor, src: int) -> None:
+        assert src == 0
+        statuses.append(int(tensor.item()))
+
+    monkeypatch.setattr(torch.distributed, "broadcast", record_broadcast)
+
+    with pytest.raises(RuntimeError, match="bad SigVQ checkpoint"):
+        decoder.decode([1], 1, 1)
+
+    assert statuses == [0]
+
+
+def test_sp_image_decoder_follower_stops_after_leader_conditioning_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    from sglang_omni.models.llada2_uni.components.image_decoder import (
+        LLaDA2ImageDecoder,
+    )
+
+    decoder = LLaDA2ImageDecoder(
+        str(tmp_path),
+        device="cpu",
+        backend="sglang",
+        stage_role="follower",
+        sp_rank=1,
+        sp_size=2,
+        ulysses_degree=2,
+    )
+    monkeypatch.setattr(decoder, "_ensure_diff_model", lambda mode: None)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    broadcast_shapes: list[tuple[int, ...]] = []
+
+    def fail_status(tensor: torch.Tensor, src: int) -> None:
+        assert src == 0
+        broadcast_shapes.append(tuple(tensor.shape))
+        tensor.zero_()
+
+    monkeypatch.setattr(torch.distributed, "broadcast", fail_status)
+
+    assert decoder.decode([1], 1, 1) is None
+    assert broadcast_shapes == [(1,)]
+
+
+def test_image_decoder_bytes_api_rejects_parallel_follower(tmp_path) -> None:
+    from sglang_omni.models.llada2_uni.components.image_decoder import (
+        LLaDA2ImageDecoder,
+    )
+
+    decoder = LLaDA2ImageDecoder(
+        str(tmp_path),
+        device="cpu",
+        backend="sglang",
+        stage_role="follower",
+        sp_rank=1,
+        sp_size=2,
+        ulysses_degree=2,
+    )
+
+    with pytest.raises(RuntimeError, match="leader-only"):
+        decoder.decode_to_bytes([1], 1, 1)
+
+
+def test_sglang_decoder_uses_stage_assigned_cuda_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sglang_omni.models.llada2_uni.components.decoder_model import (
+        _configure_sglang_device_environment,
+    )
+
+    monkeypatch.setenv("LOCAL_RANK", "0")
+
+    base_gpu_id = _configure_sglang_device_environment(torch.device("cuda:3"))
+
+    assert base_gpu_id == 3
+    assert os.environ["LOCAL_RANK"] == "3"
+
+
+def test_sglang_decoder_normalizes_singleton_batch_latent() -> None:
+    from sglang_omni.models.llada2_uni.components.decoder_model import (
+        _SGLangZImageModelAdapter,
+    )
+
+    latent = torch.empty(1, 16, 1, 64, 64)
+
+    normalized = _SGLangZImageModelAdapter._normalize_image_latent(latent)
+
+    assert normalized.shape == (16, 1, 64, 64)
+
+
+def test_sglang_decoder_context_refiner_skips_sequence_parallel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sglang.multimodal_gen.runtime.distributed import communication_op
+
+    from sglang_omni.models.llada2_uni.components.decoder_model import (
+        ZImageParallelConfig,
+        _SGLangZImageModelAdapter,
+    )
+
+    skip_sp_overrides: list[bool] = []
+
+    class PassthroughLayer(torch.nn.Module):
+        def forward(self, hidden_states, *args, **kwargs):
+            del args, kwargs
+            return hidden_states
+
+    class ContextRefinerLayer(torch.nn.Module):
+        def forward(
+            self,
+            hidden_states,
+            freqs_cis,
+            *,
+            skip_sequence_parallel_override=False,
+        ):
+            del freqs_cis
+            skip_sp_overrides.append(skip_sequence_parallel_override)
+            return hidden_states
+
+    class Model(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.noise_refiner = torch.nn.ModuleList([PassthroughLayer()])
+            self.context_refiner = torch.nn.ModuleList([ContextRefinerLayer()])
+            self.layers = torch.nn.ModuleList([PassthroughLayer()])
+            self.all_x_embedder = {"2-1": lambda hidden: (hidden, None)}
+            self.all_final_layer = {
+                "2-1": lambda hidden, adaln_input: hidden,
+            }
+            self.x_pad_token = torch.empty(0)
+            self.cap_pad_token = torch.empty(0)
+
+        @staticmethod
+        def t_embedder(timestep):
+            return timestep[:, None]
+
+        @staticmethod
+        def patchify_and_embed(images, cap_feats, patch_size, f_patch_size):
+            del images, patch_size, f_patch_size
+            return (
+                torch.zeros(1, 2, 1),
+                cap_feats[0].unsqueeze(0),
+                [(1, 1, 1)],
+                [2],
+                [cap_feats[0].shape[0]],
+            )
+
+        @staticmethod
+        def _replace_padding_with_token(hidden, valid_lens, pad_token):
+            del valid_lens, pad_token
+            return hidden
+
+        @staticmethod
+        def cap_embedder(hidden):
+            return hidden, None
+
+        @staticmethod
+        def unpatchify(outputs, x_size, patch_size, f_patch_size):
+            del x_size, patch_size, f_patch_size
+            return outputs
+
+    adapter = _SGLangZImageModelAdapter(
+        Model(),
+        ZImageParallelConfig(backend="sglang", sp_size=2, ulysses_degree=2),
+    )
+    freqs = (torch.zeros(2, 1), torch.zeros(2, 1))
+    monkeypatch.setattr(adapter, "_get_freqs_cis", lambda *args: (freqs, freqs))
+    monkeypatch.setattr(
+        adapter,
+        "_shard_sequence_for_sp",
+        lambda hidden, hidden_freqs: (hidden, hidden_freqs),
+    )
+    monkeypatch.setattr(
+        communication_op,
+        "sequence_model_parallel_all_gather",
+        lambda hidden, dim: hidden,
+    )
+
+    adapter._run_model_sp(
+        image=torch.zeros(1, 1, 1, 1),
+        cap_feat=torch.zeros(2, 1),
+        timestep=torch.tensor([500.0]),
+        patch_size=2,
+        f_patch_size=1,
+    )
+
+    assert skip_sp_overrides == [True]
+
+
+def test_sglang_decoder_maps_runtime_precision_from_dtype() -> None:
+    from sglang_omni.models.llada2_uni.components.decoder_model import (
+        _torch_dtype_to_sglang_precision,
+    )
+
+    assert _torch_dtype_to_sglang_precision(torch.bfloat16) == "bf16"
+    assert _torch_dtype_to_sglang_precision(torch.float16) == "fp16"
+    assert _torch_dtype_to_sglang_precision(torch.float32) == "fp32"
+
+
+def test_sglang_decoder_return_dict_is_output_instance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from diffusers.models.modeling_outputs import Transformer2DModelOutput
+
+    from sglang_omni.models.llada2_uni.components.decoder_model import (
+        ZImageParallelConfig,
+        _SGLangZImageModelAdapter,
+    )
+
+    class Model(torch.nn.Module):
+        def forward(self, hidden_states, **kwargs):
+            del kwargs
+            return torch.zeros_like(hidden_states[0]).unsqueeze(0)
+
+    adapter = _SGLangZImageModelAdapter(Model(), ZImageParallelConfig(backend="sglang"))
+    monkeypatch.setattr(adapter, "_sp_world_size", lambda: 1)
+    monkeypatch.setattr(
+        adapter,
+        "_get_freqs_cis",
+        lambda *args: (torch.empty(0), torch.empty(0)),
+    )
+
+    output = adapter(
+        x=[torch.zeros(16, 1, 2, 2)],
+        t=torch.tensor([0.5]),
+        cap_feats=[torch.zeros(1, 4096)],
+        return_dict=True,
+    )
+
+    assert isinstance(output, Transformer2DModelOutput)
+    assert len(output.sample) == 1
+
+
+def test_sglang_decoder_does_not_use_batch_index_as_timestep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sglang.multimodal_gen.runtime.managers import forward_context
+
+    from sglang_omni.models.llada2_uni.components.decoder_model import (
+        ZImageParallelConfig,
+        _SGLangZImageModelAdapter,
+    )
+
+    class Model(torch.nn.Module):
+        def forward(self, hidden_states, **kwargs):
+            del kwargs
+            return torch.zeros_like(hidden_states[0]).unsqueeze(0)
+
+    observed_timesteps: list[int] = []
+
+    @contextmanager
+    def record_forward_context(*, current_timestep, **kwargs):
+        del kwargs
+        observed_timesteps.append(current_timestep)
+        yield
+
+    adapter = _SGLangZImageModelAdapter(Model(), ZImageParallelConfig(backend="sglang"))
+    monkeypatch.setattr(adapter, "_sp_world_size", lambda: 1)
+    monkeypatch.setattr(
+        adapter,
+        "_get_freqs_cis",
+        lambda *args: (torch.empty(0), torch.empty(0)),
+    )
+    monkeypatch.setattr(forward_context, "set_forward_context", record_forward_context)
+
+    adapter(
+        x=[torch.zeros(16, 1, 2, 2), torch.zeros(16, 1, 2, 2)],
+        t=torch.tensor([0.5, 0.5]),
+        cap_feats=[torch.zeros(1, 4096), torch.zeros(1, 4096)],
+        return_dict=False,
+    )
+
+    assert observed_timesteps == [0, 0]
 
 
 def test_image_generation_params_validate_decoder_inputs() -> None:
@@ -545,103 +900,6 @@ def test_cfg_output_slice_ignores_unconditional_mask_padding() -> None:
     )
 
 
-def test_cfg_uncond_prompt_is_aligned_before_scheduling() -> None:
-    scheduler = object.__new__(DllmScheduler)
-    scheduler._waiting_queue = []
-    scheduler._cond_to_unconds = {}
-    scheduler._uncond_to_cond = {}
-    scheduler._uncond_rids = set()
-    tokenizer = SimpleNamespace(mask_token_id=99)
-    cond = SimpleNamespace(
-        rid="cond",
-        origin_input_ids=[1, 2, 3, 4],
-        sampling_params=SimpleNamespace(max_new_tokens=32),
-        vocab_size=100,
-        eos_token_ids={9},
-        dllm_config=None,
-    )
-
-    uncond_ids, left_pad_len = align_cfg_unconditional_input_ids(
-        tokenizer, cond.origin_input_ids, [7, 8]
-    )
-    cond._uncond_left_pad_len = left_pad_len
-    scheduler._create_uncond_companion(
-        cond,
-        uncond_ids,
-        left_pad_len,
-        "-uncond",
-        mark_img=False,
-    )
-
-    companion = scheduler._waiting_queue[0]
-    assert companion.origin_input_ids == [99, 99, 7, 8]
-    assert companion._dllm_left_pad_len == 2
-
-    with pytest.raises(ValueError, match="physically aligned"):
-        scheduler._create_uncond_companion(
-            cond,
-            [7, 8],
-            left_pad_len,
-            "-invalid",
-            mark_img=False,
-        )
-    with pytest.raises(ValueError, match="cannot be longer"):
-        align_cfg_unconditional_input_ids(
-            tokenizer, cond.origin_input_ids, [5, 6, 7, 8, 9]
-        )
-
-
-def test_cfg_uncond_positions_match_official_left_padding() -> None:
-    scheduler = object.__new__(DllmScheduler)
-
-    def apply_padding(pad_len: int, block_offset: int) -> list[int]:
-        positions = torch.cat(
-            [
-                torch.arange(block_offset, block_offset + 32),
-                torch.arange(block_offset, block_offset + 32),
-            ]
-        )
-        forward_batch = SimpleNamespace(
-            forward_mode=ForwardMode.DLLM_EXTEND,
-            extend_seq_lens_cpu=[32, 32],
-            positions=positions,
-            seq_lens=torch.tensor([32, 32]),
-        )
-        batch = SimpleNamespace(
-            reqs=[
-                SimpleNamespace(_dllm_left_pad_len=0),
-                SimpleNamespace(_dllm_left_pad_len=pad_len),
-            ]
-        )
-
-        scheduler._apply_cfg_padding_metadata(forward_batch, batch)
-        assert forward_batch.dllm_left_pad_lens.tolist() == [0, pad_len]
-        return forward_batch.positions[32:].tolist()
-
-    assert apply_padding(pad_len=2, block_offset=0) == [0, 0, *range(30)]
-    assert apply_padding(pad_len=2, block_offset=32) == [*range(30, 62)]
-    assert apply_padding(pad_len=40, block_offset=32) == [*[0] * 9, *range(1, 24)]
-
-
-def test_cfg_phases_follow_conditional_request() -> None:
-    scheduler = object.__new__(DllmScheduler)
-    scheduler._cond_to_unconds = {"cond": ["cond-uncond"]}
-    cond = SimpleNamespace(
-        rid="cond",
-        dllm_phase="staging_prefill",
-        _is_uncond=False,
-    )
-    uncond = SimpleNamespace(
-        rid="cond-uncond",
-        dllm_phase="staging_decode",
-        _is_uncond=True,
-    )
-
-    scheduler._synchronize_cfg_phases([cond, uncond])
-
-    assert uncond.dllm_phase == cond.dllm_phase
-
-
 def test_thinking_phase_requires_model_generated_boi() -> None:
     tokenizer = SimpleNamespace(
         boi_token_id=99,
@@ -660,677 +918,3 @@ def test_thinking_phase_requires_model_generated_boi() -> None:
 
     with pytest.raises(RuntimeError, match=r"did not produce <boi>.*2 token"):
         _thinking_phase1_to_phase2(state, tokenizer)
-
-
-class _FakeReq:
-    def __init__(self, rid: str, *, finishes_on_check: bool = False):
-        self.rid = rid
-        self.output_ids: list[int] = []
-        self.finished_reason = SimpleNamespace(to_json=lambda: {"type": "length"})
-        self.req_pool_idx = None
-        self._finished = False
-        self._finishes_on_check = finishes_on_check
-
-    @property
-    def output_ids_through_stop(self) -> list[int]:
-        return self.output_ids
-
-    def check_finished(self) -> None:
-        if self._finishes_on_check:
-            self._finished = True
-
-    def finished(self) -> bool:
-        return self._finished
-
-    def is_dllm_prefill(self) -> bool:
-        return False
-
-
-def _new_cfg_scheduler(
-    cond: _FakeReq,
-    companions: list[_FakeReq],
-) -> DllmScheduler:
-    scheduler = object.__new__(DllmScheduler)
-    scheduler._abort_lock = threading.Lock()
-    scheduler._aborted_request_ids = set()
-    scheduler._cond_to_unconds = {cond.rid: [companion.rid for companion in companions]}
-    scheduler._uncond_to_cond = {companion.rid: cond.rid for companion in companions}
-    scheduler._uncond_rids = {companion.rid for companion in companions}
-    scheduler._orphaned_uncond_rids = set()
-    scheduler._rid_to_req_data = {}
-    scheduler._waiting_queue = []
-    scheduler._staging_queue = [cond, *companions]
-    scheduler.inbox = Queue()
-    scheduler.outbox = Queue()
-    scheduler.tree_cache = SimpleNamespace(
-        cache_unfinished_req=lambda *args, **kwargs: None
-    )
-    scheduler.req_to_token_pool = SimpleNamespace(free=lambda req: None)
-    scheduler._result_adapter = lambda data: data
-    return scheduler
-
-
-def test_cfg_abort_purges_both_requests(monkeypatch: pytest.MonkeyPatch) -> None:
-    cond = _FakeReq("cond")
-    uncond = _FakeReq("cond-uncond")
-    scheduler = _new_cfg_scheduler(cond, [uncond])
-    scheduler._rid_to_req_data[cond.rid] = object()
-    scheduler._aborted_request_ids.add(cond.rid)
-    released: list[str] = []
-    monkeypatch.setattr(
-        dllm_scheduler_module,
-        "release_kv_cache",
-        lambda req, tree_cache: released.append(req.rid),
-    )
-
-    scheduler._drain_and_purge()
-
-    assert scheduler._waiting_queue == []
-    assert scheduler._staging_queue == []
-    assert scheduler._rid_to_req_data == {}
-    assert scheduler._cond_to_unconds == {}
-    assert scheduler._uncond_to_cond == {}
-    assert scheduler._uncond_rids == set()
-    assert set(released) == {cond.rid, uncond.rid}
-
-
-def test_cfg_completion_retires_all_companion_requests(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    cond = _FakeReq("cond", finishes_on_check=True)
-    uncond_text = _FakeReq("cond-uncond")
-    uncond_image = _FakeReq("cond-uncond-img")
-    scheduler = _new_cfg_scheduler(cond, [uncond_text, uncond_image])
-    req_data = SimpleNamespace(output_ids=[], finish_reason=None)
-    scheduler._rid_to_req_data[cond.rid] = req_data
-    released: list[str] = []
-    monkeypatch.setattr(
-        dllm_scheduler_module,
-        "release_kv_cache",
-        lambda req, tree_cache: released.append(req.rid),
-    )
-    excluded: list[_FakeReq] = []
-    batch = SimpleNamespace(
-        reqs=[cond, uncond_text, uncond_image],
-        filter_batch=lambda *, chunked_req_to_exclude: excluded.extend(
-            chunked_req_to_exclude
-        ),
-    )
-    batch_result = SimpleNamespace(next_token_ids=[[7], [7], [7]])
-
-    scheduler._apply_results(batch, batch_result)
-    scheduler._post_step(batch)
-
-    assert scheduler._staging_queue == []
-    assert scheduler._cond_to_unconds == {}
-    assert scheduler._uncond_to_cond == {}
-    assert scheduler._uncond_rids == set()
-    assert scheduler._orphaned_uncond_rids == set()
-    assert set(released) == {cond.rid, uncond_text.rid, uncond_image.rid}
-    output = scheduler.outbox.get_nowait()
-    assert output.request_id == cond.rid
-    assert output.type == "result"
-    assert req_data.output_ids == [7]
-    assert uncond_text.output_ids == [7]
-    assert uncond_image.output_ids == [7]
-    assert set(excluded) == {cond, uncond_text, uncond_image}
-
-
-def test_result_adapter_failure_is_request_scoped() -> None:
-    cond = _FakeReq("cond", finishes_on_check=True)
-    uncond = _FakeReq("cond-uncond")
-    scheduler = _new_cfg_scheduler(cond, [uncond])
-    scheduler._rid_to_req_data[cond.rid] = SimpleNamespace(
-        output_ids=[], finish_reason=None
-    )
-
-    def _fail_adapter(req_data):
-        raise RuntimeError("missing <boi>")
-
-    scheduler._result_adapter = _fail_adapter
-    batch = SimpleNamespace(reqs=[cond, uncond])
-    batch_result = SimpleNamespace(next_token_ids=[[7], [7]])
-
-    scheduler._apply_results(batch, batch_result)
-
-    output = scheduler.outbox.get_nowait()
-    assert output.request_id == cond.rid
-    assert output.type == "error"
-    assert output.data == "missing <boi>"
-
-
-def test_cfg_abort_from_image_companion_purges_whole_group(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    cond = _FakeReq("cond")
-    uncond_text = _FakeReq("cond-uncond")
-    uncond_image = _FakeReq("cond-uncond-img")
-    scheduler = _new_cfg_scheduler(cond, [uncond_text, uncond_image])
-    scheduler._rid_to_req_data[cond.rid] = object()
-    scheduler._aborted_request_ids.add(uncond_image.rid)
-    released: list[str] = []
-    monkeypatch.setattr(
-        dllm_scheduler_module,
-        "release_kv_cache",
-        lambda req, tree_cache: released.append(req.rid),
-    )
-
-    scheduler._drain_and_purge()
-
-    assert scheduler._staging_queue == []
-    assert scheduler._cond_to_unconds == {}
-    assert scheduler._uncond_to_cond == {}
-    assert scheduler._uncond_rids == set()
-    assert set(released) == {cond.rid, uncond_text.rid, uncond_image.rid}
-
-
-class _ScheduleReq(_FakeReq):
-    def __init__(
-        self,
-        rid: str,
-        *,
-        is_uncond: bool = False,
-        is_uncond_image: bool = False,
-        group_rid: str | None = None,
-    ):
-        super().__init__(rid)
-        self._is_uncond = is_uncond
-        self._is_uncond_img = is_uncond_image
-        self._cfg_group_rid = group_rid
-        self.dllm_phase = "staging_decode"
-        self.is_chunked = 0
-        self.dllm_block_offset = 0
-        self.full_untruncated_fill_ids = [rid]
-        self.extend_input_len = 0
-        self.origin_input_ids = [1]
-        self.last_node = f"node-{rid}"
-
-    def init_next_round_input(self, tree_cache=None) -> None:
-        self.dllm_block_offset += 32
-        self.full_untruncated_fill_ids = [
-            *self.full_untruncated_fill_ids,
-            "next-block",
-        ]
-
-
-class _FakeScheduleBatch:
-    def __init__(self, reqs):
-        self.reqs = reqs
-        self.forward_mode = None
-        self.decoding_reqs = None
-
-    @classmethod
-    def init_new(cls, *, reqs, **kwargs):
-        return cls(reqs)
-
-    def prepare_for_extend(self) -> None:
-        return None
-
-
-class _AcceptingPrefillAdder:
-    def __init__(self, *args, **kwargs):
-        self.can_run_list = []
-        self.tree_cache = args[1]
-
-    def add_dllm_staging_req(self, req):
-        self.can_run_list.append(req)
-        req.extend_input_len = 32
-        return dllm_scheduler_module.AddReqResult.CONTINUE
-
-    def add_one_req(self, req, **kwargs):
-        self.can_run_list.append(req)
-        req.extend_input_len = 32
-        self.tree_cache.inc_lock_ref(req.last_node)
-        return dllm_scheduler_module.AddReqResult.CONTINUE
-
-
-class _PartiallyAcceptingPrefillAdder(_AcceptingPrefillAdder):
-    def add_one_req(self, req, **kwargs):
-        if len(self.can_run_list) < 2:
-            self.can_run_list.append(req)
-            req.extend_input_len = 32
-            self.tree_cache.inc_lock_ref(req.last_node)
-            return dllm_scheduler_module.AddReqResult.CONTINUE
-        return dllm_scheduler_module.AddReqResult.NO_TOKEN
-
-    def add_dllm_staging_req(self, req):
-        if len(self.can_run_list) < 2:
-            self.can_run_list.append(req)
-            req.extend_input_len = 32
-            return dllm_scheduler_module.AddReqResult.CONTINUE
-        return dllm_scheduler_module.AddReqResult.NO_TOKEN
-
-
-class _RejectingPrefillAdder(_AcceptingPrefillAdder):
-    def add_one_req(self, req, **kwargs):
-        return dllm_scheduler_module.AddReqResult.NO_TOKEN
-
-    def add_dllm_staging_req(self, req):
-        return dllm_scheduler_module.AddReqResult.NO_TOKEN
-
-
-class _FakeTreeCache:
-    def __init__(self) -> None:
-        self.locked_nodes: set[str] = set()
-
-    def inc_lock_ref(self, node: str) -> None:
-        self.locked_nodes.add(node)
-
-    def dec_lock_ref(self, node: str) -> None:
-        self.locked_nodes.remove(node)
-
-
-def _new_scheduling_scheduler(
-    waiting: list[_ScheduleReq],
-    *,
-    cond_to_unconds: dict[str, list[str]] | None = None,
-) -> DllmScheduler:
-    scheduler = object.__new__(DllmScheduler)
-    scheduler._waiting_queue = list(waiting)
-    scheduler._staging_queue = []
-    scheduler._cond_to_unconds = cond_to_unconds or {}
-    scheduler._uncond_to_cond = {
-        companion_rid: cond_rid
-        for cond_rid, companion_rids in scheduler._cond_to_unconds.items()
-        for companion_rid in companion_rids
-    }
-    scheduler.server_args = SimpleNamespace(
-        page_size=1,
-        max_prefill_tokens=4096,
-    )
-    scheduler.dllm_config = SimpleNamespace(
-        block_size=32,
-        max_running_requests=3,
-    )
-    scheduler._chunked_prefill_size = 32
-    scheduler.tree_cache = _FakeTreeCache()
-    scheduler.token_to_kv_pool_allocator = object()
-    scheduler.req_to_token_pool = object()
-    scheduler.model_config = object()
-    return scheduler
-
-
-def test_scheduler_does_not_mix_normal_request_with_cfg_group(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    normal = _ScheduleReq("normal")
-    cond = _ScheduleReq("cond", group_rid="cond")
-    uncond_text = _ScheduleReq(
-        "cond-uncond",
-        is_uncond=True,
-        group_rid="cond",
-    )
-    uncond_image = _ScheduleReq(
-        "cond-uncond-img",
-        is_uncond=True,
-        is_uncond_image=True,
-        group_rid="cond",
-    )
-    scheduler = _new_scheduling_scheduler(
-        [normal, cond, uncond_text, uncond_image],
-        cond_to_unconds={
-            cond.rid: [uncond_text.rid, uncond_image.rid],
-        },
-    )
-    monkeypatch.setattr(
-        dllm_scheduler_module,
-        "PrefillAdder",
-        _AcceptingPrefillAdder,
-    )
-    monkeypatch.setattr(
-        dllm_scheduler_module,
-        "ScheduleBatch",
-        _FakeScheduleBatch,
-    )
-
-    batch = scheduler._schedule_next_batch()
-
-    assert [req.rid for req in batch.reqs] == ["normal"]
-    assert [req.rid for req in scheduler._waiting_queue] == [
-        "cond",
-        "cond-uncond",
-        "cond-uncond-img",
-    ]
-    assert scheduler.tree_cache.locked_nodes == {"node-normal"}
-
-
-def test_scheduler_restores_partially_admitted_staging_group(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    cond = _ScheduleReq("cond", group_rid="cond")
-    uncond_text = _ScheduleReq(
-        "cond-uncond",
-        is_uncond=True,
-        group_rid="cond",
-    )
-    uncond_image = _ScheduleReq(
-        "cond-uncond-img",
-        is_uncond=True,
-        is_uncond_image=True,
-        group_rid="cond",
-    )
-    scheduler = _new_scheduling_scheduler(
-        [],
-        cond_to_unconds={
-            cond.rid: [uncond_text.rid, uncond_image.rid],
-        },
-    )
-    scheduler._staging_queue = [cond, uncond_text, uncond_image]
-    monkeypatch.setattr(
-        dllm_scheduler_module,
-        "PrefillAdder",
-        _PartiallyAcceptingPrefillAdder,
-    )
-
-    batch = scheduler._schedule_next_batch()
-
-    assert batch is None
-    assert scheduler._waiting_queue == []
-    assert scheduler._staging_queue == [cond, uncond_text, uncond_image]
-    for req in (cond, uncond_text, uncond_image):
-        assert req.dllm_block_offset == 0
-        assert req.full_untruncated_fill_ids == [req.rid]
-        assert req.extend_input_len == 0
-
-    monkeypatch.setattr(
-        dllm_scheduler_module,
-        "PrefillAdder",
-        _AcceptingPrefillAdder,
-    )
-    monkeypatch.setattr(
-        dllm_scheduler_module,
-        "ScheduleBatch",
-        _FakeScheduleBatch,
-    )
-    retry_batch = scheduler._schedule_next_batch()
-
-    assert retry_batch.reqs == [cond, uncond_text, uncond_image]
-    for req in retry_batch.reqs:
-        assert req.dllm_block_offset == 32
-        assert req.full_untruncated_fill_ids == [req.rid, "next-block"]
-        assert req.extend_input_len == 32
-
-
-def test_scheduler_keeps_three_way_cfg_group_atomic(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    cond = _ScheduleReq("cond", group_rid="cond")
-    uncond_text = _ScheduleReq(
-        "cond-uncond",
-        is_uncond=True,
-        group_rid="cond",
-    )
-    uncond_image = _ScheduleReq(
-        "cond-uncond-img",
-        is_uncond=True,
-        is_uncond_image=True,
-        group_rid="cond",
-    )
-    scheduler = _new_scheduling_scheduler(
-        [cond, uncond_text, uncond_image],
-        cond_to_unconds={
-            cond.rid: [uncond_text.rid, uncond_image.rid],
-        },
-    )
-    monkeypatch.setattr(
-        dllm_scheduler_module,
-        "PrefillAdder",
-        _AcceptingPrefillAdder,
-    )
-    monkeypatch.setattr(
-        dllm_scheduler_module,
-        "ScheduleBatch",
-        _FakeScheduleBatch,
-    )
-
-    batch = scheduler._schedule_next_batch()
-
-    assert [req.rid for req in batch.reqs] == [
-        "cond",
-        "cond-uncond",
-        "cond-uncond-img",
-    ]
-
-
-def test_scheduler_validates_prefill_budget_for_complete_cfg_group() -> None:
-    request_group = [
-        _ScheduleReq("cond", group_rid="cond"),
-        _ScheduleReq(
-            "cond-uncond",
-            is_uncond=True,
-            group_rid="cond",
-        ),
-        _ScheduleReq(
-            "cond-uncond-img",
-            is_uncond=True,
-            is_uncond_image=True,
-            group_rid="cond",
-        ),
-    ]
-    for req in request_group:
-        req.origin_input_ids = list(range(64))
-    scheduler = _new_scheduling_scheduler(request_group)
-    scheduler.server_args.page_size = 8
-    scheduler.server_args.max_prefill_tokens = 160
-
-    with pytest.raises(RuntimeError, match="at least 161 max_prefill_tokens"):
-        scheduler._validate_request_group_capacity(request_group)
-
-    scheduler.server_args.max_prefill_tokens = 161
-    scheduler._validate_request_group_capacity(request_group)
-
-
-def test_scheduler_rejects_oversized_cfg_group_without_crashing_stage() -> None:
-    cond = _ScheduleReq("cond", group_rid="cond")
-    cond.origin_input_ids = list(range(64))
-    cond._uncond_input_ids = list(cond.origin_input_ids)
-    cond._uncond_img_input_ids = list(cond.origin_input_ids)
-    scheduler = _new_scheduling_scheduler([])
-    scheduler.server_args.page_size = 8
-    scheduler.server_args.max_prefill_tokens = 160
-    scheduler._abort_lock = threading.Lock()
-    scheduler._aborted_request_ids = set()
-    scheduler._rid_to_req_data = {}
-    scheduler._uncond_rids = set()
-    scheduler._orphaned_uncond_rids = set()
-    scheduler.inbox = Queue()
-    scheduler.outbox = Queue()
-    scheduler._request_builder = lambda data: SimpleNamespace(req=cond)
-
-    def create_companion(
-        cond_req,
-        uncond_input_ids,
-        left_pad_len,
-        rid_suffix,
-        mark_img,
-    ):
-        companion = _ScheduleReq(
-            f"{cond_req.rid}{rid_suffix}",
-            is_uncond=True,
-            is_uncond_image=mark_img,
-            group_rid=cond_req.rid,
-        )
-        companion.origin_input_ids = list(uncond_input_ids)
-        scheduler._waiting_queue.append(companion)
-        scheduler._cond_to_unconds.setdefault(cond_req.rid, []).append(companion.rid)
-        scheduler._uncond_to_cond[companion.rid] = cond_req.rid
-        scheduler._uncond_rids.add(companion.rid)
-
-    scheduler._create_uncond_companion = create_companion
-    scheduler.inbox.put(
-        IncomingMessage(
-            request_id=cond.rid,
-            type="new_request",
-            data={},
-        )
-    )
-
-    scheduler._drain_and_purge()
-
-    assert scheduler._waiting_queue == []
-    assert scheduler._rid_to_req_data == {}
-    assert scheduler._cond_to_unconds == {}
-    assert scheduler._uncond_to_cond == {}
-    assert scheduler._uncond_rids == set()
-    error = scheduler.outbox.get_nowait()
-    assert error.request_id == cond.rid
-    assert error.type == "error"
-    assert "at least 161 max_prefill_tokens" in error.data
-
-
-def test_scheduler_defers_partially_admitted_cfg_group(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    cond = _ScheduleReq("cond", group_rid="cond")
-    uncond_text = _ScheduleReq(
-        "cond-uncond",
-        is_uncond=True,
-        group_rid="cond",
-    )
-    uncond_image = _ScheduleReq(
-        "cond-uncond-img",
-        is_uncond=True,
-        is_uncond_image=True,
-        group_rid="cond",
-    )
-    scheduler = _new_scheduling_scheduler(
-        [cond, uncond_text, uncond_image],
-        cond_to_unconds={
-            cond.rid: [uncond_text.rid, uncond_image.rid],
-        },
-    )
-    monkeypatch.setattr(
-        dllm_scheduler_module,
-        "PrefillAdder",
-        _PartiallyAcceptingPrefillAdder,
-    )
-
-    batch = scheduler._schedule_next_batch()
-
-    assert batch is None
-    assert scheduler._staging_queue == []
-    assert [req.rid for req in scheduler._waiting_queue] == [
-        "cond",
-        "cond-uncond",
-        "cond-uncond-img",
-    ]
-    assert scheduler.tree_cache.locked_nodes == set()
-    for req in (cond, uncond_text, uncond_image):
-        assert req.dllm_block_offset == 0
-        assert req.full_untruncated_fill_ids == [req.rid]
-        assert req.extend_input_len == 0
-
-    monkeypatch.setattr(
-        dllm_scheduler_module,
-        "PrefillAdder",
-        _AcceptingPrefillAdder,
-    )
-    monkeypatch.setattr(
-        dllm_scheduler_module,
-        "ScheduleBatch",
-        _FakeScheduleBatch,
-    )
-    retry_batch = scheduler._schedule_next_batch()
-
-    assert retry_batch.reqs == [cond, uncond_text, uncond_image]
-    for req in retry_batch.reqs:
-        assert req.dllm_block_offset == 32
-        assert req.full_untruncated_fill_ids == [req.rid, "next-block"]
-        assert req.extend_input_len == 32
-
-
-@pytest.mark.parametrize("from_staging", [False, True])
-def test_scheduler_restores_rejected_cfg_group_before_retry(
-    from_staging: bool,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    cond = _ScheduleReq("cond", group_rid="cond")
-    uncond_text = _ScheduleReq(
-        "cond-uncond",
-        is_uncond=True,
-        group_rid="cond",
-    )
-    uncond_image = _ScheduleReq(
-        "cond-uncond-img",
-        is_uncond=True,
-        is_uncond_image=True,
-        group_rid="cond",
-    )
-    request_group = [cond, uncond_text, uncond_image]
-    scheduler = _new_scheduling_scheduler(
-        [] if from_staging else request_group,
-        cond_to_unconds={
-            cond.rid: [uncond_text.rid, uncond_image.rid],
-        },
-    )
-    if from_staging:
-        scheduler._staging_queue = request_group
-    monkeypatch.setattr(
-        dllm_scheduler_module,
-        "PrefillAdder",
-        _RejectingPrefillAdder,
-    )
-
-    assert scheduler._schedule_next_batch() is None
-    for req in request_group:
-        assert req.dllm_block_offset == 0
-        assert req.full_untruncated_fill_ids == [req.rid]
-        assert req.extend_input_len == 0
-
-    monkeypatch.setattr(
-        dllm_scheduler_module,
-        "PrefillAdder",
-        _AcceptingPrefillAdder,
-    )
-    monkeypatch.setattr(
-        dllm_scheduler_module,
-        "ScheduleBatch",
-        _FakeScheduleBatch,
-    )
-    retry_batch = scheduler._schedule_next_batch()
-
-    assert retry_batch.reqs == request_group
-    for req in retry_batch.reqs:
-        assert req.dllm_block_offset == 32
-        assert req.full_untruncated_fill_ids == [req.rid, "next-block"]
-        assert req.extend_input_len == 32
-
-
-def test_malformed_cfg_batch_does_not_fall_back_to_standard_decode() -> None:
-    algorithm = object.__new__(LowConfidenceCFG)
-    algorithm._run_standard = lambda model_runner, forward_batch: "standard"
-    forward_batch = SimpleNamespace(
-        batch_size=3,
-        reqs=[
-            _ScheduleReq("cond", group_rid="cond"),
-            _ScheduleReq(
-                "cond-uncond-img",
-                is_uncond=True,
-                is_uncond_image=True,
-                group_rid="cond",
-            ),
-            _ScheduleReq("other"),
-        ],
-    )
-
-    with pytest.raises(RuntimeError, match="Malformed CFG batch"):
-        algorithm.run(None, forward_batch)
-
-
-def test_cfg_batch_rejects_companions_from_another_request_group() -> None:
-    algorithm = object.__new__(LowConfidenceCFG)
-    algorithm._run_cfg_batch2 = lambda *args: "cfg"
-    forward_batch = SimpleNamespace(
-        batch_size=2,
-        reqs=[
-            _ScheduleReq("cond-a", group_rid="cond-a"),
-            _ScheduleReq(
-                "cond-b-uncond",
-                is_uncond=True,
-                group_rid="cond-b",
-            ),
-        ],
-    )
-
-    with pytest.raises(RuntimeError, match="Malformed CFG batch"):
-        algorithm.run(None, forward_batch)

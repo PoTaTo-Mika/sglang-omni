@@ -4,7 +4,9 @@ from __future__ import annotations
 import pytest
 
 from sglang_omni.config import (
+    ParallelismConfig,
     PipelineConfig,
+    SequenceParallelPolicy,
     StageConfig,
     StageResourceConfig,
     StageRuntimeConfig,
@@ -15,12 +17,21 @@ from sglang_omni.config import (
 _FACTORY = "tests.unit_test.fixtures.pipeline_fakes.dummy_factory"
 
 
+class _SequenceParallelPipelineConfig(PipelineConfig):
+    @classmethod
+    def sequence_parallel_policy(
+        cls, *, stage_name: str
+    ) -> SequenceParallelPolicy | None:
+        return SequenceParallelPolicy()
+
+
 def _stage(
     name: str,
     *,
     gpu: int | list[int] | None = None,
     fraction: float | None = None,
     tp_size: int = 1,
+    sp_size: int = 1,
     terminal: bool = False,
     next_stage: str | None = None,
 ) -> StageConfig:
@@ -30,6 +41,7 @@ def _stage(
         factory=_FACTORY,
         gpu=gpu,
         tp_size=tp_size,
+        parallelism=ParallelismConfig(tp=tp_size, sp=sp_size),
         runtime=StageRuntimeConfig(
             resources=StageResourceConfig(total_gpu_memory_fraction=fraction)
         ),
@@ -141,6 +153,36 @@ def test_tp_rank_gpu_ids_are_preserved() -> None:
     plan = build_stage_placement_plan(config)
 
     assert resolve_stage_gpu_ids(plan, stage) == [0, 1]
+
+
+def test_sp_rank_gpu_ids_are_preserved() -> None:
+    stage = _stage(
+        "image_decode",
+        gpu=[0, 1],
+        sp_size=2,
+        terminal=True,
+    )
+    config = _SequenceParallelPipelineConfig(model_path="dummy", stages=[stage])
+
+    plan = build_stage_placement_plan(config)
+
+    assert resolve_stage_gpu_ids(plan, stage) == [0, 1]
+    assert plan.stages["image_decode"].sp_size == 2
+    assert plan.stages["image_decode"].world_size == 2
+
+
+def test_placement_rejects_tp_sp_conflict_introduced_by_mutation() -> None:
+    stage = _stage(
+        "image_decode",
+        gpu=[0, 1],
+        tp_size=2,
+        terminal=True,
+    )
+    config = _SequenceParallelPipelineConfig(model_path="dummy", stages=[stage])
+    stage.parallelism = ParallelismConfig(tp=2, sp=2)
+
+    with pytest.raises(ValueError, match="cannot enable TP and SP"):
+        build_stage_placement_plan(config)
 
 
 def test_tp_memory_fraction_is_per_rank_per_assigned_gpu() -> None:

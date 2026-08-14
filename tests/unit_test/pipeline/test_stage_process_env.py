@@ -12,6 +12,7 @@ from sglang_omni.pipeline.stage_workers import (
     StageLaunchConfig,
     StageWorkerProcessSpec,
     _patched_spawn_env,
+    get_sp_stage_process_env,
     get_stage_process_env,
 )
 from tests.unit_test.fixtures.pipeline_fakes import FakeScheduler, fake_factory_path
@@ -39,6 +40,39 @@ def test_tp_process_env_maps_logical_gpu_through_visible_devices() -> None:
 
     assert env["CUDA_VISIBLE_DEVICES"] == "4"
     assert env["SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS"] == "true"
+    assert env["SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK"] == "false"
+
+
+def test_sp_process_env_sets_sglang_diffusion_rank_environment() -> None:
+    spec = StageLaunchConfig(
+        stage_name="image_decode",
+        role="follower",
+        sp_rank=1,
+        sp_size=2,
+        gpu_id=1,
+        nccl_port=29600,
+    )
+
+    env = get_sp_stage_process_env(spec, {"CUDA_VISIBLE_DEVICES": "3,4"})
+
+    assert env["CUDA_VISIBLE_DEVICES"] == "4"
+    assert env["WORLD_SIZE"] == "2"
+    assert env["RANK"] == "1"
+    assert env["LOCAL_RANK"] == "0"
+    assert env["MASTER_ADDR"] == "127.0.0.1"
+    assert env["MASTER_PORT"] == "29600"
+    assert "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK" not in env
+
+
+def test_sp_process_env_requires_gpu_id() -> None:
+    spec = StageLaunchConfig(
+        stage_name="image_decode",
+        sp_size=2,
+        nccl_port=29600,
+    )
+
+    with pytest.raises(ValueError, match="SP stage .* requires a GPU id"):
+        get_sp_stage_process_env(spec, {})
 
 
 def test_tp_process_env_rejects_single_visible_device_for_second_gpu() -> None:
@@ -144,6 +178,29 @@ def test_gpu_scheduler_construction_uses_startup_lock(monkeypatch) -> None:
 
     assert isinstance(scheduler, FakeScheduler)
     assert seen_gpu_ids == [0]
+
+
+def test_stage_process_main_destroys_process_group_after_clean_exit(
+    monkeypatch,
+) -> None:
+    calls: list[str] = []
+    spec = _worker_spec(StageLaunchConfig(stage_name="decode"))
+
+    monkeypatch.setattr(stage_workers, "apply_gpu_compat_env_defaults", lambda: None)
+    monkeypatch.setattr(
+        stage_workers,
+        "_run_process",
+        lambda process_spec, ready_event, log: calls.append("run"),
+    )
+    monkeypatch.setattr(
+        stage_workers,
+        "_destroy_torch_distributed_process_group",
+        lambda log: calls.append("destroy"),
+    )
+
+    stage_workers.stage_process_main(spec, object())
+
+    assert calls == ["run", "destroy"]
 
 
 def test_scheduler_applies_child_defaults_without_overriding_explicit_args(

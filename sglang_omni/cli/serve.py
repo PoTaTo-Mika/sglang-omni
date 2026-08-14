@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import Annotated, Literal, NoReturn
 
 import typer
@@ -8,6 +9,7 @@ import yaml
 
 from sglang_omni.config import PipelineConfig, StageConfig
 from sglang_omni.config.manager import ConfigManager
+from sglang_omni.config.runtime import resolve_stage_static_factory_args
 from sglang_omni.preprocessing.resource_connector import (
     resolve_allowed_local_media_path,
 )
@@ -447,6 +449,43 @@ def _validate_stage_parallelism_config(stage_name: str, tp_size: int, gpu) -> No
         )
 
 
+def _validate_stage_sequence_parallelism_config(
+    stage_name: str,
+    *,
+    sp_size: int,
+    gpu: int | list[int] | None,
+    ulysses_degree: int,
+    ring_degree: int,
+) -> None:
+    if sp_size < 1:
+        raise typer.BadParameter(f"{stage_name}_sp_size must be >= 1")
+    if ulysses_degree < 1 or ring_degree < 1:
+        raise typer.BadParameter(
+            f"{stage_name} Ulysses and Ring degrees must both be >= 1"
+        )
+    if sp_size != ulysses_degree * ring_degree:
+        raise typer.BadParameter(
+            f"{stage_name}_sp_size must equal ulysses_degree * ring_degree: "
+            f"{sp_size} != {ulysses_degree} * {ring_degree}"
+        )
+    if sp_size == 1:
+        if isinstance(gpu, list) and len(gpu) != 1:
+            raise typer.BadParameter(
+                f"{stage_name}_gpus must contain exactly 1 GPU id when "
+                f"{stage_name}_sp_size=1"
+            )
+        return
+    if not isinstance(gpu, list) or len(gpu) != sp_size:
+        raise typer.BadParameter(
+            f"{stage_name}_gpus must contain exactly {sp_size} GPU ids when "
+            f"{stage_name}_sp_size={sp_size}"
+        )
+    if len(set(gpu)) != len(gpu):
+        raise typer.BadParameter(
+            f"{stage_name}_gpus must not contain duplicate GPU ids"
+        )
+
+
 def _apply_stage_gpu_override(
     pipeline_config: PipelineConfig,
     *,
@@ -602,6 +641,12 @@ def apply_parallelism_cli_overrides(
     image_encoder_gpus: str | None = None,
     talker_gpu: int | None,
     code2wav_gpu: int | None,
+    image_decoder_sp_size: int | None = None,
+    image_decoder_gpus: str | None = None,
+    image_decoder_ulysses_degree: int | None = None,
+    image_decoder_ring_degree: int | None = None,
+    image_decoder_backend: str | None = None,
+    image_decoder_attention_backend: str | None = None,
 ) -> PipelineConfig:
     thinker_gpu_override = (
         _parse_gpu_placement("thinker_gpus", thinker_gpus)
@@ -617,7 +662,9 @@ def apply_parallelism_cli_overrides(
         for stage in thinker_stages:
             if thinker_tp_size is not None:
                 stage.tp_size = int(thinker_tp_size)
-                stage.parallelism.tp = stage.tp_size
+                stage.parallelism = stage.parallelism.model_copy(
+                    update={"tp": stage.tp_size}
+                )
             if thinker_gpu_override is not None:
                 stage.gpu = thinker_gpu_override
             _validate_stage_parallelism_config("thinker", stage.tp_size, stage.gpu)
@@ -638,7 +685,9 @@ def apply_parallelism_cli_overrides(
         for stage in image_encoder_stages:
             if image_encoder_tp_size is not None:
                 stage.tp_size = int(image_encoder_tp_size)
-                stage.parallelism.tp = stage.tp_size
+                stage.parallelism = stage.parallelism.model_copy(
+                    update={"tp": stage.tp_size}
+                )
             if image_encoder_gpu_override is not None:
                 stage.gpu = image_encoder_gpu_override
             _validate_stage_parallelism_config(
@@ -646,6 +695,197 @@ def apply_parallelism_cli_overrides(
             )
             if stage.tp_size == 1 and isinstance(stage.gpu, list):
                 stage.gpu = int(stage.gpu[0])
+
+    image_decoder_gpu_override = (
+        _parse_gpu_placement("image_decoder_gpus", image_decoder_gpus)
+        if image_decoder_gpus is not None
+        else None
+    )
+    image_decoder_override_requested = any(
+        value is not None
+        for value in (
+            image_decoder_sp_size,
+            image_decoder_gpu_override,
+            image_decoder_ulysses_degree,
+            image_decoder_ring_degree,
+            image_decoder_backend,
+            image_decoder_attention_backend,
+        )
+    )
+    if image_decoder_override_requested:
+        image_decoder_stages = _find_matching_stages(
+            pipeline_config,
+            stage_name="image_decode",
+            reason="sequence parallel settings",
+        )
+        config_cls = type(pipeline_config)
+        for stage in image_decoder_stages:
+            sp_policy = config_cls.sequence_parallel_policy(stage_name=stage.name)
+            current_parallelism = stage.parallelism
+            sp_size = int(
+                image_decoder_sp_size
+                if image_decoder_sp_size is not None
+                else current_parallelism.sp
+            )
+            sp_settings_requested = any(
+                value is not None
+                for value in (
+                    image_decoder_sp_size,
+                    image_decoder_ulysses_degree,
+                    image_decoder_ring_degree,
+                )
+            )
+            model_settings_requested = any(
+                value is not None
+                for value in (
+                    image_decoder_backend,
+                    image_decoder_attention_backend,
+                )
+            )
+            if (
+                sp_size > 1 or sp_settings_requested or model_settings_requested
+            ) and sp_policy is None:
+                raise typer.BadParameter(
+                    f"Pipeline {config_cls.__name__} does not support sequence "
+                    f"parallel settings for stage {stage.name!r}"
+                )
+            if sp_size > 1 and stage.tp_size > 1:
+                raise typer.BadParameter(
+                    f"Stage {stage.name!r} cannot enable TP and SP at the same time"
+                )
+            num_attention_heads = (
+                sp_policy.attention_heads if sp_policy is not None else None
+            )
+            if (
+                image_decoder_ulysses_degree is not None
+                and image_decoder_ulysses_degree < 1
+            ):
+                raise typer.BadParameter("image_decoder_ulysses_degree must be >= 1")
+            if image_decoder_ring_degree is not None and image_decoder_ring_degree < 1:
+                raise typer.BadParameter("image_decoder_ring_degree must be >= 1")
+            if (
+                image_decoder_ulysses_degree is None
+                and image_decoder_ring_degree is None
+            ):
+                if image_decoder_sp_size is None:
+                    ulysses_degree = current_parallelism.resolved_ulysses_degree
+                    ring_degree = current_parallelism.ring_degree
+                else:
+                    # Prefer the largest Ulysses group that evenly partitions the
+                    # declared attention heads; use Ring parallelism for the rest.
+                    attention_heads = (
+                        sp_size if num_attention_heads is None else num_attention_heads
+                    )
+                    ulysses_degree = math.gcd(sp_size, attention_heads)
+                    ring_degree = sp_size // ulysses_degree
+            elif image_decoder_ulysses_degree is None:
+                ring_degree = int(image_decoder_ring_degree)
+                if sp_size % ring_degree != 0:
+                    raise typer.BadParameter(
+                        "image_decoder_sp_size must be divisible by "
+                        "image_decoder_ring_degree"
+                    )
+                ulysses_degree = sp_size // ring_degree
+            elif image_decoder_ring_degree is None:
+                ulysses_degree = int(image_decoder_ulysses_degree)
+                if sp_size % ulysses_degree != 0:
+                    raise typer.BadParameter(
+                        "image_decoder_sp_size must be divisible by "
+                        "image_decoder_ulysses_degree"
+                    )
+                ring_degree = sp_size // ulysses_degree
+            else:
+                ulysses_degree = int(image_decoder_ulysses_degree)
+                ring_degree = int(image_decoder_ring_degree)
+
+            gpu = (
+                image_decoder_gpu_override
+                if image_decoder_gpu_override is not None
+                else stage.gpu
+            )
+            try:
+                parallelism = type(current_parallelism).model_validate(
+                    {
+                        **current_parallelism.model_dump(),
+                        "sp": sp_size,
+                        "ulysses_degree": ulysses_degree,
+                        "ring_degree": ring_degree,
+                    }
+                )
+            except ValueError as exc:
+                raise typer.BadParameter(str(exc)) from exc
+            if sp_size > 1:
+                _validate_stage_sequence_parallelism_config(
+                    "image_decoder",
+                    sp_size=sp_size,
+                    gpu=gpu,
+                    ulysses_degree=ulysses_degree,
+                    ring_degree=ring_degree,
+                )
+                assert sp_policy is not None
+                try:
+                    sp_policy.validate_config(
+                        parallelism,
+                        stage_name=stage.name,
+                    )
+                except ValueError as exc:
+                    raise typer.BadParameter(str(exc)) from exc
+            else:
+                _validate_stage_parallelism_config("image_decoder", stage.tp_size, gpu)
+
+            configured_backend: object | None = None
+            resolved_backend: str | None = None
+            if sp_policy is not None:
+                configured_backend = (
+                    image_decoder_backend
+                    if image_decoder_backend is not None
+                    else resolve_stage_static_factory_args(stage, pipeline_config).get(
+                        "backend"
+                    )
+                )
+                try:
+                    resolved_backend = sp_policy.resolve_backend(
+                        configured_backend,
+                        sp_size=sp_size,
+                    )
+                except ValueError as exc:
+                    raise typer.BadParameter(str(exc)) from exc
+            resolved_gpu = gpu
+            if sp_size == 1 and stage.tp_size == 1 and isinstance(resolved_gpu, list):
+                resolved_gpu = int(resolved_gpu[0])
+            factory_arg_updates: dict[str, object] = {}
+            if image_decoder_backend is not None:
+                assert isinstance(configured_backend, str)
+                factory_arg_updates["backend"] = configured_backend
+            if image_decoder_attention_backend is not None:
+                attention_backend = image_decoder_attention_backend.strip()
+                if not attention_backend:
+                    raise typer.BadParameter(
+                        "image_decoder_attention_backend must not be empty"
+                    )
+                assert sp_policy is not None
+                if not sp_policy.supports_attention_backend(resolved_backend):
+                    attention_backend_options = sp_policy.attention_backend_options()
+                    if attention_backend_options:
+                        required_backends = ", ".join(sorted(attention_backend_options))
+                        message = (
+                            "image_decoder_attention_backend requires "
+                            f"image_decoder_backend in: {required_backends}"
+                        )
+                    else:
+                        message = (
+                            "image_decoder_attention_backend is not supported "
+                            "by this pipeline configuration"
+                        )
+                    raise typer.BadParameter(message)
+                factory_arg_updates["attention_backend"] = attention_backend
+            _apply_stage_runtime_overrides(
+                pipeline_config,
+                stage,
+                factory_arg_updates,
+            )
+            stage.gpu = resolved_gpu
+            stage.parallelism = parallelism
 
     talker_stage = (
         _resolve_talker_stage(
@@ -813,6 +1053,21 @@ def _apply_factory_args_updates(
         stage_runtime_overrides = pipeline_config.runtime_overrides.get(stage.name)
         if isinstance(stage_runtime_overrides, dict):
             stage_runtime_overrides.update(updates)
+
+
+def _apply_stage_runtime_overrides(
+    pipeline_config: PipelineConfig,
+    stage: StageConfig,
+    updates: dict[str, object],
+) -> None:
+    """Apply CLI values to the highest-priority stage override layer."""
+    if not updates:
+        return
+    stage_runtime_overrides = dict(
+        pipeline_config.runtime_overrides.get(stage.name, {})
+    )
+    stage_runtime_overrides.update(updates)
+    pipeline_config.runtime_overrides[stage.name] = stage_runtime_overrides
 
 
 def apply_decode_mode_cli_overrides(
@@ -1047,6 +1302,54 @@ def serve(
             help="GPU ids for image_encoder TP ranks, e.g. '4,5' or '[4, 5]'.",
         ),
     ] = None,
+    image_decoder_sp_size: Annotated[
+        int | None,
+        typer.Option(
+            "--image-decoder-sp-size",
+            "--image_decoder_sp_size",
+            help="Set sequence parallel size for the image decoder stage.",
+        ),
+    ] = None,
+    image_decoder_gpus: Annotated[
+        str | None,
+        typer.Option(
+            "--image-decoder-gpus",
+            "--image_decoder_gpus",
+            help="GPU ids for image decoder SP ranks, e.g. '2,3' or '[2, 3]'.",
+        ),
+    ] = None,
+    image_decoder_ulysses_degree: Annotated[
+        int | None,
+        typer.Option(
+            "--image-decoder-ulysses-degree",
+            "--image_decoder_ulysses_degree",
+            help="Set the image decoder Ulysses degree.",
+        ),
+    ] = None,
+    image_decoder_ring_degree: Annotated[
+        int | None,
+        typer.Option(
+            "--image-decoder-ring-degree",
+            "--image_decoder_ring_degree",
+            help="Set the image decoder Ring degree.",
+        ),
+    ] = None,
+    image_decoder_backend: Annotated[
+        str | None,
+        typer.Option(
+            "--image-decoder-backend",
+            "--image_decoder_backend",
+            help="Set image decoder backend: diffusers or sglang.",
+        ),
+    ] = None,
+    image_decoder_attention_backend: Annotated[
+        str | None,
+        typer.Option(
+            "--image-decoder-attention-backend",
+            "--image_decoder_attention_backend",
+            help="Set the SGLang image decoder attention backend.",
+        ),
+    ] = None,
     talker_gpu: Annotated[
         int | None,
         typer.Option(
@@ -1108,8 +1411,7 @@ def serve(
             "--talker-torch-compile",
             "--talker_torch_compile",
             help=(
-                "torch.compile mode for supported SGLang talker stage: "
-                "default|on|off."
+                "torch.compile mode for supported SGLang talker stage: default|on|off."
             ),
         ),
     ] = "default",
@@ -1257,6 +1559,12 @@ def serve(
         image_encoder_gpus=image_encoder_gpus,
         talker_gpu=talker_gpu,
         code2wav_gpu=code2wav_gpu,
+        image_decoder_sp_size=image_decoder_sp_size,
+        image_decoder_gpus=image_decoder_gpus,
+        image_decoder_ulysses_degree=image_decoder_ulysses_degree,
+        image_decoder_ring_degree=image_decoder_ring_degree,
+        image_decoder_backend=image_decoder_backend,
+        image_decoder_attention_backend=image_decoder_attention_backend,
     )
     merged_config = apply_cuda_graph_cli_overrides(
         merged_config,

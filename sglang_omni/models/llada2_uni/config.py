@@ -3,10 +3,12 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import ClassVar
 
 from sglang_omni.config import (
     PipelineConfig,
+    SequenceParallelPolicy,
     SGLangServerArgsConfig,
     StageConfig,
     StageResourceConfig,
@@ -22,6 +24,74 @@ DECODE_STAGE = "decode"
 IMAGE_DECODE_STAGE = "image_decode"
 
 DEFAULT_THINKER_MAX_NEW_TOKENS = 2048
+LLADA2_IMAGE_DECODER_ATTENTION_HEADS = 30
+LLADA2_IMAGE_DECODER_SP_POLICY = SequenceParallelPolicy(
+    attention_heads=LLADA2_IMAGE_DECODER_ATTENTION_HEADS,
+    requires_power_of_two=True,
+    default_backend="diffusers",
+    required_backend="sglang",
+    allowed_backends=frozenset({"diffusers", "sglang"}),
+    backend_aliases=(
+        ("native", "diffusers"),
+        ("local", "diffusers"),
+        ("omni", "diffusers"),
+    ),
+    attention_backend_backends=frozenset({"sglang"}),
+)
+
+
+@dataclass(frozen=True)
+class ImageDecoderRuntimeSettings:
+    backend: str
+    attention_backend: str
+    png_compress_level: int
+
+
+def normalize_image_decoder_backend(backend: str) -> str:
+    return LLADA2_IMAGE_DECODER_SP_POLICY.normalize_backend(backend)
+
+
+def resolve_image_decoder_runtime_settings(
+    *,
+    backend: str | None,
+    attention_backend: str | None,
+    png_compress_level: int | None,
+    sp_size: int,
+) -> ImageDecoderRuntimeSettings:
+    """Resolve LLaDA2 image-decoder defaults in the model-owned config layer."""
+    if sp_size < 1:
+        raise ValueError("Image decoder SP size must be positive")
+    normalized_backend = (
+        normalize_image_decoder_backend(backend) if backend is not None else None
+    )
+    resolved_backend = LLADA2_IMAGE_DECODER_SP_POLICY.resolve_backend(
+        normalized_backend,
+        sp_size=sp_size,
+    )
+    if resolved_backend not in {"diffusers", "sglang"}:
+        raise ValueError(f"Unsupported image decoder backend: {backend!r}")
+
+    if attention_backend is None:
+        resolved_attention_backend = (
+            "fa" if resolved_backend == "sglang" else "torch_sdpa"
+        )
+    else:
+        resolved_attention_backend = attention_backend.strip().lower()
+        if not resolved_attention_backend:
+            raise ValueError("Image decoder attention backend must not be empty")
+
+    resolved_png_compress_level = (
+        (1 if resolved_backend == "sglang" else 6)
+        if png_compress_level is None
+        else int(png_compress_level)
+    )
+    if not 0 <= resolved_png_compress_level <= 9:
+        raise ValueError("png_compress_level must be between 0 and 9")
+    return ImageDecoderRuntimeSettings(
+        backend=resolved_backend,
+        attention_backend=resolved_attention_backend,
+        png_compress_level=resolved_png_compress_level,
+    )
 
 
 class LLaDA2UniPipelineConfig(PipelineConfig):
@@ -86,6 +156,14 @@ class LLaDA2UniOmniPipelineConfig(PipelineConfig):
     @classmethod
     def mem_fraction_role_to_stage(cls) -> dict[str, str]:
         return {THINKER_STAGE: THINKER_STAGE}
+
+    @classmethod
+    def sequence_parallel_policy(
+        cls, *, stage_name: str
+    ) -> SequenceParallelPolicy | None:
+        if stage_name == IMAGE_DECODE_STAGE:
+            return LLADA2_IMAGE_DECODER_SP_POLICY
+        return super().sequence_parallel_policy(stage_name=stage_name)
 
     model_path: str
     stages: list[StageConfig] = [

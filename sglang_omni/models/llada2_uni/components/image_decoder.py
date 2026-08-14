@@ -13,14 +13,18 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from diffusers import AutoencoderKL
-from safetensors.torch import load_file
+from torch import nn
 from torchvision.transforms.functional import to_pil_image
 
 from sglang_omni.models.llada2_uni.components.decoder_model import (
-    ZImageTransformer2DModel,
+    ZImageParallelConfig,
+    ZImageTransformer2DModelWrapper,
 )
 from sglang_omni.models.llada2_uni.components.sigvq import SigVQ
 from sglang_omni.models.llada2_uni.components.transport import Sampler, create_transport
+from sglang_omni.models.llada2_uni.config import (
+    resolve_image_decoder_runtime_settings,
+)
 from sglang_omni.models.weight_loader import resolve_model_path
 
 logger = logging.getLogger(__name__)
@@ -97,8 +101,18 @@ class LLaDA2ImageDecoder:
         decode_mode: str = "normal",
         num_steps: int = 50,
         resolution_multiplier: int = 2,
+        backend: str | None = None,
+        stage_role: str = "single",
+        sp_rank: int = 0,
+        sp_size: int = 1,
+        ulysses_degree: int | None = None,
+        ring_degree: int = 1,
+        attention_backend: str | None = None,
     ):
-        self.device = torch.device(device)
+        resolved_device = torch.device(device)
+        if resolved_device.type == "cuda" and resolved_device.index is None:
+            resolved_device = torch.device("cuda", torch.cuda.current_device())
+        self.device = resolved_device
         self.dtype = dtype
         self.model_path = str(resolve_model_path(model_path))
         self.decode_mode = decode_mode
@@ -106,10 +120,81 @@ class LLaDA2ImageDecoder:
         self.resolution_multiplier = resolution_multiplier
 
         self._sigvq: SigVQ | None = None
-        self._diff_model: ZImageTransformer2DModel | None = None
+        self._diff_model: nn.Module | None = None
         self._diff_model_mode: str | None = None
+        self._diff_model_backend: str | None = None
         self._vae: AutoencoderKL | None = None
         self._diff_config: dict | None = None
+
+        # ----- parallel and backend settings -----
+
+        runtime_settings = resolve_image_decoder_runtime_settings(
+            backend=backend,
+            attention_backend=attention_backend,
+            png_compress_level=None,
+            sp_size=sp_size,
+        )
+        self.backend = runtime_settings.backend
+        self.stage_role = stage_role
+        self.sp_rank = sp_rank
+        self.sp_size = sp_size
+        self.ulysses_degree = ulysses_degree
+        self.ring_degree = ring_degree
+        self.attention_backend = runtime_settings.attention_backend
+        if self.stage_role not in {"single", "leader", "follower"}:
+            raise ValueError(f"Unsupported image decoder stage role: {stage_role!r}")
+        if self.sp_size < 1 or not 0 <= self.sp_rank < self.sp_size:
+            raise ValueError(
+                f"Invalid image decoder SP rank {self.sp_rank}/{self.sp_size}"
+            )
+        if self.sp_size > 1 and self.stage_role == "single":
+            raise ValueError("Image decoder SP requires a leader or follower role")
+        if self.stage_role == "leader" and self.sp_rank != 0:
+            raise ValueError("Image decoder leader must use sp_rank=0")
+        if self.stage_role == "follower" and self.sp_rank == 0:
+            raise ValueError("Image decoder follower must use sp_rank > 0")
+
+    @property
+    def is_leader(self) -> bool:
+        return self.stage_role in {"single", "leader"}
+
+    def _broadcast_from_leader(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self.sp_size > 1:
+            if not torch.distributed.is_initialized():
+                raise RuntimeError("Image decoder SP group is not initialized")
+            torch.distributed.broadcast(tensor, src=0)
+        return tensor
+
+    def _broadcast_leader_success(self, success: bool) -> bool:
+        status = torch.tensor(
+            [1 if success else 0],
+            device=self.device,
+            dtype=torch.uint8,
+        )
+        self._broadcast_from_leader(status)
+        return bool(status.item())
+
+    @staticmethod
+    def _validate_decode_inputs(
+        token_ids: list[int],
+        h: int,
+        w: int,
+        steps: int,
+        resolution_multiplier: int,
+    ) -> None:
+        if h < 1 or w < 1:
+            raise ValueError("Image decoder grid dimensions must be positive")
+        if len(token_ids) != h * w:
+            raise ValueError(
+                "Image decoder requires exactly h * w VQ tokens: "
+                f"got {len(token_ids)} for grid {h}x{w}"
+            )
+        if any(token_id < 0 or token_id >= 16384 for token_id in token_ids):
+            raise ValueError("Image decoder VQ token ids must be between 0 and 16383")
+        if steps < 1:
+            raise ValueError("Image decoder num_steps must be positive")
+        if resolution_multiplier < 1:
+            raise ValueError("Image decoder resolution_multiplier must be positive")
 
     # ------------------------------------------------------------------
     # Lazy model loading
@@ -131,18 +216,33 @@ class LLaDA2ImageDecoder:
         logger.info("SigVQ loaded from %s", sigvq_path)
 
     def _ensure_diff_model(self, decode_mode: str):
-        if self._diff_model is not None and self._diff_model_mode == decode_mode:
+        parallel_config = ZImageParallelConfig(
+            backend=self.backend,
+            sp_size=self.sp_size,
+            ulysses_degree=self.ulysses_degree,
+            ring_degree=self.ring_degree,
+            attention_backend=self.attention_backend,
+        )
+        backend = parallel_config.normalized_backend
+        if (
+            self._diff_model is not None
+            and self._diff_model_mode == decode_mode
+            and self._diff_model_backend == backend
+        ):
             return
         if self._diff_model is not None:
             logger.info(
-                "Switching diffusion model: %s -> %s (releasing GPU memory)",
+                "Switching diffusion model: %s/%s -> %s/%s (releasing GPU memory)",
+                self._diff_model_backend,
                 self._diff_model_mode,
+                backend,
                 decode_mode,
             )
             del self._diff_model
             self._diff_model = None
             self._diff_config = None
             self._diff_model_mode = None
+            self._diff_model_backend = None
             torch.cuda.empty_cache()
 
         if decode_mode == "decoder-turbo":
@@ -157,17 +257,21 @@ class LLaDA2ImageDecoder:
         cfg["axes_lens"] = [32768, 1024, 1024]
         cfg["cap_feat_dim"] = 4096
         self._diff_config = cfg
-
-        with torch.device("meta"):
-            self._diff_model = ZImageTransformer2DModel(**cfg)
-        ckpt = os.path.join(decoder_dir, "model.safetensors")
-        self._diff_model.load_state_dict(
-            load_file(ckpt, device=str(self.device)), assign=True
+        self._diff_model = ZImageTransformer2DModelWrapper(
+            model_path=self.model_path,
+            decoder_dir=decoder_dir,
+            cfg=cfg,
+            device=self.device,
+            dtype=self.dtype,
+            parallel_config=parallel_config,
         )
-        self._diff_model = self._diff_model.to(dtype=self.dtype).eval()
         self._diff_model_mode = decode_mode
+        self._diff_model_backend = backend
         logger.info(
-            "Diffusion model loaded from %s (%s mode)", decoder_dir, decode_mode
+            "Diffusion model loaded from %s (%s mode, %s backend)",
+            decoder_dir,
+            decode_mode,
+            backend,
         )
 
     def _ensure_vae(self):
@@ -221,25 +325,86 @@ class LLaDA2ImageDecoder:
             else self.resolution_multiplier
         )
 
-        # Stage 1: SigVQ -> semantic features
-        self._ensure_sigvq()
+        validation_error: ValueError | None = None
+        if self.is_leader:
+            try:
+                self._validate_decode_inputs(token_ids, h, w, steps, rmul)
+            except ValueError as exc:
+                validation_error = exc
+        if self.sp_size == 1 and validation_error is not None:
+            raise validation_error
+
+        # SP groups are initialized while loading the SGLang DiT. They must be
+        # ready before leader-only validation and conditioning status can be
+        # broadcast to followers.
+        if self.sp_size > 1:
+            self._ensure_diff_model(mode)
+
+        # Stage 1: leader-only SigVQ -> semantic features. A status collective
+        # precedes the feature collective so leader-side validation, checkpoint,
+        # or OOM failures cannot strand followers in the next broadcast.
         th = h * 16 * rmul
         tw = w * 16 * rmul
-        tok = torch.tensor(token_ids).view(1, 1, h, w).float().to(self.device)
-        up = F.interpolate(tok, scale_factor=2, mode="nearest").long().view(1, -1)
-        cap_pos = [self._sigvq(up).squeeze(0)]
+        cap_len = h * w * 4
+        cap_pos_tensor: torch.Tensor | None = None
+        leader_error: Exception | None = validation_error
+        if self.is_leader and leader_error is None:
+            try:
+                self._ensure_sigvq()
+                tok = (
+                    torch.tensor(token_ids, device=self.device).view(1, 1, h, w).float()
+                )
+                up = (
+                    F.interpolate(tok, scale_factor=2, mode="nearest")
+                    .long()
+                    .view(1, -1)
+                )
+                cap_pos_tensor = self._sigvq(up).squeeze(0)
+                if tuple(cap_pos_tensor.shape) != (cap_len, 4096):
+                    raise RuntimeError(
+                        "SigVQ returned an unexpected conditioning shape: "
+                        f"{tuple(cap_pos_tensor.shape)} != {(cap_len, 4096)}"
+                    )
+            except Exception as exc:
+                leader_error = exc
+
+        if self.sp_size > 1:
+            leader_succeeded = self._broadcast_leader_success(leader_error is None)
+            if not leader_succeeded:
+                if leader_error is not None:
+                    raise leader_error
+                return None
+
+        if leader_error is not None:
+            raise leader_error
+        if cap_pos_tensor is None:
+            cap_pos_tensor = torch.empty(
+                (cap_len, 4096), device=self.device, dtype=self.dtype
+            )
+        cap_pos = [self._broadcast_from_leader(cap_pos_tensor)]
         cap_neg = [torch.zeros_like(cap_pos[0])]
 
         # Stage 2: Diffusion ODE sampling
         self._ensure_diff_model(mode)
         cfg = self._diff_config
         noise_shape = [1, 16, 1, 2 * (th // 16), 2 * (tw // 16)]
-        if seed is not None:
+        if self.sp_size > 1:
+            seed_tensor = torch.tensor(
+                [int(seed) if seed is not None else 0],
+                device=self.device,
+                dtype=torch.int64,
+            )
+            if self.is_leader and seed is None:
+                seed_tensor.random_(0, 2**31)
+            self._broadcast_from_leader(seed_tensor)
+            generator = torch.Generator(device=self.device).manual_seed(
+                int(seed_tensor.item())
+            )
+        elif seed is not None:
             generator = torch.Generator(device=self.device).manual_seed(int(seed))
-            z = torch.randn(noise_shape, device=self.device, generator=generator)
         else:
             generator = None
-            z = torch.randn(noise_shape, device=self.device)
+        z = torch.randn(noise_shape, device=self.device, generator=generator)
         model_fn = _create_decoder_model_fn(
             self._diff_model,
             cap_pos,
@@ -263,7 +428,9 @@ class LLaDA2ImageDecoder:
         )
         samples = sample_fn(z, model_fn)[-1].squeeze(2)
 
-        # Stage 3: VAE decode
+        # Stage 3: only the pipeline leader owns post-DiT work and output.
+        if not self.is_leader:
+            return None
         self._ensure_vae()
         s = samples.to(self.dtype)
         s = (s / self._vae.config.scaling_factor) + self._vae.config.shift_factor
@@ -293,6 +460,9 @@ class LLaDA2ImageDecoder:
         Returns:
             Image bytes.
         """
+        if not self.is_leader:
+            raise RuntimeError("decode_to_bytes is leader-only in image decoder SP")
+
         import io
 
         image = self.decode(token_ids, h, w, **decode_kwargs)

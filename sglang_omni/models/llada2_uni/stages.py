@@ -219,9 +219,18 @@ def create_image_decode_executor(
     *,
     device: str = "cuda",
     dtype: Any = None,
+    backend: str | None = None,
+    stage_role: str = "single",
+    sp_rank: int = 0,
+    sp_size: int = 1,
+    nccl_port: int | None = None,
+    ulysses_degree: int | None = None,
+    ring_degree: int = 1,
+    attention_backend: str | None = None,
     decode_mode: str = "normal",
     num_steps: int = 50,
     resolution_multiplier: int = 2,
+    png_compress_level: int | None = None,
 ):
     """Create an image decoder executor for converting VQ tokens to images.
 
@@ -234,6 +243,9 @@ def create_image_decode_executor(
     from sglang_omni.models.llada2_uni.components.image_decoder import (
         LLaDA2ImageDecoder,
     )
+    from sglang_omni.models.llada2_uni.config import (
+        resolve_image_decoder_runtime_settings,
+    )
     from sglang_omni.models.llada2_uni.merge import extract_image_vq_tokens
     from sglang_omni.models.llada2_uni.payload_types import (
         LLaDA2UniEvent,
@@ -243,6 +255,12 @@ def create_image_decode_executor(
     from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 
     dtype = resolve_dtype(dtype)
+    runtime_settings = resolve_image_decoder_runtime_settings(
+        backend=backend,
+        attention_backend=attention_backend,
+        png_compress_level=png_compress_level,
+        sp_size=sp_size,
+    )
 
     decoder = LLaDA2ImageDecoder(
         model_path=model_path,
@@ -251,10 +269,22 @@ def create_image_decode_executor(
         decode_mode=decode_mode,
         num_steps=num_steps,
         resolution_multiplier=resolution_multiplier,
+        backend=runtime_settings.backend,
+        stage_role=stage_role,
+        sp_rank=sp_rank,
+        sp_size=sp_size,
+        ulysses_degree=ulysses_degree,
+        ring_degree=ring_degree,
+        attention_backend=runtime_settings.attention_backend,
     )
 
     logger.info(
-        "Image decoder created: default decode_mode=%s, num_steps=%d",
+        "Image decoder created: role=%s, sp_rank=%d/%d, "
+        "port=%s, default decode_mode=%s, num_steps=%d",
+        stage_role,
+        sp_rank,
+        sp_size,
+        nccl_port,
         decode_mode,
         num_steps,
     )
@@ -281,9 +311,20 @@ def create_image_decode_executor(
 
         try:
             image = decoder.decode(vq_tokens, h, w, **call_kwargs)
+            if image is None:
+                payload.data = {
+                    "events": [],
+                    "modality": "image",
+                    "parallel_follower": True,
+                }
+                return payload
 
             buf = io.BytesIO()
-            image.save(buf, format="PNG")
+            image.save(
+                buf,
+                format="PNG",
+                compress_level=runtime_settings.png_compress_level,
+            )
             image_bytes = buf.getvalue()
             image_b64 = base64.b64encode(image_bytes).decode("ascii")
 

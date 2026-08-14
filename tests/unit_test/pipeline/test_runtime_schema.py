@@ -2,18 +2,32 @@
 from __future__ import annotations
 
 import pytest
+import sglang_omni.config as config_module
 
 from sglang_omni.config import (
-    ParallelismConfig,
     PipelineConfig,
     PlacementConfig,
     SGLangServerArgsConfig,
+    SequenceParallelPolicy,
     StageConfig,
     StageResourceConfig,
     StageRuntimeConfig,
 )
 
 _FACTORY = "tests.unit_test.fixtures.pipeline_fakes.dummy_factory"
+
+
+class _SequenceParallelPipelineConfig(PipelineConfig):
+    @classmethod
+    def sequence_parallel_policy(
+        cls, *, stage_name: str
+    ) -> SequenceParallelPolicy | None:
+        if stage_name == "stage":
+            return SequenceParallelPolicy(
+                attention_heads=6,
+                requires_power_of_two=True,
+            )
+        return None
 
 
 def _stage(**kwargs) -> StageConfig:
@@ -71,23 +85,137 @@ def test_stage_rejects_terminal_with_next() -> None:
         )
 
 
-def test_tp_size_normalizes_into_parallelism_tp() -> None:
+def test_tp_size_syncs_into_parallelism_tp() -> None:
     stage = _stage(tp_size=2, gpu=[0, 1])
 
     assert stage.tp_size == 2
     assert stage.parallelism.tp == 2
+    assert hasattr(config_module, "ParallelismConfig")
+    assert not hasattr(config_module, "ResolvedStageParallelism")
+    assert not hasattr(config_module, "resolve_stage_parallelism")
 
 
-def test_parallelism_tp_normalizes_back_to_tp_size() -> None:
-    stage = _stage(parallelism=ParallelismConfig(tp=2), gpu=[0, 1])
+def test_parallelism_tp_syncs_back_to_tp_size() -> None:
+    stage = _stage(
+        gpu=[0, 1],
+        parallelism=config_module.ParallelismConfig(tp=2),
+    )
 
     assert stage.tp_size == 2
     assert stage.parallelism.tp == 2
 
 
-def test_conflicting_tp_size_and_parallelism_tp_raise() -> None:
-    with pytest.raises(ValueError, match="conflicts"):
-        _stage(tp_size=2, parallelism=ParallelismConfig(tp=3), gpu=[0, 1])
+def test_stage_rejects_conflicting_tp_aliases() -> None:
+    with pytest.raises(ValueError, match="tp_size.*parallelism.tp"):
+        _stage(
+            tp_size=2,
+            gpu=[0, 1, 2, 3],
+            parallelism=config_module.ParallelismConfig(tp=4),
+        )
+
+
+def test_stage_accepts_sequence_parallel_settings_in_parallelism_config() -> None:
+    parallelism_config = config_module.ParallelismConfig(
+        sp=4,
+        ulysses_degree=2,
+        ring_degree=2,
+    )
+
+    stage = _stage(
+        gpu=[0, 1, 2, 3],
+        parallelism=parallelism_config,
+    )
+
+    assert stage.tp_size == 1
+    assert stage.parallelism == parallelism_config
+
+
+def test_stage_schema_accepts_non_power_of_two_sp() -> None:
+    stage = _stage(
+        gpu=[0, 1, 2],
+        parallelism={"sp": 3, "ulysses_degree": 3},
+    )
+
+    assert stage.parallelism.sp == 3
+    assert stage.parallelism.ulysses_degree == 3
+    assert stage.parallelism.ring_degree == 1
+
+
+def test_stage_rejects_combined_tp_and_sp() -> None:
+    with pytest.raises(ValueError, match="cannot enable TP and SP"):
+        _stage(
+            tp_size=2,
+            gpu=[0, 1, 2, 3],
+            parallelism={"tp": 2, "sp": 2},
+        )
+
+
+def test_pipeline_rejects_sequence_parallelism_without_model_policy() -> None:
+    with pytest.raises(ValueError, match="does not support sequence parallelism"):
+        PipelineConfig(
+            model_path="dummy",
+            stages=[
+                _stage(
+                    gpu=[0, 1],
+                    parallelism={"sp": 2},
+                )
+            ],
+        )
+
+
+def test_pipeline_applies_model_sequence_parallel_constraints() -> None:
+    with pytest.raises(ValueError, match="power of two"):
+        _SequenceParallelPipelineConfig(
+            model_path="dummy",
+            stages=[
+                _stage(
+                    gpu=[0, 1, 2],
+                    parallelism={"sp": 3},
+                )
+            ],
+        )
+
+    with pytest.raises(ValueError, match="must divide.*6 attention heads"):
+        _SequenceParallelPipelineConfig(
+            model_path="dummy",
+            stages=[
+                _stage(
+                    gpu=[0, 1, 2, 3],
+                    parallelism={"sp": 4, "ulysses_degree": 4},
+                )
+            ],
+        )
+
+
+def test_pipeline_accepts_model_supported_sequence_parallelism() -> None:
+    config = _SequenceParallelPipelineConfig(
+        model_path="dummy",
+        stages=[
+            _stage(
+                gpu=[0, 1, 2, 3],
+                parallelism={
+                    "sp": 4,
+                    "ulysses_degree": 2,
+                    "ring_degree": 2,
+                },
+            )
+        ],
+    )
+
+    assert config.stages[0].parallelism.sp == 4
+
+
+def test_pipeline_sequence_parallelism_requires_one_gpu_per_rank() -> None:
+    with pytest.raises(ValueError, match="one GPU id per SP rank"):
+        _SequenceParallelPipelineConfig(
+            model_path="dummy",
+            stages=[
+                _stage(
+                    gpu=0,
+                    parallelism={"sp": 2},
+                )
+            ],
+        )
 
 
 def test_pipeline_accepts_placement_config() -> None:

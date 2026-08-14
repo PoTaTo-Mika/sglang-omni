@@ -18,7 +18,7 @@ Pipelines are declared with `PipelineConfig` and `StageConfig`.
 Example:
 
 ```python
-# Every non-TP stage must declare `process` explicitly — there is no implicit
+# Every non-parallel stage must declare `process` explicitly — there is no implicit
 # default. Each stage below runs in its own OS process; multiple stages can
 # share an OS process by giving them the same `process` value (see
 # `Qwen3OmniSpeechColocatedPipelineConfig` for that pattern).
@@ -77,9 +77,10 @@ stages = [
 | `next` | `str`, `list[str]`, or `None` | `None` | Static downstream stage or stages for normal result routing. |
 | `terminal` | `bool` | `False` | Marks a stage as terminal; terminal results are sent to the coordinator. |
 | `route_fn` | `str` or `None` | `None` | Dotted function path for request-aware result routing. The function receives `(request_id, stage_output)` and returns a downstream stage name or list of stage names. |
-| `gpu` | `int`, `list[int]`, or `None` | `None` | GPU id for the stage. `None` means CPU placement. A list is used for tensor parallel ranks. |
-| `tp_size` | `int` | `1` | Number of tensor-parallel ranks. Must match `len(gpu)` when `gpu` is a list. |
-| `process` | `str` or `None` | `None` | OS process group identifier. Non-TP stages with the same `process` value share a single OS process; today every non-TP stage must declare one explicitly (see also `_validate_general`). For TP stages, `process` is optional and acts as a prefix for the derived rank-process names (`{process}_tp{rank}`); if unset, the stage name is used as the prefix. |
+| `gpu` | `int`, `list[int]`, or `None` | `None` | GPU id for the stage. `None` means CPU placement. A list provides one GPU id per TP or SP rank. |
+| `tp_size` | `int` | `1` | Compatibility alias for `parallelism.tp`. Existing TP configurations may continue to use it. When both forms are provided, they must match. |
+| `parallelism` | `ParallelismConfig` | `ParallelismConfig()` | Structured TP/SP settings. Exactly one of `tp` and `sp` may be greater than 1. A GPU list must contain one id per rank of the active mode. |
+| `process` | `str` or `None` | `None` | OS process group identifier. Non-parallel stages with the same `process` value share a single OS process; today every non-parallel stage must declare one explicitly (see also `_validate_general`). For TP or SP stages, `process` is optional and acts as a prefix for derived rank-process names (`{process}_tp{rank}` or `{process}_sp{rank}`); if unset, the stage name is used as the prefix. |
 | `wait_for` | `list[str]` or `None` | `None` | Upstream stages required before this stage can execute a request. |
 | `wait_for_fn` | `str` or `None` | `None` | Dotted function path for request-aware fan-in source selection. The function receives `(request_id, from_stage, payload)` and returns the active subset of `wait_for`, or `None` when the payload does not determine the subset yet. |
 | `merge_fn` | `str` or `None` | `None` | Dotted import path to the fan-in merge function. Required when `wait_for` is set. |
@@ -149,9 +150,9 @@ stream edges. Cross-process or unsafe fan-out edges still use the relay/control
 plane path.
 
 The first supported fusion form is conservative: a group must be adjacent,
-linear, non-TP, and fit on at most one GPU. Internal stages must route only to
-the next stage in the group. Existing explicit `process` groups are not split;
-if fusion connects two process groups, those groups are merged.
+linear, non-parallel, and fit on at most one GPU. Internal stages must route
+only to the next stage in the group. Existing explicit `process` groups are not
+split; if fusion connects two process groups, those groups are merged.
 
 ## Runtime Prep and Runner
 
@@ -173,12 +174,12 @@ Serving uses `MultiProcessPipelineRunner` for both single-process and
 multi-process topologies. Runtime prep first resolves GPU placement, then
 process topology:
 
-- every non-TP stage must declare `process` explicitly — there is no implicit
+- every non-parallel stage must declare `process` explicitly — there is no implicit
   default. Configs saved before this refactor are not auto-migrated: set
-  `process="pipeline"` on every non-TP stage to recover the historical
+  `process="pipeline"` on every non-parallel stage to recover the historical
   single-process behavior, or use any other shared/distinct process name to
   opt into the declarative multi-stage-per-process layout;
-- explicit `stage.process` groups non-TP stages declaratively.
+- explicit `stage.process` groups non-parallel stages declaratively.
 
 A process group may contain CPU stages and stages on at most one GPU. Multiple
 process groups may share the same GPU only when GPU-stage memory budgets are
@@ -194,7 +195,7 @@ pipeline/
 The child process does not recompile the pipeline. The main process builds
 fully resolved, picklable stage/process specs; the child imports stage
 factories, builds schedulers, constructs `Stage` objects, signals ready, and
-runs one or more non-TP stages in the same event loop.
+runs one or more non-parallel stages in the same event loop.
 
 ## Tensor Parallelism
 
@@ -228,3 +229,77 @@ Only rank 0 owns external stage IO:
 
 Each TP stage gets its own NCCL port allocation so multiple TP groups can exist
 inside one pipeline.
+
+`tp_size` remains supported for existing model configs, launchers, and dotted
+overrides. It is synchronized with `parallelism.tp` during schema construction
+and config merging. New structured configs may instead use
+`parallelism=ParallelismConfig(tp=4)`; setting both forms to different values is
+rejected. Sequence parallelism does not change this compatibility contract.
+
+## Sequence Parallelism
+
+Sequence parallelism is an explicit, model-owned capability. Its rank count and
+Ulysses/Ring decomposition are stored alongside TP settings in
+`ParallelismConfig`, while `tp_size` remains a compatibility alias for the
+existing TP interface.
+
+```python
+from sglang_omni.config import ParallelismConfig, StageConfig
+
+StageConfig(
+    name="image_decode",
+    factory="...create_image_decode_executor",
+    gpu=[0, 1, 2, 3],
+    parallelism=ParallelismConfig(
+        sp=4,
+        ulysses_degree=2,
+        ring_degree=2,
+    ),
+    terminal=True,
+)
+```
+
+`ParallelismConfig` has the following fields:
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `tp` | `int` | `1` | Total number of TP ranks. It is synchronized with the `StageConfig.tp_size` compatibility alias. |
+| `sp` | `int` | `1` | Total number of SP ranks. Values greater than 1 require an explicit model SP policy. |
+| `ulysses_degree` | `int` or `None` | `None` | Ulysses group size. `None` resolves to `sp`. When the model declares an attention-head count, this degree must divide it. |
+| `ring_degree` | `int` | `1` | Ring-parallel group size. The invariant is `sp == ulysses_degree * ring_degree`. |
+
+TP and SP are mutually exclusive for one stage. The runtime resolves either a
+TP rank group from `parallelism.tp`/`tp_size`, an SP rank group from
+`parallelism.sp`, or a single-rank stage. It does not multiply TP and SP sizes,
+and it will not silently reset TP when SP is requested.
+
+Pipeline config classes opt into SP by returning a `SequenceParallelPolicy` for
+the requested stage. The base `PipelineConfig` returns no policy, so passing SP
+settings in config or through CLI options to an unsupported model fails before
+placement or process startup. A model policy owns architecture constraints such
+as attention-head divisibility, power-of-two requirements, and supported
+decoder backends.
+
+### LLaDA2-Uni Image Decoder
+
+`LLaDA2UniOmniPipelineConfig` enables SP for its `image_decode` stage. Z-Image
+partitions the image latent sequence across ranks, while Context Refiner caption
+tokens remain fully replicated on every rank because that module consumes the
+complete caption and does not use sequence-parallel attention. Rank 0 owns
+external stage IO and all ranks participate in decoder collectives.
+
+The image decoder can be configured through these serve options:
+
+| Option | Description |
+| --- | --- |
+| `--image-decoder-sp-size` | Total number of image-decoder SP ranks. LLaDA2 requires a power of two. |
+| `--image-decoder-gpus` | Comma-separated GPU ids. For SP, the count must equal the SP size. A GPU-only override preserves an existing TP configuration. |
+| `--image-decoder-ulysses-degree` | Explicit Ulysses degree. It must divide the model's 30 attention heads. |
+| `--image-decoder-ring-degree` | Explicit Ring degree. Together with Ulysses it must multiply to the SP size. |
+| `--image-decoder-backend` | Decoder backend. `diffusers` is the single-rank default; SP requires `sglang`. Aliases `native`, `local`, and `omni` resolve to `diffusers`. |
+| `--image-decoder-attention-backend` | Attention implementation used by the SGLang image decoder, for example `fa`. |
+
+When only the SP size is supplied, the CLI chooses the largest Ulysses degree
+that divides both the SP size and the model's 30 attention heads, then assigns
+the remaining factor to Ring parallelism. Therefore SP4 resolves to Ulysses 2 ×
+Ring 2. The CLI and decoder runtime both validate the resulting decomposition.

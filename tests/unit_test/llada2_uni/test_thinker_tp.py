@@ -106,7 +106,7 @@ def test_sparse_moe_dual_stream_matches_single_stream(
     ("tp_size", "expected_fanout"),
     [(1, False), (4, True)],
 )
-def test_dllm_scheduler_declares_tp_work_fanout(
+def test_dllm_scheduler_declares_dispatch_safe_tp_fanout(
     tp_size: int,
     expected_fanout: bool,
 ) -> None:
@@ -124,3 +124,11 @@ def test_dllm_scheduler_declares_tp_work_fanout(
 
     assert scheduler.tp_size == tp_size
     assert scheduler.requires_tp_work_fanout is expected_fanout
+    assert scheduler.parallel_capabilities.fanout_work is expected_fanout
+    assert scheduler.parallel_capabilities.drain_aborted_work is expected_fanout
+    if expected_fanout:
+        scheduler.mark_request_aborted_for_drain("req-1", dispatch_id=1)
+        assert scheduler._aborted_request_ids == set()
+        assert scheduler._abort_drains.is_pending("req-1", dispatch_id=1)
+        scheduler.acknowledge_request_terminal("req-1", dispatch_id=1)
+        assert not scheduler._abort_drains.is_pending("req-1", dispatch_id=1)

@@ -42,6 +42,7 @@ class StreamingSimpleScheduler:
     _can_batch_stream_chunks: bool = False
     _stream_chunk_batch_max: int | None = None
     _stream_chunk_batch_distinct_requests: bool = False
+    supports_parallel_stage: bool = False
 
     def __init__(
         self,
@@ -56,7 +57,6 @@ class StreamingSimpleScheduler:
     ) -> None:
         self.inbox: _queue_mod.Queue[IncomingMessage] = _queue_mod.Queue()
         self.outbox: _queue_mod.Queue[OutgoingMessage] = _queue_mod.Queue()
-        self.requires_tp_work_fanout: bool = True
 
         self._fn = compute_fn
         self._batch_fn = batch_compute_fn
@@ -76,6 +76,11 @@ class StreamingSimpleScheduler:
         self._completed_non_streaming_request_ids: set[str] = set()
         self._state_lock = threading.RLock()
         self._abort_lock = threading.Lock()
+
+    @property
+    def requires_tp_work_fanout(self) -> bool:
+        """Compatibility view of the legacy TP work-fanout requirement."""
+        return True
 
     # ------------------------------------------------------------------
     # Hooks for subclasses
