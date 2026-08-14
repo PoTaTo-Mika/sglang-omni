@@ -344,6 +344,7 @@ class DllmScheduler:
                 f"{forward_batch.positions.numel()}"
             )
 
+        forward_batch.dllm_left_pad_lens_cpu = left_pad_lengths
         forward_batch.dllm_left_pad_lens = torch.tensor(
             left_pad_lengths,
             dtype=forward_batch.seq_lens.dtype,

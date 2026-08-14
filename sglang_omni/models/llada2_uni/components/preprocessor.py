@@ -84,31 +84,6 @@ def _resolve_edit_cfg_scales(
     return cfg_text_scale, cfg_image_scale
 
 
-def align_cfg_unconditional_input_ids(
-    tokenizer: Any,
-    conditional_input_ids: list[int],
-    unconditional_input_ids: list[int],
-) -> tuple[list[int], int]:
-    """Left-pad a CFG companion with mask tokens to physical alignment."""
-    if len(unconditional_input_ids) > len(conditional_input_ids):
-        raise ValueError(
-            "CFG unconditional input cannot be longer than conditional input: "
-            f"cond={len(conditional_input_ids)}, "
-            f"uncond={len(unconditional_input_ids)}"
-        )
-    left_pad_length = len(conditional_input_ids) - len(unconditional_input_ids)
-    if left_pad_length == 0:
-        return list(unconditional_input_ids), 0
-
-    mask_token_id = getattr(tokenizer, "mask_token_id", None)
-    if mask_token_id is None:
-        raise ValueError("LLaDA2 tokenizer has no mask_token_id for CFG padding")
-    return (
-        [int(mask_token_id)] * left_pad_length + list(unconditional_input_ids),
-        left_pad_length,
-    )
-
-
 def validate_prompt_seq_len(
     input_ids: torch.Tensor,
     *,
@@ -549,13 +524,7 @@ class LLaDA2Preprocessor:
                 # Build unconditional input_ids for CFG when cfg_scale > 1.0
                 if cfg_scale > 1.0:
                     uncond_input_ids = self._build_t2i_uncond_input_ids(grid_h, grid_w)
-                    uncond_input_ids, uncond_left_pad_len = (
-                        align_cfg_unconditional_input_ids(
-                            self._tokenizer, input_ids, uncond_input_ids
-                        )
-                    )
                     stream_state["uncond_input_ids"] = uncond_input_ids
-                    stream_state["uncond_left_pad_len"] = uncond_left_pad_len
                     stream_state["cfg_scale"] = cfg_scale
                     stream_state["cfg_rescale"] = cfg_rescale
 
@@ -765,7 +734,6 @@ class LLaDA2Preprocessor:
         *,
         stream_state: dict[str, Any],
         image_generation: dict[str, Any],
-        conditional_input_ids: list[int],
         instruction_text: str,
         src_image_block: str,
         grid_h: int,
@@ -782,13 +750,7 @@ class LLaDA2Preprocessor:
             grid_w,
             [num_image_tokens],
         )
-        uncond_input_ids, uncond_left_pad_len = align_cfg_unconditional_input_ids(
-            self._tokenizer,
-            conditional_input_ids,
-            uncond_input_ids,
-        )
         stream_state["uncond_input_ids"] = uncond_input_ids
-        stream_state["uncond_left_pad_len"] = uncond_left_pad_len
         stream_state["cfg_scale"] = cfg_text_scale
         stream_state["cfg_rescale"] = float(image_generation.get("cfg_rescale", 0.7))
 
@@ -800,13 +762,7 @@ class LLaDA2Preprocessor:
             grid_h,
             grid_w,
         )
-        no_img_input_ids, no_img_left_pad_len = align_cfg_unconditional_input_ids(
-            self._tokenizer,
-            conditional_input_ids,
-            no_img_input_ids,
-        )
         stream_state["uncond_img_input_ids"] = no_img_input_ids
-        stream_state["uncond_img_left_pad_len"] = no_img_left_pad_len
         stream_state["cfg_image_scale"] = cfg_image_scale
 
     def _build_edit_payload(
@@ -914,7 +870,6 @@ class LLaDA2Preprocessor:
         self._populate_edit_cfg_stream_state(
             stream_state=stream_state,
             image_generation=ig_meta if isinstance(ig_meta, dict) else {},
-            conditional_input_ids=input_ids,
             instruction_text=instruction_text,
             src_image_block=src_image_block,
             grid_h=grid_h,

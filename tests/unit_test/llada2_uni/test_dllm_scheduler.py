@@ -8,11 +8,15 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 from sglang_omni.models.llada2_uni.algorithm.low_confidence_cfg import LowConfidenceCFG
-from sglang_omni.models.llada2_uni.components.preprocessor import (
-    align_cfg_unconditional_input_ids,
+from sglang_omni.models.llada2_uni.cfg_attention_backend import (
+    LLaDA2CFGFlashInferAttnBackend,
+)
+from sglang_omni.models.llada2_uni.request_builders import (
+    _attach_cfg_branches,
 )
 from sglang_omni.scheduling import dllm_scheduler as dllm_scheduler_module
 from sglang_omni.scheduling.dllm_scheduler import DllmScheduler
@@ -35,14 +39,22 @@ def test_cfg_uncond_prompt_is_aligned_before_scheduling() -> None:
         dllm_config=None,
     )
 
-    uncond_ids, left_pad_len = align_cfg_unconditional_input_ids(
-        tokenizer, cond.origin_input_ids, [7, 8]
+    _attach_cfg_branches(
+        cond,
+        tokenizer=tokenizer,
+        conditional_input_ids=cond.origin_input_ids,
+        uncond_input_ids=[7, 8],
+        cfg_scale=4.0,
+        cfg_rescale=0.7,
     )
-    cond._uncond_left_pad_len = left_pad_len
+    assert cond.origin_input_ids == [1, 2, 3, 4]
+    assert cond._dllm_left_pad_len == 0
+    assert cond._uncond_input_ids == [99, 99, 7, 8]
+    assert cond._uncond_left_pad_len == 2
     scheduler._create_uncond_companion(
         cond,
-        uncond_ids,
-        left_pad_len,
+        cond._uncond_input_ids,
+        cond._uncond_left_pad_len,
         "-uncond",
         mark_img=False,
     )
@@ -55,14 +67,59 @@ def test_cfg_uncond_prompt_is_aligned_before_scheduling() -> None:
         scheduler._create_uncond_companion(
             cond,
             [7, 8],
-            left_pad_len,
+            cond._uncond_left_pad_len,
             "-invalid",
             mark_img=False,
         )
-    with pytest.raises(ValueError, match="cannot be longer"):
-        align_cfg_unconditional_input_ids(
-            tokenizer, cond.origin_input_ids, [5, 6, 7, 8, 9]
-        )
+
+
+@pytest.mark.parametrize(
+    "conditioned_input_ids",
+    [[], [1], [1, 2], [1, 2, 3]],
+)
+def test_cfg_conditioned_prompt_is_padded_when_unconditioned_is_longer(
+    conditioned_input_ids: list[int],
+) -> None:
+    tokenizer = SimpleNamespace(mask_token_id=99)
+    cond = SimpleNamespace(origin_input_ids=list(conditioned_input_ids))
+
+    _attach_cfg_branches(
+        cond,
+        tokenizer=tokenizer,
+        conditional_input_ids=cond.origin_input_ids,
+        uncond_input_ids=[5, 6, 7, 8],
+        cfg_scale=4.0,
+        cfg_rescale=0.7,
+    )
+
+    expected_pad_len = 4 - len(conditioned_input_ids)
+    assert cond.origin_input_ids == [99] * expected_pad_len + conditioned_input_ids
+    assert cond._dllm_left_pad_len == expected_pad_len
+    assert cond._uncond_input_ids == [5, 6, 7, 8]
+    assert cond._uncond_left_pad_len == 0
+
+
+def test_cfg_attachment_uses_longest_of_three_branches() -> None:
+    tokenizer = SimpleNamespace(mask_token_id=99)
+    request = type("Request", (), {})()
+
+    _attach_cfg_branches(
+        request,
+        tokenizer=tokenizer,
+        conditional_input_ids=[10, 11],
+        uncond_input_ids=[7],
+        cfg_scale=4.0,
+        cfg_rescale=0.7,
+        uncond_img_input_ids=[6, 5, 4],
+        cfg_image_scale=1.5,
+    )
+
+    assert request.origin_input_ids == [99, 10, 11]
+    assert request._dllm_left_pad_len == 1
+    assert request._uncond_input_ids == [99, 99, 7]
+    assert request._uncond_left_pad_len == 2
+    assert request._uncond_img_input_ids == [6, 5, 4]
+    assert request._uncond_img_left_pad_len == 0
 
 
 def test_cfg_uncond_positions_match_official_left_padding() -> None:
@@ -89,12 +146,143 @@ def test_cfg_uncond_positions_match_official_left_padding() -> None:
         )
 
         scheduler._apply_cfg_padding_metadata(forward_batch, batch)
+        assert forward_batch.dllm_left_pad_lens_cpu == [0, pad_len]
         assert forward_batch.dllm_left_pad_lens.tolist() == [0, pad_len]
         return forward_batch.positions[32:].tolist()
 
     assert apply_padding(pad_len=2, block_offset=0) == [0, 0, *range(30)]
     assert apply_padding(pad_len=2, block_offset=32) == [*range(30, 62)]
     assert apply_padding(pad_len=40, block_offset=32) == [*[0] * 9, *range(1, 24)]
+
+
+@pytest.mark.parametrize("query_length", [0, -1])
+def test_cfg_attention_rejects_non_positive_active_block(query_length: int) -> None:
+    forward_batch = SimpleNamespace(
+        batch_size=2,
+        dllm_left_pad_lens_cpu=[0, 1],
+        extend_prefix_lens_cpu=[32, 32],
+        extend_seq_lens_cpu=[32, query_length],
+    )
+
+    with pytest.raises(RuntimeError, match="empty active block"):
+        LLaDA2CFGFlashInferAttnBackend._get_cfg_attention_lengths(forward_batch)
+
+
+def test_cfg_cuda_graph_replay_pads_metadata_to_capture_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Replay pads CPU metadata to capture size without reading GPU scalars."""
+    capture_wrapper = object()
+    ragged_wrapper = object()
+    observed: dict[str, object] = {}
+
+    def call_begin_forward(*args, **kwargs) -> None:
+        observed["args"] = args
+        observed["kwargs"] = kwargs
+
+    backend = object.__new__(LLaDA2CFGFlashInferAttnBackend)
+    backend.dllm_config = SimpleNamespace(block_size=32)
+    backend._replay_forward_batch = SimpleNamespace(
+        batch_size=3,
+        seq_lens=torch.tensor([96, 96, 96], dtype=torch.int32),
+        extend_prefix_lens=torch.tensor([64, 64, 64], dtype=torch.int32),
+        extend_prefix_lens_cpu=[64, 64, 64],
+        extend_seq_lens_cpu=[32, 32, 32],
+        dllm_left_pad_lens=torch.tensor([0, 32, 64], dtype=torch.int32),
+        dllm_left_pad_lens_cpu=[0, 32, 64],
+    )
+    backend.prefill_cuda_graph_metadata = {4: [capture_wrapper]}
+    backend.indices_updater_prefill = SimpleNamespace(
+        prefill_wrapper_ragged=ragged_wrapper,
+        kv_indptr=[object()],
+        qo_indptr=[object()],
+        call_begin_forward=call_begin_forward,
+    )
+    backend.use_paged = False
+    backend.prefill_split_tile_size = None
+    backend._cfg_cuda_graph_prefix_lens = torch.empty(4, dtype=torch.int32)
+    backend._cfg_cuda_graph_cached_left_pad_lens = torch.empty(4, dtype=torch.int32)
+    backend._cfg_cuda_graph_paged_kernel_lens = torch.empty(4, dtype=torch.int32)
+
+    def reject_tensor_item(_self):
+        raise AssertionError("CFG metadata replay must not call Tensor.item()")
+
+    with monkeypatch.context() as context:
+        context.setattr(torch.Tensor, "item", reject_tensor_item)
+        backend.init_forward_metadata_replay_cuda_graph(
+            4,
+            torch.tensor([0, 1, 2, 0], dtype=torch.int32),
+            torch.tensor([96, 96, 96, 32], dtype=torch.int32),
+            320,
+            None,
+            ForwardMode.DLLM_EXTEND,
+            None,
+            seq_lens_cpu=torch.tensor([96, 96, 96, 32], dtype=torch.int32),
+        )
+
+    args = observed["args"]
+    assert isinstance(args, tuple)
+    assert args[0] is ragged_wrapper
+    assert args[1] is capture_wrapper
+    assert args[2].tolist() == [0, 1, 2, 0]
+    assert args[3].tolist() == [64, 32, 0, 0]
+    assert args[4] == 96
+    assert args[5].tolist() == [96, 96, 96, 32]
+    assert args[6].tolist() == [64, 64, 64, 0]
+    assert args[7].tolist() == [0, 32, 64, 0]
+    assert observed["kwargs"] == {"fixed_split_size": None}
+
+
+def test_cfg_cuda_graph_state_allocates_padded_metadata_buffers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        FlashInferAttnBackend,
+        "init_cuda_graph_state",
+        lambda *args, **kwargs: None,
+    )
+    backend = object.__new__(LLaDA2CFGFlashInferAttnBackend)
+    backend.skip_prefill = False
+    backend.is_dllm_model = True
+    backend.num_wrappers = 1
+    backend.workspace_buffer = torch.empty(1)
+
+    backend.init_cuda_graph_state(max_bs=4, max_num_tokens=128)
+
+    for attr_name in (
+        "_cfg_cuda_graph_prefix_lens",
+        "_cfg_cuda_graph_cached_left_pad_lens",
+        "_cfg_cuda_graph_paged_kernel_lens",
+    ):
+        buffer = getattr(backend, attr_name)
+        assert buffer.shape == (4,)
+        assert buffer.dtype == torch.int32
+        assert buffer.device == backend.workspace_buffer.device
+
+
+def test_cfg_in_query_left_pad_temporarily_disables_cuda_graph() -> None:
+    algorithm = object.__new__(LowConfidenceCFG)
+    graph_runner = object()
+    model_runner = SimpleNamespace(graph_runner=graph_runner)
+    forward_batch = SimpleNamespace(
+        dllm_left_pad_lens=torch.tensor([40], dtype=torch.int32),
+        dllm_left_pad_lens_cpu=[40],
+        extend_prefix_lens=torch.tensor([32], dtype=torch.int32),
+        extend_prefix_lens_cpu=[32],
+        extend_seq_lens_cpu=[32],
+    )
+    expected_result = object()
+
+    def run_eager(observed_runner, observed_batch):
+        assert observed_runner is model_runner
+        assert observed_batch is forward_batch
+        assert observed_runner.graph_runner is None
+        return expected_result
+
+    algorithm._run = run_eager
+
+    assert algorithm.run(model_runner, forward_batch) is expected_result
+    assert model_runner.graph_runner is graph_runner
 
 
 def test_cfg_phases_follow_conditional_request() -> None:
@@ -768,7 +956,7 @@ def test_malformed_cfg_batch_does_not_fall_back_to_standard_decode() -> None:
     )
 
     with pytest.raises(RuntimeError, match="Malformed CFG batch"):
-        algorithm.run(None, forward_batch)
+        algorithm.run(SimpleNamespace(graph_runner=None), forward_batch)
 
 
 def test_cfg_batch_rejects_companions_from_another_request_group() -> None:
@@ -787,4 +975,4 @@ def test_cfg_batch_rejects_companions_from_another_request_group() -> None:
     )
 
     with pytest.raises(RuntimeError, match="Malformed CFG batch"):
-        algorithm.run(None, forward_batch)
+        algorithm.run(SimpleNamespace(graph_runner=None), forward_batch)

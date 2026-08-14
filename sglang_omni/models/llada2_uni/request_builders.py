@@ -27,6 +27,84 @@ from sglang_omni.scheduling.sglang_backend import SGLangDLLMRequestData
 logger = logging.getLogger(__name__)
 
 
+def _align_cfg_branch_group(
+    *,
+    tokenizer: Any,
+    branches: dict[str, list[int]],
+    existing_left_pad_lens: dict[str, int | None],
+) -> tuple[dict[str, list[int]], dict[str, int]]:
+    """Left-pad every CFG branch to the longest physical prompt."""
+    target_length = max(len(input_ids) for input_ids in branches.values())
+    requires_padding = any(
+        len(input_ids) < target_length for input_ids in branches.values()
+    )
+    mask_token_id = getattr(tokenizer, "mask_token_id", None)
+    if requires_padding and mask_token_id is None:
+        raise ValueError("LLaDA2 tokenizer has no mask_token_id for CFG padding")
+
+    aligned: dict[str, list[int]] = {}
+    left_pad_lens: dict[str, int] = {}
+    for branch_name, input_ids in branches.items():
+        existing_left_pad_len = int(existing_left_pad_lens.get(branch_name) or 0)
+        if existing_left_pad_len < 0 or existing_left_pad_len > len(input_ids):
+            raise ValueError(
+                f"CFG {branch_name} has invalid left-pad length "
+                f"{existing_left_pad_len} for {len(input_ids)} input tokens"
+            )
+        added_left_pad_len = target_length - len(input_ids)
+        padding = (
+            [int(mask_token_id)] * added_left_pad_len if added_left_pad_len else []
+        )
+        aligned[branch_name] = padding + list(input_ids)
+        left_pad_lens[branch_name] = existing_left_pad_len + added_left_pad_len
+    return aligned, left_pad_lens
+
+
+def _attach_cfg_branches(
+    req: Any,
+    *,
+    tokenizer: Any,
+    conditional_input_ids: list[int],
+    uncond_input_ids: list[int],
+    cfg_scale: float,
+    cfg_rescale: float,
+    uncond_left_pad_len: int | None = None,
+    uncond_img_input_ids: list[int] | None = None,
+    uncond_img_left_pad_len: int | None = None,
+    cfg_image_scale: float | None = None,
+) -> None:
+    """Align and attach the CFG branches consumed by ``DllmScheduler``."""
+    branches = {
+        "conditional": list(conditional_input_ids),
+        "unconditional": list(uncond_input_ids),
+    }
+    existing_left_pad_lens = {
+        "conditional": getattr(req, "_dllm_left_pad_len", 0),
+        "unconditional": uncond_left_pad_len,
+    }
+    if uncond_img_input_ids is not None:
+        branches["image-unconditional"] = list(uncond_img_input_ids)
+        existing_left_pad_lens["image-unconditional"] = uncond_img_left_pad_len
+
+    aligned, left_pad_lens = _align_cfg_branch_group(
+        tokenizer=tokenizer,
+        branches=branches,
+        existing_left_pad_lens=existing_left_pad_lens,
+    )
+    req.origin_input_ids = aligned["conditional"]
+    req._dllm_left_pad_len = left_pad_lens["conditional"]
+    req._uncond_input_ids = aligned["unconditional"]
+    req._uncond_left_pad_len = left_pad_lens["unconditional"]
+    req._cfg_scale = float(cfg_scale)
+    req._cfg_rescale = float(cfg_rescale)
+
+    if uncond_img_input_ids is None:
+        return
+    req._uncond_img_input_ids = aligned["image-unconditional"]
+    req._uncond_img_left_pad_len = left_pad_lens["image-unconditional"]
+    req._cfg_image_scale = float(0.0 if cfg_image_scale is None else cfg_image_scale)
+
+
 def build_encoder_request(
     state: LLaDA2UniPipelineState,
     *,
@@ -212,30 +290,34 @@ def build_dllm_thinker_request(
     )
     if uncond_ids is not None and not is_thinking_phase1:
         ig_meta = state.request_metadata.get("image_generation", {})
-        if len(uncond_ids) != len(input_ids_list):
-            raise ValueError(
-                "CFG branches must have equal physical lengths: "
-                f"cond={len(input_ids_list)}, uncond={len(uncond_ids)}"
-            )
-        req._uncond_input_ids = uncond_ids
-        req._uncond_left_pad_len = int(ss.get("uncond_left_pad_len", 0))
-        req._cfg_scale = ss.get(
-            "cfg_scale",
-            ig_meta.get("cfg_text_scale", ig_meta.get("cfg_scale", 1.0)),
-        )
-        req._cfg_rescale = ss.get(
-            "cfg_rescale",
-            ig_meta.get("cfg_rescale", 0.7),
-        )
-        # Three-way editing CFG: additional no-image branch + image guidance scale.
         uncond_img_ids = ss.get("uncond_img_input_ids")
-        if uncond_img_ids is not None:
-            req._uncond_img_input_ids = uncond_img_ids
-            req._uncond_img_left_pad_len = int(ss.get("uncond_img_left_pad_len", 0))
-            req._cfg_image_scale = ss.get(
+        _attach_cfg_branches(
+            req,
+            tokenizer=tokenizer,
+            conditional_input_ids=input_ids_list,
+            uncond_input_ids=list(uncond_ids),
+            uncond_left_pad_len=int(ss.get("uncond_left_pad_len", 0)),
+            cfg_scale=ss.get(
+                "cfg_scale",
+                ig_meta.get("cfg_text_scale", ig_meta.get("cfg_scale", 1.0)),
+            ),
+            cfg_rescale=ss.get(
+                "cfg_rescale",
+                ig_meta.get("cfg_rescale", 0.7),
+            ),
+            uncond_img_input_ids=(
+                list(uncond_img_ids) if uncond_img_ids is not None else None
+            ),
+            uncond_img_left_pad_len=(
+                int(ss.get("uncond_img_left_pad_len", 0))
+                if uncond_img_ids is not None
+                else None
+            ),
+            cfg_image_scale=ss.get(
                 "cfg_image_scale",
                 ig_meta.get("cfg_image_scale", 0.0),
-            )
+            ),
+        )
 
     # Attach task metadata for algorithm-level decisions.
     req._task_kind = state.task_kind
@@ -315,7 +397,6 @@ def _thinking_phase1_to_phase2(
         from sglang_omni.models.llada2_uni.components.preprocessor import (
             SYSTEM_PROMPT_T2I_THINKING,
             UNCOND_TEXT,
-            align_cfg_unconditional_input_ids,
         )
 
         sys_encoded = tokenizer.encode(
@@ -333,11 +414,7 @@ def _thinking_phase1_to_phase2(
             f"<|reserved_token_{grid_w}|>", add_special_tokens=False
         )
         img_header = [soi_id] + h_token_ids + w_token_ids + [boi_tok]
-        uncond_ids, uncond_left_pad_len = align_cfg_unconditional_input_ids(
-            tokenizer, phase2_ids, sys_encoded + img_header
-        )
-        ss["uncond_input_ids"] = uncond_ids
-        ss["uncond_left_pad_len"] = uncond_left_pad_len
+        ss["uncond_input_ids"] = sys_encoded + img_header
 
     ss["thinking_phase"] = 2
     ss["thinking_needs_reentry"] = True

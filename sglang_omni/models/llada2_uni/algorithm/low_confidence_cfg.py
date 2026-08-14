@@ -488,6 +488,33 @@ class LowConfidenceCFG(DllmAlgorithm):
         model_runner: ModelRunner,
         forward_batch: ForwardBatch,
     ) -> Tuple[Union[LogitsProcessorOutput, torch.Tensor], List[torch.Tensor], bool]:
+        left_pad_lens = getattr(forward_batch, "dllm_left_pad_lens_cpu", None)
+        prefix_lens = getattr(forward_batch, "extend_prefix_lens_cpu", None)
+        graph_runner = model_runner.graph_runner
+        if (
+            graph_runner is not None
+            and left_pad_lens is not None
+            and prefix_lens is not None
+            and any(
+                pad_len > prefix_len
+                for pad_len, prefix_len in zip(left_pad_lens, prefix_lens)
+            )
+        ):
+            # The query-padding path uses a custom attention branch that is not
+            # part of the captured graph. Keep this block eager until all CFG
+            # padding has moved into the cached prefix.
+            model_runner.graph_runner = None
+
+        try:
+            return self._run(model_runner, forward_batch)
+        finally:
+            model_runner.graph_runner = graph_runner
+
+    def _run(
+        self,
+        model_runner: ModelRunner,
+        forward_batch: ForwardBatch,
+    ) -> Tuple[Union[LogitsProcessorOutput, torch.Tensor], List[torch.Tensor], bool]:
         reqs = getattr(forward_batch, "reqs", None)
         batch_size = forward_batch.batch_size
 

@@ -587,7 +587,6 @@ def test_edit_cfg_builds_required_companion_branches(
     has_image_branch: bool,
 ) -> None:
     preprocessor = object.__new__(LLaDA2Preprocessor)
-    preprocessor._tokenizer = SimpleNamespace(mask_token_id=99)
     preprocessor._build_edit_uncond_input_ids = lambda *args: [7, 8]
     preprocessor._build_edit_no_img_input_ids = lambda *args: [6]
     stream_state: dict = {}
@@ -595,7 +594,6 @@ def test_edit_cfg_builds_required_companion_branches(
     preprocessor._populate_edit_cfg_stream_state(
         stream_state=stream_state,
         image_generation=image_generation,
-        conditional_input_ids=[10, 11, 12],
         instruction_text="edit",
         src_image_block="<image>",
         grid_h=2,
@@ -603,7 +601,9 @@ def test_edit_cfg_builds_required_companion_branches(
         num_image_tokens=4,
     )
 
-    assert stream_state["uncond_input_ids"] == [99, 7, 8]
+    assert stream_state["uncond_input_ids"] == [7, 8]
+    assert "uncond_left_pad_len" not in stream_state
+    assert "uncond_img_left_pad_len" not in stream_state
     assert stream_state["cfg_scale"] == expected_text_scale
     assert ("uncond_img_input_ids" in stream_state) is has_image_branch
     assert ("cfg_image_scale" in stream_state) is has_image_branch
@@ -625,7 +625,6 @@ def test_edit_cfg_skips_companions_when_disabled(
     preprocessor._populate_edit_cfg_stream_state(
         stream_state=stream_state,
         image_generation=image_generation,
-        conditional_input_ids=[10, 11, 12],
         instruction_text="edit",
         src_image_block="<image>",
         grid_h=2,
