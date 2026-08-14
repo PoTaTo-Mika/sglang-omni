@@ -216,6 +216,7 @@ def make_dllm_thinker_scheduler_adapters(
             request_id=payload.request_id,
             request=payload.request,
             data=state.to_dict(),
+            timing=payload.timing,
         )
 
     return request_builder, result_adapter

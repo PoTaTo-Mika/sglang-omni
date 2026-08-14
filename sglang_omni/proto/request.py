@@ -63,14 +63,18 @@ class StagePayload:
     request_id: str
     request: OmniRequest
     data: Any
+    timing: dict[str, int] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d = {
             "_type": "StagePayload",
             "request_id": self.request_id,
             "request": self.request.to_dict(),
             "data": self.data,
         }
+        if self.timing:
+            d["timing"] = self.timing
+        return d
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "StagePayload":
@@ -83,4 +87,5 @@ class StagePayload:
             request_id=data.get("request_id", ""),
             request=request_obj,
             data=data.get("data"),
+            timing=data.get("timing", {}),
         )

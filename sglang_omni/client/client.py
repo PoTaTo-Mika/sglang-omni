@@ -150,6 +150,7 @@ class Client:
             ),
             omni_rollout=omni_rollout,
             weight_version=weight_version,
+            timings=last_chunk.timings,
         )
 
     # ------------------------------------------------------------------

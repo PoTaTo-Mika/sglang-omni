@@ -249,6 +249,7 @@ def test_relay_payload_and_cross_gpu_stream_contracts() -> None:
     async def _run() -> None:
         relay = FakeRelay()
         payload = make_tensor_payload()
+        payload.timing = {"preprocessing.enter": 1, "preprocessing.done": 2}
         data_ref, op = await stage_io.write_payload(
             relay,
             payload.request_id,
@@ -258,6 +259,7 @@ def test_relay_payload_and_cross_gpu_stream_contracts() -> None:
         await op.wait_for_completion()
         restored = await stage_io.read_payload(relay, payload.request_id, data_ref)
         assert tensor_equal(restored.data, payload.data)
+        assert restored.timing == payload.timing
 
         log = EventLog()
         stream_relay = FakeRelay(log=log)
@@ -1111,6 +1113,7 @@ def test_direct_cuda_ipc_payload_preserves_inline_cpu_tensors() -> None:
             "cpu": torch.ones(1),
         }
     )
+    payload.timing = {"image_encoder.enter": 3, "image_encoder.done": 4}
 
     ref = stage_io.serialize_direct_cuda_ipc_payload(payload)
     header = pickle.loads(ref["header"])
@@ -1119,6 +1122,7 @@ def test_direct_cuda_ipc_payload_preserves_inline_cpu_tensors() -> None:
     assert not header.data["cpu"].is_cuda
     assert torch.equal(header.data["cpu"], torch.ones(1))
     assert [entry["path"] for entry in ref["tensors"]] == ["gpu"]
+    assert header.timing == payload.timing
 
 
 def test_direct_cuda_ipc_payload_allows_large_ordinary_header(monkeypatch) -> None:

@@ -173,9 +173,10 @@ class CompleteMessage:
     success: bool
     result: Any = None
     error: str | None = None
+    timing: dict[str, int] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d = {
             "type": "complete",
             "request_id": self.request_id,
             "from_stage": self.from_stage,
@@ -183,6 +184,9 @@ class CompleteMessage:
             "result": self.result,
             "error": self.error,
         }
+        if self.timing:
+            d["timing"] = self.timing
+        return d
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "CompleteMessage":
@@ -192,6 +196,7 @@ class CompleteMessage:
             success=d["success"],
             result=d.get("result"),
             error=d.get("error"),
+            timing=d.get("timing"),
         )
 
 

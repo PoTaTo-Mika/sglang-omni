@@ -38,6 +38,29 @@ class _AdminPendingOperation:
     future: asyncio.Future | None = None
 
 
+def _compute_timings_ms(timing: dict[str, int]) -> dict[str, float]:
+    """Convert raw perf_counter_ns timestamps to per-stage durations in ms."""
+    result: dict[str, float] = {}
+    for enter_key, enter_ns in timing.items():
+        if ".enter" not in enter_key:
+            continue
+        stage_name, suffix = enter_key.split(".enter", 1)
+        done_ns = timing.get(f"{stage_name}.done{suffix}")
+        if done_ns is None:
+            continue
+        label = (
+            stage_name
+            if not suffix
+            else f"{stage_name}_pass{suffix.removeprefix('.')}"
+        )
+        result[f"{label}_ms"] = round((done_ns - enter_ns) / 1e6, 2)
+    if timing:
+        result["e2e_ms"] = round(
+            (max(timing.values()) - min(timing.values())) / 1e6, 2
+        )
+    return result
+
+
 class Coordinator:
     """Central coordinator for the multi-stage pipeline.
 
@@ -74,6 +97,7 @@ class Coordinator:
         )
         self._terminal_stages_resolver = terminal_stages_resolver
         self._partial_results: dict[str, dict[str, Any]] = {}
+        self._partial_timings: dict[str, dict[str, int]] = {}
 
         # Control plane
         self.control_plane = CoordinatorControlPlane(
@@ -531,6 +555,7 @@ class Coordinator:
                 AbortMessage(request_id=request_id)
             )
             self._partial_results.pop(request_id, None)
+            self._partial_timings.pop(request_id, None)
             self._reject_completion_future(
                 request_id, RuntimeError(msg.error or "Unknown error")
             )
@@ -553,11 +578,14 @@ class Coordinator:
         # Single active terminal (original behavior) or no terminal_stages configured
         if len(expected_terminal_stages) <= 1:
             info.state = RequestState.COMPLETED
-            info.result = msg.result
+            result = msg.result
+            if msg.timing and isinstance(result, dict):
+                result["timings"] = _compute_timings_ms(msg.timing)
+            info.result = result
             if request_id in self._completion_futures:
                 future = self._completion_futures[request_id]
                 if not future.done():
-                    future.set_result(msg.result)
+                    future.set_result(result)
             if request_id in self._stream_queues:
                 await self._stream_queues[request_id].put(msg)
             self._requests.pop(request_id, None)
@@ -566,6 +594,10 @@ class Coordinator:
         # Multi-terminal: collect partial results
         partials = self._partial_results.setdefault(request_id, {})
         partials[msg.from_stage] = msg.result
+
+        if msg.timing:
+            merged_timing = self._partial_timings.setdefault(request_id, {})
+            merged_timing.update(msg.timing)
 
         # Forward stream completion per-stage
         if request_id in self._stream_queues:
@@ -577,6 +609,9 @@ class Coordinator:
         # All terminal stages done -> merge and resolve
         merged = dict(partials)
         self._partial_results.pop(request_id)
+        final_timing = self._partial_timings.pop(request_id, None)
+        if final_timing:
+            merged["timings"] = _compute_timings_ms(final_timing)
         info.state = RequestState.COMPLETED
         info.result = merged
 

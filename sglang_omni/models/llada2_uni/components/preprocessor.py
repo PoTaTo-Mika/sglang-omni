@@ -285,6 +285,7 @@ class LLaDA2Preprocessor:
             request_id=payload.request_id,
             request=payload.request,
             data=state.to_dict(),
+            timing=payload.timing,
         )
 
     @staticmethod

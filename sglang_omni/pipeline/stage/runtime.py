@@ -14,6 +14,7 @@ import logging
 import os
 import queue as _queue_mod
 import threading
+import time
 from contextlib import suppress
 from typing import Any, Awaitable, Callable, Literal
 
@@ -796,6 +797,16 @@ class Stage:
             IncomingMessage(request_id=request_id, type="stream_chunk", data=item)
         )
 
+    def _stamp_timing(self, timing: dict[str, int], event: str) -> None:
+        """Record a timestamp, using suffixed keys when a stage is re-entered."""
+        key = f"{self.name}.{event}"
+        if key in timing:
+            pass_index = 2
+            while f"{key}.{pass_index}" in timing:
+                pass_index += 1
+            key = f"{key}.{pass_index}"
+        timing[key] = time.perf_counter_ns()
+
     async def _execute(self, payload: Any) -> None:
         request_id = payload.request_id
         _emit_event(
@@ -803,6 +814,7 @@ class Stage:
             stage=self.name,
             event_name="stage_dispatch",
         )
+        self._stamp_timing(payload.timing, "enter")
         if (
             self.role == "leader"
             and self._tp_fanout is not None
@@ -1006,6 +1018,9 @@ class Stage:
 
     async def _route_result(self, request_id: str, result: Any) -> None:
         """Route a completed result to next stage(s) or complete at coordinator."""
+        timing = getattr(result, "timing", None)
+        if timing is not None:
+            self._stamp_timing(timing, "done")
         if not self._owns_external_io:
             self._clear_request_state(request_id)
             return
@@ -1042,6 +1057,7 @@ class Stage:
                     from_stage=self.name,
                     success=True,
                     result=result.data if isinstance(result, StagePayload) else result,
+                    timing=getattr(result, "timing", None),
                 )
             )
         else:

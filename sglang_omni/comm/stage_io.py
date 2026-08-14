@@ -150,6 +150,7 @@ def serialize_direct_cuda_ipc_payload(payload: StagePayload) -> dict[str, Any]:
         request_id=payload.request_id,
         request=payload.request,
         data=data_without_tensors,
+        timing=payload.timing,
     )
     header_bytes = pickle.dumps(header)
     return {
@@ -228,6 +229,7 @@ def deserialize_direct_cuda_ipc_payload(data_ref: dict[str, Any]) -> StagePayloa
         request_id=header.request_id,
         request=header.request,
         data=restore_tensors(header.data, tensors),
+        timing=header.timing,
     )
 
 
@@ -302,6 +304,7 @@ async def write_payload(
         request_id=payload.request_id,
         request=payload.request,
         data=data_without_tensors,
+        timing=payload.timing,
     )
     op = await relay.put_async(
         packed,
@@ -349,6 +352,7 @@ async def read_payload(
         request_id=header.request_id,
         request=header.request,
         data=restore_tensors(header.data, tensors),
+        timing=header.timing,
     )
 
 

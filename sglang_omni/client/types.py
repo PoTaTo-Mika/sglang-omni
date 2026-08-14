@@ -203,6 +203,7 @@ class CompletionResult:
     output_token_logprobs: list[Any] | None = None
     omni_rollout: dict[str, Any] | None = None
     weight_version: str | None = None
+    timings: dict[str, float] | None = None
 
 
 @dataclass

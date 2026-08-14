@@ -743,7 +743,11 @@ async def _chat_non_stream(
         usage=usage,
     )
 
-    return JSONResponse(content=response.model_dump())
+    response_data = response.model_dump()
+    if result.timings:
+        response_data["timings"] = result.timings
+
+    return JSONResponse(content=response_data)
 
 
 async def _chat_stream(
