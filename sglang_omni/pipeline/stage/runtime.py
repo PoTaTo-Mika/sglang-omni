@@ -6,6 +6,7 @@ stream chunk routing, abort tracking, profiling.
 
 Dispatches all compute to scheduler (OmniScheduler or SimpleScheduler).
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -1063,6 +1064,14 @@ class Stage:
         else:
             if isinstance(next_stages, str):
                 next_stages = [next_stages]
+            # A stage can route a completed pass back to itself (for example,
+            # the two-pass LLaDA thinking flow). Clear the completed pass
+            # before dispatch so the new pass can register the same request ID
+            # without being removed by the cleanup below.
+            routes_to_self = self.name in next_stages
+            if routes_to_self:
+                self._clear_request_state(request_id)
+
             is_single_target = len(next_stages) == 1
             _emit_event(
                 request_id=request_id,
@@ -1080,7 +1089,8 @@ class Stage:
                     stream_targets_for_request=stream_targets_for_request,
                 )
 
-        self._clear_request_state(request_id)
+        if next_stages is None or not routes_to_self:
+            self._clear_request_state(request_id)
 
     async def _send_to_stage(
         self,

@@ -205,17 +205,15 @@ class LLaDA2MoeGate(nn.Module):
                 dtype=self.params_dtype,
             ),
         )
-        if getattr(config, "moe_router_enable_expert_bias", False):
-            self.expert_bias = nn.Parameter(
-                torch.empty((config.num_experts,), dtype=torch.float32),
-            )
-        else:
-            self.expert_bias = None
+        # Load-balancing expert bias added to the raw sigmoid routing scores.
+        self.register_buffer(
+            "expert_bias",
+            torch.zeros(config.num_experts, dtype=torch.float32),
+        )
 
     def forward(self, hidden_states):
-        logits = F.linear(hidden_states.to(self.weight.dtype), self.weight, None).to(
-            hidden_states.dtype
-        )
+        # Router/gate matmul return fp32
+        logits = F.linear(hidden_states.float(), self.weight.float(), None)
         return logits
 
 
@@ -462,6 +460,7 @@ class LLaDA2MoeTextModel(nn.Module):
         )
 
         params_dict = dict(self.named_parameters())
+        params_dict.update(dict(self.named_buffers()))
 
         for name, loaded_weight in weights:
             prefix = "model."

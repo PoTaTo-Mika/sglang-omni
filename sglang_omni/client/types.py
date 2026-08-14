@@ -140,6 +140,8 @@ class GenerateChunk:
     modality: str = "text"
     audio_data: Any = None
     sample_rate: int | None = None
+    image: str | None = None
+    timings: dict[str, float] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -158,6 +160,8 @@ class GenerateChunk:
             "modality": self.modality,
             "audio_data": self.audio_data,
             "sample_rate": self.sample_rate,
+            "image": self.image,
+            "timings": self.timings,
         }
 
 
@@ -198,6 +202,7 @@ class CompletionResult:
     request_id: str
     text: str
     audio: CompletionAudio | None = None
+    image: str | None = None
     finish_reason: str = "stop"
     usage: UsageInfo | None = None
     output_token_logprobs: list[Any] | None = None
@@ -214,6 +219,7 @@ class CompletionStreamChunk:
     text: str = ""
     modality: str = "text"
     audio_b64: str | None = None  # already base64-encoded
+    image_b64: str | None = None
     finish_reason: str | None = None
     usage: UsageInfo | None = None
     stage_name: str | None = None

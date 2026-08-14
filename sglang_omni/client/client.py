@@ -96,6 +96,7 @@ class Client:
         saw_output_token_logprobs = False
         omni_rollout: dict[str, Any] | None = None
         weight_version: str | None = None
+        image_b64: str | None = None
 
         async for chunk in self.generate(request, request_id=request_id):
             last_chunk = chunk
@@ -105,6 +106,8 @@ class Client:
                 audio_chunks.append(chunk.audio_data)
             if chunk.sample_rate is not None:
                 sample_rate = chunk.sample_rate
+            if chunk.image is not None:
+                image_b64 = chunk.image
             if chunk.finish_reason is not None:
                 finish_reason = chunk.finish_reason
             if chunk.output_token_logprobs is not None:
@@ -143,6 +146,7 @@ class Client:
             request_id=request_id,
             text=full_text,
             audio=audio,
+            image=image_b64,
             finish_reason=finish_reason or "stop",
             usage=last_chunk.usage,
             output_token_logprobs=(
@@ -183,6 +187,7 @@ class Client:
                 text=chunk.text,
                 modality=chunk.modality,
                 audio_b64=audio_b64,
+                image_b64=chunk.image,
                 finish_reason=chunk.finish_reason,
                 usage=chunk.usage,
                 stage_name=chunk.stage_name,
@@ -458,13 +463,17 @@ class Client:
             return result
         if isinstance(result, dict):
             # Multi-terminal merged result, e.g. decode + code2wav/talker/
-            # talker_stream.
+            # talker_stream, or decode + image_decode.
+            chunk.timings = result.get("timings")
             audio_result = None
+            image_result = None
             if "decode" in result:
                 for audio_stage in ("code2wav", "talker", "talker_stream"):
                     if audio_stage in result:
                         audio_result = result[audio_stage] or {}
                         break
+                if "image_decode" in result:
+                    image_result = result["image_decode"] or {}
             if audio_result is not None:
                 decode_result = result["decode"] or {}
                 text = decode_result.get("text")
@@ -486,6 +495,29 @@ class Client:
                 chunk.usage = Client._build_usage_info(
                     decode_result
                 ) or Client._build_usage_info(audio_result)
+                return chunk
+            if image_result is not None:
+                decode_result = result["decode"] or {}
+                text = decode_result.get("text")
+                if isinstance(text, str):
+                    chunk.text = text
+                finish_reason = decode_result.get("finish_reason")
+                if finish_reason is not None:
+                    chunk.finish_reason = finish_reason
+                output_token_logprobs = decode_result.get("output_token_logprobs")
+                if output_token_logprobs is not None:
+                    chunk.output_token_logprobs = output_token_logprobs
+                omni_rollout = decode_result.get("omni_rollout")
+                if omni_rollout is not None:
+                    chunk.omni_rollout = omni_rollout
+                weight_version = decode_result.get("weight_version")
+                if weight_version is not None:
+                    chunk.weight_version = weight_version
+                image = image_result.get("image")
+                if image is not None:
+                    chunk.image = image
+                    chunk.modality = "image"
+                chunk.usage = Client._build_usage_info(decode_result)
                 return chunk
             text = result.get("text")
             if isinstance(text, str):

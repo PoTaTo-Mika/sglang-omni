@@ -152,6 +152,34 @@ def test_stage_routes_results_streams_and_clears_abort_state() -> None:
     asyncio.run(_run())
 
 
+def test_stage_self_route_preserves_reentered_request_state() -> None:
+    async def _run() -> None:
+        dispatcher = LocalStageDispatcher()
+        scheduler = FakeScheduler()
+        stage_obj = make_stage(
+            name="thinker",
+            get_next=lambda request_id, output: "thinker",
+            endpoints={"thinker": "inproc://thinker"},
+            scheduler=scheduler,
+            same_process_targets={"thinker"},
+            local_dispatcher=dispatcher,
+        )
+        dispatcher.register(stage_obj)
+        stage_obj._active_requests.add("req-reentry")
+
+        await stage_obj._route_result(
+            "req-reentry",
+            make_stage_payload(request_id="req-reentry", data={"phase": 2}),
+        )
+
+        queued = scheduler.inbox.get_nowait()
+        assert queued.request_id == "req-reentry"
+        assert queued.data.data == {"phase": 2}
+        assert "req-reentry" in stage_obj._active_requests
+
+    asyncio.run(_run())
+
+
 def test_stage_process_rejects_dynamic_targets_outside_static_topology() -> None:
     spec = StageLaunchConfig(
         stage_name="thinker",

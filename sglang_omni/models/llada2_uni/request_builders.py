@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import torch
@@ -22,6 +23,8 @@ from sglang_omni.models.llada2_uni.payload_types import (
 )
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.sglang_backend import SGLangDLLMRequestData
+
+logger = logging.getLogger(__name__)
 
 
 def build_encoder_request(
@@ -98,6 +101,32 @@ def merge_image_tokens_for_thinker(state: LLaDA2UniPipelineState) -> None:
 
     prompt["input_ids"] = torch.tensor([new_ids], dtype=torch.long)
 
+    # Also merge into uncond_input_ids for edit/T2I CFG — the unconditional
+    # prompt also contains DUMMY_IMAGE_TOKEN_ID placeholders that must be
+    # replaced with real VQ codes from the encoder output.
+    uncond_ids = state.stream_state.get("uncond_input_ids")
+    if uncond_ids is not None and any(
+        tid == DUMMY_IMAGE_TOKEN_ID for tid in uncond_ids
+    ):
+        state.stream_state["uncond_input_ids"] = _replace_dummy_tokens(
+            uncond_ids, all_vq_tokens
+        )
+
+
+def _replace_dummy_tokens(input_ids: list[int], vq_tokens: list[int]) -> list[int]:
+    """Replace DUMMY_IMAGE_TOKEN_ID entries with actual VQ token IDs."""
+    new_ids = []
+    vq_idx = 0
+    for tid in input_ids:
+        if tid == DUMMY_IMAGE_TOKEN_ID and vq_idx < len(vq_tokens):
+            new_ids.append(vq_tokens[vq_idx])
+            vq_idx += 1
+        else:
+            new_ids.append(tid)
+    if vq_idx < len(vq_tokens):
+        new_ids.extend(vq_tokens[vq_idx:])
+    return new_ids
+
 
 def build_dllm_thinker_request(
     state: LLaDA2UniPipelineState,
@@ -122,8 +151,23 @@ def build_dllm_thinker_request(
 
     input_ids_list = input_ids.to(dtype=torch.long).flatten().tolist()
 
+    # Override max_new_tokens for t2i/edit based on output image grid size.
+    max_new_tokens = params.get("max_new_tokens", DEFAULT_THINKER_MAX_NEW_TOKENS)
+    ss = state.stream_state if isinstance(state.stream_state, dict) else {}
+    is_thinking_phase1 = ss.get("thinking_mode") and ss.get("thinking_phase") == 1
+
+    if is_thinking_phase1:
+        max_new_tokens = 2048
+    elif state.task_kind in ("t2i", "edit"):
+        image_info = ss.get("image_info", [])
+        if image_info:
+            gh = int(image_info[0].get("grid_h", 0))
+            gw = int(image_info[0].get("grid_w", 0))
+            if gh > 0 and gw > 0:
+                max_new_tokens = gh * gw
+
     sampling_params = SamplingParams(
-        max_new_tokens=params.get("max_new_tokens", DEFAULT_THINKER_MAX_NEW_TOKENS),
+        max_new_tokens=max_new_tokens,
         temperature=params.get("temperature", 0.0),
         top_p=params.get("top_p", 1.0),
         top_k=params.get("top_k", -1),
@@ -137,7 +181,13 @@ def build_dllm_thinker_request(
     sampling_params.verify(vocab_size)
 
     eos_token_id = getattr(tokenizer, "eos_token_id", None)
-    eos_token_ids = {eos_token_id} if eos_token_id is not None else None
+    eos_token_ids = {eos_token_id} if eos_token_id is not None else set()
+    if is_thinking_phase1:
+        boi_id = getattr(tokenizer, "boi_token_id", None)
+        if boi_id is None:
+            boi_id = tokenizer.convert_tokens_to_ids("<boi>")
+        if boi_id is not None:
+            eos_token_ids = (eos_token_ids or set()) | {boi_id}
 
     rid = request_id or "req-0"
     req = Req(
@@ -153,6 +203,47 @@ def build_dllm_thinker_request(
 
     req.omni_model_inputs = None
     req._omni_consumed = None
+
+    # Attach CFG metadata if present (edit and t2i with cfg_scale > 1.0)
+    uncond_ids = (
+        state.stream_state.get("uncond_input_ids")
+        if isinstance(state.stream_state, dict)
+        else None
+    )
+    if uncond_ids is not None and not is_thinking_phase1:
+        ig_meta = state.request_metadata.get("image_generation", {})
+        if len(uncond_ids) != len(input_ids_list):
+            raise ValueError(
+                "CFG branches must have equal physical lengths: "
+                f"cond={len(input_ids_list)}, uncond={len(uncond_ids)}"
+            )
+        req._uncond_input_ids = uncond_ids
+        req._uncond_left_pad_len = int(ss.get("uncond_left_pad_len", 0))
+        req._cfg_scale = ss.get(
+            "cfg_scale",
+            ig_meta.get("cfg_text_scale", ig_meta.get("cfg_scale", 1.0)),
+        )
+        req._cfg_rescale = ss.get(
+            "cfg_rescale",
+            ig_meta.get("cfg_rescale", 0.7),
+        )
+        # Three-way editing CFG: additional no-image branch + image guidance scale.
+        uncond_img_ids = ss.get("uncond_img_input_ids")
+        if uncond_img_ids is not None:
+            req._uncond_img_input_ids = uncond_img_ids
+            req._uncond_img_left_pad_len = int(ss.get("uncond_img_left_pad_len", 0))
+            req._cfg_image_scale = ss.get(
+                "cfg_image_scale",
+                ig_meta.get("cfg_image_scale", 0.0),
+            )
+
+    # Attach task metadata for algorithm-level decisions.
+    req._task_kind = state.task_kind
+    if is_thinking_phase1:
+        req._is_thinking_phase1 = True
+    dllm_steps = ss.get("dllm_steps")
+    if dllm_steps is not None:
+        req._dllm_steps = int(dllm_steps)
 
     data = SGLangDLLMRequestData(
         output_ids=req.output_ids,
@@ -181,6 +272,79 @@ def apply_dllm_thinker_result(
     return thinker_out
 
 
+def _thinking_phase1_to_phase2(
+    state: LLaDA2UniPipelineState,
+    tokenizer: Any,
+) -> None:
+    """Transition from thinking Phase 1 (text) to Phase 2 (image VQ tokens)."""
+    ss = state.stream_state
+    output_ids = state.thinker_out["output_ids"]
+
+    boi_id = getattr(tokenizer, "boi_token_id", None)
+    if boi_id is None:
+        boi_id = tokenizer.convert_tokens_to_ids("<boi>")
+
+    boi_pos = None
+    for i, tid in enumerate(output_ids):
+        if tid == boi_id:
+            boi_pos = i
+            break
+
+    if boi_pos is None:
+        raise RuntimeError(
+            "Thinking Phase 1 did not produce <boi> "
+            f"after generating {len(output_ids)} token(s)"
+        )
+
+    thinking_text = tokenizer.decode(output_ids[:boi_pos], skip_special_tokens=True)
+    ss["thinking_text"] = thinking_text
+
+    # Rebuild prompt for Phase 2: original prompt + Phase 1 output through <boi>.
+    original_ids = state.prompt["input_ids"].flatten().tolist()
+    phase2_ids = original_ids + output_ids[: boi_pos + 1]
+
+    image_info = ss.get("image_info", [{}])
+    grid_h = image_info[0].get("grid_h", 32) if image_info else 32
+    grid_w = image_info[0].get("grid_w", 32) if image_info else 32
+
+    state.prompt = {"input_ids": torch.tensor([phase2_ids], dtype=torch.long)}
+
+    # Build CFG unconditional for Phase 2 if cfg_scale > 1
+    cfg_scale = ss.get("cfg_scale", 1.0)
+    if cfg_scale > 1.0:
+        from sglang_omni.models.llada2_uni.components.preprocessor import (
+            SYSTEM_PROMPT_T2I_THINKING,
+            UNCOND_TEXT,
+            align_cfg_unconditional_input_ids,
+        )
+
+        sys_encoded = tokenizer.encode(
+            f"<role>SYSTEM</role>{SYSTEM_PROMPT_T2I_THINKING}<role>HUMAN</role>"
+            f"{UNCOND_TEXT}<role>ASSISTANT</role>",
+            add_special_tokens=False,
+        )
+        # Append full image header: <soi><reserved_h><reserved_w><boi>
+        soi_id = tokenizer.convert_tokens_to_ids("<|image|>")
+        boi_tok = tokenizer.convert_tokens_to_ids("<boi>")
+        h_token_ids = tokenizer.encode(
+            f"<|reserved_token_{grid_h}|>", add_special_tokens=False
+        )
+        w_token_ids = tokenizer.encode(
+            f"<|reserved_token_{grid_w}|>", add_special_tokens=False
+        )
+        img_header = [soi_id] + h_token_ids + w_token_ids + [boi_tok]
+        uncond_ids, uncond_left_pad_len = align_cfg_unconditional_input_ids(
+            tokenizer, phase2_ids, sys_encoded + img_header
+        )
+        ss["uncond_input_ids"] = uncond_ids
+        ss["uncond_left_pad_len"] = uncond_left_pad_len
+
+    ss["thinking_phase"] = 2
+    ss["thinking_needs_reentry"] = True
+    state.thinker_out = None
+    state.engine_outputs.pop(THINKER_STAGE, None)
+
+
 def make_dllm_thinker_scheduler_adapters(
     *,
     tokenizer: Any,
@@ -192,6 +356,16 @@ def make_dllm_thinker_scheduler_adapters(
 
     def request_builder(payload: StagePayload) -> SGLangDLLMRequestData:
         state = LLaDA2UniPipelineState.from_dict(payload.data)
+        # Clear re-entry flag so Phase 2 result routes to terminal stages
+        if isinstance(state.stream_state, dict):
+            state.stream_state.pop("thinking_needs_reentry", None)
+            # Update payload data with cleared flag
+            payload = StagePayload(
+                request_id=payload.request_id,
+                request=payload.request,
+                data=state.to_dict(),
+                timing=payload.timing,
+            )
         data = build_dllm_thinker_request(
             state,
             params=payload.request.params,
@@ -212,6 +386,12 @@ def make_dllm_thinker_scheduler_adapters(
             output_ids=data.output_ids,
             finish_reason=data.finish_reason,
         )
+
+        # Thinking mode Phase 1 → Phase 2 transition
+        ss = state.stream_state if isinstance(state.stream_state, dict) else {}
+        if ss.get("thinking_mode") and ss.get("thinking_phase") == 1:
+            _thinking_phase1_to_phase2(state, tokenizer)
+
         return StagePayload(
             request_id=payload.request_id,
             request=payload.request,

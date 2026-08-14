@@ -75,6 +75,8 @@ def _patched_forward_cuda(
             post_residual_addition=post_residual_addition,
             **kwargs,
         )
+    if post_residual_addition is None:
+        return _orig_forward_cuda(self, x, residual, **kwargs)
     return _orig_forward_cuda(
         self,
         x,

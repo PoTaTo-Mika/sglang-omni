@@ -20,6 +20,7 @@ dependencies = [
     "pybase64>=1.4.0",        # Fast base64 decoding for inline media payloads
     "torch==2.11.0",          # PyTorch for tensor operations
     "torchvision==0.26.0",    # torchvision for vision processor, pinned version based on torch 2.11.0
+    "torchdiffeq>=0.2.4",     # ODE solver for LLaDA2 image decoder
     "accelerate>=0.27.0",     # init_empty_weights for meta initialization
     "transformers==5.6.0",   # HF models/tokenizers
     "safetensors>=0.4.3",     # Direct weight loading

@@ -127,12 +127,73 @@ _BAD_REQUEST_MARKERS = (
     "Requested token count exceeds the model's maximum context length",
     "accepts audio up to",
     "max_new_tokens must be",
+    "Image editing requires a non-empty instruction",
 )
 
 
 def _is_bad_request_error(exc: Exception) -> bool:
     message = str(exc)
     return any(marker in message for marker in _BAD_REQUEST_MARKERS)
+
+
+def _validate_image_edit_instruction(req: ChatCompletionRequest) -> None:
+    """Reject image-edit requests without user text before streaming starts."""
+    if req.image_generation is None:
+        return
+
+    has_image = bool(req.images)
+    for message in req.messages:
+        content = message.content
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "image_url":
+                image_url = item.get("image_url", {})
+                if isinstance(image_url, dict):
+                    image_url = image_url.get("url", "")
+                has_image = has_image or bool(image_url)
+            elif item.get("type") == "image":
+                has_image = has_image or bool(item.get("image"))
+
+    if not has_image:
+        return
+
+    instruction_text = ""
+    for message in reversed(req.messages):
+        if message.role != "user":
+            continue
+        content = message.content
+        if isinstance(content, str):
+            instruction_text = content
+        elif isinstance(content, list):
+            text_parts: list[str] = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type", "text") == "text":
+                    text_parts.append(item.get("text", ""))
+                elif isinstance(item, str):
+                    text_parts.append(item)
+            instruction_text = "".join(text_parts)
+        break
+
+    if not instruction_text.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Image editing requires a non-empty instruction",
+        )
+
+
+def _validate_image_generation_streaming(req: ChatCompletionRequest) -> None:
+    """Reject image-generation streaming before starting the request."""
+    if not req.stream:
+        return
+    if req.image_generation is None and "image" not in (req.modalities or []):
+        return
+    raise HTTPException(
+        status_code=400,
+        detail="Image generation does not support streaming; set stream=false",
+    )
 
 
 class _RequestBodyTooLarge(Exception):
@@ -636,6 +697,9 @@ def _register_chat_completions(app: FastAPI) -> None:
         client: Client = app.state.client
         default_model: str = app.state.model_name
 
+        _validate_image_edit_instruction(req)
+        _validate_image_generation_streaming(req)
+
         request_id = req.request_id or str(uuid.uuid4())
         response_id = f"chatcmpl-{request_id}"
         created = int(time.time())
@@ -717,7 +781,13 @@ async def _chat_non_stream(
             "transcript": result.audio.transcript,
         }
 
-    if "content" not in message and "audio" not in message:
+    if "image" in requested_modalities and result.image is not None:
+        message["image"] = {
+            "data": result.image,
+            "format": "png",
+        }
+
+    if not {"content", "audio", "image"}.intersection(message):
         message["content"] = result.text
 
     # Build usage
@@ -783,13 +853,21 @@ async def _chat_stream(
                     total_tokens=chunk.usage.total_tokens or 0,
                 )
             has_payload = (
-                chunk.modality == "text"
-                and bool(chunk.text)
-                and "text" in requested_modalities
-            ) or (
-                chunk.modality == "audio"
-                and chunk.audio_b64 is not None
-                and "audio" in requested_modalities
+                (
+                    chunk.modality == "text"
+                    and bool(chunk.text)
+                    and "text" in requested_modalities
+                )
+                or (
+                    chunk.modality == "audio"
+                    and chunk.audio_b64 is not None
+                    and "audio" in requested_modalities
+                )
+                or (
+                    chunk.modality == "image"
+                    and chunk.image_b64 is not None
+                    and "image" in requested_modalities
+                )
             )
             if not has_payload:
                 continue
@@ -818,6 +896,15 @@ async def _chat_stream(
                 id=f"audio-{request_id}",
                 data=chunk.audio_b64,
             )
+            emit = True
+
+        # Image chunk
+        if (
+            chunk.modality == "image"
+            and chunk.image_b64 is not None
+            and "image" in requested_modalities
+        ):
+            delta.image = {"data": chunk.image_b64, "format": "png"}
             emit = True
 
         if not emit:
@@ -955,6 +1042,11 @@ def _build_chat_generate_request(req: ChatCompletionRequest) -> GenerateRequest:
         metadata["video_max_pixels"] = req.video_max_pixels
     if req.video_total_pixels is not None:
         metadata["video_total_pixels"] = req.video_total_pixels
+    if req.image_generation:
+        metadata["image_generation"] = req.image_generation.model_dump(
+            exclude_none=True,
+            exclude_unset=True,
+        )
     _record_explicit_generation_params(
         metadata,
         _explicit_generation_params(req),

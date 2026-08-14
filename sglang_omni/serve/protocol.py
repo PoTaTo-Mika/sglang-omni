@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
@@ -33,6 +33,26 @@ class ChatCompletionAudio(BaseModel):
     data: str  # base64-encoded audio
     expires_at: int | None = None
     transcript: str | None = None
+
+
+class ImageGenerationParams(BaseModel):
+    """Per-request image generation parameters (sglang-omni extension).
+
+    For t2i: output defaults to 1024x1024 (override via image_h/image_w).
+    For edit: output matches the input image grid.
+    """
+
+    mode: Literal["normal", "thinking"] = "normal"  # thinking = two-phase T2I
+    decode_mode: Literal["normal", "decoder-turbo"] = "normal"
+    decoder_steps: int | None = Field(default=None, ge=1)
+    seed: int | None = None  # deterministic initial noise for the diffusion decoder
+    cfg_scale: float = Field(default=1.0, ge=1.0)
+    cfg_text_scale: float | None = Field(default=None, ge=0.0)
+    cfg_image_scale: float = Field(default=0.0, ge=0.0)
+    cfg_rescale: float = Field(default=0.7, ge=0.0, le=1.0)
+    image_h: int | None = Field(default=None, ge=32, multiple_of=32)
+    image_w: int | None = Field(default=None, ge=32, multiple_of=32)
+    dllm_steps: int | None = Field(default=None, ge=1)
 
 
 class ChatCompletionRequest(BaseModel):
@@ -70,6 +90,9 @@ class ChatCompletionRequest(BaseModel):
     # Image input (sglang-omni extension)
     # Can be a list of image file paths (local paths or URLs)
     images: list[str] | None = None
+
+    # Image generation config (sglang-omni extension)
+    image_generation: ImageGenerationParams | None = None
 
     # Video input (sglang-omni extension)
     # Can be a list of video file paths (local paths or URLs)
@@ -125,6 +148,7 @@ class ChatCompletionStreamDelta(BaseModel):
     role: str | None = None
     content: str | None = None
     audio: ChatCompletionAudio | None = None
+    image: dict[str, Any] | None = None
 
 
 class ChatCompletionStreamChoice(BaseModel):

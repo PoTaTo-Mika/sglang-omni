@@ -5,7 +5,12 @@ from __future__ import annotations
 
 from typing import ClassVar
 
-from sglang_omni.config import PipelineConfig, StageConfig
+from sglang_omni.config import (
+    PipelineConfig,
+    SGLangServerArgsConfig,
+    StageConfig,
+    StageRuntimeConfig,
+)
 
 _PKG = "sglang_omni.models.llada2_uni"
 
@@ -13,6 +18,7 @@ PREPROCESSING_STAGE = "preprocessing"
 IMAGE_STAGE = "image_encoder"
 THINKER_STAGE = "thinker"
 DECODE_STAGE = "decode"
+IMAGE_DECODE_STAGE = "image_decode"
 
 DEFAULT_THINKER_MAX_NEW_TOKENS = 2048
 
@@ -61,8 +67,76 @@ class LLaDA2UniPipelineConfig(PipelineConfig):
     ]
 
 
-EntryClass = LLaDA2UniPipelineConfig
+class LLaDA2UniOmniPipelineConfig(PipelineConfig):
+    """5-stage pipeline: preprocessing → image_encoder → thinker → [decode, image_decode].
+
+    The thinker fans out to both decode (text) and image_decode stages.
+    The image_decode stage handles text-only requests by detecting no VQ tokens
+    and returning ``{"skipped": True}``.
+    """
+
+    architecture: ClassVar[str] = "LLaDA2MoeModelLM"
+
+    @classmethod
+    def mem_fraction_role_to_stage(cls) -> dict[str, str]:
+        return {THINKER_STAGE: THINKER_STAGE}
+
+    model_path: str
+    stages: list[StageConfig] = [
+        StageConfig(
+            name=PREPROCESSING_STAGE,
+            process="pipeline",
+            factory=f"{_PKG}.stages.create_preprocessing_executor",
+            factory_args={"thinker_max_seq_len": 8192},
+            runtime_arg_map={"max_seq_len": "thinker_max_seq_len"},
+            next=IMAGE_STAGE,
+        ),
+        StageConfig(
+            name=IMAGE_STAGE,
+            process="pipeline",
+            factory=f"{_PKG}.stages.create_image_encoder_executor",
+            factory_args={"device": "cuda", "dtype": None},
+            gpu=0,
+            next=THINKER_STAGE,
+        ),
+        StageConfig(
+            name=THINKER_STAGE,
+            process="pipeline",
+            factory=f"{_PKG}.stages.create_sglang_dllm_thinker_executor_from_config",
+            factory_args={"thinker_max_seq_len": 8192},
+            gpu=0,
+            next=[THINKER_STAGE, DECODE_STAGE, IMAGE_DECODE_STAGE],
+            route_fn=f"{_PKG}.routing.thinker_next",
+            runtime=StageRuntimeConfig(
+                sglang_server_args=SGLangServerArgsConfig(
+                    mem_fraction_static=0.75,
+                ),
+            ),
+        ),
+        StageConfig(
+            name=DECODE_STAGE,
+            process="pipeline",
+            factory=f"{_PKG}.stages.create_decode_executor",
+            terminal=True,
+        ),
+        StageConfig(
+            name=IMAGE_DECODE_STAGE,
+            process="pipeline",
+            factory=f"{_PKG}.stages.create_image_decode_executor",
+            factory_args={
+                "device": "cuda",
+                "dtype": None,
+                "resolution_multiplier": 2,
+            },
+            gpu=0,
+            terminal=True,
+        ),
+    ]
+
+
+EntryClass = LLaDA2UniOmniPipelineConfig
 
 Variants = {
     "text": LLaDA2UniPipelineConfig,
+    "omni": LLaDA2UniOmniPipelineConfig,
 }
