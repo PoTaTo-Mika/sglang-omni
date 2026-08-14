@@ -13,6 +13,7 @@ inheriting from ``SGLangScheduler``.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import queue as _queue_mod
 import threading
@@ -585,7 +586,7 @@ class OmniScheduler:
         self.device_module = torch.get_device_module(self.device)
 
     def _init_upstream_scheduler_components(self) -> None:
-        """Install the scheduler components required by 0.5.15 hot paths."""
+        """Install the scheduler components required by upstream hot paths."""
         from sglang.srt.managers.scheduler_components.batch_result_processor import (
             SchedulerBatchResultProcessor,
         )
@@ -602,7 +603,7 @@ class OmniScheduler:
             SchedulerPoolStatsObserver,
         )
 
-        self.dp_attn_adapter = SchedulerDPAttnAdapter(
+        dp_attn_kwargs = dict(
             tp_group=self.tp_group,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -615,6 +616,9 @@ class OmniScheduler:
             spec_algorithm=self.spec_algorithm,
             get_require_mlp_sync=lambda: self.require_mlp_sync,
         )
+        if "model_runner" in inspect.signature(SchedulerDPAttnAdapter).parameters:
+            dp_attn_kwargs["model_runner"] = self._model_runner
+        self.dp_attn_adapter = SchedulerDPAttnAdapter(**dp_attn_kwargs)
         self.pool_stats_observer = SchedulerPoolStatsObserver(
             tree_cache=self.tree_cache,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
