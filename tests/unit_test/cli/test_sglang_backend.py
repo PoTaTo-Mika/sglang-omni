@@ -75,7 +75,7 @@ def test_adapter_forwards_model_path_and_server_options(monkeypatch) -> None:
     monkeypatch.setattr(
         ConfigManager,
         "from_model_path",
-        staticmethod(lambda model_path: _DummyManager(model_path)),
+        staticmethod(_DummyManager),
     )
     monkeypatch.setattr(
         "sglang_omni.cli.serve.launch_server",
