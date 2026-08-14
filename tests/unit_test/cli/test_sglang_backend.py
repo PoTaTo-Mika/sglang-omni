@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
-import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -43,15 +42,17 @@ def _run_and_expect_success(*argv: str) -> None:
 
 
 def test_distribution_registers_backend_without_owning_sglang_executable() -> None:
-    pyproject = tomllib.loads(
-        (Path(__file__).parents[3] / "pyproject.toml").read_text(encoding="utf-8")
+    pyproject = (Path(__file__).parents[3] / "pyproject.toml").read_text(
+        encoding="utf-8"
     )
+    scripts = pyproject.split("[project.scripts]", 1)[1].split("\n[", 1)[0]
+    entry_points = pyproject.split('[project.entry-points."sglang.serve_backends"]', 1)[
+        1
+    ].split("\n[", 1)[0]
 
-    assert pyproject["project"]["scripts"]["sgl-omni"] == "sglang_omni.cli:app"
-    assert "sglang" not in pyproject["project"]["scripts"]
-    assert pyproject["project"]["entry-points"]["sglang.serve_backends"] == {
-        "omni": "sglang_omni.cli.sglang_backend:create_backend"
-    }
+    assert 'sgl-omni = "sglang_omni.cli:app"' in scripts
+    assert "\nsglang = " not in scripts
+    assert 'omni = "sglang_omni.cli.sglang_backend:create_backend"' in entry_points
 
 
 def test_factory_implements_sglang_backend_contract() -> None:
