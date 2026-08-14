@@ -297,6 +297,7 @@ def test_omni_scheduler_run_batch_failure_emits_error_and_aborts(monkeypatch) ->
     scheduler.waiting_queue = []
     scheduler.last_batch = None
     scheduler.forward_ct = 0
+    scheduler._sched_idled = False
     scheduler._first_emit_done = set()
     scheduler._prefill_start_done = set()
     scheduler._prefill_end_done = set()
