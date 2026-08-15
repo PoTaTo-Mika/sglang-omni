@@ -35,6 +35,7 @@ class MossTranscribeDiarizeEngineBuilder(AsrEngineBuilder):
         mm_embedding_cache_size_bytes: int,
         encoder_cache_size_bytes: int,
         enable_torch_compile: bool,
+        torch_compile_max_bs: int,
         enable_async_decode: bool,
         async_decode_min_batch_size: int,
         prefill_coalesce_requests: int,
@@ -56,6 +57,7 @@ class MossTranscribeDiarizeEngineBuilder(AsrEngineBuilder):
         self.mm_embedding_cache_size_bytes = mm_embedding_cache_size_bytes
         self.encoder_cache_size_bytes = encoder_cache_size_bytes
         self.enable_torch_compile = enable_torch_compile
+        self.torch_compile_max_bs = torch_compile_max_bs
         self.enable_async_decode = enable_async_decode
         self.async_decode_min_batch_size = async_decode_min_batch_size
         self.prefill_coalesce_requests = prefill_coalesce_requests
@@ -106,6 +108,7 @@ class MossTranscribeDiarizeEngineBuilder(AsrEngineBuilder):
             "disable_cuda_graph": False,
             "disable_overlap_schedule": True,
             "enable_torch_compile": self.enable_torch_compile,
+            "torch_compile_max_bs": self.torch_compile_max_bs,
             "mem_fraction_static": self.mem_fraction_static,
             "max_prefill_tokens": 4096,
             "chunked_prefill_size": 4096,
