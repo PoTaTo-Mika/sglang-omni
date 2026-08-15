@@ -45,6 +45,7 @@ class _StubModel(torch.nn.Module):
         self.fail_multi_item = False
         self.packed_3d_output = False
         self.encode_gate: threading.Event | None = None
+        self.encode_started: threading.Event | None = None
         self.row_offset = 0
         self.encode_delay_s = 0.0
         self.grad_enabled_during_encode: bool | None = None
@@ -53,6 +54,8 @@ class _StubModel(torch.nn.Module):
         self.grad_enabled_during_encode = torch.is_grad_enabled()
         self.encode_calls += 1
         self.encode_batch_sizes.append(len(items))
+        if self.encode_started is not None:
+            self.encode_started.set()
         gate = self.encode_gate
         if gate is not None:
             self.encode_gate = None
@@ -154,15 +157,16 @@ def test_submit_returns_before_encoding_completes() -> None:
 def test_async_submissions_form_full_batch_without_blocked_callers() -> None:
     model = _StubModel()
     gate = threading.Event()
+    encode_started = threading.Event()
     model.encode_gate = gate
+    model.encode_started = encode_started
     service = _make_service(model, max_batch_size=8)
     items = [_item(audio_hash, 3) for audio_hash in range(9)]
 
-    futures = [service.submit_item(item) for item in items]
-    deadline = time.monotonic() + 2
-    while model.encode_calls == 0 and time.monotonic() < deadline:
-        time.sleep(0.005)
+    futures = [service.submit_item(items[0])]
+    assert encode_started.wait(timeout=2)
     assert model.encode_calls == 1
+    futures.extend(service.submit_item(item) for item in items[1:])
     gate.set()
     for future in futures:
         future.result(timeout=2)

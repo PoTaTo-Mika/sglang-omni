@@ -146,6 +146,7 @@ tests/
     │   ├── test_translation_capability.py
     │   └── test_translations.py
     ├── scheduling/
+    │   ├── test_deferred_admission.py
     │   ├── test_engine_factory.py
     │   ├── test_pipeline_state.py
     │   ├── test_reference_encoder.py
@@ -388,6 +389,8 @@ that happened to contain an older version of the test.
   - static TTS `ModelCapabilities` declarations, registry lookup, aliases, and
     launcher startup logging.
 - `unit_test/scheduling/`: Shared scheduling-service unit tests:
+  - deferred request admission completion, abort, and dependency-failure
+    semantics.
   - `ReferenceEncodeService` cache, same-key single-flight, timeout, failure,
     and revalidation semantics.
   - `StageOutputCache` thread safety: concurrent get/put byte-accounting,
