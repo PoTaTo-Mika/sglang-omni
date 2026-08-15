@@ -23,6 +23,7 @@ from sglang_omni.models.moss_transcribe_diarize.stages import (
 from sglang_omni.models.registry import PIPELINE_CONFIG_REGISTRY
 from sglang_omni.scheduling.generation_batch_policy import (
     build_default_prefill_cuda_graph_bs,
+    build_generation_batch_overrides,
 )
 
 
@@ -115,6 +116,27 @@ def test_moss_transcribe_diarize_prefill_backend_policy() -> None:
         == defaults["chunked_prefill_size"]
         == 4096
     )
+
+
+def test_moss_transcribe_diarize_compile_cap_survives_batch_overrides() -> None:
+    """torch_compile_max_bs must bind to the named builder parameter. If it
+    ever lands in **stage_defaults instead, the merge silently replaces the
+    stage cap with max_running_requests."""
+    builder = _make_moss_engine_builder()
+
+    overrides = build_generation_batch_overrides(
+        server_args_overrides=None,
+        **builder.generation_defaults(dtype="bfloat16"),
+    )
+
+    assert overrides["torch_compile_max_bs"] == 4
+    assert overrides["max_running_requests"] == 16
+
+    operator = build_generation_batch_overrides(
+        server_args_overrides={"torch_compile_max_bs": 8},
+        **builder.generation_defaults(dtype="bfloat16"),
+    )
+    assert operator["torch_compile_max_bs"] == 8
 
 
 @pytest.mark.parametrize(
