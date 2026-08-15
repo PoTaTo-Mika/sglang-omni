@@ -22,9 +22,7 @@ from sglang_omni.models.llada2_uni.algorithm.low_confidence_cfg import (
     _slice_cfg_output_ids,
 )
 from sglang_omni.models.llada2_uni.components import preprocessor as preprocessor_module
-from sglang_omni.models.llada2_uni.components.preprocessor import (
-    LLaDA2Preprocessor,
-)
+from sglang_omni.models.llada2_uni.components.preprocessor import LLaDA2Preprocessor
 from sglang_omni.models.llada2_uni.config import LLaDA2UniOmniPipelineConfig
 from sglang_omni.models.llada2_uni.payload_types import LLaDA2UniPipelineState
 from sglang_omni.models.llada2_uni.request_builders import _thinking_phase1_to_phase2

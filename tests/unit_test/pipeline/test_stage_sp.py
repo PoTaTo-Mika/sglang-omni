@@ -15,8 +15,8 @@ from sglang_omni.config import (
     SequenceParallelPolicy,
     StageConfig,
 )
-from sglang_omni.pipeline.mp_runner import _build_sp_stage_specs
 from sglang_omni.pipeline import parallel_control
+from sglang_omni.pipeline.mp_runner import _build_sp_stage_specs
 from sglang_omni.pipeline.parallel_control import (
     ParallelAbortMessage,
     ParallelFollowerControlPlane,

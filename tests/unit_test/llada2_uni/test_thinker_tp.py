@@ -11,9 +11,7 @@ from torch import nn
 pytest.importorskip("sglang")
 
 from sglang_omni.models.llada2_uni.components import thinker as thinker_module
-from sglang_omni.models.llada2_uni.components.thinker import (
-    LLaDA2MoeSparseMoeBlock,
-)
+from sglang_omni.models.llada2_uni.components.thinker import LLaDA2MoeSparseMoeBlock
 from sglang_omni.scheduling.dllm_scheduler import DllmScheduler
 
 

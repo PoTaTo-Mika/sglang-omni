@@ -2,13 +2,13 @@
 from __future__ import annotations
 
 import pytest
-import sglang_omni.config as config_module
 
+import sglang_omni.config as config_module
 from sglang_omni.config import (
     PipelineConfig,
     PlacementConfig,
-    SGLangServerArgsConfig,
     SequenceParallelPolicy,
+    SGLangServerArgsConfig,
     StageConfig,
     StageResourceConfig,
     StageRuntimeConfig,

@@ -547,8 +547,8 @@ def test_tp_leader_skips_fanout_work_for_omni_scheduler() -> None:
         with pytest.MonkeyPatch.context() as mp:
             mp.setitem(sys.modules, "sglang_omni.relay.nixl", fake_nixl)
 
-            from sglang_omni.pipeline.stage.runtime import Stage
             from sglang_omni.pipeline.parallel_control import ParallelStageContext
+            from sglang_omni.pipeline.stage.runtime import Stage
             from sglang_omni.pipeline.tp_control import TPLeaderFanout
             from sglang_omni.scheduling.types import ParallelSchedulerCapabilities
 

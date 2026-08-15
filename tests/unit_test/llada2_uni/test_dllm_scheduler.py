@@ -19,9 +19,7 @@ from sglang_omni.models.llada2_uni.algorithm.low_confidence_cfg import (
 from sglang_omni.models.llada2_uni.cfg_attention_backend import (
     LLaDA2CFGFlashInferAttnBackend,
 )
-from sglang_omni.models.llada2_uni.request_builders import (
-    _attach_cfg_branches,
-)
+from sglang_omni.models.llada2_uni.request_builders import _attach_cfg_branches
 from sglang_omni.scheduling import dllm_scheduler as dllm_scheduler_module
 from sglang_omni.scheduling.dllm_scheduler import DllmScheduler
 from sglang_omni.scheduling.messages import IncomingMessage

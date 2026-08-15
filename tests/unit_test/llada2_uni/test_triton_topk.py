@@ -9,9 +9,7 @@ pytest.importorskip("triton")
 pytest.importorskip("sglang")
 
 from sglang_omni.models.llada2_uni.components import triton_topk
-from sglang_omni.models.llada2_uni.components.thinker import (
-    LLaDA2MoeSparseMoeBlock,
-)
+from sglang_omni.models.llada2_uni.components.thinker import LLaDA2MoeSparseMoeBlock
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="Triton top-k tests require CUDA"

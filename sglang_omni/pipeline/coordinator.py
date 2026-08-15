@@ -49,15 +49,11 @@ def _compute_timings_ms(timing: dict[str, int]) -> dict[str, float]:
         if done_ns is None:
             continue
         label = (
-            stage_name
-            if not suffix
-            else f"{stage_name}_pass{suffix.removeprefix('.')}"
+            stage_name if not suffix else f"{stage_name}_pass{suffix.removeprefix('.')}"
         )
         result[f"{label}_ms"] = round((done_ns - enter_ns) / 1e6, 2)
     if timing:
-        result["e2e_ms"] = round(
-            (max(timing.values()) - min(timing.values())) / 1e6, 2
-        )
+        result["e2e_ms"] = round((max(timing.values()) - min(timing.values())) / 1e6, 2)
     return result
 
 

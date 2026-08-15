@@ -13,10 +13,7 @@ from fastapi.testclient import TestClient
 
 from sglang_omni.client import Client, GenerateChunk
 from sglang_omni.client.audio import encode_pcm
-from sglang_omni.client.types import (
-    CompletionResult,
-    GenerateRequest,
-)
+from sglang_omni.client.types import CompletionResult, GenerateRequest
 from sglang_omni.pipeline.coordinator import Coordinator
 from sglang_omni.proto import (
     EXPLICIT_GENERATION_PARAMS_KEY,

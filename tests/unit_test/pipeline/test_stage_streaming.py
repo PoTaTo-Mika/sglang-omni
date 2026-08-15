@@ -100,7 +100,6 @@ class _DoneOp:
 
     async def wait_for_completion(self, timeout=None) -> None:
         del timeout
-        pass
 
     def mark_receiver_done(self) -> None:
         pass

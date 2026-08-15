@@ -22,9 +22,7 @@ from sglang_omni.models.llada2_uni.components.decoder_model import (
 )
 from sglang_omni.models.llada2_uni.components.sigvq import SigVQ
 from sglang_omni.models.llada2_uni.components.transport import Sampler, create_transport
-from sglang_omni.models.llada2_uni.config import (
-    resolve_image_decoder_runtime_settings,
-)
+from sglang_omni.models.llada2_uni.config import resolve_image_decoder_runtime_settings
 from sglang_omni.models.weight_loader import resolve_model_path
 
 logger = logging.getLogger(__name__)

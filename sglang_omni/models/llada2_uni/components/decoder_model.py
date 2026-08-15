@@ -14,9 +14,9 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from safetensors.torch import load_file
 
 from sglang_omni.models.llada2_uni.config import normalize_image_decoder_backend
-from safetensors.torch import load_file
 
 SEQ_MULTI_OF = 32
 
