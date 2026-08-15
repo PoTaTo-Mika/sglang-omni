@@ -46,6 +46,8 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
         mem_fraction_static: float,
         enable_encoder_cuda_graph: bool = False,
         encoder_graph_batch_buckets: list[int] | None = None,
+        enable_encoder_torch_compile: bool = False,
+        encoder_torch_compile_mode: str | None = None,
         request_build_max_workers: int = 2,
         request_build_max_pending: int | None = 16,
         prefill_coalesce_requests: int = 2,
@@ -61,6 +63,8 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
         self.encoder_graph_batch_buckets = _normalize_encoder_graph_buckets(
             encoder_graph_batch_buckets
         )
+        self.enable_encoder_torch_compile = bool(enable_encoder_torch_compile)
+        self.encoder_torch_compile_mode = encoder_torch_compile_mode
         self.request_build_max_workers = request_build_max_workers
         self.request_build_max_pending = request_build_max_pending
         self.prefill_coalesce_requests = prefill_coalesce_requests
@@ -110,6 +114,13 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
         *,
         generation_cuda_graph_enabled: bool,
     ) -> None:
+        input_feature_len = int(self.processor.feature_extractor.nb_max_frames)
+        # note (Junnan Li): compile before capture so the graphs replay fused
+        # kernels; compile is independent of the generation-graph gate.
+        if self.enable_encoder_torch_compile:
+            model.compile_encoder(
+                input_feature_len, mode=self.encoder_torch_compile_mode
+            )
         if self.enable_encoder_cuda_graph and generation_cuda_graph_enabled:
             max_prefill_tokens = int(server_args.max_prefill_tokens)
             resolved_buckets = _resolve_encoder_graph_buckets(
@@ -125,10 +136,7 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
                 max_prefill_tokens,
                 self.encoder_token_count,
             )
-            model.init_encoder_graphs(
-                resolved_buckets,
-                int(self.processor.feature_extractor.nb_max_frames),
-            )
+            model.init_encoder_graphs(resolved_buckets, input_feature_len)
 
     def adjust_overrides(self, overrides: dict[str, Any]) -> None:
         if int(overrides.get("chunked_prefill_size") or 0) > 0:

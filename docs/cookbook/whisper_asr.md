@@ -36,6 +36,33 @@ runtime_overrides:
 
 The graph is captured after SGLang's generation graphs. Raise `max_prefill_tokens` before configuring larger buckets. Each request uses the smallest captured bucket that fits its batch. Requests larger than every captured bucket, with a different feature shape, or without a successful capture run eagerly. Startup and first-replay logs identify the captured and executed buckets.
 
+## Encoder torch.compile (opt-in)
+
+The encoder layers can be fused with `torch.compile`. The shared encoder-layer
+`forward` is compiled once and bound to every layer, so Inductor folds layer
+norm, GELU and residual adds into the surrounding matmuls; the compiled layers
+are warmed up before encoder graph capture, so the CUDA graphs above replay the
+fused kernels and the eager fallback path (uncaptured batch sizes) runs them
+too. On any compile failure the encoder falls back to the eager layers and logs
+a warning.
+
+The Whisper encoder is GEMM/attention-bound, so the fusable elementwise work is
+a small share of its time: on an RTX 6000D the isolated encoder call improved by
+0-1.5% across batch 1-8, and end-to-end SeedTTS EN throughput (200 clips, 3
+repeats) moved +0.3% / +1.9% / +1.4% at concurrency 1 / 4 / 8 over the CUDA
+Graph default with unchanged WER. The path stays off by default; enable it per
+deployment after measuring on the target GPU:
+
+```yaml
+runtime_overrides:
+  asr:
+    enable_encoder_torch_compile: true
+```
+
+`encoder_torch_compile_mode` forwards a `torch.compile` mode string; leave it
+unset for the default mode (`max-autotune-no-cudagraphs` was slower on the
+measured GPU because Triton matmuls lost to cuBLAS).
+
 ## Prefill Coalescing
 
 Whisper builds up to two requests concurrently and coalesces prefill at the serving-reachable batch size of two. A partial batch waits for at most 6 ms only while another request build is pending; a single request and a partial batch with no remaining build work are released immediately. This allows concurrent traffic to replay the encoder batch-2 graph without adding a fixed wait to the idle c=1 path.
