@@ -103,6 +103,14 @@ class MossTranscribeDiarizeEngineBuilder(AsrEngineBuilder):
         )
 
     def generation_defaults(self, *, dtype: str) -> dict[str, Any]:
+        # note (Xinyu): cached-prefix extends commonly contain one or two new
+        # tokens, so keep exact graph buckets below the shared ladder's 4-token
+        # floor instead of failing the prefill padding-factor replay guard.
+        prefill_cuda_graph_bs = [
+            1,
+            2,
+            *build_default_prefill_cuda_graph_bs(4096),
+        ]
         return {
             "max_running_requests": self.max_running_requests,
             "disable_cuda_graph": False,
@@ -114,7 +122,7 @@ class MossTranscribeDiarizeEngineBuilder(AsrEngineBuilder):
             "chunked_prefill_size": 4096,
             "sampling_backend": "pytorch",
             "cuda_graph_backend_prefill": CudaGraphBackend.BREAKABLE,
-            "cuda_graph_bs_prefill": build_default_prefill_cuda_graph_bs(4096),
+            "cuda_graph_bs_prefill": prefill_cuda_graph_bs,
             "dtype": dtype,
         }
 

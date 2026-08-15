@@ -45,7 +45,7 @@ class MossTranscribeDiarizePipelineConfig(PipelineConfig):
                 "encoder_cache_size_bytes": 4 * 1024**3,
                 "encoder_max_batch_size": _ENCODER_MAX_BATCH_SIZE,
                 "enable_torch_compile": True,
-                "torch_compile_max_bs": 4,
+                "torch_compile_max_bs": 8,
                 "request_build_max_workers": _REQUEST_BUILD_MAX_WORKERS,
                 "request_build_max_pending": 16,
                 "prefill_coalesce_requests": 4,
