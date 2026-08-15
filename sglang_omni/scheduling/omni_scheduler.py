@@ -1080,7 +1080,7 @@ class OmniScheduler:
         def enqueue_if_live() -> None:
             if req_id in self._aborted_request_ids:
                 return
-            # Priority defaulting must run before the queued-limit abort.
+            # note (guozhihao): Priority defaulting must run before the queued-limit abort.
             if not self._set_or_validate_priority(req):
                 return
             if self._abort_on_queued_limit(req):
