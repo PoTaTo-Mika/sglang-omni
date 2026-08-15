@@ -78,7 +78,7 @@ The optimization stack mirrors [what we built for TTS](https://github.com/zhaoch
 **CUDA Graph.** The LLM decode step pads batch size to predefined buckets (1, 2, 4, 8, …) and replays a captured CUDA graph, eliminating kernel launch overhead on every token. This is the single biggest optimization for AR Decode. Breakable prefill graphs use token-count buckets beginning at 1 and 2 so cached-prefix extends do not fall back to eager. The Whisper encoder gets the same treatment, bucketed over chunk count (`encoder_chunk_buckets`, default `1..8` ≈ 4 min of audio).
 
 **Decoder Torch Compile.** The default pipeline compiles Qwen3 decoder shapes
-through batch size 8 and uses the eager decoder above that cap. Override the cap
+through batch size 4 and uses the eager decoder above that cap. Override the cap
 with `--talker-torch-compile-max-bs`, or disable decoder compilation with
 `--talker-torch-compile off`. This setting is independent of the encoder
 compile option below.
