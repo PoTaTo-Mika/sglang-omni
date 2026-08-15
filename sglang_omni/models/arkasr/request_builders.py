@@ -162,7 +162,7 @@ def make_arkasr_scheduler_adapters(
             feature=features,
             model_specific_data={
                 "feature_attention_mask": feature_attention_mask,
-                # the pre-LM encoder service reads these to split batched
+                # Note (Akazaakane): The service reads these to split batched
                 # encoder output and key its embedding cache.
                 "num_audio_tokens": num_audio_tokens,
                 "audio_fingerprint": fingerprint,

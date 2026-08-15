@@ -99,12 +99,12 @@ tests/
     │   ├── test_encoder_service.py
     │   ├── test_model.py
     │   ├── test_pipeline.py
-    │   └── test_request_builders.py
-    ├── arkasr/
-    │   └── test_pipeline.py
     │   ├── test_request_builders.py
     │   ├── test_stream_output_builder.py
     │   └── test_streaming_client.py
+    ├── arkasr/
+    │   ├── test_encoder_service.py
+    │   └── test_pipeline.py
     ├── moss_transcribe_diarize/
     │   ├── test_encoder_cache.py
     │   ├── test_encoder_service.py
@@ -411,6 +411,8 @@ that happened to contain an older version of the test.
   - invalid encoded-audio classification versus operational loader failures,
     including transcription-route HTTP 400/500 mapping.
 - `unit_test/arkasr/`: ARK-ASR-3B unit tests:
+  - asynchronous pre-LM encoder submission, bounded queue backpressure,
+    single-flight deduplication, CPU cache validation, and failure recovery
   - pipeline config, stage factory concurrency defaults, deferred CUDA-graph
     capture, async-decode default, and `--decode-mode async|sync` CLI overrides
   - audio-token count formula, audio-tower forward shape, marker-token

@@ -124,7 +124,7 @@ class ArkasrEngineBuilder(AsrEngineBuilder):
         model.set_encoder_max_batch_size(self.encoder_max_batch_size)
         init_mm_embedding_cache(self.mm_embedding_cache_size_bytes)
         if self.enable_pre_lm_encoder:
-            # constructed after SGLang's generation CUDA graphs so the
+            # Note (Akazaakane): Constructed after generation CUDA graphs so the
             # encoder's dedicated stream never interleaves with graph capture.
             self.audio_encoder_service = ArkasrPreLMEncoderService(
                 model,

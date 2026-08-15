@@ -32,8 +32,8 @@ class ArkasrPipelineConfig(PipelineConfig):
                 "enable_pre_lm_encoder": True,
                 "pre_lm_cache_max_entries": 4096,
                 "pre_lm_cache_size_bytes": 2 * 1024**3,
-                # one drained group maps to exactly one encoder microbatch at
-                # the matching encoder_max_batch_size default.
+                # Note (Akazaakane): One drained group maps to exactly one
+                # encoder microbatch at the matching encoder_max_batch_size.
                 "pre_lm_max_batch_size": 8,
                 "pre_lm_max_batch_wait_ms": 0,
                 "pre_lm_max_pending": 32,

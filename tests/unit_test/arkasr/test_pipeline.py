@@ -312,8 +312,8 @@ def test_arkasr_pre_lm_encoder_reaches_request_builder_and_shutdown(
 
     assert stub.adapter_kwargs["audio_encoder_service"] is encoder_service
     assert scheduler.shutdown_callback == encoder_service.close
-    # A-PR4's model-internal bound is still applied when the pre-LM service is
-    # in front of it; the two batch limits are independent.
+    # Note (Akazaakane): The model-internal bound still applies behind the
+    # pre-LM service because the two batch limits are independent.
     assert stub.encoder_batch_sizes == [8]
 
 

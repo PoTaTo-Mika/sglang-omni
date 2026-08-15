@@ -2081,6 +2081,8 @@ def test_omni_scheduler_stop_runs_shutdown_callback_once() -> None:
     scheduler = object.__new__(OmniScheduler)
     shutdowns: list[None] = []
     scheduler._running = True
+    scheduler._request_admission_lock = threading.RLock()
+    scheduler._pending_request_admissions = {}
     scheduler._shutdown_lock = threading.Lock()
     scheduler._shutdown_callback = lambda: shutdowns.append(None)
 
@@ -2115,6 +2117,8 @@ def test_omni_scheduler_start_closes_active_model_paths(
     scheduler._prefill_start_done = {"req-1", "req-2"}
     scheduler._prefill_end_done = set()
     scheduler._request_build_executor = None
+    scheduler._request_admission_lock = threading.RLock()
+    scheduler._pending_request_admissions = {}
     scheduler._shutdown_lock = threading.Lock()
     scheduler._shutdown_callback = None
 
