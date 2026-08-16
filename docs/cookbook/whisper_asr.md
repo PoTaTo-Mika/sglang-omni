@@ -53,7 +53,7 @@ GPU. SeedTTS EN, whisper-large-v3, 200 clips x 3 repeats, CUDA Graph default
 
 | GPU | c1 | c4 | c8 | isolated encoder call |
 |---|---|---|---|---|
-| A100-SXM-64GB | +3.4% | +7.3% | +7.8% | -13% |
+| A100-SXM-64GB | +1.6% | +0.3% | +2.5% | -13% |
 | RTX 6000D | +0.3% | +1.9% | +1.4% | -1% |
 
 To disable:
