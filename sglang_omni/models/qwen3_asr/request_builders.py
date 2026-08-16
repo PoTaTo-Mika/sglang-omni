@@ -10,7 +10,8 @@ into those positions. So request_builder must:
   * otherwise extract mel features (WhisperFeatureExtractor) + attention mask,
   * compute how many audio tokens the encoder will emit,
   * build the chat prompt with that many ``<|audio_pad|>`` tokens,
-  * hand features or precomputed embeddings over as a ``MultimodalDataItem``.
+  * hand features or precomputed embeddings over as a ``MultimodalDataItem``,
+  * on a cache miss, submit encode and wait or return deferred admission.
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang_omni.preprocessing.transcription import prepare_audio
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
+from sglang_omni.scheduling.types import DeferredAdmission
 from sglang_omni.utils.audio import AudioDecodeError
 
 from . import mrope_fast_path
@@ -103,8 +105,10 @@ def make_qwen3_asr_scheduler_adapters(
     feature_extractor: Any = None,
     context_length: int | None = None,
     audio_encoder_service: Any = None,
+    should_wait_for_encode: Callable[[], bool] | None = None,
 ) -> tuple[
-    Callable[[StagePayload], Qwen3ASRRequestData], Callable[[Any], StagePayload]
+    Callable[[StagePayload], Qwen3ASRRequestData | DeferredAdmission],
+    Callable[[Any], StagePayload],
 ]:
     if feature_extractor is None:
         raise ValueError("Qwen3-ASR processor is missing a feature_extractor")
@@ -162,7 +166,9 @@ def make_qwen3_asr_scheduler_adapters(
                 "reduce max_new_tokens or split the audio"
             )
 
-    def request_builder(payload: StagePayload) -> Qwen3ASRRequestData:
+    def request_builder(
+        payload: StagePayload,
+    ) -> Qwen3ASRRequestData | DeferredAdmission:
         params = payload.request.params or {}
         language = params.get("language")
         requested_language = None if language is None else str(language)
@@ -334,14 +340,8 @@ def make_qwen3_asr_scheduler_adapters(
         )
         sampling_params.normalize(tokenizer=None)
 
-        # note (luojiaxuan): encode after validation and before Req creation —
-        # a request is only admitted with its complete LM-ready embedding, and
-        # a failed encode raises here instead of poisoning the waiting queue.
-        if audio_encoder_service is not None:
-            if cached_embedding is None:
-                audio_encoder_service.encode_item(audio_item)
-            else:
-                audio_encoder_service.attach_embedding(audio_item, cached_embedding)
+        if audio_encoder_service is not None and cached_embedding is not None:
+            audio_encoder_service.attach_embedding(audio_item, cached_embedding)
 
         req = Req(
             rid=payload.request_id,
@@ -354,7 +354,7 @@ def make_qwen3_asr_scheduler_adapters(
         req.multimodal_inputs = mm_inputs
         req._codec_suppress_tokens = None
 
-        return Qwen3ASRRequestData(
+        req_data = Qwen3ASRRequestData(
             input_ids=torch.tensor(input_ids, dtype=torch.long),
             req=req,
             prompt_token_ids=input_ids,
@@ -365,6 +365,18 @@ def make_qwen3_asr_scheduler_adapters(
             engine_start_s=time.perf_counter(),
             stage_payload=payload,
         )
+        if audio_encoder_service is None or cached_embedding is not None:
+            return req_data
+        # note (guozhihao-224): a request is only admitted with its complete
+        # LM-ready embedding. Submit after validation so a failed encode
+        # never reaches the waiting queue. Wait in this worker when the
+        # build queue still fits the pool; otherwise return deferred
+        # admission so other builds can overlap encode.
+        ready = audio_encoder_service.submit_item(audio_item)
+        if should_wait_for_encode is not None and should_wait_for_encode():
+            ready.result()
+            return req_data
+        return DeferredAdmission(value=req_data, ready=ready)
 
     def result_adapter(data: Qwen3ASRRequestData) -> StagePayload:
         payload = data.stage_payload
