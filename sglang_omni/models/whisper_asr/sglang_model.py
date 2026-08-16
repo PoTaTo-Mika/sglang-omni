@@ -473,24 +473,17 @@ class WhisperForConditionalGeneration(nn.Module):
         cross_attention_states = self._batch_precomputed_encoder_states(forward_batch)
         if cross_attention_states is None:
             audio_features, encoder_lens = self._batch_audio_inputs(forward_batch)
-        else:
-            audio_features, encoder_lens = None, None
+            if audio_features is not None and encoder_lens is not None:
+                encoder_states = self._run_encoder(audio_features)
+                cross_attention_states = self._flat_encoder_result(
+                    encoder_states,
+                    encoder_lens,
+                )
 
         if get_is_capture_mode():
             skip_cross_attention = False
         else:
             skip_cross_attention = forward_batch.encoder_lens.max() == 0
-
-        if (
-            cross_attention_states is None
-            and audio_features is not None
-            and encoder_lens is not None
-        ):
-            encoder_states = self._run_encoder(audio_features)
-            cross_attention_states = self._flat_encoder_result(
-                encoder_states,
-                encoder_lens,
-            )
 
         hidden_states = self.model.decoder(
             input_ids=input_ids,
