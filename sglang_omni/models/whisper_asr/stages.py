@@ -16,7 +16,7 @@ def create_sglang_whisper_asr_executor(
     mem_fraction_static: float = 0.85,
     enable_encoder_cuda_graph: bool = False,
     encoder_graph_batch_buckets: list[int] | None = None,
-    request_build_max_workers: int = 2,
+    request_build_max_workers: int = 8,
     request_build_max_pending: int | None = 16,
     prefill_coalesce_requests: int = 2,
     prefill_coalesce_wait_ms: float = 6.0,

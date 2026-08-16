@@ -26,15 +26,26 @@ def _normalize_encoder_graph_buckets(buckets: list[int] | None) -> tuple[int, ..
 def _resolve_encoder_graph_buckets(
     buckets: tuple[int, ...],
     *,
+    enable_pre_lm_encoder: bool,
+    pre_lm_max_batch_size: int,
     max_prefill_tokens: int,
     encoder_token_count: int,
 ) -> tuple[int, ...]:
-    """Filter capture buckets to batches reachable by atomic prefill."""
-    if max_prefill_tokens < 1:
-        raise ValueError(f"max_prefill_tokens must be >= 1, got {max_prefill_tokens}")
-    if encoder_token_count < 1:
-        raise ValueError(f"encoder_token_count must be >= 1, got {encoder_token_count}")
-    max_encoder_batch_size = max_prefill_tokens // encoder_token_count
+    # note (guozhihao-224): pre-LM encoding is no longer limited by atomic prefill
+    # admission, so capture against pre_lm_max_batch_size. Keep
+    # max_prefill_tokens // encoder_token_count only for encoder-in-prefill.
+    if enable_pre_lm_encoder:
+        max_encoder_batch_size = pre_lm_max_batch_size
+    else:
+        if max_prefill_tokens < 1:
+            raise ValueError(
+                f"max_prefill_tokens must be >= 1, got {max_prefill_tokens}"
+            )
+        if encoder_token_count < 1:
+            raise ValueError(
+                f"encoder_token_count must be >= 1, got {encoder_token_count}"
+            )
+        max_encoder_batch_size = max_prefill_tokens // encoder_token_count
     return tuple(bucket for bucket in buckets if bucket <= max_encoder_batch_size)
 
 
@@ -50,7 +61,7 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
         mem_fraction_static: float,
         enable_encoder_cuda_graph: bool = False,
         encoder_graph_batch_buckets: list[int] | None = None,
-        request_build_max_workers: int = 2,
+        request_build_max_workers: int = 8,
         request_build_max_pending: int | None = 16,
         prefill_coalesce_requests: int = 2,
         prefill_coalesce_wait_ms: float = 6.0,
@@ -133,14 +144,18 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
             max_prefill_tokens = int(server_args.max_prefill_tokens)
             resolved_buckets = _resolve_encoder_graph_buckets(
                 self.encoder_graph_batch_buckets,
+                enable_pre_lm_encoder=self.enable_pre_lm_encoder,
+                pre_lm_max_batch_size=self.pre_lm_max_batch_size,
                 max_prefill_tokens=max_prefill_tokens,
                 encoder_token_count=self.encoder_token_count,
             )
             logger.info(
                 "Resolved Whisper encoder CUDA graph buckets configured=%s "
-                "reachable=%s max_prefill_tokens=%d encoder_token_count=%d",
+                "reachable=%s pre_lm=%s max_prefill_tokens=%d "
+                "encoder_token_count=%d",
                 self.encoder_graph_batch_buckets,
                 resolved_buckets,
+                self.enable_pre_lm_encoder,
                 max_prefill_tokens,
                 self.encoder_token_count,
             )

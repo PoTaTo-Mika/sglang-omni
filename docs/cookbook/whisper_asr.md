@@ -22,12 +22,12 @@ sgl-omni serve \
 
 ## Encoder CUDA Graph
 
-The encoder CUDA Graph is enabled by default for the pipeline. The final bucket
-set is resolved from the serving prefill budget and the checkpoint's encoder
-prefix length. The default prefill budget is **4,096** tokens
-(`4096 // 1500 = 2`), so LM-side encoder graph batches **1/2** are captured
-when the encoder runs inside prefill. To use eager encoder execution, override
-the pipeline configuration:
+The encoder CUDA Graph is enabled by default. With pre-LM encoding (the
+default), capture buckets follow `pre_lm_max_batch_size` (8), so batches
+**1/2/4/8** are captured. `request_build_max_workers` defaults to 8, matching
+Qwen3-ASR and Fun-ASR. When `enable_pre_lm_encoder` is false, buckets follow
+the atomic prefill budget (`4096 // 1500 = 2`). To use eager encoder
+execution, override the pipeline configuration:
 
 ```yaml
 config_cls: WhisperASRPipelineConfig
@@ -39,8 +39,8 @@ runtime_overrides:
     enable_encoder_cuda_graph: false
 ```
 
-The graph is captured after SGLang's generation graphs. Raise
-`max_prefill_tokens` further before configuring larger buckets (12/16). Each
+The graph is captured after SGLang's generation graphs. With pre-LM off, raise
+`max_prefill_tokens` before configuring larger LM-side buckets (12/16). Each
 request uses the smallest captured bucket that fits its batch. Requests larger
 than every captured bucket, with a different feature shape, or without a
 successful capture run eagerly. Startup and first-replay logs identify the
@@ -48,7 +48,11 @@ captured and executed buckets.
 
 ## Prefill Coalescing
 
-Whisper builds up to two requests concurrently and coalesces prefill at the serving-reachable batch size of two. A partial batch waits for at most 6 ms only while another request build is pending; a single request and a partial batch with no remaining build work are released immediately. This allows concurrent traffic to replay the encoder batch-2 graph without adding a fixed wait to the idle c=1 path.
+Whisper builds requests with eight worker threads by default, matching other
+pre-LM ASR pipelines. Prefill still coalesces at two under the default
+4,096-token atomic budget. A partial batch waits for at most 6 ms only while
+another request build is pending; a single request and a partial batch with no
+remaining build work are released immediately.
 
 `request_build_max_pending` bounds submitted request-build futures, not the request backlog. When `max_queued_requests` is unset, requests beyond that pending-build limit remain queued for later construction. Setting `max_queued_requests` retains the configured finite-queue rejection behavior.
 
@@ -184,12 +188,14 @@ All 1,200 measured requests completed successfully. Corpus WER remained 0.0415 i
 - Encoder CUDA Graph is enabled by default and requires SGLang generation CUDA
   Graph. Validate the selected buckets before production use.
 - Audio encoding runs before LM admission by default
-  (`pre_lm_max_batch_size=8`). Set `enable_pre_lm_encoder: false` under
-  `runtime_overrides.asr` to run the encoder inside prefill again.
+  (`pre_lm_max_batch_size=8`, `request_build_max_workers=8`). Set
+  `enable_pre_lm_encoder: false` under `runtime_overrides.asr` to run the
+  encoder inside prefill again.
 - Prefill budget defaults to 4,096 tokens (`⌊4096/1500⌋=2`) under atomic
-  admission (`chunked_prefill_size=0`). Raise `max_prefill_tokens` via
-  `server_args_overrides` only when you need larger LM-side encoder CUDA Graph
-  buckets with the encoder inside prefill.
+  admission (`chunked_prefill_size=0`). This still caps LM-side prefill
+  batching. Raise `max_prefill_tokens` via `server_args_overrides` only when
+  the encoder runs inside prefill and you need larger LM-side CUDA Graph
+  buckets.
 - Chunked prefill stays disabled because the Whisper encoder prefix must be
   admitted atomically. Requests that exceed the current prefill budget wait
   for the next batch instead of splitting the encoder prefix.
