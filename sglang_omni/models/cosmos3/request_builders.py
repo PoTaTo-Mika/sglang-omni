@@ -8,6 +8,7 @@ from typing import Any, cast
 import torch
 from transformers import GenerationConfig, PreTrainedTokenizerBase
 
+from sglang_omni.models.cosmos3.config import DECODE_STAGE, THINKER_STAGE
 from sglang_omni.models.cosmos3.payload_types import (
     Cosmos3PipelineState,
     PromptInputs,
@@ -17,9 +18,6 @@ from sglang_omni.proto import EXPLICIT_GENERATION_PARAMS_KEY, StagePayload
 from sglang_omni.scheduling.messages import OutgoingMessage
 from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
 from sglang_omni.scheduling.types import RequestOutput
-
-THINKER_STAGE = "thinker"
-DECODE_STAGE = "decode"
 
 _TRANSPORT_SAMPLING_DEFAULTS: dict[str, Any] = {
     "temperature": 1.0,
@@ -31,11 +29,6 @@ _TRANSPORT_SAMPLING_DEFAULTS: dict[str, Any] = {
 
 def _value_or_default(value: Any, fallback: Any) -> Any:
     return fallback if value is None else value
-
-
-def _request_value(params: dict[str, Any], name: str, default: Any) -> Any:
-    value = params.get(name)
-    return default if value is None else value
 
 
 def build_cosmos3_sampling_kwargs(
@@ -61,28 +54,27 @@ def build_cosmos3_sampling_kwargs(
     if sampling_seed is None:
         sampling_seed = params.get("sampling_seed")
     return {
-        "max_new_tokens": _request_value(params, "max_new_tokens", 2048),
-        "temperature": _request_value(params, "temperature", default_temperature),
-        "top_p": _request_value(
-            params,
-            "top_p",
+        "max_new_tokens": _value_or_default(params.get("max_new_tokens"), 2048),
+        "temperature": _value_or_default(
+            params.get("temperature"), default_temperature
+        ),
+        "top_p": _value_or_default(
+            params.get("top_p"),
             _value_or_default(
                 generation_config.top_p if generation_config is not None else None,
                 0.8,
             ),
         ),
-        "top_k": _request_value(
-            params,
-            "top_k",
+        "top_k": _value_or_default(
+            params.get("top_k"),
             _value_or_default(
                 generation_config.top_k if generation_config is not None else None,
                 20,
             ),
         ),
-        "min_p": _request_value(params, "min_p", 0.0),
-        "repetition_penalty": _request_value(
-            params,
-            "repetition_penalty",
+        "min_p": _value_or_default(params.get("min_p"), 0.0),
+        "repetition_penalty": _value_or_default(
+            params.get("repetition_penalty"),
             _value_or_default(
                 (
                     generation_config.repetition_penalty

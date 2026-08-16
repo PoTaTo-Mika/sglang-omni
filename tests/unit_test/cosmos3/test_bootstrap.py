@@ -85,7 +85,7 @@ def test_thinker_loads_tokenizer_from_checkpoint_root(monkeypatch, tmp_path) -> 
     monkeypatch.setattr(
         request_builders,
         "make_text_stream_output_builder",
-        lambda: object(),
+        object,
     )
     monkeypatch.setattr(
         sglang_backend,

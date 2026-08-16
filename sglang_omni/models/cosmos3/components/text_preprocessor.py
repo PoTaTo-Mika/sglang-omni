@@ -42,12 +42,7 @@ def load_cosmos3_tokenizer(model_path: str) -> Any:
 
 def _normalize_text_messages(inputs: Any) -> list[dict[str, str]]:
     if isinstance(inputs, dict):
-        populated_media = [key for key in _MEDIA_INPUT_KEYS if inputs.get(key)]
-        if populated_media:
-            raise ValueError(
-                "Cosmos3 text preprocessing does not support media inputs yet: "
-                + ", ".join(populated_media)
-            )
+        _reject_media_inputs(inputs)
         if "messages" not in inputs:
             raise ValueError("Cosmos3 text preprocessing expects a messages field")
         inputs = inputs["messages"]
