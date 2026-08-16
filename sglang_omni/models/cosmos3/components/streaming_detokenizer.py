@@ -50,6 +50,8 @@ class Cosmos3StreamingDetokenizer:
         self._running = False
         self._state: dict[str, _RequestState] = {}
         self._done_seen: OrderedDict[str, None] = OrderedDict()
+        self._aborted: OrderedDict[str, None] = OrderedDict()
+        self._last_evict_s = 0.0
         # Stage aborts run on the event-loop thread while handlers run here.
         self._state_lock = threading.RLock()
 
@@ -87,6 +89,10 @@ class Cosmos3StreamingDetokenizer:
         with self._state_lock:
             self._state.pop(request_id, None)
             self._done_seen.pop(request_id, None)
+            self._aborted[request_id] = None
+            if len(self._aborted) > _DONE_SEEN_MAX:
+                for _ in range(len(self._aborted) - _DONE_SEEN_EVICT_TO):
+                    self._aborted.popitem(last=False)
 
     def _ensure_state(self, request_id: str) -> _RequestState:
         with self._state_lock:
@@ -96,7 +102,8 @@ class Cosmos3StreamingDetokenizer:
                 state = _RequestState(last_seen=now)
                 self._state[request_id] = state
             state.last_seen = now
-            if len(self._state) > _STATE_MAX:
+            if len(self._state) > _STATE_MAX and now - self._last_evict_s >= 1.0:
+                self._last_evict_s = now
                 self._evict_idle_orphans(now)
             return state
 
@@ -119,6 +126,8 @@ class Cosmos3StreamingDetokenizer:
 
     def _on_stream_chunk(self, request_id: str, item: StreamItem) -> None:
         with self._state_lock:
+            if request_id in self._aborted:
+                return
             token_id = int(item.data.item())
             state = self._ensure_state(request_id)
             state.pending_tokens.append(token_id)
@@ -150,6 +159,8 @@ class Cosmos3StreamingDetokenizer:
 
     def _on_stream_done(self, request_id: str) -> None:
         with self._state_lock:
+            if request_id in self._aborted:
+                return
             state = self._state.get(request_id)
             if state is None:
                 self._done_seen[request_id] = None
@@ -163,6 +174,8 @@ class Cosmos3StreamingDetokenizer:
 
     def _on_new_request(self, request_id: str, payload: StagePayload) -> None:
         with self._state_lock:
+            if request_id in self._aborted:
+                return
             state = self._ensure_state(request_id)
             state.payload = payload
             if request_id in self._done_seen:
