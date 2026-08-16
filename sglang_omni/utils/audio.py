@@ -3,8 +3,9 @@
 
 from __future__ import annotations
 
-import hashlib
+import functools
 import io
+import math
 import os
 from collections.abc import Mapping
 from typing import Any
@@ -15,6 +16,7 @@ import numpy as np
 import pybase64
 import torch
 import torchaudio
+import xxhash
 
 _DEFAULT_REQUEST_TIMEOUT = 5
 
@@ -114,13 +116,59 @@ def _try_fast_wav_decode(
     if sample_rate == target_sample_rate:
         return audio
 
-    resampled = torchaudio.functional.resample(
+    resampled = _cached_resample(
         torch.from_numpy(audio),
         sample_rate,
         target_sample_rate,
-        **dict(resample_kwargs or {}),
+        resample_kwargs,
     )
     return resampled.numpy()
+
+
+@functools.lru_cache(maxsize=32)
+def _resample_kernel(
+    orig_freq: int,
+    new_freq: int,
+    gcd: int,
+    kwargs_items: tuple[tuple[str, Any], ...],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, int]:
+    # Note (Jiaxin Deng): torchaudio rebuilds this per call even though it
+    # depends only on the rate pair, the options and the tensor type.
+    return torchaudio.functional.functional._get_sinc_resample_kernel(
+        orig_freq,
+        new_freq,
+        gcd,
+        device=device,
+        dtype=dtype,
+        **dict(kwargs_items),
+    )
+
+
+def _cached_resample(
+    waveform: torch.Tensor,
+    orig_freq: int,
+    new_freq: int,
+    resample_kwargs: Mapping[str, Any] | None,
+) -> torch.Tensor:
+    kwargs = dict(resample_kwargs or {})
+    orig_freq, new_freq = int(orig_freq), int(new_freq)
+    try:
+        gcd = math.gcd(orig_freq, new_freq)
+        kernel, width = _resample_kernel(
+            orig_freq,
+            new_freq,
+            gcd,
+            tuple(sorted(kwargs.items())),
+            waveform.device,
+            waveform.dtype,
+        )
+        return torchaudio.functional.functional._apply_sinc_resample_kernel(
+            waveform, orig_freq, new_freq, gcd, kernel, width
+        )
+    except (AttributeError, TypeError, RuntimeError):
+        return torchaudio.functional.resample(waveform, orig_freq, new_freq, **kwargs)
 
 
 def decode_audio_data_uri(value: str) -> bytes | None:
@@ -207,7 +255,7 @@ def load_audio(
 
 def audio_fingerprint(audio: np.ndarray) -> str:
     contiguous = np.ascontiguousarray(audio, dtype=np.float32)
-    return hashlib.blake2b(contiguous.tobytes(), digest_size=16).hexdigest()
+    return xxhash.xxh3_128_hexdigest(contiguous)
 
 
 def audio_fingerprint_int(fingerprint: str) -> int:
