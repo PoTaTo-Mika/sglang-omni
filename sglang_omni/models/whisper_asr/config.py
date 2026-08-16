@@ -45,7 +45,7 @@ class WhisperASRPipelineConfig(PipelineConfig):
             factory_args={
                 "device": "cuda:0",
                 "enable_encoder_cuda_graph": True,
-                "enable_encoder_torch_compile": False,
+                "enable_encoder_torch_compile": True,
                 "request_build_max_workers": 2,
                 "request_build_max_pending": 16,
                 "prefill_coalesce_requests": 2,

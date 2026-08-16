@@ -36,32 +36,37 @@ runtime_overrides:
 
 The graph is captured after SGLang's generation graphs. Raise `max_prefill_tokens` before configuring larger buckets. Each request uses the smallest captured bucket that fits its batch. Requests larger than every captured bucket, with a different feature shape, or without a successful capture run eagerly. Startup and first-replay logs identify the captured and executed buckets.
 
-## Encoder torch.compile (opt-in)
+## Encoder torch.compile
 
-The encoder layers can be fused with `torch.compile`. The shared encoder-layer
-`forward` is compiled once and bound to every layer, so Inductor folds layer
-norm, GELU and residual adds into the surrounding matmuls; the compiled layers
-are warmed up before encoder graph capture, so the CUDA graphs above replay the
-fused kernels and the eager fallback path (uncaptured batch sizes) runs them
-too. On any compile failure the encoder falls back to the eager layers and logs
-a warning.
+The encoder layers are compiled with `torch.compile` by default. The shared
+encoder-layer `forward` is compiled once and bound to every layer, so Inductor
+folds layer norm, GELU and residual adds into the surrounding matmuls; the
+compiled layers are warmed up before encoder graph capture, so the CUDA graphs
+above replay the fused kernels, and the eager fallback path (uncaptured batch
+sizes) runs them too. Compilation adds a few seconds of one-time startup. On
+any compile failure the encoder falls back to the eager layers and logs a
+warning with the traceback.
 
-The Whisper encoder is GEMM/attention-bound, so the fusable elementwise work is
-a small share of its time: on an RTX 6000D the isolated encoder call improved by
-0-1.5% across batch 1-8, and end-to-end SeedTTS EN throughput (200 clips, 3
-repeats) moved +0.3% / +1.9% / +1.4% at concurrency 1 / 4 / 8 over the CUDA
-Graph default with unchanged WER. The path stays off by default; enable it per
-deployment after measuring on the target GPU:
+The gain depends on how much of the encoder is elementwise work on the target
+GPU. SeedTTS EN, whisper-large-v3, 200 clips x 3 repeats, CUDA Graph default
+-> CUDA Graph + compile, WER unchanged:
+
+| GPU | c1 | c4 | c8 | isolated encoder call |
+|---|---|---|---|---|
+| A100-SXM-64GB | +3.4% | +7.3% | +7.8% | -13% |
+| RTX 6000D | +0.3% | +1.9% | +1.4% | -1% |
+
+To disable:
 
 ```yaml
 runtime_overrides:
   asr:
-    enable_encoder_torch_compile: true
+    enable_encoder_torch_compile: false
 ```
 
 `encoder_torch_compile_mode` forwards a `torch.compile` mode string; leave it
-unset for the default mode (`max-autotune-no-cudagraphs` was slower on the
-measured GPU because Triton matmuls lost to cuBLAS).
+unset for the default mode (`max-autotune-no-cudagraphs` was slower on both
+GPUs because Triton matmuls lost to cuBLAS).
 
 ## Prefill Coalescing
 
