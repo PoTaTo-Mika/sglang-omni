@@ -381,6 +381,12 @@ The router infers required capabilities from each request:
   plus `audio_input` when configured with reference audio
 - `/v1/audio/voices` management and synthesis using an uploaded voice require
   the owner worker, which has both `speech` and `audio_input`
+- `/v1/audio/transcriptions` and `/v1/audio/translations` require
+  `audio_input`. These are multipart uploads, so the router does not read the
+  `model` form field; in a pool that mixes ASR models (for example Whisper
+  next to Qwen3-ASR), send `X-SGLang-Omni-Route-Model` so the request lands on
+  a worker that serves that model. Translation support is per model, and a
+  worker that does not support it answers `400`.
 
 Register narrower worker capabilities only when a worker cannot serve one of
 those request classes.
@@ -594,7 +600,7 @@ At `N >= 2` the router runs as a small process tree:
 - A **supervisor** binds the public port once and passes the listening socket
   to `N` **data-plane (DP)** processes, which accept from the shared queue and
   relay the model routes (`/generate`, `/v1/chat/completions`,
-  `/v1/audio/speech`, `/v1/audio/transcriptions`).
+  `/v1/audio/speech`, `/v1/audio/transcriptions`, `/v1/audio/translations`).
 - One **control plane (CP)** owns the worker registry, health checks, and the
   admin surface. DPs learn the routable-worker set from a snapshot file the CP
   republishes on every state change and on a fixed keepalive cadence. Admin

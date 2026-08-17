@@ -56,6 +56,7 @@ class RouteKind(str, Enum):
     SPEECH_BATCH = "speech_batch"
     VOICE_CONTROL = "voice_control"
     TRANSCRIPTION = "transcription"
+    TRANSLATION = "translation"
 
 
 def classify_route(path: str) -> RouteKind:
@@ -67,6 +68,8 @@ def classify_route(path: str) -> RouteKind:
         return RouteKind.VOICE_CONTROL
     if path == "/v1/audio/transcriptions":
         return RouteKind.TRANSCRIPTION
+    if path == "/v1/audio/translations":
+        return RouteKind.TRANSLATION
     return RouteKind.GENERATION
 
 
@@ -490,7 +493,7 @@ def _required_capabilities(
         capabilities: set[Capability] = {"speech"}
     elif route_kind is RouteKind.VOICE_CONTROL:
         capabilities = {"speech"}
-    elif route_kind is RouteKind.TRANSCRIPTION:
+    elif route_kind in {RouteKind.TRANSCRIPTION, RouteKind.TRANSLATION}:
         capabilities = {"audio_input"}
     else:
         capabilities = {"chat"}
@@ -532,7 +535,7 @@ def _service_class_for_route(route_kind: RouteKind) -> ServiceClass:
         return "speech_batch"
     if route_kind is RouteKind.VOICE_CONTROL:
         return "voice_control"
-    if route_kind is RouteKind.TRANSCRIPTION:
+    if route_kind in {RouteKind.TRANSCRIPTION, RouteKind.TRANSLATION}:
         return "transcription"
     return "generation"
 
