@@ -61,7 +61,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.1.2" />
-    <meta name="docbuild:last-update" content="Aug 16, 2026"/>
+    <meta name="docbuild:last-update" content="Aug 17, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -531,7 +531,12 @@
 </section>
 <section id="encoder-cuda-graph">
 <h2>Encoder CUDA Graph<a class="headerlink" href="#encoder-cuda-graph" title="Link to this heading">#</a></h2>
-<p>The encoder CUDA Graph is enabled by default for the pipeline. The final bucket set is resolved from the serving prefill budget and the checkpoint’s encoder prefix length; with the default 4,096-token budget and 1,500-token Whisper encoder prefix, only batches 1 and 2 are captured. To use eager encoder execution, override the pipeline configuration:</p>
+<p>The encoder CUDA Graph is enabled by default. With pre-LM encoding (the
+default), capture buckets follow <code class="docutils literal notranslate"><span class="pre">pre_lm_max_batch_size</span></code> (8), so batches
+<strong>1/2/4/8</strong> are captured. <code class="docutils literal notranslate"><span class="pre">request_build_max_workers</span></code> defaults to 8, matching
+Qwen3-ASR and Fun-ASR. When <code class="docutils literal notranslate"><span class="pre">enable_pre_lm_encoder</span></code> is false, buckets follow
+the atomic prefill budget (<code class="docutils literal notranslate"><span class="pre">4096</span> <span class="pre">//</span> <span class="pre">1500</span> <span class="pre">=</span> <span class="pre">2</span></code>). To use eager encoder
+execution, override the pipeline configuration:</p>
 <div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">config_cls</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">WhisperASRPipelineConfig</span>
 <span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">whisper</span>
 <span class="nt">model_path</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">openai/whisper-large-v3-turbo</span>
@@ -541,11 +546,20 @@
 <span class="w">    </span><span class="nt">enable_encoder_cuda_graph</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span>
 </pre></div>
 </div>
-<p>The graph is captured after SGLang’s generation graphs. Raise <code class="docutils literal notranslate"><span class="pre">max_prefill_tokens</span></code> before configuring larger buckets. Each request uses the smallest captured bucket that fits its batch. Requests larger than every captured bucket, with a different feature shape, or without a successful capture run eagerly. Startup and first-replay logs identify the captured and executed buckets.</p>
+<p>The graph is captured after SGLang’s generation graphs. With pre-LM off, raise
+<code class="docutils literal notranslate"><span class="pre">max_prefill_tokens</span></code> before configuring larger LM-side buckets (12/16). Each
+request uses the smallest captured bucket that fits its batch. Requests larger
+than every captured bucket, with a different feature shape, or without a
+successful capture run eagerly. Startup and first-replay logs identify the
+captured and executed buckets.</p>
 </section>
 <section id="prefill-coalescing">
 <h2>Prefill Coalescing<a class="headerlink" href="#prefill-coalescing" title="Link to this heading">#</a></h2>
-<p>Whisper builds up to two requests concurrently and coalesces prefill at the serving-reachable batch size of two. A partial batch waits for at most 6 ms only while another request build is pending; a single request and a partial batch with no remaining build work are released immediately. This allows concurrent traffic to replay the encoder batch-2 graph without adding a fixed wait to the idle c=1 path.</p>
+<p>Whisper builds requests with eight worker threads by default, matching other
+pre-LM ASR pipelines. Prefill still coalesces at two under the default
+4,096-token atomic budget. A partial batch waits for at most 6 ms only while
+another request build is pending; a single request and a partial batch with no
+remaining build work are released immediately.</p>
 <p><code class="docutils literal notranslate"><span class="pre">request_build_max_pending</span></code> bounds submitted request-build futures, not the request backlog. When <code class="docutils literal notranslate"><span class="pre">max_queued_requests</span></code> is unset, requests beyond that pending-build limit remain queued for later construction. Setting <code class="docutils literal notranslate"><span class="pre">max_queued_requests</span></code> retains the configured finite-queue rejection behavior.</p>
 <p>Use <code class="docutils literal notranslate"><span class="pre">prefill_coalesce_requests</span></code> and <code class="docutils literal notranslate"><span class="pre">prefill_coalesce_wait_ms</span></code> to tune the gate. Set <code class="docutils literal notranslate"><span class="pre">prefill_coalesce_requests:</span> <span class="pre">0</span></code> to disable only coalescing, or also set <code class="docutils literal notranslate"><span class="pre">request_build_max_workers:</span> <span class="pre">1</span></code> to restore the pre-optimization request-build path:</p>
 <div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">runtime_overrides</span><span class="p">:</span>
@@ -816,8 +830,17 @@ for validated ASR serving.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">verbose_json</span></code> returns a single segment spanning the audio duration; <code class="docutils literal notranslate"><span class="pre">srt</span></code>
 and <code class="docutils literal notranslate"><span class="pre">vtt</span></code> are not supported and return HTTP 400.</p></li>
 <li><p>Encoder CUDA Graph is enabled by default and requires SGLang generation CUDA
-Graph to remain enabled. Validate the selected buckets before production use.</p></li>
-<li><p>Chunked prefill is disabled because the Whisper encoder prefix must be
+Graph. Validate the selected buckets before production use.</p></li>
+<li><p>Audio encoding runs before LM admission by default
+(<code class="docutils literal notranslate"><span class="pre">pre_lm_max_batch_size=8</span></code>, <code class="docutils literal notranslate"><span class="pre">request_build_max_workers=8</span></code>). Set
+<code class="docutils literal notranslate"><span class="pre">enable_pre_lm_encoder:</span> <span class="pre">false</span></code> under <code class="docutils literal notranslate"><span class="pre">runtime_overrides.asr</span></code> to run the
+encoder inside prefill again.</p></li>
+<li><p>Prefill budget defaults to 4,096 tokens (<code class="docutils literal notranslate"><span class="pre">⌊4096/1500⌋=2</span></code>) under atomic
+admission (<code class="docutils literal notranslate"><span class="pre">chunked_prefill_size=0</span></code>). This still caps LM-side prefill
+batching. Raise <code class="docutils literal notranslate"><span class="pre">max_prefill_tokens</span></code> via <code class="docutils literal notranslate"><span class="pre">server_args_overrides</span></code> only when
+the encoder runs inside prefill and you need larger LM-side CUDA Graph
+buckets.</p></li>
+<li><p>Chunked prefill stays disabled because the Whisper encoder prefix must be
 admitted atomically. Requests that exceed the current prefill budget wait
 for the next batch instead of splitting the encoder prefix.</p></li>
 <li><p>First startup can take several minutes.</p></li>
@@ -924,7 +947,7 @@ By SGLang-Omni Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 16, 2026.
+  Last updated on Aug 17, 2026.
   <br/>
 </p>
   </div>
