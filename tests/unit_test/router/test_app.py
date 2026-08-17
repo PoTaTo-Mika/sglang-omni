@@ -3517,12 +3517,100 @@ def test_route_registration_split_exposes_exact_route_sets() -> None:
         "/v1/chat/completions",
         "/v1/audio/speech",
         "/v1/audio/transcriptions",
+        "/v1/audio/translations",
     }
     assert _paths(lambda app: register_tts_routes(app, proxy, websocket_proxy)) == {
         "/v1/audio/speech/batch",
         "/v1/audio/speech/stream",
         "/v1/audio/voices",
         "/v1/audio/voices/{name}",
+    }
+
+
+# Note (Jeffro): Worker /v1/ routes that the router does not forward on purpose. Every other
+# /v1/ route on the worker must also exist on the router; if you add a worker
+# endpoint and forget the router, test_router_exposes_every_worker_v1_route
+# fails and points you here.
+_WORKER_ROUTES_NOT_PROXIED = {
+    "/v1/realtime",  # the router has no websocket proxy for it yet
+}
+
+
+def test_router_exposes_every_worker_v1_route() -> None:
+    from sglang_omni.serve import create_app as create_worker_app
+
+    class _NoopClient:
+        pass
+
+    worker_app = create_worker_app(
+        _NoopClient(),
+        model_name="worker",
+        enable_realtime=True,
+        supports_audio_translation=True,
+    )
+    router_app = create_app(_router_config())
+
+    def _v1_routes(app: FastAPI) -> dict[str, frozenset[str]]:
+        routes: dict[str, set[str]] = {}
+        for route in app.routes:
+            path = getattr(route, "path", "")
+            if not path.startswith("/v1/"):
+                continue
+            methods = getattr(route, "methods", None) or {"WEBSOCKET"}
+            routes.setdefault(path, set()).update(methods - {"HEAD"})
+        return {path: frozenset(methods) for path, methods in routes.items()}
+
+    worker_routes = _v1_routes(worker_app)
+    router_routes = _v1_routes(router_app)
+
+    assert _WORKER_ROUTES_NOT_PROXIED <= set(
+        worker_routes
+    ), "stale entry in _WORKER_ROUTES_NOT_PROXIED"
+    missing = {
+        path: methods
+        for path, methods in worker_routes.items()
+        if path not in _WORKER_ROUTES_NOT_PROXIED
+        and not methods <= router_routes.get(path, frozenset())
+    }
+    assert not missing, (
+        f"worker routes missing from the router: {missing}; add a forward in "
+        "sglang_omni_router/app.py and a classify_route branch in "
+        "sglang_omni_router/route_metadata.py"
+    )
+
+
+@pytest.mark.parametrize("path", ["/v1/audio/transcriptions", "/v1/audio/translations"])
+def test_speech_to_text_routes_select_audio_input_workers(path: str) -> None:
+    seen: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "healthy"}, request=request)
+        seen.append((_request_netloc(request), request.url.path))
+        return httpx.Response(200, json={"text": "hi"}, request=request)
+
+    worker_configs = [
+        WorkerConfig(url="http://worker-a:8101", capabilities={"chat", "speech"}),
+        WorkerConfig(url="http://worker-b:8102", capabilities={"audio_input"}),
+    ]
+    app = create_app(
+        _router_config(worker_configs=worker_configs),
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            path,
+            files={"file": ("a.wav", b"RIFF....WAVE", "audio/wav")},
+            data={"model": "whisper"},
+        )
+
+    assert response.status_code == 200, response.text
+    assert seen == [("worker-b:8102", path)]
+    workers = client.get("/workers").json()["workers"]
+    by_url = {worker["url"]: worker for worker in workers}
+    assert by_url["http://worker-b:8102"]["routed_requests_by_class"] == {
+        "transcription": 1
     }
 
 
