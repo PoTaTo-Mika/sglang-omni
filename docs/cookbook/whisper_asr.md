@@ -55,6 +55,7 @@ GPU. SeedTTS EN, whisper-large-v3, 200 clips x 3 repeats, CUDA Graph default
 |---|---|---|---|---|
 | A100-SXM-64GB | +1.6% | +0.3% | +2.5% | -13% |
 | RTX 6000D | +0.3% | +1.9% | +1.4% | -1% |
+| RTX A6000 | +1.0% | +4.4% | +4.9% | n/a |
 
 To disable:
 
