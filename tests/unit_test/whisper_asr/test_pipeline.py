@@ -45,7 +45,6 @@ def test_whisper_stage_defaults() -> None:
     assert signature.parameters["encoder_graph_batch_buckets"].default is None
     assert signature.parameters["enable_encoder_torch_compile"].default is False
     assert signature.parameters["encoder_torch_compile_mode"].default is None
-    assert signature.parameters["request_build_max_workers"].default == 2
     assert signature.parameters["request_build_max_workers"].default == 8
     assert signature.parameters["enable_async_decode"].default is True
     assert signature.parameters["async_decode_min_batch_size"].default == 2
@@ -283,7 +282,6 @@ def test_whisper_asr_config_uses_single_batched_stage() -> None:
     assert config.stages[0].factory_args["max_running_requests"] == 32
     assert config.stages[0].factory_args["enable_encoder_cuda_graph"] is True
     assert config.stages[0].factory_args["enable_encoder_torch_compile"] is True
-    assert config.stages[0].factory_args["request_build_max_workers"] == 2
     assert config.stages[0].factory_args["request_build_max_workers"] == 8
     assert config.stages[0].factory_args["enable_async_decode"] is True
     assert config.stages[0].factory_args["async_decode_min_batch_size"] == 2
