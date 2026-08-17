@@ -79,6 +79,21 @@ sgl-omni serve \
   --port 8000
 ```
 
+### Deterministic Inference
+
+Dynamic batching can change Qwen3-TTS codec and waveform outputs even when the
+prompt, reference audio, and seed are unchanged. Both the 0.6B and 1.7B Base
+checkpoints provide an opt-in deterministic mode:
+
+```yaml
+enable_deterministic_inference: true
+```
+
+When enabled, the same prompt, reference audio, and seed produce byte-identical
+PCM across runtime batch sizes. This mode reduces throughput because it
+serializes reference preprocessing and vocoder decoding and disables Talker
+compilation and the initial vocoder CUDA Graph, so it is disabled by default.
+
 ### Overload / admission policy
 
 Two SGLang generation-stage knobs bound how the server behaves past saturation:

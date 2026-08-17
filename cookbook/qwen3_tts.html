@@ -490,6 +490,7 @@
                 <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#prerequisites">Prerequisites</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#server-configuration">Server Configuration</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#deterministic-inference">Deterministic Inference</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#overload-admission-policy">Overload / admission policy</a></li>
 </ul>
 </li>
@@ -586,6 +587,19 @@ sgl-omni<span class="w"> </span>serve<span class="w"> </span><span class="se">\<
 <span class="w">  </span>--port<span class="w"> </span><span class="m">8000</span>
 </pre></div>
 </div>
+<section id="deterministic-inference">
+<h3>Deterministic Inference<a class="headerlink" href="#deterministic-inference" title="Link to this heading">#</a></h3>
+<p>Dynamic batching can change Qwen3-TTS codec and waveform outputs even when the
+prompt, reference audio, and seed are unchanged. Both the 0.6B and 1.7B Base
+checkpoints provide an opt-in deterministic mode:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">enable_deterministic_inference</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+</pre></div>
+</div>
+<p>When enabled, the same prompt, reference audio, and seed produce byte-identical
+PCM across runtime batch sizes. This mode reduces throughput because it
+serializes reference preprocessing and vocoder decoding and disables Talker
+compilation and the initial vocoder CUDA Graph, so it is disabled by default.</p>
+</section>
 <section id="overload-admission-policy">
 <h3>Overload / admission policy<a class="headerlink" href="#overload-admission-policy" title="Link to this heading">#</a></h3>
 <p>Two SGLang generation-stage knobs bound how the server behaves past saturation:</p>
@@ -959,6 +973,7 @@ checkpoint is less prone.</p></li>
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#prerequisites">Prerequisites</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#server-configuration">Server Configuration</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#deterministic-inference">Deterministic Inference</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#overload-admission-policy">Overload / admission policy</a></li>
 </ul>
 </li>
