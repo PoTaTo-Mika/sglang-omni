@@ -15,6 +15,7 @@ _BAD_REQUEST_MARKERS = (
     "sequence exceeds max_length",
     "multimodal_train_inputs",
     "disallowed special token",
+    "does not support media inputs yet",
 )
 
 

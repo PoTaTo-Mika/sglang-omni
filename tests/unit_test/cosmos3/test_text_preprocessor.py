@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 import torch
 
+from sglang_omni.client.client import _extract_inputs
 from sglang_omni.models.cosmos3.components import text_preprocessor
 from sglang_omni.models.cosmos3.components.text_preprocessor import (
     Cosmos3TextPreprocessor,
@@ -14,6 +15,9 @@ from sglang_omni.models.cosmos3.components.text_preprocessor import (
 )
 from sglang_omni.models.cosmos3.payload_types import Cosmos3PipelineState
 from sglang_omni.proto import OmniRequest, StagePayload
+from sglang_omni.serve.openai_api import _build_chat_generate_request
+from sglang_omni.serve.openai_errors import is_bad_request_error
+from sglang_omni.serve.protocol import ChatCompletionRequest
 
 
 class _FakeTokenizer:
@@ -114,6 +118,35 @@ def test_preprocesses_text_messages_into_canonical_state() -> None:
     assert state.stream_state == {"token_ids": [], "text": ""}
 
 
+def test_flattens_openai_text_content_parts() -> None:
+    tokenizer = _FakeTokenizer()
+    preprocessor = Cosmos3TextPreprocessor(
+        "unused-model",
+        max_seq_len=32,
+        tokenizer=tokenizer,
+    )
+    payload = _payload(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "hel"},
+                    "lo",
+                    {"text": " world"},
+                ],
+            }
+        ],
+        max_new_tokens=8,
+    )
+
+    result = preprocessor(payload)
+    state = Cosmos3PipelineState.from_dict(result.data)
+
+    assert tokenizer.messages == [{"role": "user", "content": "hello world"}]
+    assert state.prompt is not None
+    assert state.prompt["input_ids"].tolist() == [101, 102, 103]
+
+
 def test_pretokenized_prompt_bypasses_chat_template() -> None:
     tokenizer = _FakeTokenizer()
     preprocessor = Cosmos3TextPreprocessor(
@@ -141,7 +174,15 @@ def test_pretokenized_prompt_bypasses_chat_template() -> None:
         ),
         (
             [{"role": "user", "content": [{"type": "image"}]}],
-            "content must be a string",
+            "does not support media inputs yet",
+        ),
+        (
+            [{"role": "user", "content": [{"type": "text", "text": 7}]}],
+            "text part must have a string text field",
+        ),
+        (
+            [{"role": "user", "content": None}],
+            "content must be a string or a list of text parts",
         ),
         ({"prompt": "hello"}, "expects a messages field"),
     ],
@@ -154,6 +195,59 @@ def test_rejects_inputs_outside_pr1_text_scope(inputs: Any, expected: str) -> No
 
     with pytest.raises((TypeError, ValueError), match=expected):
         preprocessor(_payload(inputs, max_new_tokens=2))
+
+
+def test_openai_structured_text_content_reaches_inference() -> None:
+    req = ChatCompletionRequest(
+        model="nvidia/Cosmos3-Nano",
+        messages=[
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "hel"}, {"text": "lo"}],
+            }
+        ],
+    )
+    inputs = _extract_inputs(_build_chat_generate_request(req))
+    tokenizer = _FakeTokenizer()
+    preprocessor = Cosmos3TextPreprocessor("unused-model", tokenizer=tokenizer)
+
+    result = preprocessor(_payload(inputs, max_new_tokens=2))
+    state = Cosmos3PipelineState.from_dict(result.data)
+
+    assert tokenizer.messages == [{"role": "user", "content": "hello"}]
+    assert state.prompt is not None
+    assert state.prompt["input_ids"].tolist() == [101, 102, 103]
+
+
+def test_openai_media_content_part_maps_to_bad_request() -> None:
+    req = ChatCompletionRequest(
+        model="nvidia/Cosmos3-Nano",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe this"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,abc"},
+                    },
+                ],
+            }
+        ],
+    )
+    inputs = _extract_inputs(_build_chat_generate_request(req))
+    preprocessor = Cosmos3TextPreprocessor(
+        "unused-model",
+        tokenizer=_FakeTokenizer(),
+    )
+
+    with pytest.raises(
+        ValueError, match="does not support media inputs yet"
+    ) as exc_info:
+        preprocessor(_payload(inputs, max_new_tokens=2))
+
+    assert is_bad_request_error(exc_info.value)
+    assert "base64" not in str(exc_info.value)
 
 
 def test_rejects_media_from_openai_request_metadata() -> None:

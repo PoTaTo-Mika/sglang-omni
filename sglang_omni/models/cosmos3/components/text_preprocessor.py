@@ -65,10 +65,29 @@ def _normalize_text_messages(inputs: Any) -> list[dict[str, str]]:
         content = message.get("content")
         if not isinstance(role, str) or not role:
             raise ValueError(f"Message {index} must have a non-empty string role")
+        if isinstance(content, list):
+            text_parts: list[str] = []
+            for part in content:
+                if isinstance(part, str):
+                    text_parts.append(part)
+                elif isinstance(part, dict) and part.get("type", "text") == "text":
+                    text = part.get("text")
+                    if not isinstance(text, str):
+                        raise ValueError(
+                            f"Message {index} text part must have a string text field"
+                        )
+                    text_parts.append(text)
+                else:
+                    raise ValueError(
+                        "Cosmos3 text preprocessing does not support media inputs "
+                        f"yet: message {index} content part "
+                        f"{part.get('type') if isinstance(part, dict) else part!r}"
+                    )
+            content = "".join(text_parts)
         if not isinstance(content, str):
             raise TypeError(
-                f"Message {index} content must be a string; multimodal content "
-                "will be added in a later Cosmos3 stage"
+                f"Message {index} content must be a string or a list of text "
+                "parts; multimodal content will be added in a later Cosmos3 stage"
             )
         messages.append({"role": role, "content": content})
     return messages
