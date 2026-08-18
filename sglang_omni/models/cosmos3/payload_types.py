@@ -23,6 +23,7 @@ class TextOutput(TypedDict):
     output_ids: list[int]
     is_final: bool
     finish_reason: NotRequired[str | None]
+    matched_stop: NotRequired[int | str | None]
     output_token_logprobs: NotRequired[list[Any]]
     weight_version: NotRequired[str | None]
 

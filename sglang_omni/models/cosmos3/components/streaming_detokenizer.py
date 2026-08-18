@@ -31,6 +31,24 @@ _STATE_MAX = 10000
 _STATE_ORPHAN_IDLE_S = 300.0
 
 
+def _trim_matched_stop_ids(
+    output_ids: list[int], matched_stop: int | str | None
+) -> list[int]:
+    """Drop a matched stop token id, mirroring SGLang's detokenizer trim."""
+    if isinstance(matched_stop, int) and output_ids and output_ids[-1] == matched_stop:
+        return output_ids[:-1]
+    return output_ids
+
+
+def _trim_matched_stop_text(text: str, matched_stop: int | str | None) -> str:
+    """Truncate at a matched stop string, mirroring SGLang's detokenizer trim."""
+    if isinstance(matched_stop, str):
+        pos = text.find(matched_stop)
+        if pos != -1:
+            return text[:pos]
+    return text
+
+
 @dataclass
 class _RequestState:
     pending_tokens: list[int] = field(default_factory=list)
@@ -192,10 +210,13 @@ class Cosmos3StreamingDetokenizer:
             if state is None or state.payload is None:
                 return
             if state.pending_tokens:
+                text_out = (state.payload.data or {}).get("text_out") or {}
+                matched_stop = text_out.get("matched_stop")
                 trailing_text = self._tokenizer.decode(
-                    state.pending_tokens,
+                    _trim_matched_stop_ids(state.pending_tokens, matched_stop),
                     skip_special_tokens=True,
                 )
+                trailing_text = _trim_matched_stop_text(trailing_text, matched_stop)
                 if trailing_text:
                     self._emit_text(request_id, trailing_text)
 
@@ -224,12 +245,14 @@ class Cosmos3StreamingDetokenizer:
         text_out = cast(TextOutput, state.text_out)
 
         output_ids = text_out["output_ids"]
+        matched_stop = text_out.get("matched_stop")
         result: dict[str, Any] = {"modality": "text"}
         if not is_streaming:
-            result["text"] = self._tokenizer.decode(
-                output_ids,
+            text = self._tokenizer.decode(
+                _trim_matched_stop_ids(output_ids, matched_stop),
                 skip_special_tokens=True,
             )
+            result["text"] = _trim_matched_stop_text(text, matched_stop)
 
         for key in ("finish_reason", "output_token_logprobs", "weight_version"):
             if text_out.get(key) is not None:

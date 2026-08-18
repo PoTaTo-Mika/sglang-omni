@@ -19,25 +19,39 @@ from sglang_omni.scheduling.messages import OutgoingMessage
 
 
 class _FakeTokenizer:
-    pieces: ClassVar[dict[int, str]] = {1: "hello", 2: " ", 3: "world"}
+    pieces: ClassVar[dict[int, str]] = {
+        1: "hello",
+        2: " ",
+        3: "world",
+        5: "hi###�",
+        6: "�",
+    }
 
     def decode(self, token_ids, skip_special_tokens: bool = True) -> str:
         del skip_special_tokens
         return "".join(self.pieces.get(int(token_id), "") for token_id in token_ids)
 
 
-def _payload(*, stream: bool, request_id: str = "decode-request") -> StagePayload:
+def _payload(
+    *,
+    stream: bool,
+    request_id: str = "decode-request",
+    matched_stop: int | str | None = None,
+) -> StagePayload:
+    text_out: dict[str, Any] = {
+        "output_ids": [1, 2, 3],
+        "finish_reason": "stop",
+        "is_final": True,
+    }
+    if matched_stop is not None:
+        text_out["matched_stop"] = matched_stop
     state = Cosmos3PipelineState(
         prompt={
             "input_ids": torch.tensor([8, 9]),
             "attention_mask": torch.ones(2, dtype=torch.long),
             "prompt_text": "prompt",
         },
-        text_out={
-            "output_ids": [1, 2, 3],
-            "finish_reason": "stop",
-            "is_final": True,
-        },
+        text_out=text_out,
     )
     return StagePayload(
         request_id=request_id,
@@ -76,6 +90,65 @@ def test_non_streaming_payload_decodes_complete_text() -> None:
             "total_tokens": 5,
         },
     }
+
+
+def test_non_streaming_trims_matched_stop_string() -> None:
+    scheduler = Cosmos3StreamingDetokenizer(_FakeTokenizer())
+
+    scheduler._on_new_request(
+        "decode-request",
+        _payload(stream=False, matched_stop="world"),
+    )
+    message = scheduler.outbox.get_nowait()
+
+    assert message.data.data["text"] == "hello "
+    assert message.data.data["usage"]["completion_tokens"] == 3
+
+
+def test_non_streaming_trims_matched_stop_token_id() -> None:
+    scheduler = Cosmos3StreamingDetokenizer(_FakeTokenizer())
+
+    scheduler._on_new_request(
+        "decode-request",
+        _payload(stream=False, matched_stop=3),
+    )
+    message = scheduler.outbox.get_nowait()
+
+    assert message.data.data["text"] == "hello "
+    assert message.data.data["usage"]["completion_tokens"] == 3
+
+
+def test_streaming_terminal_flush_trims_matched_stop_string() -> None:
+    scheduler = Cosmos3StreamingDetokenizer(_FakeTokenizer())
+
+    scheduler._on_stream_chunk("decode-request", _stream_item(5))
+    assert scheduler.outbox.empty()
+
+    scheduler._on_new_request(
+        "decode-request",
+        _payload(stream=True, matched_stop="###"),
+    )
+    scheduler._on_stream_done("decode-request")
+
+    messages = _drain_outbox(scheduler)
+    assert [message.type for message in messages] == ["stream", "result"]
+    assert messages[0].data["text"] == "hi"
+
+
+def test_streaming_terminal_flush_drops_matched_stop_token_id() -> None:
+    scheduler = Cosmos3StreamingDetokenizer(_FakeTokenizer())
+
+    scheduler._on_stream_chunk("decode-request", _stream_item(6))
+    assert scheduler.outbox.empty()
+
+    scheduler._on_new_request(
+        "decode-request",
+        _payload(stream=True, matched_stop=6),
+    )
+    scheduler._on_stream_done("decode-request")
+
+    messages = _drain_outbox(scheduler)
+    assert [message.type for message in messages] == ["result"]
 
 
 def test_streaming_tokens_emit_deltas_and_slim_terminal_result() -> None:

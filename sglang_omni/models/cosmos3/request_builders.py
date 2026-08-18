@@ -192,6 +192,9 @@ def apply_text_result(
     finish_reason = result.finish_reason
     if finish_reason is not None:
         text_out["finish_reason"] = finish_reason
+    matched_stop = result.matched_stop
+    if matched_stop is not None:
+        text_out["matched_stop"] = matched_stop
     output_token_logprobs = result.output_token_logprobs
     if output_token_logprobs:
         text_out["output_token_logprobs"] = output_token_logprobs
@@ -260,6 +263,11 @@ def make_text_stream_output_builder(*, decode_stage: str = DECODE_STAGE):
         if not bool(payload.request.params.get("stream", False)):
             return []
         token_id = int(req_output.data)
+        # Stop token ids end generation at this token; upstream SGLang trims
+        # them from output text, so never forward them to the detokenizer.
+        stop_token_ids = req.sampling_params.stop_token_ids
+        if stop_token_ids and token_id in stop_token_ids:
+            return []
         return [
             OutgoingMessage(
                 request_id=request_id,

@@ -1644,11 +1644,11 @@ class OmniScheduler:
                 data.output_ids = list(req.output_ids)
                 data.weight_version = self.server_args.weight_version
                 finished_reason = req.finished_reason
-                data.finish_reason = (
-                    finished_reason.to_json().get("type")
-                    if finished_reason is not None
-                    else None
+                finished_reason_json = (
+                    finished_reason.to_json() if finished_reason is not None else {}
                 )
+                data.finish_reason = finished_reason_json.get("type")
+                data.matched_stop = finished_reason_json.get("matched")
                 self._flush_stream_output(rid, data)
                 result = self._result_adapter(data)
             except Exception as exc:

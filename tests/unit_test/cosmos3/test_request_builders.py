@@ -239,7 +239,10 @@ def test_stream_builder_emits_only_for_streaming_requests() -> None:
         data={},
     )
     req_data = SimpleNamespace(
-        req=SimpleNamespace(inflight_middle_chunks=0),
+        req=SimpleNamespace(
+            inflight_middle_chunks=0,
+            sampling_params=SimpleNamespace(stop_token_ids=None),
+        ),
         stage_payload=payload,
     )
 
@@ -257,17 +260,41 @@ def test_stream_builder_emits_only_for_streaming_requests() -> None:
     assert builder("stream-request", req_data, SimpleNamespace(data=43)) == []
 
 
+def test_stream_builder_filters_stop_token_ids() -> None:
+    builder = make_text_stream_output_builder()
+    payload = StagePayload(
+        request_id="stream-request",
+        request=OmniRequest(inputs=None, params={"stream": True}),
+        data={},
+    )
+    req_data = SimpleNamespace(
+        req=SimpleNamespace(
+            inflight_middle_chunks=0,
+            sampling_params=SimpleNamespace(stop_token_ids={7}),
+        ),
+        stage_payload=payload,
+    )
+
+    assert builder("stream-request", req_data, SimpleNamespace(data=7)) == []
+
+    messages = builder("stream-request", req_data, SimpleNamespace(data=42))
+    assert len(messages) == 1
+    assert messages[0].data.tolist() == [42]
+
+
 def test_apply_text_result_preserves_optional_metadata() -> None:
     state = Cosmos3PipelineState()
     result: Any = SimpleNamespace(
         output_ids=[4],
-        finish_reason="length",
+        finish_reason="stop",
+        matched_stop="###",
         output_token_logprobs=[-0.5],
         weight_version="v1",
     )
 
     output = apply_text_result(state, stage_name="thinker", result=result)
 
-    assert output["finish_reason"] == "length"
+    assert output["finish_reason"] == "stop"
+    assert output["matched_stop"] == "###"
     assert output["output_token_logprobs"] == [-0.5]
     assert output["weight_version"] == "v1"
