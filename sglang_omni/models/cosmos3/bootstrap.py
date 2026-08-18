@@ -13,7 +13,10 @@ def _has_transformer_weights(path: Path | None) -> bool:
     return path is not None and path.is_dir() and any(path.glob("*.safetensors"))
 
 
-def resolve_transformer_weights_path(model_path: str) -> str:
+def resolve_transformer_weights_path(
+    model_path: str,
+    revision: str | None = None,
+) -> str:
     """Resolve the unified checkpoint's nested transformer component."""
 
     local_path = Path(model_path)
@@ -27,6 +30,7 @@ def resolve_transformer_weights_path(model_path: str) -> str:
         try:
             snapshot_path = snapshot_download(
                 model_path,
+                revision=revision,
                 allow_patterns=allow_patterns,
                 local_files_only=True,
             )
@@ -38,6 +42,7 @@ def resolve_transformer_weights_path(model_path: str) -> str:
         if not _has_transformer_weights(transformer_path):
             snapshot_path = snapshot_download(
                 model_path,
+                revision=revision,
                 allow_patterns=allow_patterns,
             )
             transformer_path = Path(snapshot_path) / "transformer"
@@ -86,7 +91,10 @@ def create_thinker_scheduler(
         tp_rank=tp_rank,
         nccl_port=nccl_port,
         model_arch_override="Cosmos3TextForCausalLM",
-        model_weights_path=resolve_transformer_weights_path(server_args.model_path),
+        model_weights_path=resolve_transformer_weights_path(
+            server_args.model_path,
+            revision=server_args.revision,
+        ),
         total_gpu_memory_fraction=total_gpu_memory_fraction,
     )
 
@@ -95,6 +103,7 @@ def create_thinker_scheduler(
     tokenizer = get_tokenizer(
         server_args.model_path,
         trust_remote_code=True,
+        tokenizer_revision=server_args.revision,
     )
     request_builder, result_adapter = make_text_scheduler_adapters(
         tokenizer=tokenizer,

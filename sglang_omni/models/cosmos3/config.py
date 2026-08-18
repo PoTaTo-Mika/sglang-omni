@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from pydantic import Field
 
@@ -60,7 +60,15 @@ class Cosmos3TextPipelineConfig(PipelineConfig):
         return {THINKER_STAGE: THINKER_STAGE}
 
     model_path: str
+    revision: str | None = None
     stages: list[StageConfig] = Field(default_factory=_text_stages)
+
+    def model_post_init(self, __context: Any = None, /) -> None:
+        super().model_post_init(__context)
+        if self.revision is None:
+            return
+        for stage in self.stages:
+            stage.factory_args["revision"] = self.revision
 
 
 EntryClass = Cosmos3TextPipelineConfig

@@ -10,22 +10,27 @@ from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 
 def test_preprocessing_factory_returns_simple_scheduler(monkeypatch) -> None:
     sentinel = object()
-    calls: list[tuple[str, int | None]] = []
+    calls: list[tuple[str, int | None, str | None]] = []
 
-    def fake_preprocessor(model_path: str, max_seq_len: int | None):
-        calls.append((model_path, max_seq_len))
+    def fake_preprocessor(
+        model_path: str,
+        max_seq_len: int | None,
+        revision: str | None,
+    ):
+        calls.append((model_path, max_seq_len, revision))
         return sentinel
 
     monkeypatch.setattr(stages, "Cosmos3TextPreprocessor", fake_preprocessor)
 
     scheduler = stages.create_preprocessing_executor(
         "nvidia/Cosmos3-Nano",
+        revision="cosmos-revision",
         thinker_max_seq_len=8192,
     )
 
     assert isinstance(scheduler, SimpleScheduler)
     assert scheduler._fn is sentinel
-    assert calls == [("nvidia/Cosmos3-Nano", 8192)]
+    assert calls == [("nvidia/Cosmos3-Nano", 8192, "cosmos-revision")]
 
 
 def test_text_factory_passes_through_tensor_parallelism(
@@ -64,6 +69,7 @@ def test_text_factory_passes_through_tensor_parallelism(
         gpu_id=2,
         tp_rank=1,
         tp_size=2,
+        revision="cosmos-revision",
         server_args_overrides={"max_running_requests": 8},
     )
 
@@ -77,6 +83,7 @@ def test_text_factory_passes_through_tensor_parallelism(
         "cuda_graph_bs": [1, 2, 4, 8],
         "disable_cuda_graph": False,
         "sampling_backend": "pytorch",
+        "revision": "cosmos-revision",
         "tp_size": 2,
     }
     assert captured["validation_kwargs"] == {

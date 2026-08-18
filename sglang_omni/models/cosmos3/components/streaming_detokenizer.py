@@ -248,10 +248,11 @@ class Cosmos3StreamingDetokenizer:
 def create_streaming_detokenize_scheduler(
     model_path: str,
     *,
+    revision: str | None = None,
     stage_name: str = "decode",
 ) -> Cosmos3StreamingDetokenizer:
     return Cosmos3StreamingDetokenizer(
-        tokenizer=load_cosmos3_tokenizer(model_path),
+        tokenizer=load_cosmos3_tokenizer(model_path, revision=revision),
         stage_name=stage_name,
     )
 

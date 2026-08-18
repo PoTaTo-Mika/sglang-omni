@@ -30,33 +30,40 @@ def test_remote_resolution_refetches_incomplete_local_snapshot(
     transformer_path = complete_snapshot / "transformer"
     transformer_path.mkdir(parents=True)
     (transformer_path / "model.safetensors").touch()
-    local_only_calls: list[bool] = []
+    calls: list[tuple[bool, str | None]] = []
 
     def fake_snapshot_download(model_path, **kwargs):
         del model_path
         local_only = bool(kwargs.get("local_files_only"))
-        local_only_calls.append(local_only)
+        calls.append((local_only, kwargs.get("revision")))
         return str(partial_snapshot if local_only else complete_snapshot)
 
     monkeypatch.setattr(bootstrap, "snapshot_download", fake_snapshot_download)
 
-    assert resolve_transformer_weights_path("nvidia/Cosmos3-Nano") == str(
-        transformer_path
-    )
-    assert local_only_calls == [True, False]
+    assert resolve_transformer_weights_path(
+        "nvidia/Cosmos3-Nano",
+        revision="cosmos-revision",
+    ) == str(transformer_path)
+    assert calls == [
+        (True, "cosmos-revision"),
+        (False, "cosmos-revision"),
+    ]
 
 
 def test_thinker_loads_tokenizer_from_checkpoint_root(monkeypatch, tmp_path) -> None:
     transformer_path = tmp_path / "transformer"
     transformer_path.mkdir()
     (transformer_path / "model.safetensors").touch()
-    server_args = SimpleNamespace(model_path=str(tmp_path))
+    server_args = SimpleNamespace(
+        model_path=str(tmp_path),
+        revision="cosmos-revision",
+    )
     model_config = SimpleNamespace(
         model_path=str(transformer_path),
         vocab_size=10,
         hf_generation_config=SimpleNamespace(),
     )
-    tokenizer_paths: list[str] = []
+    tokenizer_calls: list[tuple[str, str | None]] = []
 
     monkeypatch.setattr(
         scheduling_bootstrap,
@@ -74,7 +81,9 @@ def test_thinker_loads_tokenizer_from_checkpoint_root(monkeypatch, tmp_path) -> 
     monkeypatch.setattr(
         hf_transformers_utils,
         "get_tokenizer",
-        lambda path, **kwargs: tokenizer_paths.append(path) or object(),
+        lambda path, **kwargs: (
+            tokenizer_calls.append((path, kwargs.get("tokenizer_revision"))) or object()
+        ),
     )
     monkeypatch.setattr(model_runner_base, "ModelRunner", lambda *args: object())
     monkeypatch.setattr(
@@ -96,4 +105,4 @@ def test_thinker_loads_tokenizer_from_checkpoint_root(monkeypatch, tmp_path) -> 
 
     bootstrap.create_thinker_scheduler(server_args)
 
-    assert tokenizer_paths == [str(tmp_path)]
+    assert tokenizer_calls == [(str(tmp_path), "cosmos-revision")]

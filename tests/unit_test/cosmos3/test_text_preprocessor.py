@@ -7,8 +7,10 @@ from typing import Any
 import pytest
 import torch
 
+from sglang_omni.models.cosmos3.components import text_preprocessor
 from sglang_omni.models.cosmos3.components.text_preprocessor import (
     Cosmos3TextPreprocessor,
+    load_cosmos3_tokenizer,
 )
 from sglang_omni.models.cosmos3.payload_types import Cosmos3PipelineState
 from sglang_omni.proto import OmniRequest, StagePayload
@@ -56,6 +58,34 @@ def _payload(inputs: Any, **params: Any) -> StagePayload:
         request=OmniRequest(inputs=inputs, params=params),
         data={},
     )
+
+
+def test_tokenizer_loader_pins_local_and_remote_attempts(monkeypatch) -> None:
+    tokenizer = object()
+    calls: list[dict[str, object]] = []
+
+    def fake_from_pretrained(model_path: str, **kwargs: object):
+        assert model_path == "nvidia/Cosmos3-Nano"
+        calls.append(kwargs)
+        if kwargs["local_files_only"]:
+            raise OSError("revision is not cached")
+        return tokenizer
+
+    monkeypatch.setattr(
+        text_preprocessor.AutoTokenizer,
+        "from_pretrained",
+        fake_from_pretrained,
+    )
+
+    assert (
+        load_cosmos3_tokenizer(
+            "nvidia/Cosmos3-Nano",
+            revision="cosmos-revision",
+        )
+        is tokenizer
+    )
+    assert [call["revision"] for call in calls] == ["cosmos-revision"] * 2
+    assert [call["local_files_only"] for call in calls] == [True, False]
 
 
 def test_preprocesses_text_messages_into_canonical_state() -> None:

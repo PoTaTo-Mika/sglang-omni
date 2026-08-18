@@ -27,3 +27,15 @@ def test_cosmos_architecture_is_discoverable() -> None:
         PIPELINE_CONFIG_REGISTRY.get_config("Cosmos3ForConditionalGeneration")
         is Cosmos3TextPipelineConfig
     )
+
+
+def test_model_revision_is_shared_by_every_stage() -> None:
+    config = Cosmos3TextPipelineConfig(
+        model_path="nvidia/Cosmos3-Nano",
+        revision="cosmos-revision",
+    )
+
+    assert config.revision == "cosmos-revision"
+    assert all(
+        stage.factory_args["revision"] == "cosmos-revision" for stage in config.stages
+    )

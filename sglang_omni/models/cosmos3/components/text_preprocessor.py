@@ -20,7 +20,10 @@ DEFAULT_MAX_NEW_TOKENS = 2048
 _MEDIA_INPUT_KEYS = ("images", "videos", "audios")
 
 
-def load_cosmos3_tokenizer(model_path: str) -> Any:
+def load_cosmos3_tokenizer(
+    model_path: str,
+    revision: str | None = None,
+) -> Any:
     """Load tokenizer assets without hydrating the checkpoint weights."""
 
     local_only = Path(model_path).exists()
@@ -29,6 +32,7 @@ def load_cosmos3_tokenizer(model_path: str) -> Any:
             return AutoTokenizer.from_pretrained(
                 model_path,
                 trust_remote_code=True,
+                revision=revision,
                 local_files_only=True,
             )
         except (OSError, ValueError):
@@ -36,6 +40,7 @@ def load_cosmos3_tokenizer(model_path: str) -> Any:
     return AutoTokenizer.from_pretrained(
         model_path,
         trust_remote_code=True,
+        revision=revision,
         local_files_only=local_only,
     )
 
@@ -130,14 +135,21 @@ class Cosmos3TextPreprocessor:
         model_path: str,
         max_seq_len: int | None = None,
         *,
+        revision: str | None = None,
         tokenizer: Any | None = None,
     ) -> None:
         self.model_path = model_path
         self.max_seq_len = max_seq_len
         self.tokenizer = (
-            tokenizer if tokenizer is not None else load_cosmos3_tokenizer(model_path)
+            tokenizer
+            if tokenizer is not None
+            else load_cosmos3_tokenizer(model_path, revision=revision)
         )
-        ensure_chat_template(self.tokenizer, model_path=model_path)
+        ensure_chat_template(
+            self.tokenizer,
+            model_path=model_path,
+            revision=revision,
+        )
         if not self.tokenizer.chat_template:
             raise ValueError(
                 f"Tokenizer for {model_path!r} does not define a chat template"
