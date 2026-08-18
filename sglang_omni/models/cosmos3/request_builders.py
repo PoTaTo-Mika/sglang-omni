@@ -101,8 +101,9 @@ def project_preprocessing_to_thinker(payload: StagePayload) -> StagePayload:
     metadata: dict[str, Any] = {}
     vision_inputs = state.encoder_inputs.get(VISION_STAGE)
     if isinstance(vision_inputs, dict):
-        if vision_inputs.get("cache_key") is not None:
-            metadata["cache_key"] = vision_inputs["cache_key"]
+        for key in ("image_cache_key", "video_cache_key"):
+            if vision_inputs.get(key) is not None:
+                metadata[key] = vision_inputs[key]
         if _vision_encoder_is_active(state):
             metadata["_active"] = True
     projected = Cosmos3PipelineState(
@@ -151,14 +152,18 @@ def build_vision_encoder_request(
             model_inputs={},
             skip_result=result if isinstance(result, dict) else {},
         )
-    cache_key = inputs.get("cache_key")
+    cache_parts = [
+        str(inputs[key])
+        for key in ("image_cache_key", "video_cache_key")
+        if inputs.get(key) is not None
+    ]
     return VisionEncoderRequestData(
         model_inputs={
             key: value
             for key, value in inputs.items()
-            if key not in ("cache_key", "_active")
+            if key not in ("image_cache_key", "video_cache_key", "_active")
         },
-        cache_key=str(cache_key) if cache_key is not None else None,
+        cache_key="|".join(cache_parts) or None,
     )
 
 
@@ -381,17 +386,17 @@ def build_sglang_text_request(
     input_ids = original_input_ids
     thinker_inputs = state.thinker_inputs or {}
     model_inputs = dict(thinker_inputs.get("model_inputs", {}))
-    media_cache_key = thinker_inputs.get("media_cache_key")
-    if media_cache_key is not None and thinker_config is not None:
+    if thinker_config is not None:
         token_map: dict[int, int] = {}
         pad_values: dict[str, int] = {}
         for modality, token_id in (
             ("image", thinker_config.image_token_id),
             ("video", thinker_config.video_token_id),
         ):
-            if model_inputs.get(f"{modality}_embeds") is None:
+            cache_key = thinker_inputs.get(f"{modality}_cache_key")
+            if model_inputs.get(f"{modality}_embeds") is None or cache_key is None:
                 continue
-            digest = xxhash.xxh3_64(f"{modality}:{media_cache_key}".encode())
+            digest = xxhash.xxh3_64(f"{modality}:{cache_key}".encode())
             pad_value = vocab_size + digest.intdigest() % (1 << 62)
             pad_values[modality] = pad_value
             token_map[int(token_id)] = pad_value

@@ -27,7 +27,7 @@ def test_merge_builds_thinker_inputs_without_duplicate_encoder_payload() -> None
     preprocessing = Cosmos3PipelineState(
         prompt=prompt,
         mm_inputs={"image_grid_thw": torch.tensor([[1, 2, 2]])},
-        encoder_inputs={"vision_encoder": {"cache_key": "key", "_active": True}},
+        encoder_inputs={"vision_encoder": {"image_cache_key": "key", "_active": True}},
     )
     embeddings = torch.ones((1, 4))
     deepstack = [torch.full((1, 4), index) for index in range(3)]
@@ -52,6 +52,6 @@ def test_merge_builds_thinker_inputs_without_duplicate_encoder_payload() -> None
 
     assert model_inputs["image_embeds"] is embeddings
     assert model_inputs["deepstack_visual_embeds"] is deepstack
-    assert state.thinker_inputs["media_cache_key"] == "key"
+    assert state.thinker_inputs["image_cache_key"] == "key"
     assert state.encoder_inputs == {}
     assert state.encoder_outs == {}

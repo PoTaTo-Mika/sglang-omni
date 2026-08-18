@@ -68,12 +68,15 @@ class _FakeProcessor:
 
     def __call__(self, **kwargs):
         assert kwargs["images"] == ["loaded-image"]
+        assert kwargs["videos"] == ["loaded-video"]
         return {
-            "input_ids": torch.tensor([[10, 151655, 11]]),
-            "attention_mask": torch.ones((1, 3), dtype=torch.long),
-            "mm_token_type_ids": torch.tensor([[0, 1, 0]]),
+            "input_ids": torch.tensor([[10, 151655, 151656, 11]]),
+            "attention_mask": torch.ones((1, 4), dtype=torch.long),
+            "mm_token_type_ids": torch.tensor([[0, 1, 2, 0]]),
             "pixel_values": torch.ones((4, 6)),
             "image_grid_thw": torch.tensor([[1, 2, 2]]),
+            "pixel_values_videos": torch.ones((4, 6)),
+            "video_grid_thw": torch.tensor([[1, 2, 2]]),
         }
 
 
@@ -191,21 +194,26 @@ async def test_pretokenized_prompt_bypasses_chat_template() -> None:
 
 
 @pytest.mark.asyncio
-async def test_preprocesses_image_for_standalone_encoder(monkeypatch) -> None:
+async def test_preprocesses_media_with_independent_cache_keys(monkeypatch) -> None:
     async def fake_images(value):
         assert value == ["image.png"]
         return ["loaded-image"]
 
     async def fake_videos(value, **kwargs):
-        assert value is None
-        return [], None, None
+        assert value == ["video.mp4"]
+        return ["loaded-video"], [24.0], None
 
     monkeypatch.setattr(text_preprocessor, "ensure_image_list_async", fake_images)
     monkeypatch.setattr(text_preprocessor, "ensure_video_list_async", fake_videos)
     monkeypatch.setattr(
         text_preprocessor,
         "compute_image_cache_key",
-        lambda value: "image-cache",
+        lambda value: None,
+    )
+    monkeypatch.setattr(
+        text_preprocessor,
+        "compute_video_cache_key",
+        lambda value: "video-cache",
     )
     tokenizer = _FakeTokenizer()
     processor = _FakeProcessor(tokenizer)
@@ -220,15 +228,18 @@ async def test_preprocesses_image_for_standalone_encoder(monkeypatch) -> None:
             {
                 "messages": [{"role": "user", "content": "describe"}],
                 "images": ["image.png"],
+                "videos": ["video.mp4"],
             },
             max_new_tokens=2,
         )
     )
     state = Cosmos3PipelineState.from_dict(result.data)
 
-    assert state.prompt["mm_token_type_ids"].tolist() == [0, 1, 0]
-    assert state.encoder_inputs["vision_encoder"]["cache_key"] == "image-cache"
-    assert state.encoder_inputs["vision_encoder"]["pixel_values"].shape == (4, 6)
+    assert state.prompt["mm_token_type_ids"].tolist() == [0, 1, 2, 0]
+    vision_inputs = state.encoder_inputs["vision_encoder"]
+    assert vision_inputs["image_cache_key"].startswith("image:request:")
+    assert vision_inputs["video_cache_key"].startswith("video-cache|")
+    assert vision_inputs["pixel_values"].shape == (4, 6)
     assert processor.messages[0]["content"][0] == {"type": "image"}
 
 

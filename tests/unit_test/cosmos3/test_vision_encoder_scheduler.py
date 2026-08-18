@@ -39,7 +39,7 @@ def _vision_payload(request_id: str, cache_key: str) -> StagePayload:
             "vision_encoder": {
                 "pixel_values": torch.ones((4, 6)),
                 "image_grid_thw": torch.tensor([[1, 2, 2]]),
-                "cache_key": cache_key,
+                "image_cache_key": cache_key,
             }
         }
     )

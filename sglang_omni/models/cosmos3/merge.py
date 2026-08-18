@@ -44,9 +44,10 @@ def build_thinker_inputs(
             model_inputs[key] = value.to(dtype=torch.long)
 
     result: dict[str, Any] = {"model_inputs": model_inputs}
-    cache_key = (state.encoder_inputs.get(VISION_STAGE) or {}).get("cache_key")
-    if cache_key is not None:
-        result["media_cache_key"] = str(cache_key)
+    encoder_inputs = state.encoder_inputs.get(VISION_STAGE) or {}
+    for key in ("image_cache_key", "video_cache_key"):
+        if encoder_inputs.get(key) is not None:
+            result[key] = str(encoder_inputs[key])
     return result
 
 

@@ -7,6 +7,7 @@ import asyncio
 import logging
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import torch
 from transformers import AutoProcessor, AutoTokenizer
@@ -257,7 +258,7 @@ class Cosmos3TextPreprocessor:
     async def _tokenize_multimodal(
         self,
         inputs: dict[str, Any],
-    ) -> tuple[dict[str, torch.Tensor], str, str | None]:
+    ) -> tuple[dict[str, torch.Tensor], str, str | None, str | None]:
         if self.processor is None:
             raise ValueError("Cosmos3 media inputs require the checkpoint processor")
 
@@ -344,8 +345,13 @@ class Cosmos3TextPreprocessor:
                     f"total_pixels={video_total_pixels}",
                 )
             )
-        cache_parts = [part for part in (image_cache_key, video_cache_key) if part]
-        return dict(encoded), prompt_text, "|".join(cache_parts) or None
+
+        request_cache_id = uuid4().hex
+        if images and image_cache_key is None:
+            image_cache_key = f"image:request:{request_cache_id}"
+        if videos and video_cache_key is None:
+            video_cache_key = f"video:request:{request_cache_id}"
+        return dict(encoded), prompt_text, image_cache_key, video_cache_key
 
     @staticmethod
     def _use_pretokenized_inputs(inputs: Any) -> bool:
@@ -392,9 +398,12 @@ class Cosmos3TextPreprocessor:
                     raise ValueError(
                         "Cosmos3 text-only pipeline does not accept image/video input"
                     )
-                encoded, prompt_text, cache_key = await self._tokenize_multimodal(
-                    inputs
-                )
+                (
+                    encoded,
+                    prompt_text,
+                    image_cache_key,
+                    video_cache_key,
+                ) = await self._tokenize_multimodal(inputs)
                 input_ids = _flatten_single_batch(encoded["input_ids"])
                 raw_attention_mask = encoded.get("attention_mask")
                 attention_mask = (
@@ -423,8 +432,10 @@ class Cosmos3TextPreprocessor:
                     )
                     if isinstance(encoded.get(key), torch.Tensor)
                 }
-                if cache_key is not None:
-                    vision_inputs["cache_key"] = cache_key
+                if image_cache_key is not None:
+                    vision_inputs["image_cache_key"] = image_cache_key
+                if video_cache_key is not None:
+                    vision_inputs["video_cache_key"] = video_cache_key
             else:
                 input_ids, attention_mask, prompt_text = self._tokenize_messages(inputs)
                 mm_token_type_ids = torch.zeros_like(input_ids)

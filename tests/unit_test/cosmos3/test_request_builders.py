@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import torch
+import xxhash
 from transformers import GenerationConfig
 
 from sglang_omni.models.cosmos3.payload_types import Cosmos3PipelineState
@@ -13,6 +14,7 @@ from sglang_omni.models.cosmos3.request_builders import (
     apply_text_result,
     build_cosmos3_sampling_kwargs,
     build_sglang_text_request,
+    build_vision_encoder_request,
     compute_cosmos3_mrope_positions,
     make_text_scheduler_adapters,
     make_text_stream_output_builder,
@@ -407,7 +409,10 @@ def test_preprocessing_routes_vision_only_when_media_is_active() -> None:
         "vision_encoder": {
             "pixel_values": torch.ones((4, 6)),
             "image_grid_thw": torch.tensor([[1, 2, 2]]),
-            "cache_key": "image-key",
+            "pixel_values_videos": torch.ones((4, 6)),
+            "video_grid_thw": torch.tensor([[1, 2, 2]]),
+            "image_cache_key": "image-key",
+            "video_cache_key": "video-key",
         }
     }
     payload.data = state.to_dict()
@@ -427,25 +432,33 @@ def test_preprocessing_routes_vision_only_when_media_is_active() -> None:
     thinker_state = Cosmos3PipelineState.from_dict(thinker_payload.data)
     assert "pixel_values" in encoder_state.encoder_inputs["vision_encoder"]
     assert thinker_state.encoder_inputs == {
-        "vision_encoder": {"cache_key": "image-key", "_active": True}
+        "vision_encoder": {
+            "image_cache_key": "image-key",
+            "video_cache_key": "video-key",
+            "_active": True,
+        }
     }
+    encoder_request = build_vision_encoder_request(encoder_state)
+    assert encoder_request.cache_key == "image-key|video-key"
 
 
 def test_builds_multimodal_request_with_precomputed_vision_inputs() -> None:
     state = Cosmos3PipelineState(
         prompt={
-            "input_ids": torch.tensor([10, 151655, 11]),
-            "attention_mask": torch.ones(3, dtype=torch.long),
-            "prompt_text": "image prompt",
-            "mm_token_type_ids": torch.tensor([0, 1, 0]),
+            "input_ids": torch.tensor([10, 151655, 151656, 11]),
+            "attention_mask": torch.ones(4, dtype=torch.long),
+            "prompt_text": "media prompt",
+            "mm_token_type_ids": torch.tensor([0, 1, 2, 0]),
         },
         thinker_inputs={
             "model_inputs": {
                 "image_embeds": torch.ones((1, 4)),
-                "deepstack_visual_embeds": [torch.ones((1, 4)) for _ in range(3)],
+                "video_embeds": torch.ones((1, 4)),
                 "image_grid_thw": torch.tensor([[1, 2, 2]]),
+                "video_grid_thw": torch.tensor([[1, 2, 2]]),
             },
-            "media_cache_key": "image-key",
+            "image_cache_key": "image-key",
+            "video_cache_key": "video-key",
         },
     )
     config = SimpleNamespace(
@@ -463,16 +476,20 @@ def test_builds_multimodal_request_with_precomputed_vision_inputs() -> None:
     )
 
     assert data.req.multimodal_inputs.mrope_positions.tolist() == [
-        [0, 1, 2],
-        [0, 1, 2],
-        [0, 1, 2],
+        [0, 1, 2, 3],
+        [0, 1, 2, 3],
+        [0, 1, 2, 3],
     ]
     assert data.req.omni_model_inputs["image_embeds"].shape == (1, 4)
     assert data.req.origin_input_ids[1] > 151936
-    assert (
-        data.req.omni_model_inputs["pad_values"]["image"]
-        == (data.req.origin_input_ids[1])
-    )
+    for index, (modality, cache_key) in enumerate(
+        (("image", "image-key"), ("video", "video-key")), start=1
+    ):
+        expected = 151936 + xxhash.xxh3_64(
+            f"{modality}:{cache_key}".encode()
+        ).intdigest() % (1 << 62)
+        assert data.req.omni_model_inputs["pad_values"][modality] == expected
+        assert data.req.origin_input_ids[index] == expected
 
 
 def test_decode_projection_drops_prefill_only_vision_tensors() -> None:
