@@ -15,7 +15,6 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
-
 from sglang.srt.models.qwen3_omni_moe import _get_feat_extract_output_lengths
 
 from sglang_omni.models.qwen3_asr.audio_lengths import qwen3_asr_audio_token_lengths
