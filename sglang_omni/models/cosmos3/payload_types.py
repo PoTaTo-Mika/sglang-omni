@@ -4,9 +4,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, NotRequired, TypedDict
+from typing import Any, TypedDict
 
 import torch
+from typing_extensions import NotRequired
 
 
 class PromptInputs(TypedDict):
