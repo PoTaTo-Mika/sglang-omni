@@ -108,10 +108,7 @@ def test_moss_transcribe_diarize_prefill_backend_policy() -> None:
     assert defaults["prefill_cuda_graph_capture_budget"] == 4096
     assert "cuda_graph_bs_prefill" not in defaults
 
-    overrides = build_generation_batch_overrides(
-        context_length=builder.context_length,
-        **defaults,
-    )
+    overrides = build_generation_batch_overrides(**defaults)
     assert overrides["cuda_graph_bs_prefill"] == build_default_prefill_cuda_graph_bs(
         4096
     )

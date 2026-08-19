@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
 from numbers import Integral
 from typing import Any
 
@@ -19,13 +18,6 @@ _MISSING = object()
 # A prefill replay falls back to eager when the padded bucket exceeds this
 # multiple of the real token count.
 _PREFILL_PADDING_FACTOR = 2
-
-
-@dataclass(frozen=True)
-class PrefillBucketAnalysis:
-    bucket_count: int
-    max_bucket: int
-    eager_valleys: tuple[tuple[int, int], ...]
 
 
 def get_decode_cuda_graph_max_bs(server_args: Any) -> Any:
@@ -149,22 +141,6 @@ def resolve_prefill_cuda_graph_buckets(
     overrides["cuda_graph_max_bs_prefill"] = max(resolved_buckets)
 
 
-def analyze_prefill_cuda_graph_buckets(
-    buckets: Iterable[int],
-) -> PrefillBucketAnalysis:
-    normalized = tuple(int(bucket) for bucket in buckets)
-    valleys = []
-    for previous, next_bucket in zip(normalized, normalized[1:]):
-        eager_end = (next_bucket - 1) // _PREFILL_PADDING_FACTOR
-        if eager_end > previous:
-            valleys.append((previous + 1, eager_end))
-    return PrefillBucketAnalysis(
-        bucket_count=len(normalized),
-        max_bucket=max(normalized),
-        eager_valleys=tuple(valleys),
-    )
-
-
 def nested_prefill_overrides(overrides: Mapping[str, Any]) -> Mapping[str, Any]:
     """Extract the prefill section of a nested cuda_graph_config override."""
     config = overrides.get("cuda_graph_config")
@@ -187,9 +163,20 @@ def build_generation_batch_overrides(
     **stage_defaults: Any,
 ) -> dict[str, Any]:
     incoming = dict(server_args_overrides or {})
+    cuda_graph_config = incoming.get("cuda_graph_config")
+    if isinstance(cuda_graph_config, CudaGraphConfig):
+        cuda_graph_config = cuda_graph_config.to_dict()
+    if isinstance(cuda_graph_config, Mapping):
+        cuda_graph_config = dict(cuda_graph_config)
+        prefill_config = cuda_graph_config.get("prefill")
+        if isinstance(prefill_config, Mapping):
+            cuda_graph_config["prefill"] = dict(prefill_config)
+        incoming["cuda_graph_config"] = cuda_graph_config
+
     # note(ratish): the nested form wins in sglang; mirror its prefill
     # fields into the flat keys.
     nested_prefill = nested_prefill_overrides(incoming)
+    nested_prefill_keys = frozenset(nested_prefill)
     for nested_key, flat_key in (
         ("backend", "cuda_graph_backend_prefill"),
         ("bs", "cuda_graph_bs_prefill"),
@@ -253,6 +240,21 @@ def build_generation_batch_overrides(
         context_length=context_length,
         operator_supplied_buckets="cuda_graph_bs_prefill" in incoming,
     )
+
+    # Keep fields supplied through the authoritative nested config aligned
+    # with the resolved flat aliases that SGLang would otherwise overwrite.
+    if isinstance(nested_prefill, dict):
+        for nested_key, flat_key in (
+            ("backend", "cuda_graph_backend_prefill"),
+            ("bs", "cuda_graph_bs_prefill"),
+            ("max_bs", "cuda_graph_max_bs_prefill"),
+        ):
+            if nested_key not in nested_prefill_keys:
+                continue
+            if flat_key in overrides:
+                nested_prefill[nested_key] = overrides[flat_key]
+            else:
+                nested_prefill.pop(nested_key, None)
 
     return overrides
 
@@ -404,13 +406,17 @@ def _validate_prefill_graph_policy(
                 cap_value,
             )
 
-    analysis = analyze_prefill_cuda_graph_buckets(buckets)
-    if analysis.eager_valleys:
+    valleys = []
+    for previous, next_bucket in zip(buckets, buckets[1:]):
+        eager_end = (next_bucket - 1) // _PREFILL_PADDING_FACTOR
+        if eager_end > previous:
+            valleys.append((previous + 1, eager_end))
+    if valleys:
         logger.warning(
             "prefill CUDA graph bucket gaps exceed the %dx padding factor; "
             "prompt lengths inside %s fall back to eager",
             _PREFILL_PADDING_FACTOR,
-            list(analysis.eager_valleys),
+            valleys,
         )
 
 
