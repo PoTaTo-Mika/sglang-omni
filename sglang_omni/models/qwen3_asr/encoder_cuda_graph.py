@@ -4,7 +4,9 @@
 Fun-ASR graphs a padded (batch, T) encoder. Qwen3 concatenates miss clips
 into one packed frame stream, so buckets are (conv chunks, packed tokens,
 attention segments). Python split/pad stays outside the graph; a shape that
-fits no bucket, or a capture failure, falls back to eager.
+fits no bucket, or a capture failure, falls back to eager. Unseen buckets
+run eager on the request path; capture waits until the encoder queue is
+empty and the LM default stream is idle so it cannot stall in-flight decode.
 """
 
 from __future__ import annotations
@@ -247,6 +249,7 @@ class Qwen3ASREncoderCudaGraphRunner:
         self._warmup_iters = int(warmup_iters)
         self._graphs: dict[tuple[int, int, int], _GraphEntry] = {}
         self._failed: set[tuple[int, int, int]] = set()
+        self._pending: dict[tuple[int, int, int], tuple[int, int]] = {}
         self._pool = None
         # note (guozhihao-224): serializes capture and replay -- replay
         # mutates the bucket's static buffers, and both the pre-LM worker and
@@ -254,6 +257,73 @@ class Qwen3ASREncoderCudaGraphRunner:
         self._lock = threading.Lock()
         self._done_event = torch.cuda.Event()
         self._event_recorded = False
+
+    def has_pending(self) -> bool:
+        with self._lock:
+            return bool(self._pending)
+
+    def gpu_is_idle(self) -> bool:
+        # note (guozhihao-224): LM launches on the default stream. An empty
+        # encoder queue is not enough -- capturing then stalls decode.
+        if not torch.cuda.is_available():
+            return True
+        device = self._device
+        if not isinstance(device, torch.device):
+            device = torch.device(device)
+        if device.type != "cuda":
+            return True
+        return bool(torch.cuda.default_stream(device).query())
+
+    def capture_one_pending(self) -> bool:
+        """Capture one deferred bucket. True if more pending remain."""
+        with self._lock:
+            if not self._pending:
+                return False
+            key, (n_mels, t_cnn) = next(iter(self._pending.items()))
+            del self._pending[key]
+            if key in self._graphs or key in self._failed:
+                return bool(self._pending)
+            c_bucket, n_bucket, s_bucket = key
+            enough, free = self._enough_free_vram()
+            if not enough:
+                logger.warning(
+                    "Qwen3-ASR encoder CUDA graph: free VRAM %.1fGB < %.1fGB "
+                    "headroom; running C=%d N=%d S=%d eager",
+                    free / 1024**3,
+                    self._min_free_bytes / 1024**3,
+                    c_bucket,
+                    n_bucket,
+                    s_bucket,
+                )
+                self._failed.add(key)
+                return bool(self._pending)
+            try:
+                with torch.cuda.device(self._device):
+                    entry = self._capture(c_bucket, n_bucket, s_bucket, n_mels, t_cnn)
+            except Exception as exc:
+                logger.warning(
+                    "Qwen3-ASR encoder CUDA graph capture failed for "
+                    "C=%d N=%d S=%d: %s; using eager for this bucket",
+                    c_bucket,
+                    n_bucket,
+                    s_bucket,
+                    exc,
+                )
+                self._failed.add(key)
+                # note (guozhihao-224): a failed capture can leave the
+                # mempool recording; drop it before the next bucket.
+                self._pool = None
+                try:
+                    torch.cuda.synchronize(self._device)
+                except Exception as sync_exc:
+                    logger.warning(
+                        "Qwen3-ASR encoder CUDA graph: cleanup "
+                        "synchronize failed after capture error: %s",
+                        sync_exc,
+                    )
+                return bool(self._pending)
+            self._graphs[key] = entry
+            return bool(self._pending)
 
     def _enough_free_vram(self) -> tuple[bool, int]:
         free, _ = torch.cuda.mem_get_info(self._device)
@@ -360,7 +430,10 @@ class Qwen3ASREncoderCudaGraphRunner:
             for _ in range(self._warmup_iters):
                 _run()
         torch.cuda.current_stream().wait_stream(stream)
-        torch.cuda.synchronize()
+        # note (guozhihao-224): do not device-synchronize; that waits for
+        # and then blocks the LM default stream. Capture is only started
+        # when that stream is idle; wait_stream covers a late kernel.
+        torch.cuda.current_stream().wait_stream(torch.cuda.default_stream(self._device))
 
         if self._pool is None:
             self._pool = torch.cuda.graph_pool_handle()
@@ -439,59 +512,23 @@ class Qwen3ASREncoderCudaGraphRunner:
         if key in self._failed:
             return None
 
-        dummy_src = c_bucket * t_cnn
-        gather_index = _gather_indices(
-            padded_mask, n_bucket=n_bucket, dummy_src=dummy_src
-        )
-        static_cu = _pad_cu_seqlens(cu_seqlens, s_bucket=s_bucket, n_bucket=n_bucket)
-
         with self._lock:
             entry = self._graphs.get(key)
             if entry is None:
-                enough, free = self._enough_free_vram()
-                if not enough:
-                    logger.warning(
-                        "Qwen3-ASR encoder CUDA graph: free VRAM %.1fGB < %.1fGB "
-                        "headroom; running C=%d N=%d S=%d eager",
-                        free / 1024**3,
-                        self._min_free_bytes / 1024**3,
-                        c_bucket,
-                        n_bucket,
-                        s_bucket,
-                    )
-                    self._failed.add(key)
-                    return None
-                try:
-                    with torch.cuda.device(self._device):
-                        entry = self._capture(
-                            c_bucket, n_bucket, s_bucket, n_mels, t_cnn
-                        )
-                except Exception as exc:
-                    logger.warning(
-                        "Qwen3-ASR encoder CUDA graph capture failed for "
-                        "C=%d N=%d S=%d: %s; using eager for this bucket",
-                        c_bucket,
-                        n_bucket,
-                        s_bucket,
-                        exc,
-                    )
-                    self._failed.add(key)
-                    # note (guozhihao-224): a failed capture can leave the
-                    # mempool recording; drop it before the next bucket.
-                    self._pool = None
-                    try:
-                        torch.cuda.synchronize(self._device)
-                    except Exception as sync_exc:
-                        logger.warning(
-                            "Qwen3-ASR encoder CUDA graph: cleanup "
-                            "synchronize failed after capture error: %s",
-                            sync_exc,
-                        )
-                    return None
-                self._graphs[key] = entry
+                # note (guozhihao-224): first sighting stays eager; capture
+                # waits until the pre-LM queue is idle so it cannot inflate p99.
+                self._pending[key] = (n_mels, t_cnn)
+                return None
 
             if entry.padded_feature.shape[2] != n_mels:
                 return None
+            dummy_src = c_bucket * t_cnn
+            gather_index = _gather_indices(
+                padded_mask, n_bucket=n_bucket, dummy_src=dummy_src
+            )
+            static_cu = _pad_cu_seqlens(
+                cu_seqlens, s_bucket=s_bucket, n_bucket=n_bucket
+            )
             stream = torch.cuda.current_stream(self._device)
             # note (guozhihao-224): wait for previous caller's output copy
             # on some stream to finish before using shared resource

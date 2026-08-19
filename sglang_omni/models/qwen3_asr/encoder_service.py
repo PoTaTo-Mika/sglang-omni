@@ -36,6 +36,9 @@ logger = logging.getLogger(__name__)
 _CACHE_MAX_ENTRIES = 4096
 _CACHE_MAX_BYTES = 2 * 1024**3
 _SHUTDOWN = object()
+# note (guozhihao-224): when the encoder queue is empty but the LM stream
+# is still busy, poll so we can capture after decode without a device sync.
+_LM_IDLE_POLL_S = 0.02
 
 # note (luojiaxuan): WhisperFeatureExtractor identity fields; a change to any
 # of these changes the mel features and therefore the embedding.
@@ -358,6 +361,25 @@ class Qwen3ASRPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.T
         item.feature = None
         item.format = MultimodalInputFormat.PRECOMPUTED_EMBEDDING
 
+    def _wait_for_encode_work(self) -> Any:
+        # note (guozhihao-224): capture only when the queue is empty and
+        # the LM default stream is idle. Incoming work preempts remaining
+        # captures. A busy LM stream is polled so capture can still run
+        # after decode without a device-wide synchronize.
+        runner = getattr(self._model, "_encoder_graph_runner", None)
+        while runner is not None and runner.has_pending():
+            try:
+                return self._queue.get_nowait()
+            except queue.Empty:
+                if runner.gpu_is_idle():
+                    runner.capture_one_pending()
+                    continue
+                try:
+                    return self._queue.get(timeout=_LM_IDLE_POLL_S)
+                except queue.Empty:
+                    continue
+        return self._queue.get()
+
     def _drain_batch(
         self,
     ) -> tuple[list[QueueEntry[Any]], bool]:
@@ -366,7 +388,7 @@ class Qwen3ASRPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.T
         # so batches still form under load, and an idle-arrival request never
         # pays a batching wait -- at concurrency 1 a window is pure latency
         # (same reasoning as the MOSS-TD encoder service).
-        first = self._queue.get()
+        first = self._wait_for_encode_work()
         if first is _SHUTDOWN:
             return [], True
         batch = [cast(QueueEntry[Any], first)]

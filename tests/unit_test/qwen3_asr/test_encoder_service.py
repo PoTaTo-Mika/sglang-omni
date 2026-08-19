@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import queue
 import threading
 import time
 from collections.abc import Iterator
@@ -647,3 +648,82 @@ def test_flat_2d_encoder_output_is_also_accepted() -> None:
     service.encode_item(item)
 
     assert item.precomputed_embeddings.shape == (3, _HIDDEN_SIZE)
+
+
+def test_wait_preempts_pending_capture_when_work_is_queued() -> None:
+    captures: list[int] = []
+
+    class _Runner:
+        def has_pending(self) -> bool:
+            return True
+
+        def gpu_is_idle(self) -> bool:
+            return True
+
+        def capture_one_pending(self) -> bool:
+            captures.append(1)
+            return False
+
+    service = object.__new__(Qwen3ASRPreLMEncoderService)
+    service._model = SimpleNamespace(_encoder_graph_runner=_Runner())
+    service._queue = queue.Queue()
+    service._queue.put("work")
+    assert service._wait_for_encode_work() == "work"
+    assert captures == []
+
+
+def test_wait_captures_pending_graphs_while_queue_is_idle() -> None:
+    service = object.__new__(Qwen3ASRPreLMEncoderService)
+    service._queue = queue.Queue()
+
+    class _Runner:
+        def __init__(self) -> None:
+            self.remaining = 2
+            self.captures = 0
+
+        def has_pending(self) -> bool:
+            return self.remaining > 0
+
+        def gpu_is_idle(self) -> bool:
+            return True
+
+        def capture_one_pending(self) -> bool:
+            self.remaining -= 1
+            self.captures += 1
+            if self.remaining == 0:
+                service._queue.put("work")
+            return self.remaining > 0
+
+    runner = _Runner()
+    service._model = SimpleNamespace(_encoder_graph_runner=runner)
+    assert service._wait_for_encode_work() == "work"
+    assert runner.captures == 2
+
+
+def test_wait_does_not_capture_while_lm_stream_busy() -> None:
+    captures: list[int] = []
+
+    class _Runner:
+        def has_pending(self) -> bool:
+            return True
+
+        def gpu_is_idle(self) -> bool:
+            return False
+
+        def capture_one_pending(self) -> bool:
+            captures.append(1)
+            return True
+
+    service = object.__new__(Qwen3ASRPreLMEncoderService)
+    service._model = SimpleNamespace(_encoder_graph_runner=_Runner())
+    service._queue = queue.Queue()
+
+    def _produce() -> None:
+        time.sleep(0.05)
+        service._queue.put("work")
+
+    thread = threading.Thread(target=_produce)
+    thread.start()
+    assert service._wait_for_encode_work() == "work"
+    thread.join()
+    assert captures == []

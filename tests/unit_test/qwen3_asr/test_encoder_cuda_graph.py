@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import threading
+from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 import torch.nn as nn
 
 from sglang_omni.models.qwen3_asr.audio_lengths import qwen3_asr_num_audio_tokens
 from sglang_omni.models.qwen3_asr.encoder_cuda_graph import (
+    Qwen3ASREncoderCudaGraphRunner,
     _bucket_conv_chunks,
     _bucket_packed_tokens,
     _capture_cu_seqlens,
@@ -157,3 +161,77 @@ def test_get_audio_feature_falls_back_to_eager_when_runner_declines() -> None:
     assert tuple(out.shape) == (12, 4)
     assert torch.equal(out, torch.ones(12, 4))
     assert model.audio_tower.calls == 1
+
+
+def _pending_runner() -> Qwen3ASREncoderCudaGraphRunner:
+    runner = object.__new__(Qwen3ASREncoderCudaGraphRunner)
+    runner._lock = threading.Lock()
+    runner._pending = {}
+    runner._graphs = {}
+    runner._failed = set()
+    runner._min_free_bytes = 1
+    runner._pool = None
+    runner._device = "cuda:0"
+    return runner
+
+
+def test_capture_one_pending_noop_when_empty() -> None:
+    runner = _pending_runner()
+    assert runner.has_pending() is False
+    assert runner.capture_one_pending() is False
+
+
+def test_capture_one_pending_skips_already_cached_key() -> None:
+    runner = _pending_runner()
+    key = (1, 64, 1)
+    runner._pending[key] = (80, 10)
+    runner._graphs[key] = object()
+    assert runner.capture_one_pending() is False
+    assert runner.has_pending() is False
+
+
+def test_capture_one_pending_records_vram_failure() -> None:
+    runner = _pending_runner()
+    key = (2, 128, 2)
+    runner._pending[key] = (80, 10)
+    runner._enough_free_vram = lambda: (False, 0)
+    assert runner.capture_one_pending() is False
+    assert key in runner._failed
+    assert runner.has_pending() is False
+
+
+def test_capture_one_pending_invokes_capture() -> None:
+    runner = _pending_runner()
+    key = (4, 256, 4)
+    runner._pending[key] = (80, 10)
+    runner._pending[(8, 512, 8)] = (80, 10)
+    captured = {}
+
+    def _fake_capture(c_bucket, n_bucket, s_bucket, n_mels, t_cnn):
+        captured["args"] = (c_bucket, n_bucket, s_bucket, n_mels, t_cnn)
+        return SimpleNamespace()
+
+    runner._enough_free_vram = lambda: (True, 1)
+    runner._capture = _fake_capture
+    with patch("torch.cuda.device", return_value=nullcontext()):
+        assert runner.capture_one_pending() is True
+    assert captured["args"] == (4, 256, 4, 80, 10)
+    assert key in runner._graphs
+    assert runner.has_pending() is True
+
+
+def test_gpu_is_idle_follows_default_stream_query() -> None:
+    runner = _pending_runner()
+    runner._device = torch.device("cuda:0")
+    busy = SimpleNamespace(query=lambda: False)
+    idle = SimpleNamespace(query=lambda: True)
+    with (
+        patch("torch.cuda.is_available", return_value=True),
+        patch("torch.cuda.default_stream", return_value=busy),
+    ):
+        assert runner.gpu_is_idle() is False
+    with (
+        patch("torch.cuda.is_available", return_value=True),
+        patch("torch.cuda.default_stream", return_value=idle),
+    ):
+        assert runner.gpu_is_idle() is True
