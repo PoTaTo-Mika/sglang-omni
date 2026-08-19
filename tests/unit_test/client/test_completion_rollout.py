@@ -11,6 +11,7 @@ import pytest
 from sglang_omni.client import Client
 from sglang_omni.client.client import _extract_inputs
 from sglang_omni.client.types import GenerateRequest
+from sglang_omni.proto import EXPLICIT_GENERATION_PARAMS_KEY
 
 
 class _SubmitStubCoordinator:
@@ -190,6 +191,40 @@ def test_completion_concatenates_streamed_logprobs() -> None:
     assert out.output_token_logprobs == [[-0.1, 11], [-0.2, 22], [-0.3, 33]]
     assert out.weight_version == "v7"
     assert out.omni_rollout == {"version": 1, "action_streams": []}
+
+
+def test_explicit_sampling_fields_forwarded_as_metadata_marker() -> None:
+    request = GenerateRequest(
+        prompt_token_ids=[1, 2, 3],
+        explicit_sampling_fields=["top_p", "temperature"],
+    )
+
+    omni_request = Client._build_omni_request(request)
+
+    assert omni_request.metadata[EXPLICIT_GENERATION_PARAMS_KEY] == [
+        "temperature",
+        "top_p",
+    ]
+
+
+def test_explicit_sampling_fields_do_not_override_caller_metadata() -> None:
+    request = GenerateRequest(
+        prompt_token_ids=[1, 2, 3],
+        explicit_sampling_fields=["temperature"],
+        metadata={EXPLICIT_GENERATION_PARAMS_KEY: ["top_k"]},
+    )
+
+    omni_request = Client._build_omni_request(request)
+
+    assert omni_request.metadata[EXPLICIT_GENERATION_PARAMS_KEY] == ["top_k"]
+
+
+def test_omni_request_metadata_omits_marker_by_default() -> None:
+    request = GenerateRequest(prompt_token_ids=[1, 2, 3])
+
+    omni_request = Client._build_omni_request(request)
+
+    assert EXPLICIT_GENERATION_PARAMS_KEY not in omni_request.metadata
 
 
 def test_extract_inputs_rejects_prompt_with_multimodal_train_inputs() -> None:

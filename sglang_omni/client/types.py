@@ -89,6 +89,12 @@ class GenerateRequest:
     messages: list[Message] | None = None
 
     sampling: SamplingParams = field(default_factory=SamplingParams)
+    # Sampling fields the caller chose deliberately. SamplingParams cannot
+    # distinguish an explicit default (e.g. temperature=1.0) from an unset
+    # field, so models with generation-config defaults treat unmarked
+    # transport-default values as unset. Listing a field here makes its
+    # value authoritative.
+    explicit_sampling_fields: list[str] | None = None
     stage_sampling: dict[str, SamplingParams] | None = None
     stage_params: dict[str, dict[str, Any]] | None = None
     extra_params: dict[str, Any] = field(default_factory=dict)

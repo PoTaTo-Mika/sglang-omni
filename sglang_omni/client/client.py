@@ -31,7 +31,12 @@ from sglang_omni.client.types import (
     UsageInfo,
 )
 from sglang_omni.pipeline.coordinator import Coordinator
-from sglang_omni.proto import OmniRequest, RequestState, StreamMessage
+from sglang_omni.proto import (
+    EXPLICIT_GENERATION_PARAMS_KEY,
+    OmniRequest,
+    RequestState,
+    StreamMessage,
+)
 
 
 class Client:
@@ -457,6 +462,11 @@ class Client:
         inputs = _extract_inputs(request)
         params = _build_params(request)
         metadata = dict(request.metadata)
+        if request.explicit_sampling_fields is not None:
+            metadata.setdefault(
+                EXPLICIT_GENERATION_PARAMS_KEY,
+                sorted(request.explicit_sampling_fields),
+            )
         if request.model:
             metadata.setdefault("model", request.model)
         if request.output_modalities:
