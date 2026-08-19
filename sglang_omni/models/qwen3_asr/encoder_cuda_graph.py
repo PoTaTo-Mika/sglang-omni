@@ -35,7 +35,7 @@ def _bucket_pow2(value: int, buckets: tuple[int, ...], cap: int) -> int | None:
             break
         if bucket >= value:
             return bucket
-    return cap if value <= cap else None
+    return cap
 
 
 def _bucket_conv_chunks(chunk_count: int, max_chunks: int) -> int | None:
@@ -481,8 +481,12 @@ class Qwen3ASREncoderCudaGraphRunner:
                     self._pool = None
                     try:
                         torch.cuda.synchronize(self._device)
-                    except Exception:
-                        pass
+                    except Exception as sync_exc:
+                        logger.warning(
+                            "Qwen3-ASR encoder CUDA graph: cleanup "
+                            "synchronize failed after capture error: %s",
+                            sync_exc,
+                        )
                     return None
                 self._graphs[key] = entry
 
