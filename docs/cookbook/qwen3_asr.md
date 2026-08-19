@@ -57,6 +57,15 @@ sgl-omni serve \
   --port 8000
 ```
 
+## Encoder CUDA Graph
+
+The audio tower concatenates cache-miss clips into one packed frame stream, so
+Fun-ASR's padded `(batch, T)` encoder CUDA graphs do not apply. Packed-length
+buckets (conv-chunk count × packed tokens × attention segments) are enabled by
+default on the miss path. Cache hits never reach the tower. To force eager
+encoder execution, pass
+`--stages.asr.factory-args.enable_encoder_cuda_graph false`.
+
 ## Transcribe Audio
 
 ```bash

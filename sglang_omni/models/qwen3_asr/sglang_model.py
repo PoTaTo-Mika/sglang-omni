@@ -25,6 +25,7 @@ from sglang.srt.models.qwen3_omni_moe import Qwen3OmniMoeAudioEncoder
 from sglang.srt.utils import add_prefix
 
 from .configuration_qwen3_asr import Qwen3ASRConfig
+from .encoder_cuda_graph import Qwen3ASREncoderCudaGraphRunner
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +145,13 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
         )
         _enable_fused_asr_qk_norm_rope(self.language_model)
         self.pattern = MultiModalityDataPaddingPatternMultimodalTokens()
+        self._encoder_graph_runner: Qwen3ASREncoderCudaGraphRunner | None = None
+
+    def init_encoder_graphs(self, *, max_batch_size: int = 8) -> None:
+        self._encoder_graph_runner = Qwen3ASREncoderCudaGraphRunner(
+            self.audio_tower,
+            max_batch_size=max_batch_size,
+        )
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         return self.pattern.pad_input_tokens(input_ids, mm_inputs)
@@ -209,6 +217,13 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
             input_features = input_features.permute(0, 2, 1).reshape(
                 -1, input_features.shape[1]
             )
+
+        if self._encoder_graph_runner is not None:
+            graphed = self._encoder_graph_runner.run(
+                input_features, audio_feature_lengths
+            )
+            if graphed is not None:
+                return graphed
 
         audio_outputs = self.audio_tower(
             input_features,

@@ -183,6 +183,7 @@ def test_qwen3_asr_config_uses_batched_stage_with_64_running_requests() -> None:
     assert config.stages[0].factory_args["pre_lm_cache_size_bytes"] == 2 * 1024**3
     assert config.stages[0].factory_args["pre_lm_max_batch_size"] == 8
     assert config.stages[0].factory_args["pre_lm_max_batch_wait_ms"] == 0
+    assert config.stages[0].factory_args["enable_encoder_cuda_graph"] is True
     assert Qwen3ASRPipelineConfig.mem_fraction_role_to_stage() == {"asr": "asr"}
     assert Qwen3ASRPipelineConfig.generation_sglang_role_to_stage() == {
         "generation": "asr"
@@ -226,6 +227,7 @@ def test_qwen3_asr_stage_default_enables_pre_lm_encoder() -> None:
     assert signature.parameters["pre_lm_cache_size_bytes"].default == 2 * 1024**3
     assert signature.parameters["pre_lm_max_batch_size"].default == 8
     assert signature.parameters["pre_lm_max_batch_wait_ms"].default == 0
+    assert signature.parameters["enable_encoder_cuda_graph"].default is False
 
 
 @pytest.mark.parametrize(

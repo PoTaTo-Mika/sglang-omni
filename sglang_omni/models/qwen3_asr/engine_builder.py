@@ -59,6 +59,7 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
         pre_lm_cache_size_bytes: int = 2 * 1024**3,
         pre_lm_max_batch_size: int = 8,
         pre_lm_max_batch_wait_ms: int = 0,
+        enable_encoder_cuda_graph: bool = False,
     ) -> None:
         if pre_lm_max_batch_size < 1:
             raise ValueError(
@@ -93,6 +94,7 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
         self.pre_lm_cache_size_bytes = pre_lm_cache_size_bytes
         self.pre_lm_max_batch_size = pre_lm_max_batch_size
         self.pre_lm_max_batch_wait_ms = pre_lm_max_batch_wait_ms
+        self.enable_encoder_cuda_graph = enable_encoder_cuda_graph
         self.tokenizer: Any = None
         self.feature_extractor: Any = None
         self.context_length = 0
@@ -206,6 +208,15 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
     ) -> None:
         del generation_cuda_graph_enabled
         self._log_memory_checkpoint("post_cuda_graph_capture")
+        if self.enable_encoder_cuda_graph:
+            # note (guozhihao-224): after generation capture so the encoder
+            # graph pool stays separate from the LM graphs.
+            model.init_encoder_graphs(max_batch_size=self.pre_lm_max_batch_size)
+            logger.info(
+                "Qwen3-ASR packed encoder CUDA graphs enabled "
+                "(lazy capture per packed C/N/S bucket, max_batch=%d)",
+                self.pre_lm_max_batch_size,
+            )
         init_mm_embedding_cache(self.mm_embedding_cache_size_bytes)
         if self.enable_pre_lm_encoder:
             # note (luojiaxuan): constructed after SGLang's generation CUDA
