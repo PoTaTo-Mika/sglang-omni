@@ -4,8 +4,10 @@
 Provides the following endpoints:
 - POST /v1/chat/completions  — Text (+ audio) chat completions
 - POST /v1/audio/speech      — Text-to-speech synthesis
+- POST /v1/audio/translations — Translate audio speech to English
 - POST /v1/audio/speech/batch — Batch text-to-speech synthesis
 - WS   /v1/audio/speech/stream — Stateful TTS WebSocket streaming
+- POST /v1/audio/transcriptions — Speech-to-text transcription
 - GET  /v1/audio/voices      — List preset and uploaded TTS voices
 - POST /v1/audio/voices      — Upload a persistent TTS reference voice
 - DELETE /v1/audio/voices/{name} — Delete an uploaded TTS voice
@@ -19,10 +21,8 @@ Provides the following endpoints:
 from __future__ import annotations
 
 import asyncio
-import io
 import json
 import logging
-import math
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Coroutine
@@ -40,14 +40,9 @@ from fastapi import (
     WebSocket,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import (
-    JSONResponse,
-    PlainTextResponse,
-    Response,
-    StreamingResponse,
-)
-from starlette.types import Receive, Scope, Send
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from sglang_omni import __version__
 from sglang_omni.client import (
     Client,
     ClientError,
@@ -62,12 +57,18 @@ from sglang_omni.client.audio import (
     encode_pcm,
     select_audio_delta,
 )
+from sglang_omni.config import AudioChunkingConfig
 from sglang_omni.http.admin_auth import (
     make_admin_auth_dependency,
     resolve_admin_api_key,
 )
 from sglang_omni.http.favicon import register_favicon
-from sglang_omni.proto import EXPLICIT_GENERATION_PARAMS_KEY
+from sglang_omni.serve.generation_params import (
+    record_explicit_generation_params as _record_explicit_generation_params,
+)
+from sglang_omni.serve.openai_errors import (
+    is_bad_request_error as _is_bad_request_error,
+)
 from sglang_omni.serve.protocol import (
     DEFAULT_TTS_BATCH_MAX_ITEMS,
     AdminRequestBase,
@@ -92,10 +93,6 @@ from sglang_omni.serve.protocol import (
     RolloutGenerateRequest,
     RolloutSamplingParams,
     SpeechBatchResponse,
-    TranscriptionResponse,
-    TranscriptionTextDeltaEvent,
-    TranscriptionTextDoneEvent,
-    TranscriptionUsage,
     UpdateWeightFromDiskRequest,
     UpdateWeightsFromDistributedRequest,
     UsageResponse,
@@ -108,61 +105,33 @@ from sglang_omni.serve.speech_errors import (
     internal_error,
     openai_error_payload,
     speech_error_response,
+    speech_generation_error,
+)
+from sglang_omni.serve.speech_limits import (
+    MAX_VOICE_UPLOAD_BODY_BYTES,
+    MAX_VOICE_UPLOAD_BYTES,
 )
 from sglang_omni.serve.speech_service import SpeechRequestValidator
-from sglang_omni.serve.speech_voices import MAX_VOICE_UPLOAD_BYTES, SpeakerSampleStore
+from sglang_omni.serve.speech_voices import SpeakerSampleStore
 from sglang_omni.serve.speech_ws import SpeechWebSocketSession
-from sglang_omni.serve.transcription_adapters import resolve_adapter
+from sglang_omni.serve.streaming import STREAM_DONE_SENTINEL
+from sglang_omni.serve.streaming import (
+    ClosableStreamingResponse as _ClosableStreamingResponse,
+)
+from sglang_omni.serve.streaming import (
+    close_async_iterator_if_supported as _close_async_iterator_if_supported,
+)
+from sglang_omni.serve.transcriptions import register_transcriptions
+from sglang_omni.serve.translations import register_translations
 
 logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
-STREAM_DONE_SENTINEL = "[DONE]"
 HTTP_DISCONNECT_POLL_INTERVAL_S = 0.05
 HTTP_DISCONNECT_CANCEL_TIMEOUT_S = 0.1
-VOICE_UPLOAD_MULTIPART_OVERHEAD_BYTES = 64 * 1024
-MAX_VOICE_UPLOAD_BODY_BYTES = (
-    MAX_VOICE_UPLOAD_BYTES + VOICE_UPLOAD_MULTIPART_OVERHEAD_BYTES
-)
-
-_BAD_REQUEST_MARKERS = (
-    "longer than the model's context length",
-    "Requested token count exceeds the model's maximum context length",
-    "accepts audio up to",
-    "max_new_tokens must be",
-    "multimodal_train_inputs",
-)
-
-
-def _is_bad_request_error(exc: Exception) -> bool:
-    message = str(exc)
-    return any(marker in message for marker in _BAD_REQUEST_MARKERS)
 
 
 class _RequestBodyTooLarge(Exception):
     pass
-
-
-class _ClosableStreamingResponse(StreamingResponse):
-    """Close the response body iterator at the ASGI ownership boundary."""
-
-    async def __call__(
-        self,
-        scope: Scope,
-        receive: Receive,
-        send: Send,
-    ) -> None:
-        try:
-            await super().__call__(scope, receive, send)
-        finally:
-            await self._close_body_iterator()
-
-    async def _close_body_iterator(self) -> None:
-        try:
-            await _close_async_iterator_if_supported(self.body_iterator)
-        except asyncio.CancelledError:
-            logger.warning("Cancelled while closing streaming response body")
-        except Exception:
-            logger.warning("Failed to close streaming response body", exc_info=True)
 
 
 class VoiceUploadBodyLimitMiddleware:
@@ -210,15 +179,19 @@ def create_app(
     model_name: str | None = None,
     requires_uploaded_voice_for_named_voice: bool = False,
     supports_uploaded_voice_references: bool = True,
+    supports_audio_translation: bool = False,
     required_speech_reference_count: int | None = None,
     speech_reference_text_required: bool = False,
+    speech_reference_text_excludes_instructions: bool = False,
     additional_speech_languages: frozenset[str] = frozenset(),
     enable_realtime: bool = False,
+    supports_realtime_audio_output: bool = False,
     allowed_local_media_path: str | None = None,
     allowed_media_domains: list[str] | None = None,
     admin_api_key: str | None = None,
     tts_batch_max_items: int = DEFAULT_TTS_BATCH_MAX_ITEMS,
     architectures: list[str] | None = None,
+    audio_chunking: AudioChunkingConfig | None = None,
 ) -> FastAPI:
     """Create a FastAPI application with OpenAI-compatible endpoints.
 
@@ -229,24 +202,32 @@ def create_app(
             names must resolve to uploaded voices before reaching the model.
         supports_uploaded_voice_references: Whether uploaded voice names can be
             lowered into backend reference-audio requests.
+        supports_audio_translation: Whether the configured pipeline supports
+            ``/v1/audio/translations``.
         required_speech_reference_count: Exact reference count required before
             dispatching a speech request to the backend.
         speech_reference_text_required: Whether each speech reference requires
             a transcript.
+        speech_reference_text_excludes_instructions: Whether a reference
+            transcript and style instructions are mutually exclusive.
         additional_speech_languages: Pipeline-specific accepted languages.
         enable_realtime: If True, mount the WebSocket ``/v1/realtime``
             endpoint (OpenAI Realtime API).
+        supports_realtime_audio_output: Whether the mounted realtime endpoint
+            can request streamed audio from the configured pipeline.
         allowed_local_media_path: Directory allowed for ``file://`` TTS
             reference audio.
         allowed_media_domains: Domains allowed for remote TTS reference audio.
         admin_api_key: Optional API key for admin-control endpoints.
         tts_batch_max_items: Maximum items accepted by
             ``/v1/audio/speech/batch``.
+        audio_chunking: Long-audio chunking policy for ``/v1/audio/transcriptions``,
+            declared by the pipeline config. None keeps chunking off.
 
     Returns:
         Configured FastAPI application.
     """
-    app = FastAPI(title="sglang-omni", version="0.1.0")
+    app = FastAPI(title="sglang-omni", version=__version__)
 
     app.add_middleware(
         CORSMiddleware,
@@ -264,7 +245,12 @@ def create_app(
     app.state.client = client
     app.state.model_name = model_name or "sglang-omni"
     app.state.architectures = [a for a in (architectures or []) if a]
+    app.state.supports_audio_translation = supports_audio_translation
+    app.state.audio_chunking = (
+        audio_chunking or AudioChunkingConfig()
+    )  # allow_audio_chunking default false
     app.state.realtime_enabled = enable_realtime
+    app.state.supports_realtime_audio_output = supports_realtime_audio_output
     app.state.speaker_sample_store = SpeakerSampleStore()
     app.state.speech_service = SpeechRequestValidator(
         default_model=app.state.model_name,
@@ -274,6 +260,9 @@ def create_app(
         supports_uploaded_voice_references=supports_uploaded_voice_references,
         required_speech_reference_count=required_speech_reference_count,
         speech_reference_text_required=speech_reference_text_required,
+        speech_reference_text_excludes_instructions=(
+            speech_reference_text_excludes_instructions
+        ),
         additional_speech_languages=additional_speech_languages,
         allowed_local_media_path=allowed_local_media_path,
         allowed_media_domains=allowed_media_domains,
@@ -294,7 +283,8 @@ def create_app(
     _register_speech(app)
     _register_speech_batch(app)
     _register_speech_ws(app)
-    _register_transcriptions(app)
+    register_transcriptions(app)
+    register_translations(app)
     if enable_realtime:
         _register_realtime(app)
 
@@ -303,8 +293,12 @@ def create_app(
 
 def _register_voices(app: FastAPI) -> None:
     @app.get("/v1/audio/voices")
-    async def list_voices() -> JSONResponse:
+    async def list_voices(names_only: bool = False) -> JSONResponse:
         voice_store: SpeakerSampleStore = app.state.speaker_sample_store
+        if names_only:
+            return JSONResponse(
+                content={"uploaded_voice_names": voice_store.uploaded_voice_names()}
+            )
         response = VoiceListResponse.model_validate(voice_store.list_response())
         return JSONResponse(content=response.model_dump(exclude_none=True))
 
@@ -912,14 +906,6 @@ def _explicit_generation_params(request: Any) -> list[str]:
     )
 
 
-def _record_explicit_generation_params(
-    metadata: dict[str, Any],
-    explicit_fields: list[str],
-) -> None:
-    if explicit_fields:
-        metadata[EXPLICIT_GENERATION_PARAMS_KEY] = explicit_fields
-
-
 def _build_chat_generate_request(req: ChatCompletionRequest) -> GenerateRequest:
     """Convert a ChatCompletionRequest into a client GenerateRequest."""
     # Parse stop sequences
@@ -1210,7 +1196,11 @@ def _register_realtime(app: FastAPI) -> None:
 
     client: Client = app.state.client
     model_name: str = app.state.model_name
-    manager = RealtimeSessionManager(client=client, model_name=model_name)
+    manager = RealtimeSessionManager(
+        client=client,
+        model_name=model_name,
+        supports_audio_output=app.state.supports_realtime_audio_output,
+    )
     app.state.realtime_manager = manager
 
     @app.websocket("/v1/realtime")
@@ -1221,6 +1211,27 @@ def _register_realtime(app: FastAPI) -> None:
             await session.run()
         finally:
             await manager.close(session.session_id)
+
+
+def _speech_generation_failure_response(
+    request_id: str,
+    exc: BaseException,
+    *,
+    unexpected_message: str | None = None,
+) -> JSONResponse:
+    mapped = speech_generation_error(exc)
+    if mapped.status_code == 503:
+        logger.warning(
+            "Rejecting speech request %s: %s",
+            request_id,
+            mapped.message,
+        )
+    else:
+        logger.exception(
+            unexpected_message or "Error generating speech for request %s",
+            request_id,
+        )
+    return speech_error_response(mapped)
 
 
 def _register_speech(app: FastAPI) -> None:
@@ -1259,13 +1270,15 @@ def _register_speech(app: FastAPI) -> None:
                     speed=req.speed,
                 )
             except ClientError as exc:
-                return speech_error_response(internal_error(str(exc)))
+                return _speech_generation_failure_response(request_id, exc)
             except Exception as exc:
-                logger.exception(
-                    "Error preparing raw PCM speech stream for request %s",
+                return _speech_generation_failure_response(
                     request_id,
+                    exc,
+                    unexpected_message=(
+                        "Error preparing raw PCM speech stream for request %s"
+                    ),
                 )
-                return speech_error_response(internal_error(str(exc)))
 
         try:
             result = await _await_speech_response(
@@ -1277,14 +1290,21 @@ def _register_speech(app: FastAPI) -> None:
                 speed=req.speed,
             )
         except ClientError as exc:
-            return speech_error_response(internal_error(str(exc)))
+            return _speech_generation_failure_response(request_id, exc)
         except Exception as exc:
-            logger.exception("Error generating speech for request %s", request_id)
-            return speech_error_response(internal_error(str(exc)))
+            return _speech_generation_failure_response(
+                request_id,
+                exc,
+                unexpected_message="Error generating speech for request %s",
+            )
 
         headers = {
             "Content-Disposition": f'attachment; filename="speech.{result.format}"',
         }
+        if result.finish_reason is not None:
+            # note (Junnan Li): the body is binary audio, so the terminal state
+            # travels in the same X- header channel as usage.
+            headers["X-Finish-Reason"] = str(result.finish_reason)
         if result.usage is not None:
             if result.usage.prompt_tokens is not None:
                 headers["X-Prompt-Tokens"] = str(result.usage.prompt_tokens)
@@ -1572,14 +1592,6 @@ async def _wait_for_request_disconnect(request: Request) -> None:
         await asyncio.sleep(HTTP_DISCONNECT_POLL_INTERVAL_S)
 
 
-async def _close_async_iterator_if_supported(stream: AsyncIterator[Any]) -> None:
-    try:
-        close = stream.aclose
-    except AttributeError:
-        return
-    await close()
-
-
 async def _await_until_disconnect(
     request: Request,
     operation: Coroutine[Any, Any, _T],
@@ -1598,7 +1610,8 @@ async def _await_until_disconnect(
         message = disconnect_task.result()
         if message["type"] != "http.disconnect":
             raise RuntimeError(
-                f"Unexpected ASGI message while awaiting disconnect: {message['type']}"
+                "Unexpected ASGI message while awaiting disconnect: "
+                f"{message['type']}"
             )
         raise asyncio.CancelledError
     finally:
@@ -1621,225 +1634,3 @@ async def _abort_and_close_speech_stream(
         await client.abort(request_id)
     finally:
         await _close_async_iterator_if_supported(stream)
-
-
-def _register_transcriptions(app: FastAPI) -> None:
-    @app.post("/v1/audio/transcriptions")
-    async def create_transcription(
-        request: Request,
-        file: UploadFile = File(...),
-        model: str | None = Form(default=None),
-        language: str | None = Form(default=None),
-        prompt: str | None = Form(default=None),
-        response_format: str = Form(default="json"),
-        temperature: float | None = Form(default=None),
-        max_new_tokens: int | None = Form(default=None, ge=1),
-        stream: bool = Form(default=False),
-    ) -> Response:
-        client: Client = app.state.client
-        default_model: str = app.state.model_name
-        request_id = f"transcription-{uuid.uuid4()}"
-
-        # TODO(Ratish): add the same pre-parser body limit used by voice uploads
-        # once transcription upload limits are defined.
-        audio_bytes = await file.read()
-        if not audio_bytes:
-            raise HTTPException(status_code=400, detail="Uploaded audio file is empty")
-
-        normalized_response_format = response_format.strip().lower()
-        if stream:
-            if normalized_response_format not in {"json", "text"}:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        "stream=true supports only response_format 'json' or "
-                        f"'text', got {response_format!r}"
-                    ),
-                )
-            gen_req = build_transcription_generate_request(
-                audio_bytes=audio_bytes,
-                filename=file.filename,
-                content_type=file.content_type,
-                model=model or default_model,
-                language=language,
-                prompt=prompt,
-                temperature=temperature,
-                max_new_tokens=max_new_tokens,
-                stream=True,
-            )
-            adapter = resolve_adapter(getattr(app.state, "architectures", None))
-            duration_s = _probe_audio_duration(audio_bytes)
-            return _ClosableStreamingResponse(
-                _transcription_stream(
-                    client,
-                    gen_req,
-                    request_id=request_id,
-                    adapter=adapter,
-                    duration_s=duration_s,
-                ),
-                media_type="text/event-stream",
-                headers={"Cache-Control": "no-cache", "X-Request-Id": request_id},
-            )
-
-        gen_req = build_transcription_generate_request(
-            audio_bytes=audio_bytes,
-            filename=file.filename,
-            content_type=file.content_type,
-            model=model or default_model,
-            language=language,
-            prompt=prompt,
-            temperature=temperature,
-            max_new_tokens=max_new_tokens,
-        )
-
-        try:
-            result = await _await_until_disconnect(
-                request,
-                client.completion(gen_req, request_id=request_id),
-            )
-        except ClientError as exc:
-            if _is_bad_request_error(exc):
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
-        except Exception as exc:
-            if _is_bad_request_error(exc):
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-            logger.exception("Error transcribing audio for request %s", request_id)
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-        text = result.text
-        if normalized_response_format == "text":
-            return PlainTextResponse(text)
-        if normalized_response_format not in {"json", "verbose_json"}:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Unsupported response_format for /v1/audio/transcriptions: "
-                    f"{response_format!r}"
-                ),
-            )
-
-        adapter = resolve_adapter(getattr(app.state, "architectures", None))
-        text = adapter.postprocess_text(text)
-        duration_s = _probe_audio_duration(audio_bytes)
-        usage = (
-            TranscriptionUsage(seconds=math.ceil(duration_s))
-            if duration_s > 0
-            else None
-        )
-        if normalized_response_format == "verbose_json":
-            response = adapter.build_verbose_response(
-                text=text,
-                language=language,
-                audio_duration_s=duration_s,
-            )
-            response.usage = usage
-            return JSONResponse(content=response.model_dump(exclude_none=True))
-        return JSONResponse(
-            content=TranscriptionResponse(text=text, usage=usage).model_dump(
-                exclude_none=True
-            )
-        )
-
-
-async def _transcription_stream(
-    client: Client,
-    gen_req: GenerateRequest,
-    *,
-    request_id: str,
-    adapter: Any,
-    duration_s: float,
-) -> AsyncIterator[str]:
-    """SSE generator for streaming transcriptions.
-
-    Emits OpenAI-style transcript.text.delta events for each partial text
-    chunk, then a terminal transcript.text.done event carrying the full
-    post-processed transcript.
-    """
-    final_text: str | None = None
-    chunk_stream = client.generate(gen_req, request_id=request_id)
-    try:
-        async with aclosing(chunk_stream):
-            async for chunk in chunk_stream:
-                if chunk.finish_reason is not None:
-                    if isinstance(chunk.text, str) and chunk.text:
-                        final_text = chunk.text
-                    continue
-                if chunk.modality == "text" and chunk.text:
-                    event = TranscriptionTextDeltaEvent(delta=chunk.text)
-                    yield f"data: {event.model_dump_json(exclude_none=True)}\n\n"
-    except Exception as exc:
-        logger.exception("Error streaming transcription for request %s", request_id)
-        payload = {"type": "error", "error": {"message": str(exc)}}
-        yield f"data: {json.dumps(payload)}\n\n"
-        return
-
-    text = adapter.postprocess_text(final_text or "")
-    usage = (
-        TranscriptionUsage(seconds=math.ceil(duration_s)) if duration_s > 0 else None
-    )
-    done_event = TranscriptionTextDoneEvent(text=text, usage=usage)
-    yield f"data: {done_event.model_dump_json(exclude_none=True)}\n\n"
-    yield f"data: {STREAM_DONE_SENTINEL}\n\n"
-
-
-def _probe_audio_duration(audio_bytes: bytes) -> float:
-    """Best-effort audio duration (seconds) from raw upload bytes.
-
-    Uses ``soundfile.info`` (metadata only, no full decode; torchaudio removed
-    its ``info`` API in 2.x). Returns 0.0 if the duration cannot be
-    determined; callers treat 0.0 as "unknown".
-    """
-    try:
-        import soundfile as sf
-
-        info = sf.info(io.BytesIO(audio_bytes))
-        if info.samplerate:
-            return max(info.frames / float(info.samplerate), 0.0)
-    except (RuntimeError, ValueError):
-        logger.debug("Could not probe audio duration", exc_info=True)
-    return 0.0
-
-
-def build_transcription_generate_request(
-    *,
-    audio_bytes: bytes,
-    filename: str | None,
-    content_type: str | None,
-    model: str,
-    language: str | None,
-    prompt: str | None,
-    temperature: float | None,
-    max_new_tokens: int | None = None,
-    stream: bool = False,
-) -> GenerateRequest:
-    params: dict[str, Any] = {"task": "transcribe"}
-    metadata: dict[str, Any] = {"task": "asr"}
-    explicit_fields: list[str] = []
-    if language is not None:
-        params["language"] = language
-    if prompt is not None:
-        params["prompt"] = prompt
-    if temperature is not None:
-        explicit_fields.append("temperature")
-    if max_new_tokens is not None:
-        explicit_fields.append("max_new_tokens")
-    _record_explicit_generation_params(metadata, sorted(explicit_fields))
-    sampling = SamplingParams(
-        temperature=temperature if temperature is not None else 0.0,
-        max_new_tokens=max_new_tokens,
-    )
-
-    return GenerateRequest(
-        model=model,
-        prompt={
-            "audio_bytes": audio_bytes,
-            "filename": filename,
-            "content_type": content_type,
-        },
-        sampling=sampling,
-        extra_params=params,
-        stream=stream,
-        output_modalities=["text"],
-        metadata=metadata,
-    )

@@ -15,7 +15,6 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
-import numpy as np
 import torch
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -25,9 +24,10 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 
+from sglang_omni.preprocessing.transcription import prepare_audio
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
-from sglang_omni.utils.audio import audio_fingerprint, audio_fingerprint_int, load_audio
+from sglang_omni.scheduling.types import DeferredAdmission
 
 from .audio_lengths import arkasr_num_audio_tokens
 
@@ -49,24 +49,6 @@ class ArkASRRequestData(SGLangARRequestData):
     audio_duration_s: float = 0.0
     language: str = "en"
     engine_start_s: float = 0.0
-
-
-def _audio_source_from_payload(payload: StagePayload) -> Any:
-    inputs = payload.request.inputs
-    if isinstance(inputs, dict):
-        for key in ("audio_bytes", "bytes", "file"):
-            value = inputs.get(key)
-            if value is not None:
-                return value
-        for key in ("audio_path", "path", "url"):
-            value = inputs.get(key)
-            if value is not None:
-                return value
-    return inputs
-
-
-def _load_audio(source: Any) -> np.ndarray:
-    return load_audio(source, source_name="ARK-ASR", target_sample_rate=_SAMPLE_RATE)
 
 
 def _decode_token_ids(
@@ -113,7 +95,11 @@ def make_arkasr_scheduler_adapters(
     feature_extractor: Any = None,
     merge_factor: int = 4,
     audio_token_id: int = 151663,
-) -> tuple[Callable[[StagePayload], ArkASRRequestData], Callable[[Any], StagePayload]]:
+    audio_encoder_service: Any = None,
+) -> tuple[
+    Callable[[StagePayload], ArkASRRequestData | DeferredAdmission],
+    Callable[[Any], StagePayload],
+]:
     if feature_extractor is None:
         raise ValueError("ARK-ASR processor is missing a feature_extractor")
 
@@ -137,11 +123,16 @@ def make_arkasr_scheduler_adapters(
         )
         return list(tokenizer(prompt, add_special_tokens=False).input_ids)
 
-    def request_builder(payload: StagePayload) -> ArkASRRequestData:
+    def request_builder(
+        payload: StagePayload,
+    ) -> ArkASRRequestData | DeferredAdmission:
         params = payload.request.params or {}
-        audio = _load_audio(_audio_source_from_payload(payload))
-        audio_duration_s = float(len(audio) / _SAMPLE_RATE)
-        fingerprint = audio_fingerprint(audio)
+        prepared = prepare_audio(
+            payload, source_name="ARK-ASR", target_sample_rate=_SAMPLE_RATE
+        )
+        audio = prepared.waveform
+        audio_duration_s = prepared.duration_s
+        fingerprint = prepared.fingerprint
 
         # mel: pad to the clip's true length (short clips do not pay the full
         # 30s of FFT). ARK's WhisperEncoder is variable-length; conv2 stride-2
@@ -167,9 +158,15 @@ def make_arkasr_scheduler_adapters(
 
         audio_item = MultimodalDataItem(
             modality=Modality.AUDIO,
-            hash=audio_fingerprint_int(fingerprint),
+            hash=prepared.fingerprint_int,
             feature=features,
-            model_specific_data={"feature_attention_mask": feature_attention_mask},
+            model_specific_data={
+                "feature_attention_mask": feature_attention_mask,
+                # Note (Akazaakane): The service reads these to split batched
+                # encoder output and key its embedding cache.
+                "num_audio_tokens": num_audio_tokens,
+                "audio_fingerprint": fingerprint,
+            },
         )
         # scatter contract (same as qwen3_asr): replace <|audio|> placeholders
         # with the item's pad_value and record the span as inclusive offsets.
@@ -211,7 +208,7 @@ def make_arkasr_scheduler_adapters(
         req.multimodal_inputs = mm_inputs
         req._codec_suppress_tokens = None
 
-        return ArkASRRequestData(
+        req_data = ArkASRRequestData(
             input_ids=torch.tensor(input_ids, dtype=torch.long),
             req=req,
             prompt_token_ids=input_ids,
@@ -221,6 +218,12 @@ def make_arkasr_scheduler_adapters(
             language=str(params.get("language") or "en"),
             engine_start_s=time.perf_counter(),
             stage_payload=payload,
+        )
+        if audio_encoder_service is None:
+            return req_data
+        return DeferredAdmission(
+            value=req_data,
+            ready=audio_encoder_service.submit_item(audio_item),
         )
 
     def result_adapter(data: ArkASRRequestData) -> StagePayload:
@@ -254,4 +257,4 @@ def make_arkasr_scheduler_adapters(
     return request_builder, result_adapter
 
 
-__all__ = ["ArkASRRequestData", "load_audio", "make_arkasr_scheduler_adapters"]
+__all__ = ["ArkASRRequestData", "make_arkasr_scheduler_adapters"]

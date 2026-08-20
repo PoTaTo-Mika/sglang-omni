@@ -4,33 +4,25 @@
 Handles image/video/audio token → embedding replacement and deepstack
 visual embeddings for Qwen3-Omni's thinker stage.
 """
+
 from __future__ import annotations
 
-import contextlib
 import logging
-from collections.abc import Callable
+from numbers import Integral
 from typing import Any
 
 import torch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 
 from sglang_omni.model_runner.base import ModelRunner
+from sglang_omni.model_runner.sglang_execution import attn_forward_context
 
 logger = logging.getLogger(__name__)
 
 
 class ThinkerModelRunner(ModelRunner):
-    """Thinker: injects multimodal embeddings in the prefill phase."""
-
-    def __init__(
-        self,
-        tp_worker: Any,
-        output_processor: Any,
-        *,
-        should_capture_hidden: Callable[[Any], bool] | None = None,
-    ):
+    def __init__(self, tp_worker: Any, output_processor: Any):
         super().__init__(tp_worker, output_processor)
-        self._should_capture_hidden = should_capture_hidden
 
         model = self.model
         self._outer_model = model.thinker
@@ -44,73 +36,143 @@ class ThinkerModelRunner(ModelRunner):
         self._video_token_id = thinker_cfg.video_token_id
         self._audio_token_id = thinker_cfg.audio_token_id
 
-    @contextlib.contextmanager
-    def _text_only_capture_guard(self, requests: list[Any]):
-        # note (jiaxin deng): drop hidden-capture for an all-text batch, shared by
-        # sync execute() and async execute_launch so both take the same path.
-        capture_layers = self._text_model.layers_to_capture
-        if not (capture_layers and not self._batch_should_capture_hidden(requests)):
-            yield
-            return
-        saved_capture_layers = list(capture_layers)
-        self._text_model.layers_to_capture = []
-        try:
-            yield
-        finally:
-            self._text_model.layers_to_capture = saved_capture_layers
-
-    def execute(self, scheduler_output: Any):
-        with self._text_only_capture_guard(scheduler_output.requests):
-            return super().execute(scheduler_output)
-
-    def execute_launch(self, scheduler_output: Any):
-        with self._text_only_capture_guard(scheduler_output.requests):
-            return super().execute_launch(scheduler_output)
-
-    def _batch_should_capture_hidden(self, requests: list[Any]) -> bool:
-        if self._should_capture_hidden is None:
-            return True
-        for request in requests:
-            if self._should_capture_hidden(request):
-                return True
-        return False
-
     def custom_prefill_forward(self, forward_batch, schedule_batch, requests):
-        """Run custom prefill when multimodal embeddings must be injected."""
         if not schedule_batch.forward_mode.is_extend():
             return None
 
         omni_result = self._inject_multimodal_embeds(forward_batch, schedule_batch)
         if omni_result is not None and omni_result[0] is not None:
             input_embeds, ds_embeds, vis_masks = omni_result
+            # note (jun): SGLang owns ordinary input embeds and attention
+            # dispatch; deepstack uses the custom forward because ForwardBatch
+            # cannot carry its residual embeddings.
+            if ds_embeds is None:
+                forward_batch.input_embeds = input_embeds
+                return None
             return self._forward_with_omni_embeds(
                 forward_batch, input_embeds, ds_embeds, vis_masks
             )
         return None
 
+    # note (jingwen): thinker streaming captures hidden states through local
+    # forward hooks; both SGLang hooks must return NULL because LAST can disable
+    # CUDA-graph replay.
     def requested_capture_hidden_mode_prefill(
         self, schedule_batch: Any, requests: list
     ):
         del schedule_batch, requests
         from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 
-        # Hidden capture for thinker streaming comes from our local forward hooks,
-        # not from SGLang's logits-output hidden-state path. Requesting LAST here
-        # causes CUDA-graph mode mismatches and can silently disable replay.
         return CaptureHiddenMode.NULL
 
     def requested_capture_hidden_mode_decode(self, schedule_batch: Any, requests: list):
         del schedule_batch, requests
         from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 
-        # Hidden capture for thinker streaming comes from our local forward hooks,
-        # not from SGLang's logits-output hidden-state path. Requesting LAST here
-        # causes CUDA-graph mode mismatches and can silently disable replay.
         return CaptureHiddenMode.NULL
 
     # ------------------------------------------------------------------
-    # Multimodal embedding injection (~160 lines, from SGLangModelRunner)
+    # Multimodal embedding injection
     # ------------------------------------------------------------------
+
+    def _req_mm_token_positions(
+        self, req: Any, pad_values: dict
+    ) -> dict[str, torch.Tensor]:
+        """Prompt-absolute placeholder positions per modality, as CPU int64
+        tensors so the merge never reads placement off a GPU mask."""
+        positions = getattr(req, "_omni_mm_positions", None)
+        if positions is not None:
+            return positions
+        prompt_ids = torch.as_tensor(req.origin_input_ids, dtype=torch.long)
+        positions = {
+            modality: (prompt_ids == pad_values.get(modality, default_id)).nonzero(
+                as_tuple=True
+            )[0]
+            for modality, default_id in (
+                ("image", self._image_token_id),
+                ("video", self._video_token_id),
+                ("audio", self._audio_token_id),
+            )
+        }
+        req._omni_mm_positions = positions
+        return positions
+
+    @staticmethod
+    def _plan_modality_chunk(
+        positions: torch.Tensor,
+        consumed: dict[str, Any],
+        modality: str,
+        prefix: int,
+        length: int,
+    ) -> tuple[torch.Tensor, Any, int]:
+        """Plan the embed slice for positions in ``[prefix, prefix + length)``.
+
+        The caller owns cursor advancement; this helper never mutates ``consumed``.
+        """
+        in_chunk = (positions >= prefix) & (positions < prefix + length)
+        relative_positions = positions[in_chunk] - prefix
+        return (
+            relative_positions,
+            consumed.get(modality, 0),
+            relative_positions.numel(),
+        )
+
+    @staticmethod
+    def _ensure_consumed_cursor(req: Any) -> dict[str, Any]:
+        consumed = req._omni_consumed
+        if consumed is None:
+            consumed = {}
+            req._omni_consumed = consumed
+        elif not isinstance(consumed, dict):
+            raise TypeError(
+                "req._omni_consumed must be None or a dict, "
+                f"got {type(consumed).__name__}"
+            )
+        return consumed
+
+    @staticmethod
+    def _validate_modality_cursor(
+        modality: str, offset: Any, row_count: int, live_count: int
+    ) -> int:
+        if not isinstance(offset, Integral) or isinstance(offset, bool):
+            raise TypeError(
+                f"Invalid {modality} multimodal cursor: expected a non-negative "
+                f"integer, got {offset!r}"
+            )
+        offset = int(offset)
+        if offset < 0:
+            raise ValueError(
+                f"Invalid {modality} multimodal cursor: offset {offset} is negative"
+            )
+        if offset > row_count or offset + live_count > row_count:
+            raise ValueError(
+                f"Invalid {modality} multimodal cursor: source range "
+                f"[{offset}, {offset + live_count}) exceeds {row_count} embedding rows"
+            )
+        return offset
+
+    @staticmethod
+    def _reconstruct_missing_cursor(
+        modality: str,
+        positions: torch.Tensor,
+        prefix: int,
+        row_count: int,
+    ) -> int | None:
+        """Recover a missing cursor only when cached rows map unambiguously."""
+        position_count = positions.numel()
+        if prefix <= 0 or position_count == 0:
+            return None
+
+        cached_count = positions[positions < prefix].numel()
+        if cached_count == 0 or cached_count == position_count:
+            return None
+        if position_count != row_count:
+            raise ValueError(
+                f"Cannot reconstruct {modality} multimodal cursor: "
+                f"{position_count} prompt placeholders do not map one-to-one "
+                f"to {row_count} embedding rows"
+            )
+        return cached_count
 
     def _inject_multimodal_embeds(
         self, forward_batch: Any, schedule_batch: Any
@@ -119,25 +181,30 @@ class ThinkerModelRunner(ModelRunner):
             return None
 
         device = forward_batch.input_ids.device
-        image_token_id = self._image_token_id
-        video_token_id = self._video_token_id
-        audio_token_id = self._audio_token_id
 
         embed_input_ids = forward_batch.input_ids.clamp(
             0, self._embed_tokens.num_embeddings - 1
         )
         input_embeds = self._embed_tokens(embed_input_ids)
 
+        # note (chenrui): these arrive as CPU tensors on some sglang paths, where
+        # int(tensor[i]) per request would put a .item() on the hot path.
         extend_lens = forward_batch.extend_seq_lens_cpu
+        prefix_lens = forward_batch.extend_prefix_lens_cpu
+        if isinstance(extend_lens, torch.Tensor):
+            extend_lens = extend_lens.tolist()
+        if isinstance(prefix_lens, torch.Tensor):
+            prefix_lens = prefix_lens.tolist()
         offsets = []
         pos = 0
         for length in extend_lens:
             offsets.append(pos)
             pos += length
 
+        scatter_rows: list[torch.Tensor] = []
+        scatter_srcs: list[torch.Tensor] = []
         deepstack_visual_embeds_list = []
-        visual_pos_masks_list = []
-        has_deepstack = False
+        visual_rows: list[torch.Tensor] = []
 
         for i, req in enumerate(schedule_batch.reqs):
             omni_inputs = req.omni_model_inputs
@@ -145,63 +212,76 @@ class ThinkerModelRunner(ModelRunner):
                 continue
 
             start = offsets[i]
-            end = start + extend_lens[i]
-            req_input_ids = forward_batch.input_ids[start:end]
-            consumed = req._omni_consumed or {}
+            length = extend_lens[i]
+            prefix = 0 if prefix_lens is None else int(prefix_lens[i])
+            consumed = self._ensure_consumed_cursor(req)
             chunk_offsets: dict[str, tuple[int, int]] = {}
             pad_values = omni_inputs.get("pad_values", {})
 
-            for modality, token_id in [
-                ("image", image_token_id),
-                ("video", video_token_id),
-                ("audio", audio_token_id),
-            ]:
+            positions = self._req_mm_token_positions(req, pad_values)
+            chunk_positions: dict[str, torch.Tensor] = {}
+            for modality in ("image", "video", "audio"):
+                rel, offset, n_tokens = self._plan_modality_chunk(
+                    positions[modality], consumed, modality, prefix, length
+                )
+                chunk_positions[modality] = rel
                 embeds = omni_inputs.get(f"{modality}_embeds")
                 if embeds is None:
                     continue
-                match_id = pad_values.get(modality, token_id)
-                mask = req_input_ids == match_id
-                if not mask.any():
-                    continue
-                n_tokens = int(mask.sum().item())
-                offset = consumed.get(modality, 0)
-                chunk_offsets[modality] = (offset, n_tokens)
-                chunk_embeds = embeds[offset : offset + n_tokens].to(
-                    device=device, dtype=input_embeds.dtype
+                row_count = embeds.shape[0]
+                if modality not in consumed:
+                    reconstructed_offset = self._reconstruct_missing_cursor(
+                        modality,
+                        positions[modality],
+                        prefix,
+                        row_count,
+                    )
+                    if reconstructed_offset is not None:
+                        consumed[modality] = reconstructed_offset
+                        offset = reconstructed_offset
+                offset = self._validate_modality_cursor(
+                    modality, offset, row_count, n_tokens
                 )
-                input_embeds[torch.where(mask)[0] + start] = chunk_embeds
-                consumed[modality] = offset + n_tokens
-
-            req._omni_consumed = consumed
+                if n_tokens:
+                    chunk_offsets[modality] = (offset, n_tokens)
+                    chunk_embeds = embeds[offset : offset + n_tokens]
+                    scatter_rows.append(rel + start)
+                    scatter_srcs.append(chunk_embeds)
+                    consumed[modality] = offset + n_tokens
 
             ds_embeds = omni_inputs.get("deepstack_visual_embeds")
             image_ds = omni_inputs.get("image_deepstack_visual_embeds")
             video_ds = omni_inputs.get("video_deepstack_visual_embeds")
 
             if ds_embeds is not None or image_ds is not None or video_ds is not None:
-                has_deepstack = True
-                img_match_id = pad_values.get("image", image_token_id)
-                vid_match_id = pad_values.get("video", video_token_id)
-                img_mask = req_input_ids == img_match_id
-                vid_mask = req_input_ids == vid_match_id
-                visual_mask = img_mask | vid_mask
+                img_pos = chunk_positions["image"]
+                vid_pos = chunk_positions["video"]
+                # note (chenrui): unique modality positions make this sort
+                # tie-free; its inverse below preserves prompt order without
+                # device-mask synchronization.
+                visual_pos, visual_order = torch.sort(torch.cat([img_pos, vid_pos]))
+                visual_count = visual_pos.numel()
 
                 if ds_embeds is None:
                     if image_ds and video_ds:
                         image_offset, image_count = chunk_offsets.get("image", (0, 0))
                         video_offset, video_count = chunk_offsets.get("video", (0, 0))
+                        slots = torch.empty_like(visual_order)
+                        slots[visual_order] = torch.arange(
+                            visual_count, device=slots.device
+                        )
+                        n_image = img_pos.numel()
+                        img_idx = slots[:n_image].to(device)
+                        vid_idx = slots[n_image:].to(device)
                         merged = []
                         for img_e, vid_e in zip(image_ds, video_ds):
                             img_e = img_e[image_offset : image_offset + image_count]
                             vid_e = vid_e[video_offset : video_offset + video_count]
-                            num_visual = int(visual_mask.sum().item())
-                            joint = img_e.new_zeros(num_visual, img_e.shape[-1])
-                            img_in_visual = img_mask[visual_mask]
-                            vid_in_visual = vid_mask[visual_mask]
-                            if img_in_visual.any():
-                                joint[img_in_visual] = img_e.to(device=device)
-                            if vid_in_visual.any():
-                                joint[vid_in_visual] = vid_e.to(device=device)
+                            joint = img_e.new_zeros(
+                                visual_count, img_e.shape[-1], device=device
+                            )
+                            joint[img_idx] = img_e.to(device=device)
+                            joint[vid_idx] = vid_e.to(device=device)
                             merged.append(joint)
                         ds_embeds = merged
                     elif image_ds:
@@ -216,11 +296,10 @@ class ThinkerModelRunner(ModelRunner):
                             layer[video_offset : video_offset + video_count]
                             for layer in video_ds
                         ]
-                elif visual_mask.any():
-                    visual_count = int(visual_mask.sum().item())
-                    if vid_mask.any() and not img_mask.any():
+                elif visual_count > 0:
+                    if not img_pos.numel():
                         visual_offset = chunk_offsets.get("video", (0, 0))[0]
-                    elif img_mask.any() and not vid_mask.any():
+                    elif not vid_pos.numel():
                         visual_offset = chunk_offsets.get("image", (0, 0))[0]
                     else:
                         visual_offset = consumed.get("_visual", 0)
@@ -233,31 +312,36 @@ class ThinkerModelRunner(ModelRunner):
                     ds_embeds = None
 
                 if ds_embeds is not None:
-                    global_mask = torch.zeros(
-                        len(forward_batch.input_ids),
-                        dtype=torch.bool,
-                        device=device,
-                    )
-                    global_mask[start:end] = visual_mask
                     deepstack_visual_embeds_list.append(ds_embeds)
-                    visual_pos_masks_list.append(global_mask)
+                    visual_rows.append(visual_pos + start)
 
-            if req.is_chunked == 0:
+            if req.inflight_middle_chunks == 0:
                 req.omni_model_inputs = None
                 req._omni_consumed = None
+                req._omni_mm_positions = None
+
+        if scatter_rows:
+            # note (chenrui): one index_copy_ keeps the kernel count independent
+            # of batch mix; avoid concatenating the common single-source case.
+            row_idx = torch.cat(scatter_rows).to(device=device)
+            srcs = [
+                s.to(device=device, dtype=input_embeds.dtype, non_blocking=True)
+                for s in scatter_srcs
+            ]
+            src = srcs[0] if len(srcs) == 1 else torch.cat(srcs, dim=0)
+            input_embeds.index_copy_(0, row_idx, src)
 
         ds_embeds_out = None
         visual_masks_out = None
-        if has_deepstack and deepstack_visual_embeds_list:
+        if deepstack_visual_embeds_list:
+            combined_mask = torch.zeros(
+                len(forward_batch.input_ids), dtype=torch.bool, device=device
+            )
+            combined_mask[torch.cat(visual_rows).to(device=device)] = True
+            visual_masks_out = combined_mask
             if len(deepstack_visual_embeds_list) == 1:
                 ds_embeds_out = deepstack_visual_embeds_list[0]
-                visual_masks_out = visual_pos_masks_list[0]
             else:
-                combined_mask = torch.zeros(
-                    len(forward_batch.input_ids), dtype=torch.bool, device=device
-                )
-                for m in visual_pos_masks_list:
-                    combined_mask |= m
                 num_layers = len(deepstack_visual_embeds_list[0])
                 merged_ds = []
                 for layer_idx in range(num_layers):
@@ -267,7 +351,6 @@ class ThinkerModelRunner(ModelRunner):
                     ]
                     merged_ds.append(torch.cat(parts, dim=0))
                 ds_embeds_out = merged_ds
-                visual_masks_out = combined_mask
 
         return input_embeds, ds_embeds_out, visual_masks_out
 
@@ -305,34 +388,31 @@ class ThinkerModelRunner(ModelRunner):
             full_ds[visual_pos_masks] = ds_input
             ds_input = full_ds
 
-        hidden_states = outer.model(
-            input_ids=None,
-            positions=positions,
-            forward_batch=forward_batch,
-            input_embeds=input_embeds,
-            input_deepstack_embeds=ds_input,
-        )
+        with attn_forward_context(model_runner.attn_backend):
+            hidden_states = outer.model(
+                input_ids=None,
+                positions=positions,
+                forward_batch=forward_batch,
+                input_embeds=input_embeds,
+                input_deepstack_embeds=ds_input,
+            )
 
-        logits_output = outer.logits_processor(
-            forward_batch.input_ids,
-            hidden_states,
-            outer.lm_head,
-            forward_batch,
-        )
+            logits_output = outer.logits_processor(
+                forward_batch.input_ids,
+                hidden_states,
+                outer.lm_head,
+                forward_batch,
+            )
 
         return GenerationBatchResult(
             logits_output=logits_output, can_run_cuda_graph=False
         )
 
     def lookahead_eligible(self, batch: Any) -> bool:
-        """Route to sync where the one-step lag would diverge from sync. A request
-        that emits audio captures hidden states for the talker; the per-forward
-        _captured_aux_hidden_states side channel would be overwritten by a lookahead
-        launch(N) before resolve(N-1) collects it, so those requests route to sync
-        per batch. Sampling that reads the lagged output history (repetition /
-        presence / frequency penalty, min_new_tokens), a fixed seed, or
-        return_logprob (the lookahead sampler skips the base logprob path) also
-        diverges; logit_bias / custom_params are routed conservatively.
+        """Reject batches whose state would diverge under one-step lookahead.
+
+        Audio can overwrite hidden-state capture before resolve; stateful or
+        unsupported sampling options use the synchronous path for parity.
         """
         from sglang_omni.models.qwen3_omni.request_builders import (
             should_generate_audio_output,

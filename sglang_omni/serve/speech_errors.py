@@ -8,6 +8,8 @@ from typing import Any
 
 from fastapi.responses import JSONResponse
 
+from sglang_omni.admission import QueueFullError
+
 
 @dataclass
 class SpeechAPIError(Exception):
@@ -73,6 +75,20 @@ def speech_error_response(error: SpeechAPIError) -> JSONResponse:
     )
 
 
+def speech_websocket_error_payload(error: SpeechAPIError) -> dict[str, Any]:
+    """Build the public error event used by speech WebSocket transports."""
+    payload: dict[str, Any] = {
+        "type": "error",
+        "message": error.message,
+        "error_type": error.error_type,
+    }
+    if error.param is not None:
+        payload["param"] = error.param
+    if error.code is not None:
+        payload["code"] = error.code
+    return payload
+
+
 def bad_request(message: str, *, param: str | None = None) -> SpeechAPIError:
     return SpeechAPIError(
         message=message,
@@ -101,3 +117,10 @@ def service_unavailable(message: str, *, param: str | None = None) -> SpeechAPIE
         param=param,
         code=None,
     )
+
+
+def speech_generation_error(exc: BaseException) -> SpeechAPIError:
+    """Map pipeline failures to speech HTTP errors (queue-full → 503)."""
+    if QueueFullError.matches(exc):
+        return service_unavailable(QueueFullError.MESSAGE)
+    return internal_error(str(exc))

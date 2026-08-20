@@ -6,16 +6,23 @@ from typing import Annotated, Literal, NoReturn
 import typer
 import yaml
 
-from sglang_omni.config import PipelineConfig, StageConfig
+from sglang_omni.config import (
+    PipelineConfig,
+    StageConfig,
+    apply_stage_process_overrides,
+)
 from sglang_omni.config.manager import ConfigManager
 from sglang_omni.preprocessing.resource_connector import (
     resolve_allowed_local_media_path,
+)
+from sglang_omni.scheduling.prefill_coalesce import (
+    validate_prefill_coalesce_requests,
+    validate_prefill_coalesce_wait_ms,
 )
 from sglang_omni.serve.protocol import DEFAULT_TTS_BATCH_MAX_ITEMS
 from sglang_omni.utils.gpu_compat import should_disable_custom_all_reduce_for_gpus
 
 logger = logging.getLogger(__name__)
-
 
 _STAGE_TOGGLE_MODE = Literal["default", "on", "off"]
 _QWEN_COLOCATED_CONFIG_CLASS = "Qwen3OmniSpeechColocatedPipelineConfig"
@@ -29,10 +36,31 @@ _ASYNC_DECODE_FACTORIES = frozenset(
         "sglang_omni.models.moss_transcribe_diarize.stages."
         "create_sglang_moss_transcribe_diarize_executor",
         "sglang_omni.models.fun_asr.stages.create_sglang_fun_asr_executor",
+        "sglang_omni.models.qwen3_asr.stages.create_sglang_qwen3_asr_executor",
+        "sglang_omni.models.arkasr.stages.create_sglang_arkasr_executor",
+        "sglang_omni.models.whisper_asr.stages.create_sglang_whisper_asr_executor",
     }
 )
 _ASYNC_DECODE_SUPPORTED_MODELS = (
-    "Higgs TTS, MOSS-TTS-Local, MOSS-Transcribe-Diarize, and Fun-ASR"
+    "Higgs TTS, MOSS-TTS-Local, MOSS-Transcribe-Diarize, Fun-ASR, "
+    "Qwen3-ASR, ARK-ASR, Whisper ASR, and the Qwen3-Omni thinker"
+)
+_PREFILL_COALESCE_FACTORIES = frozenset(
+    {
+        "sglang_omni.models.higgs_tts.stages.create_sglang_tts_engine_executor",
+        "sglang_omni.models.moss_tts_local.stages.create_sglang_tts_engine_executor",
+        "sglang_omni.models.qwen3_omni.stages."
+        "create_sglang_thinker_executor_from_config",
+        "sglang_omni.models.moss_transcribe_diarize.stages."
+        "create_sglang_moss_transcribe_diarize_executor",
+        "sglang_omni.models.fun_asr.stages.create_sglang_fun_asr_executor",
+        "sglang_omni.models.qwen3_asr.stages.create_sglang_qwen3_asr_executor",
+        "sglang_omni.models.whisper_asr.stages.create_sglang_whisper_asr_executor",
+    }
+)
+_PREFILL_COALESCE_SUPPORTED_MODELS = (
+    "Higgs TTS, MOSS-TTS-Local, MOSS-Transcribe-Diarize, Fun-ASR, "
+    "Qwen3-ASR, Whisper ASR, and the Qwen3-Omni thinker"
 )
 _QWEN_PARTIAL_START_TALKER_FACTORY = (
     "sglang_omni.models.qwen3_omni.stages.create_talker_ar_executor_from_config"
@@ -567,33 +595,49 @@ def _validate_parallelism_config(pipeline_config: PipelineConfig) -> None:
         raise typer.BadParameter(str(exc)) from exc
 
 
-def apply_thinker_server_args_cli_overrides(
+def _resolve_backbone_stage(pipeline_config: PipelineConfig) -> str:
+    if any(stage.name == "thinker" for stage in pipeline_config.stages):
+        return "thinker"
+    generation_stage = (
+        type(pipeline_config).generation_sglang_role_to_stage().get("generation")
+    )
+    if generation_stage is None:
+        _raise_unsupported_flag(pipeline_config, "--quantization/--cpu-offload-gb")
+    return generation_stage
+
+
+def apply_backbone_server_args_cli_overrides(
     pipeline_config: PipelineConfig,
     *,
     cpu_offload_gb: int | None,
     quantization: str | None,
     thinker_max_running_requests: int | None = None,
 ) -> PipelineConfig:
-    updates: dict[str, object] = {}
+    backbone_updates: dict[str, object] = {}
     if cpu_offload_gb is not None:
         if cpu_offload_gb < 0:
             raise typer.BadParameter("--cpu-offload-gb must be >= 0")
-        updates["cpu_offload_gb"] = int(cpu_offload_gb)
+        backbone_updates["cpu_offload_gb"] = int(cpu_offload_gb)
     if quantization is not None:
         quantization = quantization.strip()
         if not quantization:
             raise typer.BadParameter("--quantization must not be empty")
-        updates["quantization"] = quantization
+        backbone_updates["quantization"] = quantization
+    if backbone_updates:
+        _apply_stage_server_args_override(
+            pipeline_config,
+            stage_name=_resolve_backbone_stage(pipeline_config),
+            updates=backbone_updates,
+            reason="generation SGLang ServerArgs override",
+        )
+
     if thinker_max_running_requests is not None:
         if thinker_max_running_requests < 1:
             raise typer.BadParameter("--thinker-max-running-requests must be >= 1")
-        updates["max_running_requests"] = int(thinker_max_running_requests)
-
-    if updates:
         _apply_stage_server_args_override(
             pipeline_config,
             stage_name="thinker",
-            updates=updates,
+            updates={"max_running_requests": int(thinker_max_running_requests)},
             reason="thinker SGLang ServerArgs override",
         )
     return pipeline_config
@@ -858,6 +902,67 @@ def apply_decode_mode_cli_overrides(
     return pipeline_config
 
 
+def apply_prefill_coalesce_cli_overrides(
+    pipeline_config: PipelineConfig,
+    *,
+    prefill_coalesce_requests: int | None,
+    prefill_coalesce_wait_ms: float | None,
+) -> PipelineConfig:
+    updates: dict[str, object] = {}
+    try:
+        if prefill_coalesce_requests is not None:
+            updates["prefill_coalesce_requests"] = validate_prefill_coalesce_requests(
+                prefill_coalesce_requests
+            )
+        if prefill_coalesce_wait_ms is not None:
+            updates["prefill_coalesce_wait_ms"] = validate_prefill_coalesce_wait_ms(
+                prefill_coalesce_wait_ms
+            )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    if not updates:
+        return pipeline_config
+    matching_stages = [
+        stage
+        for stage in pipeline_config.stages
+        if stage.factory in _PREFILL_COALESCE_FACTORIES
+    ]
+    if not matching_stages:
+        raise typer.BadParameter(
+            "--prefill-coalesce-requests/--prefill-coalesce-wait-ms currently "
+            f"support only {_PREFILL_COALESCE_SUPPORTED_MODELS}; no stage in "
+            "this pipeline uses a supported factory"
+        )
+
+    def configured_requests(stage: StageConfig) -> int:
+        raw_value = (stage.factory_args or {}).get("prefill_coalesce_requests", 0)
+        runtime_overrides = pipeline_config.runtime_overrides.get(stage.name)
+        if (
+            isinstance(runtime_overrides, dict)
+            and "prefill_coalesce_requests" in runtime_overrides
+        ):
+            raw_value = runtime_overrides["prefill_coalesce_requests"]
+        try:
+            return validate_prefill_coalesce_requests(raw_value)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+
+    if prefill_coalesce_requests is None and not any(
+        # The YAML may already enable the gate; only warn when tuning the wait
+        # would genuinely have no effect on any targeted stage.
+        configured_requests(stage) >= 2
+        for stage in matching_stages
+    ):
+        logger.warning(
+            "--prefill-coalesce-wait-ms alone does not enable coalescing; the "
+            "gate engages only when prefill_coalesce_requests is >= 2 (via "
+            "--prefill-coalesce-requests or per-stage YAML)"
+        )
+    _apply_factory_args_updates(pipeline_config, matching_stages, updates)
+    return pipeline_config
+
+
 def apply_torch_compile_cli_overrides(
     pipeline_config: PipelineConfig,
     *,
@@ -865,6 +970,8 @@ def apply_torch_compile_cli_overrides(
     talker_torch_compile: str,
     thinker_torch_compile_max_bs: int | None,
     talker_torch_compile_max_bs: int | None,
+    torch_compile: str = "default",
+    torch_compile_max_bs: int | None = None,
 ) -> PipelineConfig:
     thinker_mode = _normalize_stage_toggle_mode(
         "thinker_torch_compile", thinker_torch_compile
@@ -872,6 +979,7 @@ def apply_torch_compile_cli_overrides(
     talker_mode = _normalize_stage_toggle_mode(
         "talker_torch_compile", talker_torch_compile
     )
+    generation_mode = _normalize_stage_toggle_mode("torch_compile", torch_compile)
     _apply_stage_torch_compile_override(
         pipeline_config,
         stage_name="thinker",
@@ -892,6 +1000,27 @@ def apply_torch_compile_cli_overrides(
             ),
             mode=talker_mode,
             max_bs=talker_torch_compile_max_bs,
+        )
+    # note (Jeffro): single-stage pipelines (ASR, single-stage TTS) expose no
+    # talker role, so the role-qualified flags cannot reach their SGLang stage.
+    # Route the neutral flags through the generation role the same way
+    # --max-running-requests does.
+    if generation_mode != "default" or torch_compile_max_bs is not None:
+        generation_flag = (
+            "--torch-compile"
+            if generation_mode != "default"
+            else "--torch-compile-max-bs"
+        )
+        generation_stage = (
+            type(pipeline_config).generation_sglang_role_to_stage().get("generation")
+        )
+        if generation_stage is None:
+            _raise_unsupported_flag(pipeline_config, generation_flag)
+        _apply_stage_torch_compile_override(
+            pipeline_config,
+            stage_name=generation_stage,
+            mode=generation_mode,
+            max_bs=torch_compile_max_bs,
         )
     return pipeline_config
 
@@ -924,6 +1053,30 @@ def serve(
             help="Run Qwen speech with GPU stages colocated on one GPU.",
         ),
     ] = False,
+    isolate_stage: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--isolate-stage",
+            help=(
+                "Run this model-supported stage in a dedicated process. Repeat "
+                "the flag to isolate multiple stages. When omitted, preserve "
+                "the model's declared process topology. Shorthand for "
+                "--stage-process STAGE=STAGE."
+            ),
+        ),
+    ] = None,
+    stage_process: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--stage-process",
+            metavar="STAGE=PROCESS",
+            help=(
+                "Read left to right: place STAGE in PROCESS. Repeat the flag "
+                "with one process name to colocate several stages in it. Use "
+                "this instead of --isolate-stage for grouped topologies."
+            ),
+        ),
+    ] = None,
     host: Annotated[
         str, typer.Option(help="Server bind address (default: 0.0.0.0).")
     ] = "0.0.0.0",
@@ -1007,14 +1160,21 @@ def serve(
         typer.Option(
             "--cpu-offload-gb",
             "--cpu_offload_gb",
-            help="Set SGLang cpu_offload_gb for the thinker stage.",
+            help=(
+                "Set SGLang cpu_offload_gb for the backbone generation stage "
+                "(thinker for Omni, tts_engine for Higgs/TTS pipelines)."
+            ),
         ),
     ] = None,
     quantization: Annotated[
         str | None,
         typer.Option(
             "--quantization",
-            help="Set SGLang quantization mode for the thinker stage.",
+            help=(
+                "Set SGLang quantization mode (e.g. fp8) for the backbone "
+                "generation stage (thinker for Omni, tts_engine for Higgs/TTS "
+                "pipelines)."
+            ),
         ),
     ] = None,
     log_level: Annotated[
@@ -1135,6 +1295,27 @@ def serve(
             help="Override torch_compile_max_bs for supported SGLang talker stage.",
         ),
     ] = None,
+    torch_compile: Annotated[
+        str,
+        typer.Option(
+            "--torch-compile",
+            "--torch_compile",
+            help=(
+                "torch.compile mode for the SGLang generation stage: "
+                "default|on|off. Use this for single-stage pipelines (ASR, "
+                "single-stage TTS) that expose no talker role."
+            ),
+        ),
+    ] = "default",
+    torch_compile_max_bs: Annotated[
+        int | None,
+        typer.Option(
+            "--torch-compile-max-bs",
+            "--torch_compile_max_bs",
+            min=1,
+            help="Override torch_compile_max_bs for the SGLang generation stage.",
+        ),
+    ] = None,
     enable_realtime: Annotated[
         bool,
         typer.Option(
@@ -1153,8 +1334,8 @@ def serve(
                 "async|sync. Omit this flag to use the model-specific pipeline "
                 "default. Async mode enables one-step lookahead, "
                 "which can overlap the previous step's host-side collect with "
-                "the next GPU forward. Available for Higgs TTS, MOSS-TTS-Local, "
-                "MOSS-Transcribe-Diarize, and Fun-ASR."
+                "the next GPU forward. Available for "
+                f"{_ASYNC_DECODE_SUPPORTED_MODELS}."
             ),
         ),
     ] = None,
@@ -1165,7 +1346,8 @@ def serve(
             "--async_lookahead_min_batch_size",
             help=(
                 "Decode batches smaller than this bypass async lookahead and "
-                "run synchronously (fast path). Default 2."
+                "run synchronously (fast path). Model default: 1 for "
+                "Qwen3-ASR and 2 for other supported models."
             ),
         ),
     ] = None,
@@ -1181,6 +1363,32 @@ def serve(
             ),
         ),
     ] = None,
+    prefill_coalesce_requests: Annotated[
+        int | None,
+        typer.Option(
+            "--prefill-coalesce-requests",
+            "--prefill_coalesce_requests",
+            help=(
+                "Hold prefill admission until this many requests are waiting "
+                "(or the oldest has waited --prefill-coalesce-wait-ms), "
+                "amortizing the per-step host cost. The gate engages at >= 2; "
+                "0 disables (default), and 1 is likewise a no-op (logs a "
+                "warning). "
+                f"Available for {_PREFILL_COALESCE_SUPPORTED_MODELS}."
+            ),
+        ),
+    ] = None,
+    prefill_coalesce_wait_ms: Annotated[
+        float | None,
+        typer.Option(
+            "--prefill-coalesce-wait-ms",
+            "--prefill_coalesce_wait_ms",
+            help=(
+                "Upper bound on the extra time-to-first-token a queued request "
+                "pays for prefill coalescing. Default 60."
+            ),
+        ),
+    ] = None,
     max_running_requests: Annotated[
         int | None,
         typer.Option(
@@ -1190,6 +1398,19 @@ def serve(
             help=(
                 "Override SGLang generation stage max_running_requests. "
                 "Omit to use the pipeline config default."
+            ),
+        ),
+    ] = None,
+    max_queued_requests: Annotated[
+        int | None,
+        typer.Option(
+            "--max-queued-requests",
+            "--max_queued_requests",
+            min=1,
+            help=(
+                "Override SGLang generation stage max_queued_requests "
+                "(waiting-queue depth before fast-reject). Omit to use the "
+                "pipeline config default."
             ),
         ),
     ] = None,
@@ -1262,7 +1483,7 @@ def serve(
         mem_fraction_static=mem_fraction_static,
         thinker_mem_fraction_static=thinker_mem_fraction_static,
     )
-    merged_config = apply_thinker_server_args_cli_overrides(
+    merged_config = apply_backbone_server_args_cli_overrides(
         merged_config,
         cpu_offload_gb=cpu_offload_gb,
         quantization=quantization,
@@ -1277,6 +1498,11 @@ def serve(
         talker_gpu=talker_gpu,
         code2wav_gpu=code2wav_gpu,
     )
+    merged_config = apply_stage_process_overrides(
+        merged_config,
+        isolate_stages=isolate_stage,
+        stage_processes=stage_process,
+    )
     merged_config = apply_cuda_graph_cli_overrides(
         merged_config,
         thinker_cuda_graph=thinker_cuda_graph,
@@ -1288,15 +1514,24 @@ def serve(
         talker_torch_compile=talker_torch_compile,
         thinker_torch_compile_max_bs=thinker_torch_compile_max_bs,
         talker_torch_compile_max_bs=talker_torch_compile_max_bs,
+        torch_compile=torch_compile,
+        torch_compile_max_bs=torch_compile_max_bs,
     )
     merged_config = apply_decode_mode_cli_overrides(
         merged_config,
         decode_mode=decode_mode,
         async_lookahead_min_batch_size=async_lookahead_min_batch_size,
     )
+    merged_config = apply_prefill_coalesce_cli_overrides(
+        merged_config,
+        prefill_coalesce_requests=prefill_coalesce_requests,
+        prefill_coalesce_wait_ms=prefill_coalesce_wait_ms,
+    )
     generation_server_args_overrides: dict[str, object] = {}
     if max_running_requests is not None:
         generation_server_args_overrides["max_running_requests"] = max_running_requests
+    if max_queued_requests is not None:
+        generation_server_args_overrides["max_queued_requests"] = max_queued_requests
     if max_total_tokens is not None:
         generation_server_args_overrides["max_total_tokens"] = max_total_tokens
     if cuda_graph_max_bs is not None:
@@ -1308,7 +1543,8 @@ def serve(
         if generation_stage_name is None:
             _raise_unsupported_flag(
                 merged_config,
-                "--max-running-requests/--max-total-tokens/--cuda-graph-max-bs",
+                "--max-running-requests/--max-queued-requests/"
+                "--max-total-tokens/--cuda-graph-max-bs",
             )
         _apply_stage_server_args_override(
             merged_config,

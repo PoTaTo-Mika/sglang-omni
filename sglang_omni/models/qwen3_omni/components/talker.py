@@ -23,6 +23,7 @@ from sglang_omni.models.qwen3_omni.hf_config import (
     Qwen3OmniMoeTalkerConfig,
     Qwen3OmniMoeTalkerTextConfig,
 )
+from sglang_omni.platforms import current_platform
 from sglang_omni.quantization import get_weight_preprocessor
 from sglang_omni.sampling.seed import (
     SAMPLING_SEED_MASK,
@@ -52,17 +53,6 @@ def _bind_default_weight_loaders(module: nn.Module) -> None:
     for param in module.parameters():
         if not hasattr(param, "weight_loader"):
             param.weight_loader = default_weight_loader
-
-
-def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """Repeat KV heads to match the number of query heads."""
-    batch, num_kv_heads, seq_len, head_dim = hidden_states.shape
-    if n_rep == 1:
-        return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(
-        batch, num_kv_heads, n_rep, seq_len, head_dim
-    )
-    return hidden_states.reshape(batch, num_kv_heads * n_rep, seq_len, head_dim)
 
 
 class _PredictorDecodeGraph:
@@ -132,7 +122,7 @@ class _PredictorDecodeGraph:
         if self.result_codes is None or self.summed_embeddings is None:
             raise RuntimeError("Qwen3-Omni predictor CUDA graph captured no outputs")
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def replay(
         self,
         layer0_codes: torch.Tensor,
@@ -458,7 +448,7 @@ class Qwen3OmniMoeTalkerTextModel(nn.Module):
         )
 
         # Decoder layers
-        alt_stream = torch.cuda.Stream()
+        alt_stream = torch.cuda.Stream() if current_platform.is_cuda() else None
         self.layers = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Qwen3OmniMoeTalkerDecoderLayer(
@@ -589,7 +579,7 @@ class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
         )
 
         # 5 dense decoder layers
-        alt_stream = torch.cuda.Stream()
+        alt_stream = torch.cuda.Stream() if current_platform.is_cuda() else None
         self.model.layers = nn.ModuleList()
         for idx in range(cp_config.num_hidden_layers):
             # Create a decoder layer similar to Thinker but with dense MLP
@@ -770,8 +760,8 @@ class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
             raise ValueError(f"Unsupported positions rank: {positions.ndim}")
         return positions.to(device=device, dtype=torch.long).reshape(-1)
 
+    @staticmethod
     def _direct_self_attention(
-        self,
         *,
         attn: Qwen3OmniMoeThinkerTextAttention,
         hidden_states: torch.Tensor,
@@ -802,16 +792,14 @@ class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
             1, 2
         )
 
-        num_kv_groups = attn.num_heads // attn.num_kv_heads
-        k = _repeat_kv(k, num_kv_groups)
-        v = _repeat_kv(v, num_kv_groups)
-
         # Use SDPA to match HF's attention computation
+        # note (EdwardZhang1108): enable_gqa broadcasts KV heads in-kernel (#1145)
         attn_output = torch.nn.functional.scaled_dot_product_attention(
             q,
             k,
             v,
             is_causal=True,
+            enable_gqa=attn.num_heads != attn.num_kv_heads,
         )
         attn_output = attn_output.transpose(1, 2).reshape(
             batch_size * seq_len, attn.num_heads * attn.head_dim
@@ -870,6 +858,11 @@ class Qwen3OmniTalker(nn.Module):
             isinstance(layer.self_attn.rotary_emb, MRotaryEmbedding)
             for layer in self.model.layers
         )
+        # The prefill CUDA graph runner picks capture-time positions by probing
+        # this; if it disagrees with forward() below, MRotaryEmbedding takes its
+        # out-of-place path and the rebuilt q/k do not survive a graph-segment
+        # boundary, leaving attention to run on zeros.
+        self.is_mrope_enabled = self._uses_mrope
         self.codec_head = ReplicatedLinear(
             config.text_config.hidden_size,
             config.text_config.vocab_size,
@@ -986,7 +979,7 @@ class Qwen3OmniTalker(nn.Module):
             device=device,
         )
         self._sampling_staging_event = (
-            torch.cuda.Event() if device.type == "cuda" else None
+            torch.get_device_module().Event() if device.type != "cpu" else None
         )
         self._decode_prep_rids: list | None = None
         self._decode_prep_out_lens: list[int] = []
@@ -1233,6 +1226,7 @@ class Qwen3OmniTalker(nn.Module):
         input_deepstack_embeds: Optional[torch.Tensor] = None,
         input_deepstack_mask: Optional[torch.Tensor] = None,
         input_embeds_are_projected: bool = False,
+        omni_prefill_rids: Optional[list[str] | tuple[str, ...]] = None,
     ):
         """Forward pass through the talker MoE backbone.
 
@@ -1248,10 +1242,13 @@ class Qwen3OmniTalker(nn.Module):
             input_deepstack_embeds: optional layer-N thinker hidden states
             input_deepstack_mask: positions that should use hidden_projection
             input_embeds_are_projected: whether `input_embeds` is already in talker space
+            omni_prefill_rids: request ids SGLModelRunner forwards alongside the
+                Omni prefill sidecar; the talker keys nothing off them
 
         Returns:
             LogitsProcessorOutput with codec logits
         """
+        del omni_prefill_rids
         if forward_batch.forward_mode.is_extend():
             self.invalidate_decode_buffers()
 
@@ -1372,6 +1369,13 @@ class Qwen3OmniTalker(nn.Module):
             # Keep sampler control flow static during graph capture while
             # preserving SGLang's actual sampling kernel semantics.
             is_all_greedy=False,
+            # Added by 0.5.16 as a required field. Only the dspark speculative
+            # verify path reads it (the regular sampler branches on
+            # is_all_greedy alone), and this scheduler refuses speculative
+            # decoding, so False is inert here -- it also matches what upstream
+            # itself passes for the equivalent static, capture-time info in
+            # eagle_draft_cuda_graph_runner.
+            is_any_greedy=False,
             need_top_p_sampling=True,
             need_top_k_sampling=True,
             need_min_p_sampling=False,
@@ -1387,7 +1391,7 @@ class Qwen3OmniTalker(nn.Module):
             custom_params=None,
             custom_logit_processor=None,
             sampling_seed=self._sampling_seeds[:batch_size],
-            device="cuda",
+            device=current_platform.device_type,
             logit_bias=None,
         )
 
@@ -1400,19 +1404,10 @@ class Qwen3OmniTalker(nn.Module):
         if extend_seq_lens is None:
             return torch.tensor([forward_batch.input_ids.shape[0] - 1], device=device)
 
-        if (
-            forward_batch.padded_static_len is not None
-            and forward_batch.padded_static_len >= 0
-        ):
-            idx = torch.arange(
-                len(extend_seq_lens), device=device, dtype=extend_seq_lens.dtype
-            )
-            return (
-                idx * forward_batch.padded_static_len
-                + extend_seq_lens.to(device=device)
-                - 1
-            )
-
+        # The static-padded variant that used ForwardBatch.padded_static_len is
+        # gone: only the EAGLE draft-extend graph runners ever set that field,
+        # and the talker refuses speculative decoding, so it was always -1 here.
+        # sglang 0.5.16 removed the field and the matching upstream branch.
         seq_lens = extend_seq_lens.to(device=device)
         return torch.cumsum(seq_lens, dim=0) - 1
 
@@ -1482,7 +1477,11 @@ class Qwen3OmniTalker(nn.Module):
         *,
         max_batch_size: int,
     ) -> tuple[int, ...]:
-        raw_batch_sizes = getattr(server_args, "cuda_graph_bs", None)
+        from sglang_omni.scheduling.generation_batch_policy import (
+            get_decode_cuda_graph_bs,
+        )
+
+        raw_batch_sizes = get_decode_cuda_graph_bs(server_args)
         if raw_batch_sizes is None:
             raw_batch_sizes = (max_batch_size,)
 
@@ -1717,15 +1716,14 @@ class Qwen3OmniTalker(nn.Module):
 
         cached_k = layer_k_cache[:, :, : cache_len + 1, :]
         cached_v = layer_v_cache[:, :, : cache_len + 1, :]
-        num_kv_groups = attn.num_heads // attn.num_kv_heads
-        cached_k = _repeat_kv(cached_k, num_kv_groups)
-        cached_v = _repeat_kv(cached_v, num_kv_groups)
 
+        # note (EdwardZhang1108): enable_gqa broadcasts KV heads in-kernel (#1145)
         attn_output = torch.nn.functional.scaled_dot_product_attention(
             q,
             cached_k,
             cached_v,
             is_causal=False,
+            enable_gqa=attn.num_heads != attn.num_kv_heads,
         )
         attn_output = attn_output.transpose(1, 2).reshape(
             batch_size, attn.num_heads * attn.head_dim

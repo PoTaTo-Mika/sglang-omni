@@ -30,6 +30,7 @@ from benchmarks.metrics.transcribe_diarize_metrics import (
 from benchmarks.tasks.transcribe_diarize import (
     MOVIES800_REPO_ID,
     build_evaluation_payload,
+    build_long_audio_concat_sample,
     load_movies800_samples,
 )
 from tests.test_model.omni_router_utils import (
@@ -51,71 +52,84 @@ MOSS_TD_GOOGLETIME_CI_SAMPLES = 25
 MOSS_TD_STARTUP_TIMEOUT = 600
 MOSS_TD_MEM_FRACTION_STATIC = 0.80
 MOSS_TD_LONG_MAX_NEW_TOKENS = 65536
+# note (db-ol): clip 2 leads and gets truncated to hit 90 minutes, clips 0
+# and 1 stay whole so their transcripts sit at the deepest token positions.
+MOSS_TD_LONG90_CLIP_INDICES = (2, 0, 1)
+MOSS_TD_LONG90_TARGET_S = 5400.0
+# note (db-ol): well above the observed 30k output tokens for this sample
+# and below the context remaining after the 72k token input.
+MOSS_TD_LONG90_MAX_NEW_TOKENS = 50000
 
 
-MOSS_TD_CER_PERCENT_REF = 5.8058980551671535
-MOSS_TD_CER_NO_SPK_PERCENT_REF = 5.8058980551671535
-MOSS_TD_CER_NO_SPK_BELOW_50_PERCENT_REF: float | None = 4.976211906904976
+MOSS_TD_CER_PERCENT_REF = 5.812253718062794
+MOSS_TD_CER_NO_SPK_PERCENT_REF = 5.812253718062794
+MOSS_TD_CER_NO_SPK_BELOW_50_PERCENT_REF: float | None = 4.97942651407998
 MOSS_TD_N_ABOVE_50_CER_REF: int | None = 29
-MOSS_TD_CP_CER_PERCENT_REF = 13.211834244311682
-MOSS_TD_CER_NO_SPK_CP_VALID_PERCENT_REF = 5.8058980551671535
+MOSS_TD_CP_CER_PERCENT_REF = 13.219778822931232
+MOSS_TD_CER_NO_SPK_CP_VALID_PERCENT_REF = 5.812253718062794
 MOSS_TD_DELTA_CER_PERCENT_REF = 7.421825346383629
-MOSS_TD_SPEAKER_TIMESTAMP_DER_PERCENT_REF: float | None = 21.011564782231943
+MOSS_TD_SPEAKER_TIMESTAMP_DER_PERCENT_REF: float | None = 21.016722368599407
 MOSS_TD_CER_VALID_SAMPLES_MIN: int | None = 784
 MOSS_TD_CP_CER_VALID_SAMPLES_MIN: int | None = 784
-MOSS_TD_THROUGHPUT_QPS_REF = 39.671
-MOSS_TD_LATENCY_MEAN_S_REF = 0.333
-MOSS_TD_LATENCY_P95_S_REF = 0.702
-MOSS_TD_RTF_MEAN_REF = 0.0366
-MOSS_TD_RTF_P95_REF = 0.0473
+MOSS_TD_THROUGHPUT_QPS_REF = 45.436
+MOSS_TD_LATENCY_MEAN_S_REF = 0.295
+MOSS_TD_LATENCY_P95_S_REF = 0.609
+MOSS_TD_RTF_MEAN_REF = 0.0324
+MOSS_TD_RTF_P95_REF = 0.0417
 
-AISHELL4_LONG_CER_PERCENT_REF = 13.801266201727444
-AISHELL4_LONG_CER_NO_SPK_PERCENT_REF = 13.801266201727444
-AISHELL4_LONG_CP_CER_PERCENT_REF = 14.04630173742391
-AISHELL4_LONG_DELTA_CER_PERCENT_REF = 0.26055814881750794
-AISHELL4_LONG_SPEAKER_TIMESTAMP_DER_PERCENT_REF = 9.557172277711036
-AISHELL4_LONG_THROUGHPUT_QPS_REF = 0.069
-AISHELL4_LONG_LATENCY_MEAN_S_REF = 161.985
-AISHELL4_LONG_LATENCY_P95_S_REF = 208.915
-AISHELL4_LONG_RTF_MEAN_REF = 0.0708
-AISHELL4_LONG_RTF_P95_REF = 0.0926
+AISHELL4_LONG_CER_PERCENT_REF = 13.855595347651095
+AISHELL4_LONG_CER_NO_SPK_PERCENT_REF = 13.855595347651095
+AISHELL4_LONG_CP_CER_PERCENT_REF = 14.20651727999468
+AISHELL4_LONG_DELTA_CER_PERCENT_REF = 0.36256389218436436
+AISHELL4_LONG_SPEAKER_TIMESTAMP_DER_PERCENT_REF = 9.700722891345189
+AISHELL4_LONG_THROUGHPUT_QPS_REF = 0.068
+AISHELL4_LONG_LATENCY_MEAN_S_REF = 163.564
+AISHELL4_LONG_LATENCY_P95_S_REF = 208.081
+AISHELL4_LONG_RTF_MEAN_REF = 0.0715
+AISHELL4_LONG_RTF_P95_REF = 0.0934
+# note (db-ol): catastrophic bounds for the single 90 minute sample, not
+# calibrated thresholds. The healthy greedy run measures cer_no_spk 11.63
+# and missed detection ratio 0.039, the known format dropout failure
+# measures 80.3 and loses DER validity entirely.
+AISHELL4_LONG90_CER_NO_SPK_PERCENT_MAX: float | None = 30.0
+AISHELL4_LONG90_MISSED_DETECTION_RATIO_MAX = 0.5
 
 
-GOOGLETIME_CER_PERCENT_REF = 32.98946954391862
-GOOGLETIME_CER_NO_SPK_PERCENT_REF = 32.98946954391862
-GOOGLETIME_CER_NO_SPK_BELOW_50_PERCENT_REF: float | None = 31.813485220089945
+GOOGLETIME_CER_PERCENT_REF = 32.88493971954541
+GOOGLETIME_CER_NO_SPK_PERCENT_REF = 32.88493971954541
+GOOGLETIME_CER_NO_SPK_BELOW_50_PERCENT_REF: float | None = 31.708566672917655
 GOOGLETIME_N_ABOVE_50_CER_REF: int | None = 1
-GOOGLETIME_CP_CER_PERCENT_REF = 33.81712644294662
-GOOGLETIME_DELTA_CER_PERCENT_REF = 0.8360002145423984
-GOOGLETIME_SPEAKER_TIMESTAMP_DER_PERCENT_REF = 31.168548796685062
-GOOGLETIME_THROUGHPUT_QPS_REF = 0.047
-GOOGLETIME_LATENCY_MEAN_S_REF = 250.903
-GOOGLETIME_LATENCY_P95_S_REF = 273.908
-GOOGLETIME_RTF_MEAN_REF = 0.0973
-GOOGLETIME_RTF_P95_REF = 0.1247
+GOOGLETIME_CP_CER_PERCENT_REF = 33.70759062926478
+GOOGLETIME_DELTA_CER_PERCENT_REF = 0.8364769754289347
+GOOGLETIME_SPEAKER_TIMESTAMP_DER_PERCENT_REF = 31.042260093758223
+GOOGLETIME_THROUGHPUT_QPS_REF = 0.046
+GOOGLETIME_LATENCY_MEAN_S_REF = 253.922
+GOOGLETIME_LATENCY_P95_S_REF = 279.229
+GOOGLETIME_RTF_MEAN_REF = 0.0984
+GOOGLETIME_RTF_P95_REF = 0.1253
 
 # Note (guozhihao): Streaming emits partial deltas, so keep its refs separate
 # from non-streaming thresholds to avoid mixing latency and accuracy baselines.
-MOSS_TD_STREAM_CER_PERCENT_REF: float | None = 5.832909622473624
-MOSS_TD_STREAM_CER_NO_SPK_PERCENT_REF: float | None = 5.832909622473624
-MOSS_TD_STREAM_CER_NO_SPK_BELOW_50_PERCENT_REF: float | None = 5.003536067892504
+MOSS_TD_STREAM_CER_PERCENT_REF: float | None = 5.820198296682344
+MOSS_TD_STREAM_CER_NO_SPK_PERCENT_REF: float | None = 5.820198296682344
+MOSS_TD_STREAM_CER_NO_SPK_BELOW_50_PERCENT_REF: float | None = 4.996223504266636
 
 # note (chenyang): It's quite unstable for the MOSS_TD_STREAM_N_ABOVE_50_CER_MAX
 # We keep it fixed to 31 and no need to change it during calibration.
 MOSS_TD_STREAM_N_ABOVE_50_CER_MAX: int | None = 31
-MOSS_TD_STREAM_CP_CER_PERCENT_REF: float | None = 13.04976484047286
-MOSS_TD_STREAM_CER_NO_SPK_CP_VALID_PERCENT_REF: float | None = 5.832909622473624
-MOSS_TD_STREAM_DELTA_CER_PERCENT_REF: float | None = 7.251811363925256
-MOSS_TD_STREAM_SPEAKER_TIMESTAMP_DER_PERCENT_REF: float | None = 20.96720953947172
+MOSS_TD_STREAM_CP_CER_PERCENT_REF: float | None = 13.22295665437905
+MOSS_TD_STREAM_CER_NO_SPK_CP_VALID_PERCENT_REF: float | None = 5.820198296682344
+MOSS_TD_STREAM_DELTA_CER_PERCENT_REF: float | None = 7.421825346383626
+MOSS_TD_STREAM_SPEAKER_TIMESTAMP_DER_PERCENT_REF: float | None = 21.034847600690796
 MOSS_TD_STREAM_CER_VALID_SAMPLES_MIN: int | None = 784
 MOSS_TD_STREAM_CP_CER_VALID_SAMPLES_MIN: int | None = 784
-MOSS_TD_STREAM_THROUGHPUT_QPS_REF: float | None = 42.444
-MOSS_TD_STREAM_LATENCY_MEAN_S_REF: float | None = 0.318
-MOSS_TD_STREAM_LATENCY_P95_S_REF: float | None = 0.643
-MOSS_TD_STREAM_RTF_MEAN_REF: float | None = 0.034
-MOSS_TD_STREAM_RTF_P95_REF: float | None = 0.0429
-MOSS_TD_STREAM_TEXT_TTFT_P95_S_REF: float | None = 0.0515
-MOSS_TD_STREAM_INTER_CHUNK_P95_S_REF: float | None = 0.0628
+MOSS_TD_STREAM_THROUGHPUT_QPS_REF: float | None = 47.847
+MOSS_TD_STREAM_LATENCY_MEAN_S_REF: float | None = 0.274
+MOSS_TD_STREAM_LATENCY_P95_S_REF: float | None = 0.572
+MOSS_TD_STREAM_RTF_MEAN_REF: float | None = 0.0298
+MOSS_TD_STREAM_RTF_P95_REF: float | None = 0.0374
+MOSS_TD_STREAM_TEXT_TTFT_P95_S_REF: float | None = 0.0555
+MOSS_TD_STREAM_INTER_CHUNK_P95_S_REF: float | None = 0.0559
 
 THRESHOLD_SLACK_HIGHER = 0.9
 THRESHOLD_SLACK_LOWER = 1.1
@@ -353,6 +367,15 @@ def aishell4_long_samples():
 
 
 @pytest.fixture(scope="module")
+def aishell4_long90_sample(aishell4_long_samples):
+    return build_long_audio_concat_sample(
+        clips=[aishell4_long_samples[i] for i in MOSS_TD_LONG90_CLIP_INDICES],
+        target_duration_s=MOSS_TD_LONG90_TARGET_S,
+        sample_id="aishell4_long90",
+    )
+
+
+@pytest.fixture(scope="module")
 def googletime_samples():
     return load_movies800_samples(
         repo_id=GOOGLETIME_REPO_ID,
@@ -393,6 +416,7 @@ def moss_td_router_server(
 def test_moss_transcribe_diarize_multi_speaker_datasets(
     movies800times_samples,
     aishell4_long_samples,
+    aishell4_long90_sample,
     googletime_samples,
     moss_td_router_server: ManagedRouterHandle,
     tmp_path: Path,
@@ -507,6 +531,31 @@ def test_moss_transcribe_diarize_multi_speaker_datasets(
 
     with router_worker_traffic_guard(
         moss_td_router_server,
+        label="MOSS-Transcribe-Diarize aishell4_long90",
+    ):
+        long90_outputs, long90_wall_clock_s = _run_transcribe_diarize(
+            [aishell4_long90_sample],
+            moss_td_router_server=moss_td_router_server,
+            request_timeout_s=1800,
+            max_new_tokens=MOSS_TD_LONG90_MAX_NEW_TOKENS,
+        )
+    long90_results = _build_results(
+        samples=[aishell4_long90_sample],
+        outputs=long90_outputs,
+        wall_clock_s=long90_wall_clock_s,
+        repo_id=AISHELL4_REPO_ID,
+        dataset="aishell4_long90",
+    )
+    _print_and_save_results(
+        results=long90_results,
+        tmp_path=tmp_path,
+        filename="moss_transcribe_diarize_aishell4_long90_results.json",
+        router_ready_s=moss_td_router_server.router_ready_s,
+    )
+    _assert_aishell4_long90_results(checks, long90_results)
+
+    with router_worker_traffic_guard(
+        moss_td_router_server,
         label="MOSS-Transcribe-Diarize googletime",
     ):
         googletime_outputs, googletime_wall_clock_s = _run_transcribe_diarize(
@@ -572,6 +621,7 @@ def _build_results(
     outputs,
     wall_clock_s: float,
     repo_id: str,
+    dataset: str | None = None,
 ):
     return build_evaluation_payload(
         samples=samples,
@@ -581,7 +631,7 @@ def _build_results(
         concurrency=MOSS_TD_CONCURRENCY,
         repo_id=repo_id,
         split="validation",
-        dataset=_dataset_preset(repo_id),
+        dataset=dataset or _dataset_preset(repo_id),
     )
 
 
@@ -1000,6 +1050,70 @@ def _assert_aishell4_long_results(checks: MetricCheckCollector, results) -> None
         "aishell4_long rtf_p95",
         speed.get("rtf_p95"),
         AISHELL4_LONG_RTF_P95_MAX,
+    )
+    _check_format_validity(
+        checks,
+        "aishell4_long",
+        diarization_percent,
+        expected_valid=MOSS_TD_AISHELL4_LONG_CI_SAMPLES,
+    )
+
+
+def _assert_aishell4_long90_results(checks: MetricCheckCollector, results) -> None:
+    summary = results["summary"]
+    speed = results["speed"]
+    diarization_percent = results["diarization_metrics_percent"]
+    checks.check(
+        summary["evaluated"] == 1,
+        f"Expected the aishell4_long90 sample evaluated, got {summary['evaluated']}",
+    )
+    failed_requests = speed.get("failed_requests")
+    checks.check(
+        failed_requests == 0,
+        f"Expected 0 aishell4_long90 failed requests, got {failed_requests}",
+    )
+    _check_format_validity(
+        checks, "aishell4_long90", diarization_percent, expected_valid=1
+    )
+    missed = diarization_percent.get("speaker_timestamp_der_missed_detection")
+    total = diarization_percent.get("speaker_timestamp_der_total_seconds")
+    if total:
+        ratio = missed / total
+        checks.check(
+            ratio <= AISHELL4_LONG90_MISSED_DETECTION_RATIO_MAX,
+            "Expected aishell4_long90 timestamped segments to cover the "
+            f"reference speech, got missed detection ratio {ratio:.3f}",
+        )
+    _check_optional_max(
+        checks,
+        "aishell4_long90 cer_no_spk",
+        diarization_percent.get("cer_no_spk"),
+        AISHELL4_LONG90_CER_NO_SPK_PERCENT_MAX,
+        unit="%",
+    )
+    # note (db-ol): one 90 minute sample, so speaker attribution and speed
+    # are logged for observability but not asserted.
+    print(
+        "[report-only] aishell4_long90 "
+        f"cp_cer={diarization_percent.get('cp_cer')}% "
+        f"speaker_timestamp_der={diarization_percent.get('speaker_timestamp_der')}% "
+        f"latency_mean_s={speed.get('latency_mean_s')} "
+        f"rtf_mean={speed.get('rtf_mean')}"
+    )
+
+
+def _check_format_validity(
+    checks: MetricCheckCollector,
+    label: str,
+    diarization_percent,
+    *,
+    expected_valid: int,
+) -> None:
+    valid = diarization_percent.get("speaker_timestamp_der_valid_samples")
+    checks.check(
+        valid == expected_valid,
+        f"Expected {expected_valid} {label} outputs with parseable "
+        f"timestamped segments, got speaker_timestamp_der_valid_samples={valid}",
     )
 
 

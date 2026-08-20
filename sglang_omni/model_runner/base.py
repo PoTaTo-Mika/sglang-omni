@@ -4,14 +4,16 @@
 Handles: ForwardBatch construction, phase-aware pre/post hooks, forward
 pass, sampling, logit post-processing, and output extraction.
 """
+
 from __future__ import annotations
 
-import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
 
+from sglang_omni.model_runner.prefill_inputs import clear_omni_prefill_inputs
+from sglang_omni.platforms import current_platform
 from sglang_omni.sampling.seed import (
     SAMPLING_SEED_MASK,
     derive_sampling_seed,
@@ -23,8 +25,6 @@ from sglang_omni.scheduling.types import (
     SchedulerRequest,
     sampled_logprobs_to_list,
 )
-
-logger = logging.getLogger(__name__)
 
 
 def _current_sglang_sampling_backend() -> str | None:
@@ -39,6 +39,26 @@ def _current_sglang_sampling_backend() -> str | None:
 def _rank_shared_unseeded_sampling_seed(request: SchedulerRequest, row_idx: int) -> int:
     request_id = request.request_id or f"row-{row_idx}"
     return derive_sampling_seed("sglang-omni-unseeded-row", request_id)
+
+
+def resolve_deferred_prefill_inputs(schedule_batch: Any, device: torch.device) -> None:
+    """Materialize staged CPU prefill inputs before a direct worker forward.
+
+    Scheduler-owned execution resolves staging through SGLangExecutionBridge;
+    DllmScheduler calls this before invoking the worker directly.
+    """
+    staged_input_ids = schedule_batch.prefill_input_ids_cpu
+    if staged_input_ids is None:
+        return
+
+    if schedule_batch.mix_running_indices is not None:
+        raise RuntimeError(
+            "Omni does not support SGLang mixed chunked-prefill batches with "
+            "deferred decode tokens"
+        )
+
+    schedule_batch.input_ids = staged_input_ids.to(device, non_blocking=True)
+    schedule_batch.prefill_input_ids_cpu = None
 
 
 @dataclass
@@ -60,12 +80,11 @@ class _PendingStep:
     launch(N+1) writes the other (design.md section 1.4).
     """
 
-    event: Any  # torch.cuda.Event, recorded after post_decode_launch publishes
+    event: Any  # device Event, recorded after post_decode_launch publishes
     launch_buf: Any  # post_decode_launch return: device snapshot or host staging
     scheduler_output: Any  # this step's SchedulerOutput (routing + output proc)
     forward_batch: Any  # for resolve-time finalize sampling
-    schedule_batch: Any  # to set .output_ids during resolve
-    model_worker_batch: Any  # for the prefill-only finalize branch (unused in decode)
+    schedule_batch: Any  # resolve-time snapshot (copy of the live batch)
     batch_result: Any  # carries logits_output (device of next_token_ids)
 
 
@@ -80,8 +99,9 @@ class ModelRunner:
     def __init__(self, tp_worker: Any, output_processor: Any):
         self.tp_worker = tp_worker
         self.output_processor = output_processor
-        self.device = torch.device(f"cuda:{tp_worker.gpu_id}")
+        self.device = current_platform.get_device(tp_worker.gpu_id)
         self.model = tp_worker.model_runner.model
+        self._execution_bridge: Any | None = None
 
         # Async decode (one-step lookahead). Inert unless ``_async_enabled`` is set.
         self._async_enabled: bool = False
@@ -96,6 +116,7 @@ class ModelRunner:
         self._async_query_miss: int = 0
         self._token_id_host_bufs: list[torch.Tensor] | None = None
         self._token_id_host_slot: int = 0
+        self._suppress_tensor_cache: dict[tuple, tuple[Any, torch.Tensor | None]] = {}
 
     def _stage_token_ids(self, result: Any, ids: torch.Tensor) -> None:
         # Note (wenyao): pinned host copy staged once at sample time so downstream
@@ -165,6 +186,21 @@ class ModelRunner:
             result._host_token_ids_event = None
         return getattr(result, "_host_token_ids", None)
 
+    def bind_execution_bridge(self, bridge: Any) -> None:
+        """Bind the scheduler-owned SGLang execution-contract adapter."""
+        self._execution_bridge = bridge
+
+    def _execution_context(
+        self,
+        schedule_batch: Any,
+        *,
+        isolate_sampling: bool = False,
+    ):
+        return self._execution_bridge.forward_context(
+            schedule_batch,
+            isolate_sampling=isolate_sampling,
+        )
+
     def _next_host_staging(
         self, shape: tuple[int, ...] | torch.Size, dtype: torch.dtype
     ) -> torch.Tensor:
@@ -200,33 +236,54 @@ class ModelRunner:
         ``_finalize``) that ``execute_launch`` + ``execute_resolve`` also use,
         in the same order. Async decode splits this at the post-decode boundary.
         """
-        built = self._build_forward_batch(scheduler_output)
-        if built is None:
+        schedule_batch = scheduler_output.batch_data
+        if schedule_batch is None:
             return ModelRunnerOutput(outputs={}, req_ids=[], req_id_to_index={})
-        forward_batch, schedule_batch, model_worker_batch, is_prefill = built
-        batch_result = self._prepare_and_forward(
-            forward_batch, schedule_batch, scheduler_output.requests, is_prefill
-        )
-        if is_prefill:
-            self.post_prefill(
-                batch_result, forward_batch, schedule_batch, scheduler_output.requests
+        with self._execution_context(schedule_batch, isolate_sampling=True):
+            built = self._build_forward_batch(scheduler_output)
+            if built is None:
+                return ModelRunnerOutput(outputs={}, req_ids=[], req_id_to_index={})
+            forward_batch, schedule_batch, is_prefill = built
+            batch_result = self._prepare_and_forward(
+                forward_batch, schedule_batch, scheduler_output.requests, is_prefill
             )
-        else:
-            self.post_decode(
-                batch_result, forward_batch, schedule_batch, scheduler_output.requests
+            if is_prefill:
+                self.post_prefill(
+                    batch_result,
+                    forward_batch,
+                    schedule_batch,
+                    scheduler_output.requests,
+                )
+            else:
+                self.post_decode(
+                    batch_result,
+                    forward_batch,
+                    schedule_batch,
+                    scheduler_output.requests,
+                )
+            self._ensure_next_token_ids(
+                batch_result,
+                forward_batch,
+                schedule_batch,
+                scheduler_output,
+            )
+            self._publish_next_tokens(
+                batch_result,
+                forward_batch,
+                schedule_batch,
+                scheduler_output.requests,
             )
         return self._finalize(
             batch_result,
             forward_batch,
             schedule_batch,
-            model_worker_batch,
             scheduler_output,
         )
 
     def execute_launch(self, scheduler_output: Any) -> "_PendingStep | None":
         """Enqueue a decode step's forward + on-GPU sample, call
         ``post_decode_launch`` to publish a model-specific resolve payload
-        (returned as ``launch_buf``), and record a CUDA event right after
+        (returned as launch_buf), and record a device event right after
         publication. Does NOT wait on the GPU. Decode batches only. ``launch_buf``
         is a device-side correctness snapshot (MOSS-TTS-Local) or pinned host
         staging (Higgs); only the latter overlaps a host copy with the next
@@ -239,39 +296,50 @@ class ModelRunner:
         scheduling has two steps momentarily in flight: the just-launched step
         N and the not-yet-resolved step N-1.
         """
-        built = self._build_forward_batch(scheduler_output)
-        if built is None:
+        schedule_batch = scheduler_output.batch_data
+        if schedule_batch is None:
             return None
-        forward_batch, schedule_batch, model_worker_batch, is_prefill = built
-        assert not is_prefill, "async lookahead launch is decode-only"
-        batch_result = self._prepare_and_forward(
-            forward_batch,
-            schedule_batch,
-            scheduler_output.requests,
-            is_prefill,
-            is_lookahead=True,
-        )
-        launch_buf = self.post_decode_launch(
-            batch_result, forward_batch, scheduler_output.requests
-        )
-        # Publish this step's output token ids now (post_decode_launch set them
-        # from GPU state without a host sync) so the NEXT decode step's
-        # get_next_batch_to_run / prepare_for_decode can build its input_ids;
-        # under lookahead the host collect (resolve) lags by one step.
-        if batch_result.next_token_ids is not None:
-            schedule_batch.output_ids = batch_result.next_token_ids
-        event = torch.cuda.Event()
-        # Recorded after post_decode_launch publishes this step, so
-        # event.query()==True means the launched step's GPU work is done and
-        # launch_buf is ready (design.md section 3).
-        event.record()
+        with self._execution_context(schedule_batch, isolate_sampling=True):
+            built = self._build_forward_batch(scheduler_output)
+            if built is None:
+                return None
+            forward_batch, schedule_batch, is_prefill = built
+            assert not is_prefill, "async lookahead launch is decode-only"
+            batch_result = self._prepare_and_forward(
+                forward_batch,
+                schedule_batch,
+                scheduler_output.requests,
+                is_prefill,
+                is_lookahead=True,
+            )
+            launch_buf = self.post_decode_launch(
+                batch_result, forward_batch, scheduler_output.requests
+            )
+            self._ensure_next_token_ids(
+                batch_result,
+                forward_batch,
+                schedule_batch,
+                scheduler_output,
+            )
+            self._publish_next_tokens(
+                batch_result,
+                forward_batch,
+                schedule_batch,
+                scheduler_output.requests,
+            )
+            event = self._execution_bridge.record_completion()
+            # Never retain the mutable live ScheduleBatch across a lookahead
+            # iteration. The upstream overlap loop likewise queues batch.copy().
+            resolve_batch = schedule_batch.copy()
+            resolve_scheduler_output = replace(
+                scheduler_output, batch_data=resolve_batch
+            )
         return _PendingStep(
             event=event,
             launch_buf=launch_buf,
-            scheduler_output=scheduler_output,
+            scheduler_output=resolve_scheduler_output,
             forward_batch=forward_batch,
-            schedule_batch=schedule_batch,
-            model_worker_batch=model_worker_batch,
+            schedule_batch=resolve_batch,
             batch_result=batch_result,
         )
 
@@ -310,29 +378,26 @@ class ModelRunner:
             pending.batch_result,
             pending.forward_batch,
             pending.schedule_batch,
-            pending.model_worker_batch,
             pending.scheduler_output,
-            set_output_ids=False,
             skip_rids=skip_rids,
         )
 
     def _build_forward_batch(self, scheduler_output: Any):
         """Build the ForwardBatch + capture-hidden mode. Returns
-        ``(forward_batch, schedule_batch, model_worker_batch, is_prefill)``, or
+        ``(forward_batch, schedule_batch, is_prefill)``, or
         None when there is no batch to run."""
         from sglang.srt.model_executor.forward_batch_info import (
             CaptureHiddenMode,
             ForwardBatch,
         )
 
-        if self.device.type == "cuda":
-            torch.cuda.set_device(self.device)
+        if self.device.type != "cpu":
+            torch.get_device_module(self.device).set_device(self.device.index or 0)
 
         schedule_batch = scheduler_output.batch_data
         if schedule_batch is None:
             return None
 
-        model_worker_batch = schedule_batch.get_model_worker_batch()
         is_prefill = bool(schedule_batch.forward_mode.is_extend())
 
         capture_hidden_mode = (
@@ -344,15 +409,19 @@ class ModelRunner:
                 schedule_batch, scheduler_output.requests
             )
         )
-        if capture_hidden_mode is not None:
-            model_worker_batch.capture_hidden_mode = capture_hidden_mode
-        elif self.output_processor._capture_hidden:
-            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
+        if capture_hidden_mode is None and self.output_processor._capture_hidden:
+            capture_hidden_mode = CaptureHiddenMode.LAST
 
+        # sglang 0.5.16 dropped ScheduleBatch.capture_hidden_mode: init_new no
+        # longer reads it off the batch, so setting it there is a dead write.
+        # Pass the per-forward override explicitly (None lets upstream derive it).
         forward_batch = ForwardBatch.init_new(
-            model_worker_batch, self.tp_worker.model_runner
+            schedule_batch,
+            self.tp_worker.model_runner,
+            capture_hidden_mode=capture_hidden_mode,
+            return_hidden_states_before_norm=False,
         )
-        return forward_batch, schedule_batch, model_worker_batch, is_prefill
+        return forward_batch, schedule_batch, is_prefill
 
     def _prepare_and_forward(
         self,
@@ -365,40 +434,49 @@ class ModelRunner:
     ):
         """Prepare hook → standard forward (if not custom) → sample-before-post
         block. Returns ``batch_result``."""
-        if is_prefill:
-            self.before_prefill(forward_batch, schedule_batch, requests)
-            batch_result = self.custom_prefill_forward(
-                forward_batch, schedule_batch, requests
-            )
-        else:
-            self.before_decode(
-                forward_batch,
-                schedule_batch,
-                requests,
-                is_lookahead=is_lookahead,
-            )
-            batch_result = self.custom_decode_forward(
-                forward_batch, schedule_batch, requests
-            )
-        if batch_result is None:
-            batch_result = self.tp_worker.forward_batch_generation(forward_batch)
-
-        if (
-            not schedule_batch.is_prefill_only
-            and batch_result.next_token_ids is None
-            and (
-                self.sample_before_post_prefill(forward_batch, schedule_batch, requests)
-                if is_prefill
-                else self.sample_before_post_decode(
+        try:
+            if is_prefill:
+                self.before_prefill(forward_batch, schedule_batch, requests)
+                batch_result = self.custom_prefill_forward(
                     forward_batch, schedule_batch, requests
                 )
-            )
-        ):
-            batch_result.next_token_ids = self._sample_next_token_ids(
-                batch_result.logits_output, forward_batch, schedule_batch, requests
-            )
-            schedule_batch.output_ids = batch_result.next_token_ids
-        return batch_result
+            else:
+                self.before_decode(
+                    forward_batch,
+                    schedule_batch,
+                    requests,
+                    is_lookahead=is_lookahead,
+                )
+                batch_result = self.custom_decode_forward(
+                    forward_batch, schedule_batch, requests
+                )
+            if batch_result is None:
+                batch_result = self.tp_worker.forward_batch_generation(forward_batch)
+
+            if (
+                not schedule_batch.is_prefill_only
+                and batch_result.next_token_ids is None
+                and (
+                    self.sample_before_post_prefill(
+                        forward_batch, schedule_batch, requests
+                    )
+                    if is_prefill
+                    else self.sample_before_post_decode(
+                        forward_batch, schedule_batch, requests
+                    )
+                )
+            ):
+                batch_result.next_token_ids = self._sample_next_token_ids(
+                    batch_result.logits_output,
+                    forward_batch,
+                    schedule_batch,
+                    requests,
+                )
+            return batch_result
+        finally:
+            if is_prefill:
+                clear_omni_prefill_inputs(forward_batch)
+                self.cleanup_prefill(forward_batch, schedule_batch, requests)
 
     def finalize_skip_rids(self, scheduler_output) -> set[str]:
         """Request ids whose ``generation_steps`` must NOT advance this step.
@@ -432,41 +510,14 @@ class ModelRunner:
         batch_result,
         forward_batch,
         schedule_batch,
-        model_worker_batch,
         scheduler_output,
-        set_output_ids: bool = True,
         skip_rids: set[str] | None = None,
     ) -> ModelRunnerOutput:
-        """Final sampling (if still needed) + output extraction + per-request
-        bookkeeping. Shared tail of both the sync and async paths.
-
-        ``set_output_ids`` publishes this step's tokens onto
-        ``schedule_batch.output_ids`` so the NEXT step's ``prepare_for_decode``
-        can build its input_ids. The synchronous path needs this. The async
-        RESOLVE path must NOT do it: under launch-first the resolve runs one
-        step behind, and ``schedule_batch`` here is the *live* running batch
-        whose output_ids was already published by the (current) launch at the
-        right length — re-stamping the lagged step's next_token_ids would leave
-        a stale-length output_ids on the running batch, which the next
-        prepare_for_decode turns into an input_ids that mismatches seq_lens once
-        a request finishes mid-batch (the bs>1 replay size mismatch)."""
-        if schedule_batch.is_prefill_only:
-            if batch_result.next_token_ids is None:
-                batch_result.next_token_ids = torch.zeros(
-                    len(model_worker_batch.seq_lens),
-                    dtype=torch.long,
-                    device=model_worker_batch.input_ids.device,
-                )
-        elif batch_result.next_token_ids is None:
-            batch_result.next_token_ids = self._sample_next_token_ids(
-                batch_result.logits_output,
-                forward_batch,
-                schedule_batch,
-                scheduler_output.requests,
-            )
-        if set_output_ids:
-            schedule_batch.output_ids = batch_result.next_token_ids
-
+        """Output extraction + per-request bookkeeping. Shared tail of both
+        the sync and async paths; callers materialize reporting tokens via
+        _ensure_next_token_ids before the launch is considered complete. The
+        next-forward GPU token rail is published through SGLangExecutionBridge;
+        async resolve must never stamp its lagged result onto a live batch."""
         host_token_ids = self._resolve_host_token_ids(batch_result)
         if host_token_ids is None:
             outputs = self.output_processor.process(batch_result, scheduler_output)
@@ -497,7 +548,59 @@ class ModelRunner:
             req_ids=req_ids,
             req_id_to_index=req_id_to_index,
             can_run_cuda_graph=bool(batch_result.can_run_cuda_graph),
+            next_token_ids=batch_result.next_token_ids,
             host_token_ids=host_token_ids,
+        )
+
+    def _ensure_next_token_ids(
+        self,
+        batch_result: Any,
+        forward_batch: Any,
+        schedule_batch: Any,
+        scheduler_output: Any,
+    ) -> None:
+        """Materialize this step's reporting tokens while still on its stream."""
+        if schedule_batch.is_prefill_only:
+            if batch_result.next_token_ids is None:
+                batch_result.next_token_ids = torch.zeros(
+                    len(schedule_batch.seq_lens),
+                    dtype=torch.long,
+                    device=schedule_batch.input_ids.device,
+                )
+        elif batch_result.next_token_ids is None:
+            batch_result.next_token_ids = self._sample_next_token_ids(
+                batch_result.logits_output,
+                forward_batch,
+                schedule_batch,
+                scheduler_output.requests,
+            )
+
+    def next_input_token_ids(
+        self,
+        result: Any,
+        forward_batch: Any,
+        requests: list,
+    ) -> torch.Tensor | None:
+        """Return the GPU token rail consumed by the next forward."""
+        del forward_batch, requests
+        return (
+            result.next_token_ids
+            if isinstance(result.next_token_ids, torch.Tensor)
+            else None
+        )
+
+    def _publish_next_tokens(
+        self,
+        result: Any,
+        forward_batch: Any,
+        schedule_batch: Any,
+        requests: list,
+    ) -> None:
+        if schedule_batch.is_prefill_only:
+            return
+        self._execution_bridge.publish_next_tokens(
+            schedule_batch,
+            self.next_input_token_ids(result, forward_batch, requests),
         )
 
     # ------------------------------------------------------------------
@@ -508,6 +611,11 @@ class ModelRunner:
         self, forward_batch: Any, schedule_batch: Any, requests: list
     ) -> None:
         """Mutate state before the standard or custom prefill forward."""
+
+    def cleanup_prefill(
+        self, forward_batch: Any, schedule_batch: Any, requests: list
+    ) -> None:
+        """Release one-forward prefill state on success or failure."""
 
     def before_decode(
         self,
@@ -579,12 +687,20 @@ class ModelRunner:
     ) -> None:
         """Called after output tokens are materialized into RequestOutput."""
 
+    def on_request_finished(self, request_id: str, req_data: Any) -> None:
+        """Drain per-request state on any non-abort finish.
+
+        Called from ``OmniScheduler.stream_output`` before the terminal payload
+        is enqueued on the same outbox, so runners that buffer stream chunks
+        across decode steps can flush them ahead of stream completion.
+        """
+
     def post_decode_launch(
         self, result: Any, forward_batch: Any, requests: list
     ) -> Any:
         """Async-decode GPU half of ``post_decode``: sample now, publish
         ``result.next_token_ids``, and return the resolve payload (``launch_buf``);
-        the caller records a CUDA event right after.
+        the caller records a device event right after.
 
         Default (plain-LM): sample via ``_sample_next_token_ids`` and snapshot the
         ids into a pinned ping-pong host buffer (required — the sampler output can
@@ -715,13 +831,13 @@ class ModelRunner:
 
     @staticmethod
     def _validate_seeded_sampling_supported(sampling_info: Any) -> None:
-        if getattr(sampling_info, "need_min_p_sampling", False):
+        if sampling_info.need_min_p_sampling:
             raise ValueError(
                 "SGLang seeded sampling does not support min_p yet; set min_p=0 "
                 "or omit request seed"
             )
-        need_top_p_sampling = getattr(sampling_info, "need_top_p_sampling", False)
-        need_top_k_sampling = getattr(sampling_info, "need_top_k_sampling", False)
+        need_top_p_sampling = sampling_info.need_top_p_sampling
+        need_top_k_sampling = sampling_info.need_top_k_sampling
         if not (need_top_p_sampling or need_top_k_sampling):
             return
         if _current_sglang_sampling_backend() == "flashinfer":
@@ -734,17 +850,9 @@ class ModelRunner:
     @staticmethod
     def _enable_sampler_logprobs(forward_batch: Any, batch_size: int) -> None:
         forward_batch.return_logprob = True
-        try:
-            top_logprobs_nums = forward_batch.top_logprobs_nums
-        except AttributeError:
-            top_logprobs_nums = None
-        if top_logprobs_nums is None:
+        if forward_batch.top_logprobs_nums is None:
             forward_batch.top_logprobs_nums = [0] * batch_size
-        try:
-            token_ids_logprobs = forward_batch.token_ids_logprobs
-        except AttributeError:
-            token_ids_logprobs = None
-        if token_ids_logprobs is None:
+        if forward_batch.token_ids_logprobs is None:
             forward_batch.token_ids_logprobs = [None] * batch_size
 
     def _record_rollout_logprobs(
@@ -783,10 +891,25 @@ class ModelRunner:
 
     @staticmethod
     def _req_is_retracted(req: Any) -> bool:
-        try:
-            return bool(req.is_retracted)
-        except AttributeError:
-            return False
+        return bool(req.is_retracted)
+
+    @staticmethod
+    def _rep_penalty_unique_tokens(data: Any, output_ids: list, vocab: int) -> set:
+        # Note: (Jiaxin Deng) rebuilding unique(output_ids) every decode step is
+        # quadratic over the generation; track the consumed prefix and fold in
+        # only new tokens. A shrunk output_ids (retract/restart) resets the state.
+        seen_len = getattr(data, "_rep_seen_len", 0)
+        seen: set | None = getattr(data, "_rep_seen_tokens", None)
+        if seen is None or len(output_ids) < seen_len:
+            seen = set()
+            seen_len = 0
+        for t in output_ids[seen_len:]:
+            tok = int(t)
+            if 0 <= tok < vocab:
+                seen.add(tok)
+        data._rep_seen_tokens = seen
+        data._rep_seen_len = len(output_ids)
+        return seen
 
     def _apply_repetition_penalty(self, logits_output: Any, requests: list) -> None:
         logits = logits_output.next_token_logits
@@ -805,8 +928,14 @@ class ModelRunner:
                 continue
             output_ids = req.output_ids
             if not output_ids:
+                # Note: (Jiaxin Deng) a retract can replace output_ids with an
+                # empty list; drop the incremental state so a restart does not
+                # inherit stale tokens.
+                if getattr(data, "_rep_seen_len", 0):
+                    data._rep_seen_tokens = set()
+                    data._rep_seen_len = 0
                 continue
-            unique = {int(t) for t in output_ids if 0 <= int(t) < vocab}
+            unique = ModelRunner._rep_penalty_unique_tokens(data, output_ids, vocab)
             if not unique:
                 continue
             rep_rows.extend([row_idx] * len(unique))
@@ -827,8 +956,15 @@ class ModelRunner:
             return
         vocab = logits.shape[1]
         device = logits.device
-        sup_rows: list[int] = []
-        sup_toks: list[int] = []
+        # Note: (Jiaxin Deng) the suppress set comes from model config, so keying
+        # by content collapses the whole fleet onto one device tensor; the key
+        # itself is derived once per request because the builder hands out a
+        # fresh list object each time.
+        cache = getattr(self, "_suppress_tensor_cache", None)
+        if cache is None:
+            cache = {}
+            self._suppress_tensor_cache = cache
+        row_groups: dict[Any, tuple[torch.Tensor, list[int]]] = {}
         for row_idx, sched_req in enumerate(requests):
             data = sched_req.data
             suppress_tokens = data.suppress_tokens
@@ -840,13 +976,30 @@ class ModelRunner:
                     suppress_tokens = None
             if not suppress_tokens:
                 continue
-            for token_id in suppress_tokens:
-                tok = int(token_id)
-                if 0 <= tok < vocab:
-                    sup_rows.append(row_idx)
-                    sup_toks.append(tok)
-        if sup_rows:
-            logits[
-                torch.tensor(sup_rows, dtype=torch.long, device=device),
-                torch.tensor(sup_toks, dtype=torch.long, device=device),
-            ] = float("-inf")
+            content = getattr(data, "_suppress_content", None)
+            if content is None:
+                content = tuple(int(t) for t in suppress_tokens)
+                data._suppress_content = content
+            key = (content, vocab, str(device))
+            toks_t = cache.get(key)
+            if key not in cache:
+                toks = [t for t in content if 0 <= t < vocab]
+                toks_t = (
+                    torch.tensor(toks, dtype=torch.long, device=device)
+                    if toks
+                    else None
+                )
+                cache[key] = toks_t
+            if toks_t is None:
+                continue
+            group = row_groups.get(key)
+            if group is None:
+                row_groups[key] = (toks_t, [row_idx])
+            else:
+                group[1].append(row_idx)
+        for toks_t, rows in row_groups.values():
+            if len(rows) == logits.shape[0]:
+                logits[:, toks_t] = float("-inf")
+            else:
+                rows_t = torch.tensor(rows, dtype=torch.long, device=device)
+                logits[rows_t[:, None], toks_t[None, :]] = float("-inf")

@@ -13,7 +13,7 @@ import time
 from collections.abc import Iterable
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
-from typing import Any, Literal, Mapping, Sequence
+from typing import Any, Literal, Sequence
 
 from sglang_omni.config.runtime import resolve_factory_signature_args
 from sglang_omni.pipeline.control_plane import StageControlPlane
@@ -22,12 +22,14 @@ from sglang_omni.pipeline.stage.input import AggregatedInput, DirectInput
 from sglang_omni.pipeline.stage.runtime import Stage
 from sglang_omni.pipeline.stage.stream_queue import StreamQueue
 from sglang_omni.pipeline.tp_control import TPFollowerControlPlane, TPLeaderFanout
+from sglang_omni.platforms import current_platform, get_platform_spec
 from sglang_omni.utils.gpu_compat import (
     apply_gpu_compat_env_defaults,
     get_gpu_compat_env_defaults,
 )
 from sglang_omni.utils.gpu_memory import gpu_startup_lock
 from sglang_omni.utils.imports import import_string
+from sglang_omni.utils.ipc_weights import prepare_weight_share_process_compat
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +80,7 @@ class StageLaunchConfig:
     coordinator_endpoint: str = ""
     abort_endpoint: str = ""
     stage_endpoints: dict[str, str] = field(default_factory=dict)
+    rank_endpoints: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
     # Stream wiring
     stream_targets: list[str] = field(default_factory=list)
@@ -143,7 +146,7 @@ def _get_worker_process_env(spec: StageWorkerProcessSpec) -> dict[str, str]:
             "stages; TP stages must own their OS process exclusively. "
             f"stage_specs={[s.stage_name for s in spec.stage_specs]}"
         )
-    return get_stage_process_env(tp_stages[0])
+    return current_platform.get_stage_process_env(tp_stages[0])
 
 
 @contextmanager
@@ -172,11 +175,8 @@ def _patched_spawn_env(spec: StageWorkerProcessSpec):
         **env_default_updates,
         **compat_env_defaults,
         **worker_process_env,
+        "SGLANG_OMNI_PLATFORM_SPEC": get_platform_spec(current_platform),
     }
-    if not updates:
-        yield
-        return
-
     backup = {key: os.environ.get(key) for key in updates}
     try:
         for key, value in updates.items():
@@ -375,8 +375,9 @@ def stage_process_main(
 
     try:
         for stage_spec in spec.stage_specs:
-            _prepare_cuda_environment(stage_spec, log)
+            _prepare_accelerator_environment(stage_spec, log)
         apply_gpu_compat_env_defaults()
+        prepare_weight_share_process_compat()
         _run_process(spec, ready_event, log)
     except (KeyboardInterrupt, SystemExit):
         _destroy_torch_distributed_process_group(log)
@@ -579,10 +580,8 @@ def _construct_stage(
 ) -> Stage:
     gpu_id = spec.gpu_id
     if gpu_id is not None:
-        import torch
-
-        torch.cuda.set_device(int(gpu_id))
-        log.info("Set current CUDA device to %s for stage %s", gpu_id, spec.stage_name)
+        current_platform.set_device(int(gpu_id))
+        log.info("Set current device to %s for stage %s", gpu_id, spec.stage_name)
 
     # --- Build scheduler via factory ---
     log.info(
@@ -745,6 +744,9 @@ def _construct_stage(
         gpu_id=spec.gpu_id,
         placement_gpu_id=spec.placement_gpu_id,
         endpoints=spec.stage_endpoints,
+        rank_endpoints=spec.rank_endpoints,
+        tp_rank=spec.tp_rank,
+        tp_size=spec.tp_size,
         control_plane=control_plane,
         input_handler=input_handler,
         comm_config=spec.comm_config,
@@ -790,42 +792,20 @@ def _construct_scheduler(
         return factory(**factory_args)
 
 
-def get_stage_process_env(
-    spec: StageLaunchConfig,
-    env: Mapping[str, str] | None = None,
-) -> dict[str, str]:
-    """Return per-process env overrides needed before TP child startup."""
-    if spec.tp_size <= 1:
-        return {}
-
-    source_env = env if env is not None else os.environ
-    original_visible = source_env.get("CUDA_VISIBLE_DEVICES")
-    if spec.gpu_id is None:
-        raise ValueError(f"tp stage {spec.stage_name!r} requires a GPU id")
-    if original_visible:
-        visible_devices = [item.strip() for item in original_visible.split(",")]
-        if spec.gpu_id >= len(visible_devices):
-            raise ValueError(
-                f"tp stage {spec.stage_name!r} assigned gpu_id={spec.gpu_id}, "
-                f"but CUDA_VISIBLE_DEVICES only exposes {visible_devices}"
-            )
-        mapped_gpu = visible_devices[spec.gpu_id]
-    else:
-        mapped_gpu = str(spec.gpu_id)
-
-    return {
-        "CUDA_VISIBLE_DEVICES": mapped_gpu,
-        "SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS": "true",
-        "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK": "false",
-    }
-
-
-def _prepare_cuda_environment(
+def _prepare_accelerator_environment(
     spec: StageLaunchConfig,
     log: logging.Logger,
 ) -> None:
-    """Map TP rank processes to one visible CUDA device before torch init."""
-    if os.environ.get("SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS") == "true":
+    """Map TP rank processes to their accelerator before torch init.
+
+    Which variables to set is platform policy; this only applies whatever the platform
+    returns, and normalizes gpu_id only when the platform narrowed the process to a
+    single visible device.
+    """
+    if (
+        current_platform.is_cuda_alike()
+        and os.environ.get("SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS") == "true"
+    ):
         mapped_gpu = os.environ.get("CUDA_VISIBLE_DEVICES", str(spec.gpu_id))
         _normalize_spec_gpu_id_to_local_device(spec)
         log.info(
@@ -836,13 +816,22 @@ def _prepare_cuda_environment(
         )
         return
 
-    env_updates = get_stage_process_env(spec)
+    env_updates = current_platform.get_stage_process_env(spec)
     if not env_updates:
         return
 
-    mapped_gpu = env_updates["CUDA_VISIBLE_DEVICES"]
     for key, value in env_updates.items():
         os.environ[key] = value
+
+    mapped_gpu = env_updates.get("CUDA_VISIBLE_DEVICES")
+    if mapped_gpu is None:
+        log.info(
+            "TP stage %s rank %d keeps every card visible, using gpu_id=%s",
+            spec.stage_name,
+            spec.tp_rank,
+            spec.gpu_id,
+        )
+        return
 
     _normalize_spec_gpu_id_to_local_device(spec)
     log.info(

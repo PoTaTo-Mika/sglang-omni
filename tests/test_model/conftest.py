@@ -16,6 +16,75 @@ if TYPE_CHECKING:
 
     from tests.utils import ServerHandle
 
+
+def _parse_cpuset(spec: str) -> set[int]:
+    """Parse a Linux cpulist such as "0-23,64-87" into a CPU id set."""
+    cpus: set[int] = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            raise ValueError(f"Empty component in OMNI_CI_CPUSET {spec!r}")
+        if "-" in part:
+            lo_text, hi_text = part.split("-", 1)
+            lo, hi = int(lo_text), int(hi_text)
+            if lo > hi:
+                raise ValueError(f"Invalid OMNI_CI_CPUSET range {part!r}")
+            cpus.update(range(lo, hi + 1))
+        else:
+            cpus.add(int(part))
+    if not cpus:
+        raise ValueError(f"OMNI_CI_CPUSET {spec!r} selects no CPUs")
+    return cpus
+
+
+def _apply_omni_ci_cpuset() -> set[int] | None:
+    spec = os.environ.get("OMNI_CI_CPUSET", "").strip()
+    if not spec or not hasattr(os, "sched_setaffinity"):
+        return None
+    requested = _parse_cpuset(spec)
+    previous = os.sched_getaffinity(0)
+    os.sched_setaffinity(0, requested)
+    # Note: (Jiaxin Deng) Linux may silently intersect the request with the
+    # cgroup/cpuset-allowed CPUs; a partial pin would invalidate calibration.
+    effective = os.sched_getaffinity(0)
+    if effective != requested:
+        raise RuntimeError(
+            f"OMNI_CI_CPUSET pinning ineffective: requested {sorted(requested)}, "
+            f"previously allowed {sorted(previous)}, effective {sorted(effective)}"
+        )
+    return requested
+
+
+@pytest.fixture(autouse=True, scope="session")
+def pin_omni_ci_cpuset() -> "Generator[None, None, None]":
+    """Pin the test session, and every server it spawns, to OMNI_CI_CPUSET.
+
+    The gates in this directory measure host-bound serving stacks, so on a
+    shared runner concurrent jobs inflate per-request CPU cost and shift
+    calibrated floors. Child processes inherit the affinity, which keeps the
+    managed router, its workers, and the bench client on the reserved cores.
+    Pinning restrains only this session, so a contention sampler reports
+    foreign load on the reserved cores at session end. The report is
+    advisory, never fatal: contention can only depress perf numbers, so a
+    gate that passed under intrusion passed for real, and a gate that failed
+    carries the contention line for triage while retrying through the normal
+    failure path. Calibration is stricter and rejects the round itself.
+    """
+    cpus = _apply_omni_ci_cpuset()
+    if cpus is None:
+        yield
+        return
+    from tests.utils.ci_cpu_contention import ContentionSampler
+
+    sampler = ContentionSampler(cpus)
+    sampler.start()
+    try:
+        yield
+    finally:
+        sampler.stop()
+        print(sampler.summary())
+
+
 TTS_ALLOWED_CONCURRENCIES = (1, 2, 4, 8, 16)
 TTS_STAGE_NONSTREAM = "tts-stage-1-nonstream"
 TTS_STAGE_STREAM = "tts-stage-2-stream"
@@ -32,6 +101,7 @@ SELECTED_TTS_CONCURRENCIES = pytest.StashKey[tuple[int, ...]]()
 TTS_STAGE_OPTION = "--tts-stage"
 SELECTED_TTS_CI_STAGE = pytest.StashKey[str]()
 TTS_CI_MODEL_OPTION = "--tts-ci-model"
+ASR_CI_MODEL_OPTION = "--asr-ci-model"
 QWEN3_OMNI_MODEL_PATH = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 # Single source of truth for the model path used by Qwen3-Omni vision-encoder
 # benchmarks and the SGLang state they bring up. Honors
@@ -46,7 +116,9 @@ QWEN3_OMNI_FP8_TEST_MODEL_PATH = os.environ.get(
 )
 QWEN3_OMNI_MODEL_NAME = "qwen3-omni"
 QWEN3_OMNI_TP2_THINKER_MEM_FRACTION = "0.55"
-QWEN3_OMNI_TP2_TALKER_MEM_FRACTION = "0.20"
+# note (db-ol): SGLang 0.5.16 counts draft weights in the KV budget and
+# the talker needs at least 0.2008, so 0.20 crashes intermittently.
+QWEN3_OMNI_TP2_TALKER_MEM_FRACTION = "0.21"
 QWEN3_OMNI_TP2_THINKER_MAX_SEQ_LEN = 32768
 QWEN3_OMNI_FP8_COLOCATED_CONFIG = "examples/configs/qwen3_omni_colocated_h100_fp8.yaml"
 QWEN3_OMNI_FP8_COLOCATED_VIDEO_ARGS = (
@@ -233,11 +305,10 @@ def _start_qwen3_omni_tp2(
 
     model_path = QWEN3_OMNI_TEST_MODEL_PATH
     is_short_thinker_context = thinker_max_seq_len != QWEN3_OMNI_TP2_THINKER_MAX_SEQ_LEN
-    thinker_mem_fraction = (
-        QWEN3_OMNI_FP8_TP2_THINKER_MEM_FRACTION
-        if is_short_thinker_context
-        else QWEN3_OMNI_TP2_THINKER_MEM_FRACTION
-    )
+    # Shortening the context reduces KV-cache use, but SGLang 0.5.16 errors
+    # out at startup unless this fraction also covers the BF16 model weights
+    # themselves (KVCacheConfigurator refuses negative KV headroom).
+    thinker_mem_fraction = QWEN3_OMNI_TP2_THINKER_MEM_FRACTION
     extra_args = [
         "--thinker-tp-size",
         "2",
@@ -264,7 +335,9 @@ def _start_qwen3_omni_tp2(
         model_path=model_path,
         extra_args=extra_args,
         thinker_max_seq_len=thinker_max_seq_len,
-        timeout=600,
+        # SGLang 0.5.16 may cold-JIT the FlashInfer fused-MoE kernels on the
+        # first H100 startup; keep this within the workflow's 20-minute budget.
+        timeout=1200,
         log_prefix="server_logs_tp2_ci",
         force_log=True,
     )
@@ -469,6 +542,16 @@ def pytest_addoption(parser: pytest.Parser) -> None:
             "If omitted, use TTS_CI_MODEL from the environment."
         ),
     )
+    parser.addoption(
+        ASR_CI_MODEL_OPTION,
+        action="store",
+        default="",
+        help=(
+            "Select the ASR CI model preset. "
+            "Use one of the presets in tests/test_model/asr_ci_config.py. "
+            "If omitted, use ASR_CI_MODEL from the environment."
+        ),
+    )
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -476,9 +559,12 @@ def pytest_configure(config: pytest.Config) -> None:
     config.stash[SELECTED_TTS_CONCURRENCIES] = _parse_tts_concurrency(option_value)
     stage_value = config.getoption(TTS_STAGE_OPTION)
     config.stash[SELECTED_TTS_CI_STAGE] = _parse_tts_ci_stage(stage_value)
-    model_value = config.getoption(TTS_CI_MODEL_OPTION)
-    if model_value:
-        os.environ["TTS_CI_MODEL"] = _parse_tts_ci_model(model_value)
+    tts_model_value = config.getoption(TTS_CI_MODEL_OPTION)
+    if tts_model_value:
+        os.environ["TTS_CI_MODEL"] = _parse_tts_ci_model(tts_model_value)
+    asr_model_value = config.getoption(ASR_CI_MODEL_OPTION)
+    if asr_model_value:
+        os.environ["ASR_CI_MODEL"] = _parse_asr_ci_model(asr_model_value)
 
 
 @pytest.fixture(scope="session")
@@ -533,6 +619,19 @@ def _parse_tts_ci_model(option_value: str) -> str:
         allowed = tuple(sorted(TTS_CI_PRESETS))
         raise pytest.UsageError(
             f"Unsupported value for {TTS_CI_MODEL_OPTION}: {option_value!r}. "
+            f"Use one of {allowed}."
+        )
+    return normalized_value
+
+
+def _parse_asr_ci_model(option_value: str) -> str:
+    from tests.test_model.asr_ci_config import ASR_CI_PRESETS
+
+    normalized_value = option_value.strip().lower()
+    if normalized_value not in ASR_CI_PRESETS:
+        allowed = tuple(sorted(ASR_CI_PRESETS))
+        raise pytest.UsageError(
+            f"Unsupported value for {ASR_CI_MODEL_OPTION}: {option_value!r}. "
             f"Use one of {allowed}."
         )
     return normalized_value

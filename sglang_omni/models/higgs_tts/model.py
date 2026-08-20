@@ -211,6 +211,12 @@ class HiggsTTSModel(nn.Module):
             pool_size, dtype=torch.long, device=cg_device
         )
 
+    @property
+    def language_model(self) -> Qwen3ForCausalLM:
+        """Decoder handle for SGLang prefill-graph discovery; a property
+        keeps the parameter tree free of a duplicate alias."""
+        return self.backbone
+
     def get_input_embeddings(self) -> nn.Embedding:
         return self.backbone.get_input_embeddings()
 
@@ -250,8 +256,11 @@ class HiggsTTSModel(nn.Module):
         return row
 
     def set_request_seed(self, req_id: str, seed: int | None) -> None:
-        """Pin ``req_id``'s sampler seed (``None`` -> unseeded/random). Constant
-        across the request's AR steps; consumed by ``multinomial_with_seed``."""
+        """Pin req_id's sampler seed (None -> unseeded torch.multinomial).
+
+        Constant across the request's AR steps; consumed by
+        multinomial_with_seed for seeded rows.
+        """
         row = self.acquire_row(req_id)
         self._sampler_pool.seeds[row] = (
             NO_SEED if seed is None else resolve_row_seed(seed)
@@ -419,6 +428,7 @@ class HiggsTTSModel(nn.Module):
         positions: torch.Tensor,
         forward_batch,
         input_embeds: torch.Tensor | None = None,
+        omni_prefill_rids: list[str] | None = None,
         **kwargs,
     ):
         """Run the backbone then sample multi-codebook codes per request.
@@ -434,7 +444,17 @@ class HiggsTTSModel(nn.Module):
                 input_ids, batch_size=input_ids.shape[0]
             )
         else:
-            req_ids, gen_params = self._extract_batch_metadata(forward_batch)
+            if input_embeds is None:
+                raise RuntimeError(
+                    "Higgs prefill requires runner-composed input_embeds"
+                )
+            if omni_prefill_rids is None:
+                raise RuntimeError(
+                    "Higgs prefill requires omni_prefill_rids from ForwardBatch.rids"
+                )
+            req_ids, gen_params = self._extract_batch_metadata(
+                forward_batch, omni_prefill_rids
+            )
 
         hidden_states = self.backbone.model(
             input_ids,
@@ -463,6 +483,8 @@ class HiggsTTSModel(nn.Module):
                 hidden_states_last, req_ids, gen_params
             )
 
+        # Rows are per-request, not per-token; the graph runner's replay trim
+        # is a no-op on these shapes only because bs <= extend tokens.
         return LogitsProcessorOutput(
             next_token_logits=text_logits_BV,
             hidden_states=hidden_states_last,
@@ -495,17 +517,12 @@ class HiggsTTSModel(nn.Module):
         return bool(is_decode()) if callable(is_decode) else False
 
     def _extract_batch_metadata(
-        self, forward_batch
+        self,
+        forward_batch,
+        req_ids: list[str],
     ) -> tuple[list[str], list[HiggsGenParams]]:
-        req_ids_raw = getattr(forward_batch, "req_ids", None)
         batch_size = self._infer_batch_size(forward_batch)
-        if req_ids_raw is None:
-            req_ids = [f"req-{i}" for i in range(batch_size)]
-        else:
-            req_ids = [str(r) for r in req_ids_raw]
-
-        sampling_info = getattr(forward_batch, "sampling_info", None)
-        gen_params = self._gen_params_for_batch(sampling_info, batch_size)
+        gen_params = self._gen_params_for_batch(forward_batch.sampling_info, batch_size)
         return req_ids, gen_params
 
     @staticmethod

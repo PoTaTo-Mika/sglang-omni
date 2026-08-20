@@ -3,15 +3,20 @@ from __future__ import annotations
 import logging
 import os
 import socket
-from dataclasses import dataclass
+from bisect import bisect_left
+from collections import Counter
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
+from sglang_omni.platforms import current_platform
 from sglang_omni.quantization import (
     needs_quant_config_normalization,
     normalize_quant_config,
     resolve_quant_config,
 )
+from sglang_omni.utils.misc import model_config_has_moe
+from sglang_omni.vendor.sglang.server_args import override_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -26,10 +31,20 @@ class ModelWorkerConfig:
     weight_prefix: str | None = None
     nccl_port: int | None = None
     total_gpu_memory_fraction: float | None = None
+    enable_prefill_input_embeds: bool = False
+
+
+@dataclass(slots=True)
+class _PrefillCudaGraphUsage:
+    replay_count: int = 0
+    standard_eager_count: int = 0
+    custom_eager_count: int = 0
+    replay_buckets: Counter[int] = field(default_factory=Counter)
 
 
 _ARCH_CONFIG_MAP: dict[str, tuple[str, str | None]] = {
     "BailingMoeV2ForCausalLM": ("llm_config", None),
+    "DotsTTSForConditionalGeneration": ("llm_config", None),
     "MingTTSSGLangModel": ("llm_config", None),
     "Qwen3OmniTalker": ("talker_config", "text_config"),
     "Qwen3OmniThinkerForCausalLM": ("thinker_config", "text_config"),
@@ -55,6 +70,7 @@ class ModelWorker:
         self.weight_prefix = config.weight_prefix
         self.nccl_port = config.nccl_port
         self.total_gpu_memory_fraction = config.total_gpu_memory_fraction
+        self.enable_prefill_input_embeds = config.enable_prefill_input_embeds
 
         self.gpu_id = gpu_id
         self.tp_rank = tp_rank
@@ -62,6 +78,7 @@ class ModelWorker:
         self._configure_backend_policy()
         self._init_model_runner()
         self._init_dllm_algorithm()
+        self._prefill_cuda_graph_usage = _PrefillCudaGraphUsage()
 
         self.device = self.model_runner.device
         from sglang.srt.utils import broadcast_pyobj, set_random_seed
@@ -86,6 +103,12 @@ class ModelWorker:
             )
 
             register_ming_tts_hf_config()
+        if self.model_arch_override == "DotsTTSForConditionalGeneration":
+            from sglang_omni.models.dots_tts.hf_config import (
+                register_dots_tts_hf_config,
+            )
+
+            register_dots_tts_hf_config()
 
         from sglang.srt.configs.model_config import ModelConfig
 
@@ -140,7 +163,12 @@ class ModelWorker:
         # model_worker backend policy.
         _apply_omni_quantization_adapters(self.model_config)
 
-        effective_quantization = _apply_model_worker_backend_policy(
+        _apply_model_worker_backend_common_policy(
+            self.server_args,
+            self.model_arch_override,
+        )
+
+        effective_quantization = current_platform.apply_model_worker_backend_policy(
             self.server_args,
             self.model_config,
             self.model_arch_override,
@@ -159,14 +187,21 @@ class ModelWorker:
 
     def get_worker_info(self):
         max_total_num_tokens = self.model_runner.max_total_num_tokens
-        max_req_len = min(self.server_args.context_length - 1, max_total_num_tokens - 1)
+        effective_max_total_num_tokens = (
+            self.model_runner.effective_max_total_num_tokens
+        )
+        max_req_len = min(
+            self.server_args.context_length - 1,
+            effective_max_total_num_tokens - 1,
+        )
         max_req_input_len = max_req_len - 1
         req_pool = self.model_runner.req_to_token_pool
         kv_pool = self.model_runner.token_to_kv_pool_allocator
+        max_running_requests = self.model_runner.max_running_requests
         return (
             max_total_num_tokens,
             self.server_args.max_prefill_tokens,
-            self.server_args.max_running_requests,
+            max_running_requests,
             self.server_args.max_queued_requests,
             max_req_len,
             max_req_input_len,
@@ -222,27 +257,102 @@ class ModelWorker:
     def forward_batch_generation(
         self,
         forward_batch,
+        *,
+        batch=None,
     ):
         from sglang.srt.managers.scheduler import GenerationBatchResult
 
         if self.dllm_algorithm is not None:
-            logits_output, next_token_ids, can_run_cuda_graph = self.dllm_algorithm.run(
-                self.model_runner, forward_batch
+            algo_states = None
+            if self.dllm_algorithm.fdfo and batch is not None:
+                algo_states = [req.dllm_algo_state for req in batch.reqs]
+
+            (
+                logits_output,
+                next_token_ids,
+                accept_length_per_req_cpu,
+                dllm_algo_state,
+                can_run_cuda_graph,
+            ) = self.dllm_algorithm.run(
+                self.model_runner,
+                forward_batch,
+                algo_states,
             )
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
+                accept_length_per_req_cpu=accept_length_per_req_cpu,
+                dllm_algo_state=dllm_algo_state,
                 can_run_cuda_graph=can_run_cuda_graph,
             )
 
         out = self.model_runner.forward(forward_batch=forward_batch)
         logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
+        self._record_prefill_cuda_graph_usage(
+            forward_batch,
+            can_run_graph=bool(can_run_cuda_graph),
+        )
         batch_result = GenerationBatchResult(
             logits_output=logits_output,
             can_run_cuda_graph=can_run_cuda_graph,
             expert_distribution_metrics=out.expert_distribution_metrics,
         )
         return batch_result
+
+    def _record_prefill_cuda_graph_usage(
+        self,
+        forward_batch: Any,
+        *,
+        can_run_graph: bool,
+    ) -> None:
+        mode = forward_batch.forward_mode
+        if not mode.is_extend() or mode.is_cuda_graph():
+            return
+
+        if not can_run_graph:
+            # Note (wenyao): custom eager forwards (visual/deepstack) return
+            # before ModelWorker is called; intentionally absent here.
+            self._prefill_cuda_graph_usage.standard_eager_count += 1
+            return
+
+        runner = self.model_runner.prefill_cuda_graph_runner
+        buckets = runner.capture_num_tokens
+        actual_bucket = buckets[bisect_left(buckets, len(forward_batch.input_ids))]
+        self._prefill_cuda_graph_usage.replay_count += 1
+        self._prefill_cuda_graph_usage.replay_buckets[int(actual_bucket)] += 1
+
+    def record_custom_prefill_eager(self) -> None:
+        """Record a custom prefill forward that bypasses SGLang graph dispatch."""
+        self._prefill_cuda_graph_usage.custom_eager_count += 1
+
+    def _prefill_cuda_graph_info(self) -> dict[str, Any]:
+        from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+            PrefillCudaGraphRunner,
+        )
+
+        runner = self.model_runner.prefill_cuda_graph_runner
+        if isinstance(runner, PrefillCudaGraphRunner):
+            capture_num_tokens = [int(value) for value in runner.capture_num_tokens]
+            backend_runner = type(runner.backend).__name__
+            input_embeds_slot = runner.buffer_registry.has_slot("input_embeds")
+        else:
+            capture_num_tokens, backend_runner, input_embeds_slot = None, None, False
+        backend = self.server_args.cuda_graph_config.prefill.backend
+        usage = self._prefill_cuda_graph_usage
+        return {
+            "backend": backend,
+            "runner": type(runner).__name__ if runner is not None else None,
+            "backend_runner": backend_runner,
+            "capture_num_tokens": capture_num_tokens,
+            "input_embeds_slot": input_embeds_slot,
+            "replay_count": int(usage.replay_count),
+            "standard_eager_count": int(usage.standard_eager_count),
+            "custom_eager_count": int(usage.custom_eager_count),
+            "replay_buckets": {
+                str(bucket): int(count)
+                for bucket, count in sorted(usage.replay_buckets.items())
+            },
+        }
 
     def model_info(self) -> dict[str, Any]:
         return {
@@ -256,15 +366,14 @@ class ModelWorker:
                 self.model_runner, "update_weights_from_disk"
             ),
             "supports_weight_checker": True,
+            "prefill_cuda_graph": self._prefill_cuda_graph_info(),
         }
 
     def update_weights_from_disk(self, payload: dict[str, Any]) -> tuple[bool, str]:
         model_path = payload.get("model_path")
         if not model_path:
             return False, "model_path is required"
-        update = getattr(self.model_runner, "update_weights_from_disk", None)
-        if update is None:
-            return False, "model runner does not support update_weights_from_disk"
+        update = self.model_runner.update_weights_from_disk
         load_format = payload.get("load_format") or self.server_args.load_format
         success, message = update(
             model_path,
@@ -272,21 +381,28 @@ class ModelWorker:
             recapture_cuda_graph=bool(payload.get("recapture_cuda_graph", False)),
         )
         if success:
-            runner_args = getattr(self.model_runner, "server_args", None)
-            setattr(self.server_args, "model_path", model_path)
-            setattr(self.server_args, "load_format", load_format)
-            if runner_args is not None:
-                setattr(runner_args, "model_path", model_path)
-                setattr(runner_args, "load_format", load_format)
-            model_config = getattr(self.model_runner, "model_config", None)
-            if model_config is not None:
-                setattr(model_config, "model_path", model_path)
-
+            runner_args = self.model_runner.server_args
+            updated_fields = {
+                "model_path": model_path,
+                "load_format": load_format,
+            }
             weight_version = payload.get("weight_version")
             if weight_version is not None:
-                setattr(self.server_args, "weight_version", weight_version)
-                if runner_args is not None:
-                    setattr(runner_args, "weight_version", weight_version)
+                updated_fields["weight_version"] = weight_version
+
+            override_server_args(
+                self.server_args,
+                "sglang-omni-weight-update-disk",
+                **updated_fields,
+            )
+            if runner_args is not self.server_args:
+                override_server_args(
+                    runner_args,
+                    "sglang-omni-weight-update-disk",
+                    **updated_fields,
+                )
+
+            self.model_runner.model_config.model_path = model_path
         return bool(success), str(message)
 
     def update_weights_from_tensor(self, payload: dict[str, Any]) -> tuple[bool, str]:
@@ -299,9 +415,7 @@ class ModelWorker:
         return self._call_optional_weight_method("update_weights_from_tensor", payload)
 
     def init_weights_update_group(self, payload: dict[str, Any]) -> tuple[bool, str]:
-        init = getattr(self.model_runner, "init_weights_update_group", None)
-        if init is None:
-            return False, "model runner does not support init_weights_update_group"
+        init = self.model_runner.init_weights_update_group
         master_address = payload.get("master_address")
         master_port = payload.get("master_port")
         world_size = payload.get("world_size")
@@ -324,21 +438,14 @@ class ModelWorker:
         return bool(success), str(message)
 
     def destroy_weights_update_group(self, payload: dict[str, Any]) -> tuple[bool, str]:
-        destroy = getattr(self.model_runner, "destroy_weights_update_group", None)
-        if destroy is None:
-            return False, "model runner does not support destroy_weights_update_group"
+        destroy = self.model_runner.destroy_weights_update_group
         success, message = destroy(payload.get("group_name") or "weight_update_group")
         return bool(success), str(message)
 
     def update_weights_from_distributed(
         self, payload: dict[str, Any]
     ) -> tuple[bool, str]:
-        update = getattr(self.model_runner, "update_weights_from_distributed", None)
-        if update is None:
-            return (
-                False,
-                "model runner does not support update_weights_from_distributed",
-            )
+        update = self.model_runner.update_weights_from_distributed
         names = payload.get("names")
         dtypes = payload.get("dtypes")
         shapes = payload.get("shapes")
@@ -364,10 +471,18 @@ class ModelWorker:
         if success:
             weight_version = payload.get("weight_version")
             if weight_version is not None:
-                setattr(self.server_args, "weight_version", weight_version)
-                runner_args = getattr(self.model_runner, "server_args", None)
-                if runner_args is not None:
-                    setattr(runner_args, "weight_version", weight_version)
+                override_server_args(
+                    self.server_args,
+                    "sglang-omni-weight-update-distributed",
+                    weight_version=weight_version,
+                )
+                runner_args = self.model_runner.server_args
+                if runner_args is not self.server_args:
+                    override_server_args(
+                        runner_args,
+                        "sglang-omni-weight-update-distributed",
+                        weight_version=weight_version,
+                    )
         return bool(success), str(message)
 
     def weights_checker(self, action: str) -> dict[str, Any]:
@@ -384,9 +499,7 @@ class ModelWorker:
         method_name: str,
         payload: dict[str, Any],
     ) -> tuple[bool, str]:
-        method = getattr(self.model_runner, method_name, None)
-        if method is None:
-            return False, f"model runner does not support {method_name}"
+        method = getattr(self.model_runner, method_name)
         recv_req = SimpleNamespace(**payload)
         success, message = method(recv_req)
         return bool(success), str(message)
@@ -412,21 +525,10 @@ def _resolve_nccl_port() -> int:
     return port
 
 
-def _apply_model_worker_backend_policy(
+def _apply_model_worker_backend_common_policy(
     server_args: ServerArgs,
-    model_config: ModelConfig,
     model_arch_override: str | None,
 ) -> str | None:
-    """Apply Omni backend policy after checkpoint quantization is known."""
-
-    effective_quantization = _normalize_quantization(
-        getattr(model_config, "quantization", None)
-    )
-    server_quantization = _normalize_quantization(server_args.quantization)
-    if server_quantization is not None:
-        effective_quantization = server_quantization
-
-    moe_runner_backend = server_args.moe_runner_backend
     is_qwen3_omni_arch = model_arch_override in (
         "Qwen3OmniTalker",
         "Qwen3OmniThinkerForCausalLM",
@@ -436,127 +538,6 @@ def _apply_model_worker_backend_policy(
             "Qwen3-Omni ModelWorker does not support expert parallelism; "
             "use ep_size=1."
         )
-    has_moe = _model_config_has_moe(model_config)
-    has_native_fp8_block_quant = _model_config_has_native_fp8_block_quant(model_config)
-
-    if (
-        model_arch_override == "Qwen3OmniTalker"
-        and effective_quantization is None
-        and moe_runner_backend == "auto"
-    ):
-        # Note:(Chenchen Hong) flashinfer_cutlass MoE deadlocks CUDA-graph
-        # capture on H20 (no H20 kernel coverage); triton captures cleanly there.
-        server_args.moe_runner_backend = (
-            "triton" if _is_h20_device() else "flashinfer_cutlass"
-        )
-        moe_runner_backend = server_args.moe_runner_backend
-
-    if (
-        is_qwen3_omni_arch
-        and effective_quantization == "fp8"
-        and has_moe
-        and moe_runner_backend == "auto"
-        and has_native_fp8_block_quant
-        and _is_fp8_cutlass_moe_supported()
-    ):
-        server_args.moe_runner_backend = "cutlass"
-        moe_runner_backend = server_args.moe_runner_backend
-
-    if (
-        is_qwen3_omni_arch
-        and effective_quantization == "fp8"
-        and has_moe
-        and moe_runner_backend == "cutlass"
-    ):
-        if not has_native_fp8_block_quant:
-            raise ValueError(
-                "Qwen3-Omni FP8 CUTLASS MoE requires a native serialized "
-                "block-FP8 checkpoint with weight_block_size."
-            )
-
-    if (
-        is_qwen3_omni_arch
-        and effective_quantization == "fp8"
-        and moe_runner_backend == "flashinfer_cutlass"
-    ):
-        raise ValueError(
-            "Qwen3-Omni native FP8 checkpoints cannot use "
-            "moe_runner_backend='flashinfer_cutlass'. Leave the backend as "
-            "'auto' so Omni selects a native-FP8-compatible MoE runner."
-        )
-
-    fp8_gemm_backend = _normalize_quantization(server_args.fp8_gemm_runner_backend)
-    if (
-        model_arch_override == "Qwen3OmniTalker"
-        and effective_quantization == "fp8"
-        and has_native_fp8_block_quant
-        and fp8_gemm_backend in (None, "auto")
-    ):
-        # Projected talker prefill has request-dependent FP8 dense GEMM shapes
-        # outside decode CUDA graph replay; DeepGEMM can otherwise JIT there.
-        server_args.fp8_gemm_runner_backend = "triton"
-        fp8_gemm_backend = server_args.fp8_gemm_runner_backend
-
-    server_quantization = server_args.quantization
-    logger.info(
-        f"Configured SGLang backend policy: arch={model_arch_override} "
-        f"effective_quantization={effective_quantization} "
-        f"server_quantization={server_quantization} "
-        f"moe_runner_backend={moe_runner_backend} "
-        f"fp8_gemm_backend={fp8_gemm_backend}"
-    )
-    return effective_quantization
-
-
-def _normalize_quantization(value: object) -> str | None:
-    if value is None:
-        return None
-    return str(value).lower()
-
-
-def _model_config_has_moe(model_config: ModelConfig) -> bool:
-    config_to_check = getattr(model_config, "hf_text_config", None)
-    if config_to_check is None:
-        hf_config = getattr(model_config, "hf_config", None)
-        config_to_check = getattr(hf_config, "text_config", hf_config)
-    return hasattr(config_to_check, "num_experts_per_tok")
-
-
-def _model_config_has_native_fp8_block_quant(model_config: ModelConfig) -> bool:
-    quant_dict = resolve_quant_config(getattr(model_config, "hf_config", None))
-    if quant_dict is None:
-        return False
-    return (
-        _normalize_quantization(quant_dict.get("quant_method")) == "fp8"
-        and quant_dict.get("weight_block_size") is not None
-    )
-
-
-def _is_h20_device() -> bool:
-    """True only on NVIDIA H20 (word-boundary match so "H200" isn't caught)."""
-    try:
-        import re
-
-        import torch
-
-        if not torch.cuda.is_available():
-            return False
-        return bool(re.search(r"\bH20\b", torch.cuda.get_device_name(0)))
-    except Exception:
-        return False
-
-
-def _is_fp8_cutlass_moe_supported() -> bool:
-    """Mirror pinned SGLang 0.5.12.post1 FP8 CUTLASS MoE assertions."""
-    try:
-        from sglang.srt.layers.quantization.fp8_utils import cutlass_fp8_supported
-        from sglang.srt.utils import is_sm90_supported, is_sm100_supported
-    except ImportError:
-        return False
-
-    return bool(
-        cutlass_fp8_supported() and (is_sm90_supported() or is_sm100_supported())
-    )
 
 
 def _apply_omni_quantization_adapters(model_config: ModelConfig) -> None:
@@ -567,7 +548,7 @@ def _apply_omni_quantization_adapters(model_config: ModelConfig) -> None:
     name normalization for methods whose per-block quant names are matched
     against runtime module names, currently AutoRound.
     """
-    quant_dict = resolve_quant_config(getattr(model_config, "hf_config", None))
+    quant_dict = resolve_quant_config(model_config.hf_config)
     if quant_dict is None:
         return
 
@@ -582,7 +563,7 @@ def _initialize_model_worker_backend_globals(
 ) -> None:
     """Initialize backend globals needed by direct workers before model loading."""
 
-    if _model_config_has_moe(model_config):
+    if model_config_has_moe(model_config):
         from sglang.srt.layers.moe import initialize_moe_config
 
         initialize_moe_config(server_args)

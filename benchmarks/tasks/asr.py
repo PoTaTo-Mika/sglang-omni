@@ -3,7 +3,7 @@
 
 Owns the ASR/WER primitives shared by the standalone ASR benchmark
 (benchmarks/eval/benchmark_asr_seedtts.py), the ASR CI gate
-(tests/test_model/test_asr_ci_fun_asr.py), the TTS WER stage
+(tests/test_model/test_asr_ci_seedtts.py), the TTS WER stage
 (benchmarks.tasks.tts.run_seedtts_transcribe), and the talker WER paths.
 """
 
@@ -220,8 +220,8 @@ def load_router_asr(
 def _transcribe_qwen3_asr(asr: dict, wav_path: str, lang: str) -> str:
     """Transcribe one wav via the Qwen3-ASR server's /v1/audio/transcriptions.
 
-    Note: do not send temperature=0 because Qwen3-ASR degenerates under pure
-    greedy (the server bumps it to 0.01). The language field selects the
+    note (Xinyu): Qwen3-ASR uses its greedy server default unless the caller
+    sends an explicit sampling temperature. The language field selects the
     forced prefix. max_new_tokens comes from the Qwen3 ASR pipeline config.
     """
     with open(wav_path, "rb") as audio_file:
@@ -325,8 +325,8 @@ def make_asr_send_fn(
     """Return a send_fn(session, sample) -> RequestResult that transcribes one
     SeedTTS reference clip via the Omni /v1/audio/transcriptions endpoint.
 
-    Note: do not send temperature=0 because Qwen3-ASR degenerates under pure
-    greedy (the server bumps it to 0.01). The language field selects the
+    note (Xinyu): Qwen3-ASR uses its greedy server default unless the caller
+    sends an explicit sampling temperature. The language field selects the
     forced prefix. max_new_tokens comes from the Qwen3 ASR pipeline config.
     """
 

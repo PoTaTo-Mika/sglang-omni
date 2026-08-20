@@ -286,6 +286,7 @@ def _make_args(**overrides) -> argparse.Namespace:
         host="0.0.0.0",
         port=8000,
         model_name="qwen3-omni",
+        enable_realtime=False,
     )
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -356,6 +357,23 @@ def test_tp1_default_config_contract(mock_launch_server):
     assert thinker.gpu == 0
     assert talker.gpu == 1
     assert code2wav.gpu == 0
+
+
+def test_speech_server_code2wav_follows_relocated_thinker(mock_launch_server):
+    args = _make_args(gpu_thinker=2, gpu_talker=3)
+    _launch_speech_server(args)
+
+    config = mock_launch_server.call_args[0][0]
+    assert _stage(config, "thinker").gpu == 2
+    assert _stage(config, "talker_ar").gpu == 3
+    assert _stage(config, "code2wav").gpu == 2
+
+
+def test_speech_server_forwards_realtime_flag(mock_launch_server):
+    args = _make_args(enable_realtime=True)
+    _launch_speech_server(args)
+
+    assert mock_launch_server.call_args.kwargs["enable_realtime"] is True
 
 
 def test_mem_fractions_applied(mock_launch_server):

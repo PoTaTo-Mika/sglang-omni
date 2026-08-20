@@ -29,17 +29,21 @@ def _fake_runner(
     disable_cuda_graph=False,
     capture_bs=None,
     request_slots=64,
-    has_graph_runner=True,
+    has_decode_cuda_graph_runner=True,
 ):
-    graph_runner = SimpleNamespace(capture_bs=capture_bs) if has_graph_runner else None
+    decode_cuda_graph_runner = (
+        SimpleNamespace(capture_bs=capture_bs) if has_decode_cuda_graph_runner else None
+    )
     return SimpleNamespace(
         server_args=SimpleNamespace(
             max_running_requests=max_running_requests,
-            cuda_graph_max_bs=cuda_graph_max_bs,
+            cuda_graph_config=SimpleNamespace(
+                decode=SimpleNamespace(max_bs=cuda_graph_max_bs)
+            ),
             disable_cuda_graph=disable_cuda_graph,
         ),
         req_to_token_pool=SimpleNamespace(size=request_slots),
-        graph_runner=graph_runner,
+        decode_cuda_graph_runner=decode_cuda_graph_runner,
         model=model,
     )
 
@@ -151,12 +155,12 @@ def test_read_captured_bs_sorts_and_ints():
 
 
 def test_read_captured_bs_missing_capture_returns_none():
-    runner = _fake_runner(has_graph_runner=True, capture_bs=None)
+    runner = _fake_runner(has_decode_cuda_graph_runner=True, capture_bs=None)
     assert read_captured_bs(runner) is None
 
 
 def test_read_captured_bs_no_graph_runner_returns_none():
-    runner = _fake_runner(has_graph_runner=False)
+    runner = _fake_runner(has_decode_cuda_graph_runner=False)
     assert read_captured_bs(runner) is None
 
 
@@ -293,7 +297,7 @@ def test_validate_stage_disabled_cuda_graph_is_valid_no_op():
         model=model,
         disable_cuda_graph=True,
         capture_bs=None,
-        has_graph_runner=False,
+        has_decode_cuda_graph_runner=False,
     )
     report = validate_stage("tts_engine", runner)
     assert report.is_valid
@@ -334,3 +338,97 @@ def test_every_generation_model_has_a_probe():
         "Qwen3OmniTalker",
     }
     assert expected <= set(cgv._BUFFER_PROBES)
+
+
+def _real_prefill_runner(
+    *,
+    backend: str = "breakable",
+    buckets: tuple[int, ...] = (128, 256),
+    has_slot: bool = True,
+):
+    from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+        PrefillCudaGraphRunner,
+    )
+
+    runner = object.__new__(PrefillCudaGraphRunner)
+    runner.prefill_backend_name = backend
+    runner.capture_num_tokens = sorted(buckets)
+    runner.buffer_registry = SimpleNamespace(
+        has_slot=lambda name: has_slot and name == "input_embeds"
+    )
+    return runner
+
+
+def _attest_server_args(
+    *,
+    backend: str = "breakable",
+    bs: tuple[int, ...] = (128, 256),
+    backend_locked: bool = True,
+):
+    return SimpleNamespace(
+        cuda_graph_config=SimpleNamespace(
+            prefill=SimpleNamespace(backend=backend, bs=list(bs))
+        ),
+        _cuda_graph_config_locked=(
+            {("prefill", "backend")} if backend_locked else set()
+        ),
+    )
+
+
+def test_attest_prefill_graphs_accepts_matching_capture():
+    model_runner = SimpleNamespace(prefill_cuda_graph_runner=_real_prefill_runner())
+
+    cgv.attest_prefill_cuda_graphs(model_runner, _attest_server_args())
+
+
+def test_attest_prefill_graphs_rejects_missing_runner():
+    import pytest
+
+    model_runner = SimpleNamespace(prefill_cuda_graph_runner=SimpleNamespace())
+
+    with pytest.raises(RuntimeError, match="did not construct"):
+        cgv.attest_prefill_cuda_graphs(model_runner, _attest_server_args())
+
+
+def test_attest_prefill_graphs_allows_auto_backend_to_fall_back(caplog):
+    model_runner = SimpleNamespace(prefill_cuda_graph_runner=SimpleNamespace())
+
+    cgv.attest_prefill_cuda_graphs(
+        model_runner,
+        _attest_server_args(backend_locked=False),
+    )
+
+    assert "eager prefill fallback" in caplog.text
+
+
+def test_attest_prefill_graphs_rejects_backend_mismatch():
+    import pytest
+
+    model_runner = SimpleNamespace(
+        prefill_cuda_graph_runner=_real_prefill_runner(backend="full")
+    )
+
+    with pytest.raises(RuntimeError, match="backend mismatch"):
+        cgv.attest_prefill_cuda_graphs(model_runner, _attest_server_args())
+
+
+def test_attest_prefill_graphs_rejects_bucket_mismatch():
+    import pytest
+
+    model_runner = SimpleNamespace(
+        prefill_cuda_graph_runner=_real_prefill_runner(buckets=(128,))
+    )
+
+    with pytest.raises(RuntimeError, match="capture shapes differ"):
+        cgv.attest_prefill_cuda_graphs(model_runner, _attest_server_args())
+
+
+def test_attest_prefill_graphs_rejects_missing_embeds_slot():
+    import pytest
+
+    model_runner = SimpleNamespace(
+        prefill_cuda_graph_runner=_real_prefill_runner(has_slot=False)
+    )
+
+    with pytest.raises(RuntimeError, match="input_embeds slot"):
+        cgv.attest_prefill_cuda_graphs(model_runner, _attest_server_args())

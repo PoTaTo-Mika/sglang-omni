@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 from typing import Any
 
@@ -38,6 +39,7 @@ class RecordingBatchSpeechClient:
             audio_bytes=f"audio:{request.prompt}".encode(),
             mime_type=f"audio/{response_format}",
             format=response_format,
+            finish_reason="length" if request.prompt == "third" else "stop",
         )
 
 
@@ -148,11 +150,13 @@ def test_batch_speech_preserves_order_and_item_errors() -> None:
     assert body["failed"] == 3
     assert [item["index"] for item in body["results"]] == [0, 1, 2, 3, 4]
     assert body["results"][0]["status"] == "success"
+    assert body["results"][0]["finish_reason"] == "stop"
     assert "success" not in body["results"][0]
     assert body["results"][1]["status"] == "error"
     assert "success" not in body["results"][1]
     assert body["results"][1]["error"]["param"] == "items.1.input"
     assert body["results"][2]["media_type"] == "audio/pcm"
+    assert body["results"][2]["finish_reason"] == "length"
     assert body["results"][3]["error"]["param"] == "items.3.input"
     assert body["results"][4]["error"]["param"] == "items.4.input"
     assert [request.prompt for request in client_impl.requests] == ["first", "third"]
@@ -196,6 +200,37 @@ def test_batch_speech_applies_pipeline_reference_requirements() -> None:
 
     assert response.status_code == 200
     assert response.json()["results"][0]["error"]["param"] == "items.0.ref_audio"
+    assert client_impl.requests == []
+
+
+def test_batch_speech_applies_reference_text_instruction_exclusion() -> None:
+    client_impl = RecordingBatchSpeechClient()
+    client = TestClient(
+        create_app(
+            client_impl,
+            model_name="cosyvoice",
+            required_speech_reference_count=1,
+            speech_reference_text_excludes_instructions=True,
+        )
+    )
+    ref_audio = base64.b64encode(b"RIFF").decode("ascii")
+
+    response = client.post(
+        "/v1/audio/speech/batch",
+        json={
+            "items": [
+                {
+                    "input": "hello",
+                    "ref_audio": f"data:audio/wav;base64,{ref_audio}",
+                    "ref_text": "reference transcript",
+                    "instructions": "speak warmly",
+                }
+            ]
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["results"][0]["error"]["param"] == ("items.0.instructions")
     assert client_impl.requests == []
 
 

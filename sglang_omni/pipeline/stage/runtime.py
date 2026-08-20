@@ -6,6 +6,7 @@ stream chunk routing, abort tracking, profiling.
 
 Dispatches all compute to scheduler (OmniScheduler or SimpleScheduler).
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -20,7 +21,7 @@ from typing import Any, Awaitable, Callable, Literal
 import torch
 
 from sglang_omni.comm import stage_io
-from sglang_omni.comm.data_ref import DataRef
+from sglang_omni.comm.data_ref import DataKind, DataRef
 from sglang_omni.comm.engine import CommEngine
 from sglang_omni.comm.router import CommRouter
 from sglang_omni.pipeline.stage.input import DirectInput, InputHandler
@@ -49,6 +50,9 @@ from sglang_omni.relay.base import Relay
 from sglang_omni.scheduling.messages import IncomingMessage
 
 logger = logging.getLogger(__name__)
+
+_SCHEDULER_THREAD_JOIN_TIMEOUT_S = 5.0
+_OUTBOX_DRAIN_BATCH_SIZE = 64
 
 GetNextFn = Callable[[str, Any], str | list[str] | None]
 GetStreamDoneTargetsFn = Callable[[str, Any], str | list[str] | None]
@@ -83,6 +87,9 @@ class Stage:
         gpu_id: int | None,
         endpoints: dict[str, str],
         control_plane: Any,
+        rank_endpoints: dict[str, tuple[str, ...]] | None = None,
+        tp_rank: int = 0,
+        tp_size: int = 1,
         placement_gpu_id: int | None = None,
         input_handler: InputHandler | None = None,
         relay: Relay | None = None,
@@ -132,6 +139,9 @@ class Stage:
                 comm_config=comm_config or {},
                 injected_relay=relay,
             ),
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            rank_endpoints=rank_endpoints,
             task_done_callback=self._on_background_task_done,
         )
 
@@ -154,6 +164,7 @@ class Stage:
         if self._running:
             return
         await self.control_plane.start()
+        await self._comm.start()
         self._loop = asyncio.get_running_loop()
         self._running = True
 
@@ -166,12 +177,15 @@ class Stage:
                 _set_active_stage(self.name)
                 try:
                     if self.gpu_id is not None:
-                        import torch
+                        from sglang_omni.platforms import current_platform
 
-                        torch.cuda.set_device(int(self.gpu_id))
+                        current_platform.set_device(
+                            current_platform.get_device(int(self.gpu_id))
+                        )
                         logger.info(
-                            "Scheduler thread for stage %s set CUDA device to %s",
+                            "Scheduler thread for stage %s set %s device to %s",
                             self.name,
+                            current_platform.device_type,
                             self.gpu_id,
                         )
                     self.scheduler.start()
@@ -221,6 +235,30 @@ class Stage:
                 self.scheduler.stop()
             except Exception as exc:
                 _record_cleanup_error("scheduler", exc)
+            # Note: (Jiaxin Deng) the scheduler thread emits its terminal
+            # model-path events from its own finally, and the MPS validation
+            # stage reads those files right after stop() returns, so wait for
+            # the thread instead of letting a daemon thread be reclaimed at
+            # process exit. A slow thread is logged, not fatal: shutdown
+            # correctness must not start depending on this timeout.
+            scheduler_thread = self._scheduler_thread
+            if scheduler_thread is not None:
+                try:
+                    await asyncio.to_thread(
+                        scheduler_thread.join,
+                        _SCHEDULER_THREAD_JOIN_TIMEOUT_S,
+                    )
+                except Exception as exc:
+                    _record_cleanup_error("scheduler thread", exc)
+                else:
+                    if scheduler_thread.is_alive():
+                        logger.warning(
+                            "Stage %s scheduler thread did not stop within %gs",
+                            self.name,
+                            _SCHEDULER_THREAD_JOIN_TIMEOUT_S,
+                        )
+                    else:
+                        self._scheduler_thread = None
         try:
             self.control_plane.close()
         except Exception as exc:
@@ -231,7 +269,7 @@ class Stage:
             except Exception as exc:
                 _record_cleanup_error("TP fanout", exc)
         try:
-            self._comm.close()
+            await self._comm.close()
         except Exception as exc:
             _record_cleanup_error("comm", exc)
         logger.info("Stage %s stopped", self.name)
@@ -319,7 +357,7 @@ class Stage:
             label = f"stream chunk {msg.request_id}:{msg.from_stage}:{msg.chunk_id}"
         else:
             handler = self._on_data_ready
-            label = f"payload {msg.request_id}:{msg.from_stage}"
+            label = f"data {msg.request_id}:{msg.from_stage}"
 
         lane = (msg.request_id, msg.from_stage)
         predecessor = self._receive_lane_tails.get(lane)
@@ -385,11 +423,8 @@ class Stage:
     ) -> None:
         request_id = msg.request_id
         if request_id in self._aborted:
-            await self._discard_payload_data(msg)
+            await self._discard_data(msg)
             return
-        self._active_requests.add(request_id)
-        if self._stream_queue is not None and not self._stream_queue.has(request_id):
-            self._stream_queue.open(request_id)
 
         if stage_io.is_direct_cuda_ipc_payload_ref(msg.data_ref):
             try:
@@ -412,7 +447,7 @@ class Stage:
         data_ref = self._data_ref_from_message(msg)
         relay = self._comm.relay(data_ref.transport)
         try:
-            payload = await self._comm.read_payload(
+            payload = await self._comm.read_data(
                 relay=relay,
                 request_id=request_id,
                 data_ref=data_ref,
@@ -424,14 +459,15 @@ class Stage:
             await self._send_data_ack(
                 msg, data_ref, success=False, error=_error_text(exc)
             )
-            relay.cleanup(request_id)
+            self._comm.cleanup(request_id)
             await self._wait_for_receive_predecessor(predecessor)
             await self._send_failure(request_id, f"relay read failed: {exc}")
             return
         await self._send_data_ack(msg, data_ref, success=True)
 
         await self._wait_for_receive_predecessor(predecessor)
-        await self._receive_payload_from_stage(request_id, msg.from_stage, payload)
+        if payload is not None:
+            await self._receive_payload_from_stage(request_id, msg.from_stage, payload)
 
     async def receive_local_payload(
         self,
@@ -491,9 +527,6 @@ class Stage:
         self._active_requests.add(request_id)
         if self._stream_queue is not None and not self._stream_queue.has(request_id):
             self._stream_queue.open(request_id)
-
-        if request_id in self._aborted:
-            return
 
         _emit_event(
             request_id=request_id,
@@ -675,16 +708,26 @@ class Stage:
             ),
         )
 
-    async def _discard_payload_data(self, msg: DataReadyMessage) -> None:
+    async def _discard_data(self, msg: DataReadyMessage) -> None:
         if stage_io.is_direct_cuda_ipc_payload_ref(msg.data_ref):
             imported = stage_io.deserialize_direct_cuda_ipc_payload(msg.data_ref)
             del imported
             return
         request_id = msg.request_id
         data_ref = self._data_ref_from_message(msg)
+        if data_ref.kind is DataKind.KV_PAGES:
+            error = RuntimeError(f"request {request_id!r} was aborted")
+            self._comm.cleanup(request_id)
+            await self._send_data_ack(
+                msg,
+                data_ref,
+                success=False,
+                error=_error_text(error),
+            )
+            return
         relay = self._comm.relay(data_ref.transport)
         try:
-            await self._comm.read_payload(
+            await self._comm.read_data(
                 relay=relay,
                 request_id=request_id,
                 data_ref=data_ref,
@@ -941,48 +984,55 @@ class Stage:
     async def _drain_outbox_external(self) -> None:
         """Drain scheduler outbox and route results downstream."""
         loop = asyncio.get_running_loop()
-        while self._running or not self.scheduler.outbox.empty():
+        outbox = self.scheduler.outbox
+        while self._running or not outbox.empty():
             try:
-                out = await loop.run_in_executor(
-                    None, lambda: self.scheduler.outbox.get(timeout=0.1)
-                )
+                out = await loop.run_in_executor(None, lambda: outbox.get(timeout=0.1))
             except _queue_mod.Empty:
                 continue
 
-            if out.request_id not in self._active_requests:
-                continue
-
-            if out.type == "result":
-                await self._route_result(out.request_id, out.data)
-            elif out.type == "stream":
-                if out.target is None:
-                    if self._stream_targets:
-                        await asyncio.gather(
-                            *(
-                                self._send_stream_to_target(
+            for batch_index in range(_OUTBOX_DRAIN_BATCH_SIZE):
+                if out.request_id in self._active_requests:
+                    if out.type == "result":
+                        await self._route_result(out.request_id, out.data)
+                    elif out.type == "stream":
+                        if out.target is None:
+                            if self._stream_targets:
+                                await asyncio.gather(
+                                    *(
+                                        self._send_stream_to_target(
+                                            out.request_id,
+                                            out.data,
+                                            target,
+                                            out.metadata,
+                                        )
+                                        for target in self._stream_targets
+                                    )
+                                )
+                            else:
+                                await self._send_stream_to_coordinator(
                                     out.request_id,
                                     out.data,
-                                    target,
                                     out.metadata,
                                 )
-                                for target in self._stream_targets
+                        else:
+                            await self._send_stream_to_target(
+                                out.request_id,
+                                out.data,
+                                out.target,
+                                out.metadata,
                             )
-                        )
-                    else:
-                        await self._send_stream_to_coordinator(
-                            out.request_id,
-                            out.data,
-                            out.metadata,
-                        )
-                else:
-                    await self._send_stream_to_target(
-                        out.request_id,
-                        out.data,
-                        out.target,
-                        out.metadata,
-                    )
-            elif out.type == "error":
-                await self._send_failure(out.request_id, str(out.data))
+                    elif out.type == "error":
+                        await self._send_failure(out.request_id, str(out.data))
+
+                if batch_index + 1 >= _OUTBOX_DRAIN_BATCH_SIZE:
+                    await asyncio.sleep(0)
+                    break
+
+                try:
+                    out = outbox.get_nowait()
+                except _queue_mod.Empty:
+                    break
 
     async def _drain_outbox_follower(self) -> None:
         """Drain follower outbox without emitting external stage traffic."""

@@ -12,12 +12,15 @@ patched to a sentinel.
 
 from __future__ import annotations
 
+import threading
 from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 
 pytest.importorskip("sglang")
+
+from sglang.srt.managers.schedule_batch import NextBatchPlan  # noqa: E402
 
 from sglang_omni.scheduling import omni_scheduler  # noqa: E402
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler  # noqa: E402
@@ -34,15 +37,35 @@ def _req(enqueue_t: float | None):
 class _StubScheduler:
     """The attribute surface get_new_batch_prefill touches."""
 
-    def __init__(self, *, coalesce_requests: int, wait_ms: float = 60.0) -> None:
+    def __init__(
+        self,
+        *,
+        coalesce_requests: int,
+        wait_ms: float = 60.0,
+        coalesce_when_idle: bool = False,
+        requires_pending_builds: bool = False,
+        coalesce_after_builds_during_decode: bool = False,
+    ) -> None:
         self.prefill_coalesce_requests = coalesce_requests
         self.prefill_coalesce_wait_s = wait_ms / 1e3
+        self.prefill_coalesce_when_idle = coalesce_when_idle
+        self.prefill_coalesce_requires_pending_builds = requires_pending_builds
+        self.prefill_coalesce_after_builds_during_decode = (
+            coalesce_after_builds_during_decode
+        )
         self.chunked_req = None
         self.waiting_queue: list = []
         self.running_batch = SimpleNamespace(is_empty=lambda: False)
+        self._request_admission_lock = threading.RLock()
+        self._pending_request_builds: dict = {}
+        self._pending_request_admissions: dict = {}
+        self._backlogged_request_build_payloads: list = []
 
     def get_new_batch_prefill(self):
-        return OmniScheduler.get_new_batch_prefill(self)
+        # sglang 0.5.16 takes running_batch in and hands back a NextBatchPlan;
+        # unwrap it so the assertions below stay about the gate decision.
+        plan = OmniScheduler.get_new_batch_prefill(self, self.running_batch)
+        return plan.batch_to_run
 
 
 @pytest.fixture()
@@ -50,7 +73,7 @@ def upstream():
     with mock.patch.object(
         omni_scheduler._Upstream,
         "get_new_batch_prefill",
-        return_value=_UPSTREAM_BATCH,
+        return_value=NextBatchPlan(batch_to_run=_UPSTREAM_BATCH, running_batch=None),
     ) as patched:
         yield patched
 
@@ -137,12 +160,138 @@ def test_idle_loop_bypasses_gate(upstream):
     assert sched.get_new_batch_prefill() is _UPSTREAM_BATCH
 
 
+def test_idle_loop_can_coalesce_when_explicitly_enabled(upstream, clock):
+    sched = _StubScheduler(
+        coalesce_requests=8,
+        wait_ms=10.0,
+        coalesce_when_idle=True,
+    )
+    sched.running_batch = None
+    sched.waiting_queue = [_req(100.0)]
+
+    clock.return_value = 100.005
+    assert sched.get_new_batch_prefill() is None
+
+    clock.return_value = 100.011
+    assert sched.get_new_batch_prefill() is _UPSTREAM_BATCH
+
+
+@pytest.mark.parametrize("source", ["pending", "backlog"])
+def test_pending_build_work_holds_small_prefill(upstream, clock, source):
+    sched = _StubScheduler(
+        coalesce_requests=8,
+        wait_ms=6.0,
+        coalesce_when_idle=True,
+        requires_pending_builds=True,
+    )
+    sched.running_batch = None
+    sched.waiting_queue = [_req(100.0)]
+    if source == "pending":
+        sched._pending_request_builds["building"] = object()
+    else:
+        sched._backlogged_request_build_payloads.append(object())
+
+    clock.return_value = 100.005
+    assert sched.get_new_batch_prefill() is None
+
+
+def test_pending_build_gate_releases_when_build_work_drains(upstream, clock):
+    sched = _StubScheduler(
+        coalesce_requests=8,
+        wait_ms=6.0,
+        coalesce_when_idle=True,
+        requires_pending_builds=True,
+    )
+    sched.running_batch = None
+    sched.waiting_queue = [_req(100.0)]
+    sched._pending_request_builds["building"] = object()
+
+    clock.return_value = 100.001
+    assert sched.get_new_batch_prefill() is None
+
+    sched._pending_request_builds.clear()
+    assert sched.get_new_batch_prefill() is _UPSTREAM_BATCH
+
+
+def test_pending_build_gate_releases_at_target(upstream, clock):
+    sched = _StubScheduler(
+        coalesce_requests=8,
+        wait_ms=6.0,
+        coalesce_when_idle=True,
+        requires_pending_builds=True,
+    )
+    sched.running_batch = None
+    sched.waiting_queue = [_req(100.0)] * 8
+    sched._pending_request_builds["building"] = object()
+
+    clock.return_value = 100.001
+    assert sched.get_new_batch_prefill() is _UPSTREAM_BATCH
+
+
+def test_pending_build_gate_releases_at_deadline(upstream, clock):
+    sched = _StubScheduler(
+        coalesce_requests=8,
+        wait_ms=6.0,
+        coalesce_when_idle=True,
+        requires_pending_builds=True,
+    )
+    sched.running_batch = None
+    sched.waiting_queue = [_req(100.0)]
+    sched._pending_request_builds["building"] = object()
+
+    clock.return_value = 100.006
+    assert sched.get_new_batch_prefill() is _UPSTREAM_BATCH
+
+
+def test_pending_build_gate_does_not_wait_without_build_work(upstream, clock):
+    sched = _StubScheduler(
+        coalesce_requests=8,
+        wait_ms=6.0,
+        coalesce_when_idle=True,
+        requires_pending_builds=True,
+    )
+    sched.running_batch = None
+    sched.waiting_queue = [_req(100.0)]
+
+    clock.return_value = 100.001
+    assert sched.get_new_batch_prefill() is _UPSTREAM_BATCH
+
+
+def test_decode_can_coalesce_after_build_work_drains(upstream, clock):
+    sched = _StubScheduler(
+        coalesce_requests=8,
+        wait_ms=6.0,
+        coalesce_when_idle=True,
+        requires_pending_builds=True,
+        coalesce_after_builds_during_decode=True,
+    )
+    sched.waiting_queue = [_req(100.0)]
+
+    clock.return_value = 100.001
+    assert sched.get_new_batch_prefill() is None
+
+
+def test_idle_decode_still_releases_after_build_work_drains(upstream, clock):
+    sched = _StubScheduler(
+        coalesce_requests=8,
+        wait_ms=6.0,
+        coalesce_when_idle=True,
+        requires_pending_builds=True,
+        coalesce_after_builds_during_decode=True,
+    )
+    sched.running_batch = None
+    sched.waiting_queue = [_req(100.0)]
+
+    clock.return_value = 100.001
+    assert sched.get_new_batch_prefill() is _UPSTREAM_BATCH
+
+
 def test_real_partial_admission_cycle_releases_leftovers_immediately(clock):
     # Note: (Jiaxin Deng) real admit cycle: upstream pops only the head of an
     # expired wave; the leftover keeps its stamp and releases on the next pass.
-    def _admit_head(self):
+    def _admit_head(self, running_batch):
         self.waiting_queue.pop(0)
-        return _UPSTREAM_BATCH
+        return NextBatchPlan(batch_to_run=_UPSTREAM_BATCH, running_batch=running_batch)
 
     sched = _StubScheduler(coalesce_requests=8, wait_ms=60.0)
     clock.return_value = 100.07

@@ -8,6 +8,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from sglang_omni.scheduling.generation_batch_policy import get_decode_cuda_graph_max_bs
+
 logger = logging.getLogger(__name__)
 
 
@@ -199,11 +201,12 @@ def evaluate_cuda_graph_batch_sizing(
 def read_captured_bs(model_runner: object) -> list[int] | None:
     """Read the actually-captured CUDA graph batch sizes, or None if absent."""
     try:
-        captured = model_runner.graph_runner.capture_bs
+        captured = model_runner.decode_cuda_graph_runner.capture_bs
     except AttributeError:
         logger.debug(
-            "cuda_graph_batch_validator: model_runner.graph_runner.capture_bs "
-            "missing (CUDA graphs disabled)."
+            "cuda_graph_batch_validator: "
+            "model_runner.decode_cuda_graph_runner.capture_bs missing "
+            "(decode CUDA graphs disabled)."
         )
         return None
     try:
@@ -262,6 +265,59 @@ def read_model_buffer_capacity(model: object) -> tuple[int | None, str]:
     return smallest, source
 
 
+def attest_prefill_cuda_graphs(model_runner: Any, server_args: Any) -> None:
+    """Assert captured prefill graphs match an explicit or realized policy.
+
+    An operator-locked backend must materialize or fail startup. An unlocked
+    model default retains SGLang's auto-selection semantics and may fall back
+    to eager at capture-time safety gates such as insufficient free memory.
+    """
+    from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+        PrefillCudaGraphRunner,
+    )
+
+    prefill_cfg = server_args.cuda_graph_config.prefill
+    # init_cuda_graphs always assigns this before attestation runs.
+    runner = model_runner.prefill_cuda_graph_runner
+    if not isinstance(runner, PrefillCudaGraphRunner):
+        if ("prefill", "backend") not in server_args._cuda_graph_config_locked:
+            logger.warning(
+                "auto-selected prefill CUDA graph backend %r did not capture; "
+                "using SGLang's eager prefill fallback",
+                prefill_cfg.backend,
+            )
+            return
+        raise RuntimeError(
+            f"prefill CUDA graph backend {prefill_cfg.backend!r} was declared "
+            "but SGLang did not construct PrefillCudaGraphRunner "
+            f"(got {type(runner).__name__}); an eligibility gate disabled "
+            "prefill graphs during capture"
+        )
+    if runner.prefill_backend_name != prefill_cfg.backend:
+        raise RuntimeError(
+            "prefill CUDA graph backend mismatch: declared "
+            f"{prefill_cfg.backend!r}, captured {runner.prefill_backend_name!r}"
+        )
+    expected_buckets = sorted(int(b) for b in prefill_cfg.bs)
+    if list(runner.capture_num_tokens) != expected_buckets:
+        raise RuntimeError(
+            "prefill CUDA graph capture shapes differ from the declared "
+            f"policy: declared={expected_buckets}, "
+            f"captured={list(runner.capture_num_tokens)}"
+        )
+    if not runner.buffer_registry.has_slot("input_embeds"):
+        raise RuntimeError(
+            "prefill CUDA graph runner has no input_embeds slot; "
+            "enable_prefill_input_embeds did not reach the model config "
+            "before SGLang ModelRunner construction"
+        )
+    logger.info(
+        "prefill CUDA graphs attested: backend=%s buckets=%s",
+        runner.prefill_backend_name,
+        expected_buckets,
+    )
+
+
 def validate_stage(
     stage_name: str,
     model_runner: object,
@@ -269,14 +325,9 @@ def validate_stage(
     buffer_capacity: int | None = None,
 ) -> CudaGraphBatchReport:
     """Validate one SGLang-backed stage's batch sizing from its live runner."""
-    try:
-        server_args = model_runner.server_args
-        max_running_requests = server_args.max_running_requests
-        cuda_graph_max_bs = server_args.cuda_graph_max_bs
-    except AttributeError:
-        server_args = None
-        max_running_requests = None
-        cuda_graph_max_bs = None
+    server_args = model_runner.server_args
+    max_running_requests = server_args.max_running_requests
+    cuda_graph_max_bs = get_decode_cuda_graph_max_bs(server_args)
 
     try:
         model = model_runner.model

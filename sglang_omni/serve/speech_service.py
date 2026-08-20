@@ -40,6 +40,7 @@ from sglang_omni.serve.speech_errors import (
     openai_error_payload,
     service_unavailable,
 )
+from sglang_omni.serve.speech_limits import MAX_REFERENCE_AUDIO_BYTES
 
 if TYPE_CHECKING:
     from sglang_omni.client import Client
@@ -55,9 +56,7 @@ _TTS_TASK_TYPE_ALIASES = {
     for task_type in SUPPORTED_TTS_TASK_TYPES
 }
 MAX_SPEECH_INPUT_CHARS = 4096
-MAX_REFERENCE_AUDIO_BYTES = 10 * 1024 * 1024
 _REFERENCE_AUDIO_FIELDS = ("audio_path", "ref_audio", "audio")
-RAW_PCM_DEFAULT_INITIAL_CODEC_CHUNK_FRAMES = 1
 _ReferenceCacheKey = tuple[Any, ...]
 
 
@@ -86,6 +85,7 @@ class SpeechRequestValidator:
         supports_uploaded_voice_references: bool = True,
         required_speech_reference_count: int | None = None,
         speech_reference_text_required: bool = False,
+        speech_reference_text_excludes_instructions: bool = False,
         additional_speech_languages: frozenset[str] = frozenset(),
         allowed_local_media_path: str | Path | None = None,
         allowed_media_domains: list[str] | None = None,
@@ -109,6 +109,9 @@ class SpeechRequestValidator:
         )
         self.required_speech_reference_count = required_speech_reference_count
         self.speech_reference_text_required = speech_reference_text_required
+        self.speech_reference_text_excludes_instructions = (
+            speech_reference_text_excludes_instructions
+        )
         supported_languages = SUPPORTED_TTS_LANGUAGES | frozenset(
             additional_speech_languages
         )
@@ -195,7 +198,7 @@ class SpeechRequestValidator:
 
         updates = self._prepare_generation_updates(request)
         prepared_references = self._prepare_reference_fields(request)
-        self._validate_speech_references(prepared_references)
+        self._validate_speech_references(request, prepared_references)
         updates.update(prepared_references.request_updates)
         prepared_request = request.model_copy(update=updates)
         return PreparedSpeechRequest(
@@ -257,7 +260,9 @@ class SpeechRequestValidator:
         return normalized
 
     def _validate_speech_references(
-        self, prepared_references: PreparedSpeechReferences
+        self,
+        request: CreateSpeechRequest,
+        prepared_references: PreparedSpeechReferences,
     ) -> None:
         references = prepared_references.reference_descriptors
         required_count = self.required_speech_reference_count
@@ -273,6 +278,21 @@ class SpeechRequestValidator:
             for reference in references
         ):
             raise bad_request("reference transcript is required", param="ref_text")
+        instructions = request.instructions
+        has_instructions = isinstance(instructions, str) and bool(instructions.strip())
+        has_reference_text = any(
+            isinstance(reference.get("text"), str) and bool(reference["text"].strip())
+            for reference in references
+        )
+        if (
+            self.speech_reference_text_excludes_instructions
+            and has_instructions
+            and has_reference_text
+        ):
+            raise bad_request(
+                "instructions cannot be combined with a reference transcript",
+                param="instructions",
+            )
 
     def _prepare_reference_fields(
         self, request: CreateSpeechRequest
@@ -460,6 +480,7 @@ class SpeechRequestValidator:
             audio_data=base64.b64encode(result.audio_bytes).decode("ascii"),
             format=result.format,
             media_type=result.mime_type,
+            finish_reason=result.finish_reason,
         )
 
     async def _prepare_batch_item_request(
@@ -482,7 +503,7 @@ class SpeechRequestValidator:
                 reference_tasks[cache_key] = task
 
         prepared_references = await task
-        self._validate_speech_references(prepared_references)
+        self._validate_speech_references(request, prepared_references)
         updates.update(prepared_references.request_updates)
         return PreparedSpeechRequest(
             request=request.model_copy(update=updates),
@@ -811,11 +832,10 @@ def _build_speech_prompt(
 
 def _build_extra_params(request: CreateSpeechRequest) -> dict[str, Any]:
     extra_params: dict[str, Any] = {}
-    initial_codec_chunk_frames = request.initial_codec_chunk_frames
-    if initial_codec_chunk_frames is None and request.stream:
-        initial_codec_chunk_frames = RAW_PCM_DEFAULT_INITIAL_CODEC_CHUNK_FRAMES
-    if initial_codec_chunk_frames is not None:
-        extra_params[INITIAL_CODEC_CHUNK_FRAMES_PARAM] = initial_codec_chunk_frames
+    if request.initial_codec_chunk_frames is not None:
+        extra_params[INITIAL_CODEC_CHUNK_FRAMES_PARAM] = (
+            request.initial_codec_chunk_frames
+        )
     return extra_params
 
 

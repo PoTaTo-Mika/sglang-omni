@@ -23,20 +23,28 @@ from sglang_omni.client.audio import (
     select_audio_delta,
 )
 from sglang_omni.serve.protocol import CreateSpeechRequest, SpeechStreamSessionConfig
-from sglang_omni.serve.speech_errors import SpeechAPIError, bad_request, internal_error
+from sglang_omni.serve.speech_errors import (
+    SpeechAPIError,
+    bad_request,
+    internal_error,
+    speech_websocket_error_payload,
+)
+from sglang_omni.serve.speech_limits import (
+    MAX_SPEECH_WS_CONFIG_MESSAGE_BYTES,
+    MAX_SPEECH_WS_TEXT_MESSAGE_BYTES,
+    SPEECH_WS_CONFIG_TIMEOUT_S,
+)
 from sglang_omni.serve.speech_service import (
-    MAX_REFERENCE_AUDIO_BYTES,
     PreparedSpeechRequest,
     SpeechRequestValidator,
 )
 
 logger = logging.getLogger(__name__)
 
-CONFIG_TIMEOUT_S = 10.0
+CONFIG_TIMEOUT_S = SPEECH_WS_CONFIG_TIMEOUT_S
 IDLE_TIMEOUT_S = 30.0
-BASE64_ENCODED_REFERENCE_AUDIO_BYTES = ((MAX_REFERENCE_AUDIO_BYTES + 2) // 3) * 4
-MAX_CONFIG_MESSAGE_BYTES = BASE64_ENCODED_REFERENCE_AUDIO_BYTES + 1024 * 1024
-MAX_TEXT_MESSAGE_BYTES = 128 * 1024
+MAX_CONFIG_MESSAGE_BYTES = MAX_SPEECH_WS_CONFIG_MESSAGE_BYTES
+MAX_TEXT_MESSAGE_BYTES = MAX_SPEECH_WS_TEXT_MESSAGE_BYTES
 MAX_BUFFERED_TEXT_CHARS = 256 * 1024
 MAX_BUFFERED_RECEIVE_MESSAGES_DURING_GENERATION = 16
 MAX_BUFFERED_RECEIVE_BYTES_DURING_GENERATION = (
@@ -76,6 +84,8 @@ class SpeechWebSocketSession:
         self.config: SpeechStreamSessionConfig | None = None
         self.buffer = ""
         self.sentence_index = 0
+        self.committed_sentence_count = 0
+        self.segment_index = 0
         self.active_request_id: str | None = None
         self.buffered_receive_messages: deque[dict[str, Any]] = deque()
         self.buffered_receive_message_bytes = 0
@@ -153,6 +163,8 @@ class SpeechWebSocketSession:
             message_type = payload.get("type")
             if message_type == "input.text":
                 await self._handle_input_text(payload)
+            elif message_type == "input.commit":
+                await self._handle_input_commit()
             elif message_type == "input.done":
                 await self._handle_input_done()
                 return
@@ -185,11 +197,29 @@ class SpeechWebSocketSession:
         for sentence in self._pop_complete_segments():
             await self._generate_sentence(sentence)
 
-    async def _handle_input_done(self) -> None:
+    async def _flush_buffer(self) -> None:
         remaining = self.buffer.strip()
         self.buffer = ""
         if remaining:
             await self._generate_sentence(remaining)
+
+    async def _handle_input_commit(self) -> None:
+        await self._flush_buffer()
+        segment_sentences = self.sentence_index - self.committed_sentence_count
+        self.committed_sentence_count = self.sentence_index
+        await self._send_json(
+            {
+                "type": "input.committed",
+                "session_id": self.session_id,
+                "segment_index": self.segment_index,
+                "segment_sentences": segment_sentences,
+                "total_sentences": self.sentence_index,
+            }
+        )
+        self.segment_index += 1
+
+    async def _handle_input_done(self) -> None:
+        await self._flush_buffer()
         await self._send_json(
             {
                 "type": "session.done",
@@ -546,14 +576,7 @@ class SpeechWebSocketSession:
         await self.websocket.send_text(json.dumps(payload))
 
     async def _send_error(self, error: SpeechAPIError) -> None:
-        payload: dict[str, Any] = {"type": "error", "message": error.message}
-        if error.error_type is not None:
-            payload["error_type"] = error.error_type
-        if error.param is not None:
-            payload["param"] = error.param
-        if error.code is not None:
-            payload["code"] = error.code
-        await self._send_json(payload)
+        await self._send_json(speech_websocket_error_payload(error))
 
     async def _send_audio_start(
         self,

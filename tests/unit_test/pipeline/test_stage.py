@@ -5,18 +5,23 @@ from __future__ import annotations
 import asyncio
 import logging
 import pickle
+import threading
 
 import pytest
 import torch
 
+import sglang_omni.platforms as platforms
 from sglang_omni.comm import stage_io
 from sglang_omni.comm.data_ref import DataRef, TransportKind
 from sglang_omni.pipeline.local_dispatch import LocalStageDispatcher
+from sglang_omni.pipeline.stage import runtime as stage_runtime_module
 from sglang_omni.pipeline.stage.input import AggregatedInput
 from sglang_omni.pipeline.stage.runtime import Stage
 from sglang_omni.pipeline.stage.stream_queue import StreamQueue
 from sglang_omni.pipeline.stage_workers import StageLaunchConfig, _construct_stage
 from sglang_omni.proto import DataReadyMessage
+from sglang_omni.scheduling import omni_scheduler as omni_scheduler_module
+from sglang_omni.scheduling.omni_scheduler import OmniScheduler
 from tests.unit_test.fixtures.pipeline_fakes import (
     EventLog,
     FakeRelay,
@@ -32,6 +37,19 @@ from tests.unit_test.fixtures.pipeline_fakes import (
     tensor_equal,
 )
 from tests.unit_test.pipeline.helpers import make_stage
+
+
+@pytest.fixture(autouse=True)
+def _cuda_ipc_capable_platform(monkeypatch):
+    """These stage tests assert the cuda_ipc transport contract on any host, so pin
+    the policy that supplies it rather than the host's own platform.
+    """
+    monkeypatch.setattr(
+        platforms.current_platform,
+        "get_intra_node_transport",
+        lambda: TransportKind.CUDA_IPC,
+        raising=False,
+    )
 
 
 class _CloseAwareControlPlane(RecordingStageControlPlane):
@@ -239,6 +257,111 @@ def test_stage_run_raises_when_scheduler_thread_crashes() -> None:
             await asyncio.wait_for(stage_obj.run(), timeout=2.0)
 
         assert scheduler.stopped is True
+
+    asyncio.run(_run())
+
+
+def test_stage_stop_waits_for_scheduler_model_path_terminalization(
+    monkeypatch,
+) -> None:
+    async def _run() -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        stop_called = threading.Event()
+        model_path_ends: list[tuple[str, str]] = []
+        monkeypatch.setattr(
+            omni_scheduler_module,
+            "_emit_model_path_end",
+            lambda rid, *, status: model_path_ends.append((rid, status)),
+        )
+
+        scheduler = object.__new__(OmniScheduler)
+        scheduler.enable_async_decode = False
+        scheduler.enable_overlap = False
+        scheduler._prefill_start_done = {"req-active"}
+        scheduler._prefill_end_done = set()
+        scheduler._request_build_executor = None
+        scheduler._request_admission_lock = threading.RLock()
+        scheduler._pending_request_admissions = {}
+        scheduler._shutdown_lock = threading.Lock()
+        scheduler._shutdown_callback = None
+
+        def run_loop() -> None:
+            entered.set()
+            release.wait()
+
+        scheduler._event_loop_normal = run_loop
+        stop_scheduler = scheduler.stop
+
+        def stop() -> None:
+            stop_scheduler()
+            stop_called.set()
+
+        scheduler.stop = stop
+        stage_obj = make_stage(scheduler=scheduler)
+
+        await stage_obj.start()
+        assert await asyncio.to_thread(entered.wait, 1.0)
+
+        stop_task = asyncio.create_task(stage_obj.stop())
+        assert await asyncio.to_thread(stop_called.wait, 1.0)
+        await asyncio.sleep(0)
+        assert not stop_task.done()
+
+        release.set()
+        await asyncio.wait_for(stop_task, timeout=1.0)
+
+        assert stage_obj._scheduler_thread is None
+        assert scheduler._prefill_start_done == set()
+        assert model_path_ends == [("req-active", "aborted")]
+
+    asyncio.run(_run())
+
+
+def test_stage_stop_warns_but_succeeds_on_a_stuck_scheduler_thread(
+    monkeypatch, caplog
+) -> None:
+    async def _run() -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        scheduler = object.__new__(OmniScheduler)
+        scheduler.enable_async_decode = False
+        scheduler.enable_overlap = False
+        scheduler._prefill_start_done = set()
+        scheduler._prefill_end_done = set()
+        scheduler._request_build_executor = None
+        scheduler._request_admission_lock = threading.RLock()
+        scheduler._pending_request_admissions = {}
+        scheduler._shutdown_lock = threading.Lock()
+        scheduler._shutdown_callback = None
+
+        def run_loop() -> None:
+            entered.set()
+            release.wait()
+
+        scheduler._event_loop_normal = run_loop
+        stage_obj = make_stage(scheduler=scheduler)
+        monkeypatch.setattr(
+            stage_runtime_module,
+            "_SCHEDULER_THREAD_JOIN_TIMEOUT_S",
+            0.01,
+        )
+
+        await stage_obj.start()
+        assert await asyncio.to_thread(entered.wait, 1.0)
+
+        try:
+            # Shutdown must not start failing because of this join; the stage
+            # only waits so the scheduler thread can flush its terminal events.
+            with caplog.at_level(logging.WARNING):
+                await stage_obj.stop()
+            assert "scheduler thread did not stop within" in caplog.text
+            assert stage_obj._scheduler_thread is not None
+            assert stage_obj._scheduler_thread.is_alive()
+        finally:
+            release.set()
+            if stage_obj._scheduler_thread is not None:
+                await asyncio.to_thread(stage_obj._scheduler_thread.join, 1.0)
 
     asyncio.run(_run())
 

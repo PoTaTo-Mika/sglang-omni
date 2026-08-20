@@ -28,9 +28,11 @@ import asyncio
 import json
 import logging
 import os
+import signal
 import socket
+import threading
 import time
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from typing import Any
 
 import uvicorn
@@ -53,6 +55,35 @@ from sglang_omni.utils.gpu_memory import (
 )
 
 logger = logging.getLogger(__name__)
+
+_HANDLED_SIGNALS = (signal.SIGINT, signal.SIGTERM)
+
+
+class _PipelineUvicornServer(uvicorn.Server):
+    """Keep Uvicorn's graceful handling without re-raising process signals.
+
+    Uvicorn re-raises a captured SIGTERM after HTTP shutdown. That terminates
+    the interpreter before ``_run_server`` can stop spawned pipeline workers.
+    The pipeline launcher owns child-process cleanup, so it restores the
+    original handlers but deliberately consumes the already-handled signal.
+    """
+
+    @contextmanager
+    def capture_signals(self):
+        if threading.current_thread() is not threading.main_thread():
+            yield
+            return
+
+        original_handlers = {
+            sig: signal.signal(sig, self.handle_exit) for sig in _HANDLED_SIGNALS
+        }
+        try:
+            yield
+        finally:
+            for sig, handler in original_handlers.items():
+                signal.signal(sig, handler)
+            self._captured_signals.clear()
+
 
 # ---------------------------------------------------------------------------
 # Built-in pipeline registry
@@ -177,6 +208,9 @@ def _model_capabilities_log_summary(
         "streaming_vocoder": capabilities.supports_streaming_vocoder,
         "cuda_graph": capabilities.supports_cuda_graph,
         "torch_compile": capabilities.supports_torch_compile,
+        "breakable_prefill_cuda_graph": (
+            capabilities.supports_breakable_prefill_cuda_graph
+        ),
     }
 
 
@@ -387,18 +421,26 @@ async def _run_server(
             supports_uploaded_voice_references=(
                 pipeline_config.supports_uploaded_voice_references()
             ),
+            supports_audio_translation=(pipeline_config.supports_audio_translation()),
             required_speech_reference_count=(
                 pipeline_config.required_speech_reference_count
             ),
             speech_reference_text_required=(
                 pipeline_config.speech_reference_text_required
             ),
+            speech_reference_text_excludes_instructions=(
+                pipeline_config.speech_reference_text_excludes_instructions
+            ),
             additional_speech_languages=pipeline_config.additional_speech_languages,
             enable_realtime=enable_realtime,
+            supports_realtime_audio_output=(
+                type(pipeline_config).code2wav_stage() is not None
+            ),
             allowed_local_media_path=allowed_local_media_path,
             allowed_media_domains=allowed_media_domains,
             tts_batch_max_items=tts_batch_max_items,
             architectures=[pipeline_config.architecture],
+            audio_chunking=pipeline_config.audio_chunking,
         )
         profiler_dir = os.environ.get("SGLANG_TORCH_PROFILER_DIR")
         profiler_ctl = ProfilerControlClient(mp_runner.stage_control_endpoints)
@@ -411,7 +453,7 @@ async def _run_server(
             log_level=log_level,
             timeout_keep_alive=120,
         )
-        server = uvicorn.Server(config)
+        server = _PipelineUvicornServer(config)
         await _serve_with_failure_watch(server, [mp_runner.wait_failed()])
     finally:
         logger.info("Shutting down pipeline …")

@@ -9,6 +9,7 @@ from typing import Any
 from sglang_omni.models.qwen3_tts import request_builders
 from sglang_omni.models.qwen3_tts import stages as qwen3_stages
 from sglang_omni.scheduling.engine_factory import TtsEngineBuilder
+from sglang_omni.vendor.sglang.server_args import override_server_args
 
 
 class Qwen3TtsEngineBuilder(TtsEngineBuilder):
@@ -19,6 +20,7 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder):
     def __init__(self, *, attn_implementation: str | None = None) -> None:
         self.attn_implementation = attn_implementation
         self.wrapper: Any | None = None
+        self._stream_output_builder: Any | None = None
 
     def resolve_checkpoint(self, model_path: str) -> str:
         qwen3_stages.apply_qwen_tts_transformers_compatibility_patches()
@@ -40,6 +42,7 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder):
     ) -> dict[str, Any]:
         return {
             "max_running_requests": 16,
+            "max_queued_requests": 16,
             "cuda_graph_max_bs": 32,
             "torch_compile_max_bs": 32,
             "dtype": dtype,
@@ -90,9 +93,20 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder):
         )
 
     def compile_model(self, model: Any, server_args: Any) -> None:
-        if bool(getattr(server_args, "enable_torch_compile", False)):
+        if server_args.enable_deterministic_inference:
+            override_server_args(
+                server_args,
+                "sglang_omni.qwen3_tts.deterministic_inference",
+                enable_torch_compile=False,
+            )
+            return
+        if bool(server_args.enable_torch_compile):
             qwen3_stages._compile_qwen3_tts_backbone(model)
-            server_args.enable_torch_compile = False
+            override_server_args(
+                server_args,
+                "sglang_omni.qwen3_tts.compile_complete",
+                enable_torch_compile=False,
+            )
 
     def make_model_runner(self, model_worker: Any, output_proc: Any) -> Any:
         model_runner_mod = importlib.import_module(
@@ -102,10 +116,20 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder):
         return model_runner_mod.Qwen3TTSModelRunner(model_worker, output_proc)
 
     def make_adapters(self, model: Any) -> tuple[Any, Any]:
-        return request_builders.make_qwen3_tts_scheduler_adapters(
-            model=model,
-            wrapper=self.wrapper,
+        request_builder, result_adapter, self._stream_output_builder = (
+            request_builders.make_qwen3_tts_scheduler_adapters(
+                model=model,
+                wrapper=self.wrapper,
+            )
         )
+        return request_builder, result_adapter
+
+    def extra_scheduler_kwargs(self) -> dict[str, Any]:
+        return {
+            "stream_output_builder": self._stream_output_builder,
+            "request_build_max_workers": 4,
+            "request_build_max_pending": 16,
+        }
 
     def make_abort_callback(self) -> Any | None:
         return request_builders.cleanup_prepared_qwen3_tts_request

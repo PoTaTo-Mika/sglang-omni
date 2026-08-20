@@ -38,11 +38,11 @@ Examples:
   python examples/run_omni.py qwen3-speech-server
 
   python examples/run_omni.py qwen3-speech-server \\
-      --gpu-thinker 0 --gpu-talker 1 --gpu-code2wav 1
+      --gpu-thinker 0 --gpu-talker 1 --gpu-code2wav 0
 
   python examples/run_omni.py qwen3-speech-server \\
       --thinker-tp-size 2 --gpu-thinker-tp 0,1 \\
-      --gpu-talker 2 --gpu-code2wav 2
+      --gpu-talker 2 --gpu-code2wav 0
 """
 
 _SPEECH_DESCRIPTION = """Run one Qwen3-Omni text-to-speech request.
@@ -308,7 +308,13 @@ def _build_qwen_speech_server_parser() -> argparse.ArgumentParser:
             "point to the same device."
         ),
     )
+    target.add_argument(
+        "--enable-realtime",
+        action="store_true",
+        help="Mount the WebSocket /v1/realtime endpoint.",
+    )
     add_server_args(target, model_name="qwen3-omni")
+
     return target
 
 
@@ -347,7 +353,7 @@ def launch_qwen_speech_server(args: argparse.Namespace) -> None:
         gpu_talker = args.gpu_thinker if args.colocated else 1
     gpu_code2wav = args.gpu_code2wav
     if gpu_code2wav is None:
-        gpu_code2wav = args.gpu_thinker if args.colocated else 0
+        gpu_code2wav = args.gpu_thinker
     gpu_image_encoder = args.gpu_image_encoder
     if gpu_image_encoder is None:
         gpu_image_encoder = args.gpu_thinker if args.colocated else 0
@@ -457,6 +463,7 @@ def launch_qwen_speech_server(args: argparse.Namespace) -> None:
         host=args.host,
         port=args.port,
         model_name=args.model_name,
+        enable_realtime=args.enable_realtime,
     )
 
 

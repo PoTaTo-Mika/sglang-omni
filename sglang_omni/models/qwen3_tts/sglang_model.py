@@ -26,7 +26,7 @@ from sglang_omni.models.qwen3_tts.compat import (
     apply_qwen_tts_transformers_compatibility_patches,
 )
 from sglang_omni.models.qwen3_tts.sampling_kernels import (
-    sample_from_sorted_probs_with_seed_small_k,
+    sample_from_sorted_logprobs_with_seed_small_k,
 )
 from sglang_omni.vendor.sglang.core import ForwardBatch
 from sglang_omni.vendor.sglang.layers import ReplicatedLinear, RMSNorm
@@ -57,11 +57,11 @@ def _quantize_predictor_top_k(max_top_k: int, vocab_size: int) -> int | None:
 
 
 def _sample_seeded_categorical(
-    weights: torch.Tensor,
+    logprobs: torch.Tensor,
     seeds: torch.Tensor,
     positions: torch.Tensor,
 ) -> torch.Tensor:
-    return multinomial_with_seed(weights, seeds, positions).view(-1)
+    return multinomial_with_seed(logprobs, seeds, positions).view(-1)
 
 
 class _PredictorDecodeGraph:
@@ -506,6 +506,7 @@ class Qwen3TTSTalker(nn.Module):
         self._sub_sampled_has_top_p = False
         self._sub_sampled_max_top_k = 0
         self._sub_sampled_has_unbounded_top_k = False
+        self._decode_prep_rids: list | None = None
         self._predictor_graph_batch_sizes = self._normalize_predictor_graph_batch_sizes(
             server_args,
             max_batch_size=max_batch_size,
@@ -973,6 +974,28 @@ class Qwen3TTSTalker(nn.Module):
         if batch_size > self._sub_temperature_tensor.shape[0]:
             raise RuntimeError("Qwen3-TTS sampling buffers are too small")
 
+        # Note: (Jiaxin Deng) every staged value here is static per request, so
+        # an unchanged batch composition can reuse the previous staging wholesale.
+        # Request ids alone are reusable across request lifetimes, so identity is
+        # (request_id, per-data epoch); test doubles without request_id restage.
+        rids: list | None = []
+        for sched_req in requests:
+            rid = getattr(sched_req, "request_id", None)
+            if rid is None:
+                rids = None
+                break
+            data = sched_req.data
+            epoch = getattr(data, "_qwen3_tts_prep_epoch", None)
+            if epoch is None:
+                epoch = self._decode_prep_epoch = (
+                    getattr(self, "_decode_prep_epoch", 0) + 1
+                )
+                data._qwen3_tts_prep_epoch = epoch
+            rids.append((rid, epoch))
+        if rids is not None and rids == getattr(self, "_decode_prep_rids", None):
+            return
+        self._decode_prep_rids = None
+
         semantic_seeds: list[int] = []
         sub_temperatures: list[float] = []
         sub_top_ps: list[float] = []
@@ -1034,6 +1057,7 @@ class Qwen3TTSTalker(nn.Module):
         self._sub_sampled_has_unbounded_top_k = has_unbounded_top_k
 
         if batch_size == 0:
+            self._decode_prep_rids = rids
             return
 
         device = self._sub_temperature_tensor.device
@@ -1058,6 +1082,7 @@ class Qwen3TTSTalker(nn.Module):
             self._sub_sample_row_indices_tensor[: self._sub_sample_count] = (
                 torch.tensor(self._sub_sample_rows, device=device, dtype=torch.long)
             )
+        self._decode_prep_rids = rids
 
     @torch.no_grad()
     def forward(
@@ -1129,7 +1154,11 @@ class Qwen3TTSTalker(nn.Module):
         *,
         max_batch_size: int,
     ) -> tuple[int, ...]:
-        raw_batch_sizes = getattr(server_args, "cuda_graph_bs", None)
+        from sglang_omni.scheduling.generation_batch_policy import (
+            get_decode_cuda_graph_bs,
+        )
+
+        raw_batch_sizes = get_decode_cuda_graph_bs(server_args)
         if raw_batch_sizes is None:
             # Note: (Jiaxin Deng) mirrors the backbone's default capture list
             # ([1, 2, 4, 8, 12, 16] at max_running_requests=16).
@@ -1221,6 +1250,9 @@ class Qwen3TTSTalker(nn.Module):
                 self._sub_sampled_max_top_k,
                 self._sub_sampled_has_unbounded_top_k,
             ) = saved
+            # Note: (Jiaxin Deng) capture overwrote the staged row-indices
+            # tensor; drop the reuse fingerprint so the next prepare restages.
+            self._decode_prep_rids = None
 
     def _predictor_graph_memory_pool(self):
         # Note: (Jiaxin Deng) one shared pool across keys; private per-graph
@@ -1237,7 +1269,7 @@ class Qwen3TTSTalker(nn.Module):
             return False
         # Note: (Jiaxin Deng) capture under TP would record collectives; the
         # graphed chain is only validated single-rank, so TP stays eager.
-        return int(getattr(server_args, "tp_size", 1) or 1) == 1
+        return int(server_args.tp_size) == 1
 
     def _predictor_forward_graphed(
         self,
@@ -1501,15 +1533,20 @@ class Qwen3TTSTalker(nn.Module):
         if self._sub_sampled_has_top_p:
             active_top_p = (top_ps > 0.0) & (top_ps < 1.0)
             cdf = torch.cumsum(sorted_probs, dim=-1)
-            remove = (cdf > top_ps.unsqueeze(1)) & active_top_p.unsqueeze(1)
+            remove = (
+                cdf - sorted_probs >= top_ps.unsqueeze(1)
+            ) & active_top_p.unsqueeze(1)
             remove[:, 0] = False
             sorted_probs = sorted_probs.masked_fill(remove, -float("inf"))
-        # Note: (Jiaxin Deng) the seeded sampler scores prob + gumbel, so a
-        # 0.0 prob can still win; -inf keeps ranks past a row's true k out.
         sorted_probs = sorted_probs.masked_fill(~keep_top_k, -float("inf"))
+        sorted_logprobs = torch.where(
+            sorted_probs > 0,
+            torch.log(sorted_probs),
+            torch.full_like(sorted_probs, -float("inf")),
+        )
 
-        sampled = sample_from_sorted_probs_with_seed_small_k(
-            sorted_probs,
+        sampled = sample_from_sorted_logprobs_with_seed_small_k(
+            sorted_logprobs,
             sorted_idx,
             seeds,
             sub_positions,
@@ -1518,7 +1555,7 @@ class Qwen3TTSTalker(nn.Module):
             return sampled.to(torch.long)
 
         sampled_rank = _sample_seeded_categorical(
-            sorted_probs,
+            sorted_logprobs,
             seeds,
             sub_positions,
         ).to(device=logits.device, dtype=torch.long)
