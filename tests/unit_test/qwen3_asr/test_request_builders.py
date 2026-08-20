@@ -739,16 +739,11 @@ def test_qwen3_asr_cache_miss_waits_in_builder_when_asked(monkeypatch) -> None:
             return None
 
         def encode_item(self, item) -> None:
-            raise AssertionError("builder should wait on submit_item, not encode_item")
-
-        def submit_item(self, item):
             item.precomputed_embeddings = torch.zeros((item.num_audio_tokens, 4))
             item.feature = None
-            future: concurrent.futures.Future[torch.Tensor] = (
-                concurrent.futures.Future()
-            )
-            future.set_result(item.precomputed_embeddings)
-            return future
+
+        def submit_item(self, item):
+            raise AssertionError("builder should wait on encode_item, not submit_item")
 
     monkeypatch.setattr(
         transcription,

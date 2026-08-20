@@ -370,13 +370,16 @@ def make_qwen3_asr_scheduler_adapters(
         # note (guozhihao-224): a request is only admitted with its complete
         # LM-ready embedding. Submit after validation so a failed encode
         # never reaches the waiting queue. Wait in this worker when the
-        # build queue still fits the pool; otherwise return deferred
-        # admission so other builds can overlap encode.
-        ready = audio_encoder_service.submit_item(audio_item)
+        # build queue still fits the pool so encode_item keeps its timeout
+        # and failed counting; otherwise return deferred admission so
+        # other builds can overlap encode.
         if should_wait_for_encode is not None and should_wait_for_encode():
-            ready.result()
+            audio_encoder_service.encode_item(audio_item)
             return req_data
-        return DeferredAdmission(value=req_data, ready=ready)
+        return DeferredAdmission(
+            value=req_data,
+            ready=audio_encoder_service.submit_item(audio_item),
+        )
 
     def result_adapter(data: Qwen3ASRRequestData) -> StagePayload:
         payload = data.stage_payload
