@@ -492,8 +492,8 @@ class WhisperPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.Te
         key = self._cache_key(item)
         if key is None:
             return
-        # host_copy is complete here (synchronize_batch ran in between) and
-        # already pinned, so the cache stores it without another copy.
+        # note (Jeffro): host_copy is complete here (synchronize_batch ran in
+        # between) and already pinned, so the cache stores it without another copy.
         self._cache.put(key, host_copy if host_copy is not None else embedding)
 
     def _retry_batch(self, batch: list[QueueEntry[Any]], _exc: Exception) -> bool:

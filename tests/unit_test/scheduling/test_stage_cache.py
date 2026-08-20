@@ -177,7 +177,7 @@ def test_pinned_cache_stores_device_tensors_in_page_locked_memory() -> None:
     assert cached is not None
     assert cached.device.type == "cpu" and cached.is_pinned()
     assert torch.equal(cached, src.cpu())
-    # Nested containers are pinned too.
+    # note (Jeffro): nested containers are pinned too.
     cache.put("nested", {"a": [src, src + 1]})
     nested = cache.get("nested")
     assert nested is not None

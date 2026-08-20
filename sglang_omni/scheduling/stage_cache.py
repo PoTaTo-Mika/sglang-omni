@@ -91,7 +91,8 @@ class StageOutputCache:
         self.max_size = max_size
         self.max_bytes = max_bytes
         self.cache_device = cache_device
-        # Pinning needs a CUDA context to be meaningful, so on CPU-only hosts it degrades to plain pageable storage.
+        # note (Jeffro): pinning needs a CUDA context to be meaningful, so on
+        # CUDA-less hosts (CI runners, dev boxes) it degrades to pageable storage.
         self.pin_memory = bool(pin_memory) and torch.cuda.is_available()
         self.current_bytes = 0
         self.eviction_count = 0

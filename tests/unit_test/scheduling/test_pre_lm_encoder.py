@@ -113,7 +113,7 @@ def test_stage_host_copy_runs_in_batch_context_and_reaches_cache() -> None:
         future = service._submit(4)
 
         assert future.result(timeout=2) == 8
-        # Staged inside the batch context (before its exit), delivered to
+        # note (Jeffro): staged inside the batch context (before its exit), delivered to
         # cache_embedding after the barrier.
         assert service.context_events == ["enter", "stage", "exit"]
         assert service.cached == [(4, 8, ("host", 8))]

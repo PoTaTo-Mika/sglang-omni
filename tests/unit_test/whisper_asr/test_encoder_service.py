@@ -137,7 +137,7 @@ def _cached_entry(
 
 
 def test_pinning_is_off_without_cuda_device() -> None:
-    # The stub model lives on CPU: there is nothing to DMA against, so the
+    # note (Jeffro): the stub model lives on CPU: there is nothing to DMA against, so the
     # service must not try to page-lock anything.
     service = _make_service()
     assert service.pin_host_memory is False
@@ -158,7 +158,7 @@ def test_cuda_cache_entries_are_pinned_and_match_device_result() -> None:
     assert cached.dtype == torch.float16
     torch.cuda.synchronize()
     assert torch.equal(cached.to("cuda"), item.precomputed_embeddings)
-    # No fingerprint means nothing will be cached, so nothing is staged.
+    # note (Jeffro): no fingerprint means nothing will be cached, so nothing is staged.
     anonymous = _make_item(fingerprint="ignored")
     anonymous.audio_fingerprint = None
     assert service.stage_host_copy(anonymous, item.precomputed_embeddings) is None
@@ -202,7 +202,7 @@ def test_pinned_allocation_failure_falls_back_to_pageable(
     monkeypatch.setattr(service, "_new_pinned_host", _boom)
     item = _make_item(fingerprint="fallback", fill=4.0)
     service.encode_item(item)
-    # The entry is still cached, just in pageable memory, and the service
+    # note (Jeffro): the entry is still cached, just in pageable memory, and the service
     # stops trying to pin so the failure is paid once, not per request.
     cached = _cached_entry(service, "fallback")
     assert not cached.is_pinned()
