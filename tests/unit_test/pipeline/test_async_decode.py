@@ -293,24 +293,24 @@ def test_base_lookahead_eligible_gates_output_history_sampling():
     def _batch(*reqs):
         return types.SimpleNamespace(reqs=list(reqs))
 
-    r = _StubRunner()
+    runner = _StubRunner()
+    history_free = _req(custom_logit_processor=None)
+    history_dependent = _req(custom_logit_processor="processor")
+
     # Empty batch and all-history-free rows are eligible.
-    assert r.lookahead_eligible(_batch()) is True
-    assert r.lookahead_eligible(_batch(_req(), _req())) is True
+    assert runner.lookahead_eligible(_batch()) is True
+    assert runner.lookahead_eligible(_batch(history_free)) is True
     # Any output-history-dependent term on any row forces sync.
-    assert r.lookahead_eligible(_batch(_req(repetition_penalty=1.05))) is False
-    assert r.lookahead_eligible(_batch(_req(frequency_penalty=0.5))) is False
-    assert r.lookahead_eligible(_batch(_req(presence_penalty=0.5))) is False
-    assert r.lookahead_eligible(_batch(_req(min_new_tokens=4))) is False
-    assert (
-        r.lookahead_eligible(_batch(_req(custom_logit_processor="processor"))) is False
-    )
+    assert runner.lookahead_eligible(_batch(_req(repetition_penalty=1.05))) is False
+    assert runner.lookahead_eligible(_batch(_req(frequency_penalty=0.5))) is False
+    assert runner.lookahead_eligible(_batch(_req(presence_penalty=0.5))) is False
+    assert runner.lookahead_eligible(_batch(_req(min_new_tokens=4))) is False
+    assert runner.lookahead_eligible(_batch(history_dependent)) is False
     # A single tainted row taints the whole batch.
-    assert r.lookahead_eligible(_batch(_req(), _req(frequency_penalty=0.1))) is False
     assert (
-        r.lookahead_eligible(_batch(_req(), _req(custom_logit_processor="processor")))
-        is False
+        runner.lookahead_eligible(_batch(_req(), _req(frequency_penalty=0.1))) is False
     )
+    assert runner.lookahead_eligible(_batch(history_free, history_dependent)) is False
 
 
 def test_finalize_skips_overrun_bookkeeping_and_extras():
@@ -768,12 +768,15 @@ def test_custom_logit_processor_transitions_async_sync_async():
     events = []
     s = _scaffold_async_loop()
     s._model_runner = _StubRunner()
-    s._run_batch_launch = lambda batch: (
-        events.append("launch") or "sched_output",
-        "pending_step",
-    )
-    s._resolve_and_process = lambda *args: events.append("resolve")
-    s.run_batch = lambda batch: events.append("sync") or object()
+    launch_events = iter(("launch async N", "launch async N+2"))
+
+    def launch_async(batch):
+        events.append(next(launch_events))
+        return "sched_output", "pending_step"
+
+    s._run_batch_launch = launch_async
+    s._resolve_and_process = lambda *args: events.append("resolve N")
+    s.run_batch = lambda batch: events.append("run sync N+1") or object()
     s.process_batch_result = lambda batch, result: None
 
     timestamp_batch = _FakeBatch(2)
@@ -791,7 +794,12 @@ def test_custom_logit_processor_transitions_async_sync_async():
     s.get_next_batch_to_run = get_next_batch_to_run
     s._event_loop_async_decode()
 
-    assert events == ["launch", "resolve", "sync", "launch"]
+    assert events == [
+        "launch async N",
+        "resolve N",
+        "run sync N+1",
+        "launch async N+2",
+    ]
 
 
 @pytest.mark.parametrize(
