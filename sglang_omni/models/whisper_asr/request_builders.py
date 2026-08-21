@@ -49,7 +49,32 @@ class WhisperASRRequestData(SGLangARRequestData):
     audio_duration_s: float = 0.0
     language: str = "en"
     detect_language: bool = False
+    segment_timestamps: bool = False
     engine_start_s: float = 0.0
+
+
+# Note (Akazaakane): Whisper timestamp token IDs advance in 20 ms steps from
+# the <|0.00|> token.
+_TIMESTAMP_STEP_S = 0.02
+
+
+def _render_timestamped_text(
+    tokenizer: Any, output_ids: list[int], *, timestamp_begin_id: int
+) -> str:
+    parts: list[str] = []
+    text_ids: list[int] = []
+    for token_id in output_ids:
+        if token_id >= timestamp_begin_id:
+            if text_ids:
+                parts.append(tokenizer.decode(text_ids, skip_special_tokens=True))
+                text_ids = []
+            seconds = (token_id - timestamp_begin_id) * _TIMESTAMP_STEP_S
+            parts.append(f"<|{seconds:.2f}|>")
+        else:
+            text_ids.append(token_id)
+    if text_ids:
+        parts.append(tokenizer.decode(text_ids, skip_special_tokens=True))
+    return "".join(parts).strip()
 
 
 def _resolve_language(value: Any) -> str:
@@ -68,11 +93,17 @@ def _build_logit_bias(generation_config: GenerationConfig) -> dict[str, float] |
     return {str(int(token_id)): -1.0e9 for token_id in suppress_tokens if token_id >= 0}
 
 
-def _build_prefix_tokens(tokenizer: Any, *, language: str, task: str) -> list[int]:
+def _build_prefix_tokens(
+    tokenizer: Any,
+    *,
+    language: str,
+    task: str,
+    predict_timestamps: bool = False,
+) -> list[int]:
     tokenizer.set_prefix_tokens(
         language=language,
         task=task,
-        predict_timestamps=False,
+        predict_timestamps=predict_timestamps,
     )
     return list(tokenizer.prefix_tokens)
 
@@ -130,10 +161,11 @@ def make_whisper_scheduler_adapters(
     tokenizer_lock = Lock()
     eos_token_id = int(tokenizer.eos_token_id)
     pad_token_id = int(tokenizer.pad_token_id or eos_token_id)
-    # note (Junnan Li): language identification samples language tokens, which
-    # sit above the base vocabulary, so the sampling vocab must cover them.
+    # Note (Akazaakane): Language identification and timestamp decoding sample
+    # tokens above the base vocabulary, so the sampling vocab must cover them.
     vocab_size = len(tokenizer)
     sot_token_id = int(tokenizer.convert_tokens_to_ids("<|startoftranscript|>"))
+    timestamp_begin_id = int(tokenizer.convert_tokens_to_ids("<|0.00|>"))
     # note (Junnan Li): a uniform positive bias keeps the relative order of the
     # language tokens while guaranteeing one of them wins the detection step.
     lang_to_id = getattr(generation_config, "lang_to_id", None) or {}
@@ -167,6 +199,7 @@ def make_whisper_scheduler_adapters(
         language = _resolve_language(params.get("language"))
         task = str(params.get("task") or "transcribe")
         detect_language = bool(params.get("detect_language"))
+        segment_timestamps = bool(params.get("segment_timestamps"))
         if detect_language:
             prompt_token_ids = [sot_token_id]
             request_max_new_tokens = 1
@@ -176,7 +209,12 @@ def make_whisper_scheduler_adapters(
                     tokenizer,
                     language=language,
                     task=task,
+                    predict_timestamps=segment_timestamps,
                 )
+                if segment_timestamps:
+                    # Note (Akazaakane): Greedy Whisper needs <|0.00|> priming
+                    # to begin emitting timestamp token pairs.
+                    prefix_token_ids.append(timestamp_begin_id)
                 request_max_new_tokens, max_prev_tokens = _decoder_token_budgets(
                     decoder_context_len=decoder_context_len,
                     prefix_len=len(prefix_token_ids),
@@ -260,6 +298,7 @@ def make_whisper_scheduler_adapters(
             audio_duration_s=audio_duration_s,
             language=language,
             detect_language=detect_language,
+            segment_timestamps=segment_timestamps,
             engine_start_s=time.perf_counter(),
             stage_payload=payload,
         )
@@ -269,6 +308,10 @@ def make_whisper_scheduler_adapters(
         output_ids = list(data.output_ids or [])
         if data.detect_language:
             text = id_to_language.get(output_ids[0], "") if output_ids else ""
+        elif data.segment_timestamps:
+            text = _render_timestamped_text(
+                tokenizer, output_ids, timestamp_begin_id=timestamp_begin_id
+            )
         else:
             text = tokenizer.decode(output_ids, skip_special_tokens=True).strip()
         engine_time_s = (

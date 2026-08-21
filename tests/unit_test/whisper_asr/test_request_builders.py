@@ -34,18 +34,24 @@ class _FakeTokenizer:
         return 51866
 
     def convert_tokens_to_ids(self, token: str) -> int:
-        return {"<|startoftranscript|>": 50258}[token]
+        return {"<|startoftranscript|>": 50258, "<|0.00|>": 50365}[token]
 
     def set_prefix_tokens(
         self, *, language: str, task: str, predict_timestamps: bool
     ) -> None:
-        assert predict_timestamps is False
         self.prefix_language = language
         self.prefix_task = task
+        self.predict_timestamps = predict_timestamps
 
     @property
     def prefix_tokens(self) -> list[int]:
-        return list(_PREFIX)
+        prefix = list(_PREFIX)
+        if getattr(self, "predict_timestamps", False):
+            prefix = prefix[:-1]
+        return prefix
+
+    def decode(self, ids, skip_special_tokens=True):
+        return " ".join(str(token_id) for token_id in ids if token_id < 50000)
 
     def get_prompt_ids(self, text: str, return_tensors=None) -> list[int]:
         assert return_tensors is None
@@ -286,6 +292,30 @@ def test_concurrent_request_builds_serialize_mutable_tokenizer_state(
         "english": [1],
         "fr": [2],
     }
+
+
+def test_request_builder_primes_first_timestamp_for_segment_formats(
+    monkeypatch,
+) -> None:
+    data = _build(monkeypatch, {"segment_timestamps": True})
+
+    assert data.prompt_token_ids[-1] == 50365
+
+
+def test_request_builder_keeps_timestamp_off_prefix_by_default(monkeypatch) -> None:
+    data = _build(monkeypatch)
+
+    assert data.prompt_token_ids == list(_PREFIX)
+
+
+def test_timestamped_text_renders_markers_from_token_ids() -> None:
+    tokenizer = _FakeTokenizer()
+
+    text = whisper_request_builders._render_timestamped_text(
+        tokenizer, [50365, 7, 8, 50415, 50440, 9, 50465], timestamp_begin_id=50365
+    )
+
+    assert text == "<|0.00|>7 8<|1.00|><|1.50|>9<|2.00|>"
 
 
 def test_request_builder_pre_lm_encode_attaches_embeddings(monkeypatch) -> None:

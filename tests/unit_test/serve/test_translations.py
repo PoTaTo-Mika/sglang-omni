@@ -34,6 +34,10 @@ class RecordingTranslationClient:
         self.requests.append(request)
         if request.extra_params.get("detect_language"):
             return CompletionResult(request_id=request_id, text=self.detected_language)
+        if request.extra_params.get("segment_timestamps"):
+            return CompletionResult(
+                request_id=request_id, text="<|0.00|>hello world<|1.50|>"
+            )
         return CompletionResult(request_id=request_id, text="hello world")
 
     async def generate(
@@ -137,8 +141,8 @@ def test_unsupported_model_returns_openai_shaped_400_before_audio_read() -> None
         ("json", 200, "application/json"),
         ("verbose_json", 200, "application/json"),
         ("text", 200, "text/plain"),
-        ("srt", 400, "application/json"),
-        ("vtt", 400, "application/json"),
+        ("srt", 200, "text/plain"),
+        ("vtt", 200, "text/plain"),
     ],
 )
 def test_translation_response_format_matrix(
@@ -146,7 +150,7 @@ def test_translation_response_format_matrix(
     expected_status: int,
     expected_content_type: str,
 ) -> None:
-    client, _ = _translation_client()
+    client, backend = _translation_client()
 
     response = _post_translation(client, response_format=response_format)
 
@@ -164,11 +168,13 @@ def test_translation_response_format_matrix(
     elif response_format == "text":
         assert response.text == "hello world"
         assert not response.text.startswith("{")
+    elif response_format == "srt":
+        assert response.text == "1\n00:00:00,000 --> 00:00:01,500\nhello world\n\n"
     else:
-        error = response.json()["error"]
-        assert error["type"] == "invalid_request_error"
-        assert error["param"] == "response_format"
-        assert "segment-timestamp capability" in error["message"]
+        assert response.text == "WEBVTT\n\n00:00.000 --> 00:01.500\nhello world\n\n"
+    if response_format in {"srt", "vtt"}:
+        assert backend.requests[-1].extra_params["task"] == "translate"
+        assert backend.requests[-1].extra_params["segment_timestamps"] is True
 
 
 def test_omitted_language_detects_the_source() -> None:
@@ -194,10 +200,16 @@ def test_invalid_response_format_returns_openai_400() -> None:
     assert backend.requests == []
 
 
-def test_response_format_is_case_normalized() -> None:
-    client, backend = _translation_client()
+def test_segment_format_without_adapter_timestamps_returns_400() -> None:
+    backend = RecordingTranslationClient()
+    app = create_app(
+        backend,
+        model_name=WHISPER_MODEL,
+        architectures=None,
+        supports_audio_translation=True,
+    )
 
-    response = _post_translation(client, response_format="SRT")
+    response = _post_translation(app, response_format="SRT")
 
     assert response.status_code == 400
     error = response.json()["error"]
@@ -240,7 +252,7 @@ def test_translation_stream_rejects_formats_without_segment_timestamps(
     )
 
     assert response.status_code == 400
-    assert "segment-timestamp capability" in response.json()["error"]["message"]
+    assert "stream=true" in response.json()["error"]["message"]
     assert backend.requests == []
 
 
