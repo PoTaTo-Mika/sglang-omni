@@ -54,6 +54,14 @@ def resolve_transformer_weights_path(
     return str(transformer_path)
 
 
+def _refuse_weight_update(payload: dict[str, Any]) -> tuple[bool, str]:
+    del payload
+    return False, (
+        "Cosmos3 does not support weight updates; weights load only at "
+        "startup from the nested transformer/ checkpoint component"
+    )
+
+
 def create_thinker_scheduler(
     server_args: Any,
     gpu_id: int = 0,
@@ -97,6 +105,17 @@ def create_thinker_scheduler(
         ),
         total_gpu_memory_fraction=total_gpu_memory_fraction,
     )
+
+    # A weight update would resolve the advertised model root instead of the
+    # nested transformer/ component, so refuse every update path (PR #1263).
+    for admin_method in (
+        "update_weights_from_disk",
+        "update_weights_from_tensor",
+        "update_weights_from_distributed",
+        "init_weights_update_group",
+        "destroy_weights_update_group",
+    ):
+        setattr(model_worker, admin_method, _refuse_weight_update)
 
     output_processor = SGLangOutputProcessor(capture_hidden=False)
     model_runner = ModelRunner(model_worker, output_processor)

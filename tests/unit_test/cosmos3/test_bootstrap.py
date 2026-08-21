@@ -69,7 +69,7 @@ def test_thinker_loads_tokenizer_from_checkpoint_root(monkeypatch, tmp_path) -> 
         scheduling_bootstrap,
         "create_sglang_infrastructure",
         lambda *args, **kwargs: (
-            object(),
+            SimpleNamespace(),
             object(),
             object(),
             object(),
