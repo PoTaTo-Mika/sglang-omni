@@ -185,7 +185,7 @@ class Qwen3ASRPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.T
         key = self._cache_key(item)
 
         if key is None:
-            return self._submit(item)
+            return self._count_failed(self._submit(item))
 
         cached = self.lookup_cached_embedding(
             getattr(item, "audio_fingerprint", None), expected_tokens
@@ -226,6 +226,7 @@ class Qwen3ASRPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.T
             future.add_done_callback(
                 lambda done, cache_key=key: self._clear_inflight(cache_key, done)
             )
+            self._count_failed(future)
             try:
                 self._submit(item, future)
             except Exception as exc:
@@ -253,7 +254,7 @@ class Qwen3ASRPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.T
                 completion.set_exception(exc)
 
         follower_of.add_done_callback(attach_follower)
-        return completion
+        return self._count_failed(completion)
 
     def encode_item(self, item: Any) -> None:
         """Block until the item holds the LM-ready embedding.
@@ -261,12 +262,22 @@ class Qwen3ASRPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.T
         On success the CPU mel tensor is cleared. Raises on encode failure;
         the request must not be admitted without the complete embedding.
         """
-        try:
-            self.submit_item(item).result(timeout=self.ENCODE_TIMEOUT_S)
-        except Exception:
-            with self._lock:
-                self._failed += 1
-            raise
+        self.submit_item(item).result(timeout=self.ENCODE_TIMEOUT_S)
+
+    def _count_failed(
+        self, future: concurrent.futures.Future[torch.Tensor]
+    ) -> concurrent.futures.Future[torch.Tensor]:
+        def finish(done: concurrent.futures.Future[torch.Tensor]) -> None:
+            try:
+                failed = done.exception() is not None
+            except concurrent.futures.CancelledError:
+                failed = True
+            if failed:
+                with self._lock:
+                    self._failed += 1
+
+        future.add_done_callback(finish)
+        return future
 
     def _clear_inflight(
         self,

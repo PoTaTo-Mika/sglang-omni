@@ -385,6 +385,18 @@ def test_concurrent_identical_requests_deduplicate_without_cache() -> None:
     assert torch.equal(items[0].precomputed_embeddings, items[1].precomputed_embeddings)
 
 
+def test_submit_item_failure_counts_failed() -> None:
+    model = _StubModel()
+    model.fail = True
+    service = _make_service(model)
+
+    future = service.submit_item(_item(88, 3))
+
+    with pytest.raises(RuntimeError, match="boom"):
+        future.result(timeout=2)
+    assert service.stats()["failed"] == 1
+
+
 def test_encode_failure_propagates_without_poisoning_cache() -> None:
     model = _StubModel()
     model.fail = True
