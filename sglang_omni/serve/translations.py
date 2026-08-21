@@ -160,20 +160,23 @@ def register_translations(app: FastAPI) -> None:
         except HTTPException as exc:
             return _http_exception_response(exc, param=None)
 
-        # note (Junnan Li): verbose_json keeps transcription parity: with no
-        # segment-timestamp channel, the shared adapter emits one placeholder
-        # segment.
-        return speech_to_text.assemble_speech_to_text_response(
-            text=result.text,
-            response_format=form.response_format,
-            endpoint_path=TRANSLATIONS_ENDPOINT,
-            task="translate",
-            language=language,
-            audio_bytes=audio_bytes,
-            architectures=getattr(app.state, "architectures", None),
-            duration_s=duration_s,
-            response_formats=TRANSLATION_RESPONSE_FORMATS,
-        )
+        try:
+            # note (Junnan Li): verbose_json keeps transcription parity: with no
+            # segment-timestamp channel, the shared adapter emits one placeholder
+            # segment.
+            return speech_to_text.assemble_speech_to_text_response(
+                text=result.text,
+                response_format=form.response_format,
+                endpoint_path=TRANSLATIONS_ENDPOINT,
+                task="translate",
+                language=language,
+                audio_bytes=audio_bytes,
+                architectures=getattr(app.state, "architectures", None),
+                duration_s=duration_s,
+                response_formats=TRANSLATION_RESPONSE_FORMATS,
+            )
+        except HTTPException as exc:
+            return _http_exception_response(exc, param=None)
 
 
 __all__ = ["register_translations"]

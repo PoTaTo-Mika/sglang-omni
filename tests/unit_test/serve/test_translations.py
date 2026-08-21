@@ -19,9 +19,14 @@ UNSUPPORTED_MODEL = "Qwen/Qwen3-ASR-1.7B"
 
 
 class RecordingTranslationClient:
-    def __init__(self, detected_language: str = "zh") -> None:
+    def __init__(
+        self,
+        detected_language: str = "zh",
+        timestamp_text: str = "<|0.00|>hello world<|1.50|>",
+    ) -> None:
         self.requests: list[GenerateRequest] = []
         self.detected_language = detected_language
+        self.timestamp_text = timestamp_text
 
     async def completion(
         self,
@@ -36,7 +41,8 @@ class RecordingTranslationClient:
             return CompletionResult(request_id=request_id, text=self.detected_language)
         if request.extra_params.get("segment_timestamps"):
             return CompletionResult(
-                request_id=request_id, text="<|0.00|>hello world<|1.50|>"
+                request_id=request_id,
+                text=self.timestamp_text,
             )
         return CompletionResult(request_id=request_id, text="hello world")
 
@@ -216,6 +222,26 @@ def test_segment_format_without_adapter_timestamps_returns_400() -> None:
     assert error["param"] == "response_format"
     assert "segment-timestamp capability" in error["message"]
     assert backend.requests == []
+
+
+def test_translation_timestamp_decode_error_uses_openai_envelope() -> None:
+    """Keep post-decode subtitle failures in translation's OpenAI error schema."""
+    backend = RecordingTranslationClient(timestamp_text="hello world")
+    app = create_app(
+        backend,
+        model_name=WHISPER_MODEL,
+        architectures=["WhisperForConditionalGeneration"],
+        supports_audio_translation=True,
+    )
+
+    response = _post_translation(app, response_format="srt")
+
+    assert response.status_code == 400
+    assert "detail" not in response.json()
+    error = response.json()["error"]
+    assert error["type"] == "invalid_request_error"
+    assert error["param"] is None
+    assert error["message"] == "model did not produce segment timestamps"
 
 
 def test_whisper_translation_stream_matches_transcription_sse_lifecycle() -> None:

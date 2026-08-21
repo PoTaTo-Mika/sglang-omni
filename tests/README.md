@@ -216,7 +216,9 @@ tests/
     │   ├── test_encoder_cuda_graph.py
     │   ├── test_encoder_service.py
     │   ├── test_pipeline.py
-    │   └── test_request_builders.py
+    │   ├── test_request_builders.py
+    │   ├── test_timestamp_logit_processor.py
+    │   └── test_transcription_adapter.py
     └── voxtral_tts/
         └── test_pipeline.py
 ```
