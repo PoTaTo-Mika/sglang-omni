@@ -46,6 +46,7 @@ class FunCosyVoice3PipelineConfig(PipelineConfig):
             factory=FactoryArgs(dtype="bfloat16"),
             gpu=0,
             next="vocoder",
+            stream_to=["vocoder"],
         ),
         StageConfig(
             name="vocoder",
@@ -60,6 +61,7 @@ class FunCosyVoice3PipelineConfig(PipelineConfig):
             ),
             gpu=0,
             terminal=True,
+            can_accept_stream_before_payload=True,
         ),
     ]
 

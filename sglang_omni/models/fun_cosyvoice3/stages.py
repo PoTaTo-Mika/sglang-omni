@@ -16,6 +16,7 @@ from sglang_omni.models.fun_cosyvoice3.request_builders import (
     cleanup_prepared_cosyvoice3_request,
     preprocess_cosyvoice3_payload,
 )
+from sglang_omni.models.fun_cosyvoice3.streaming import TOKEN_MEL_RATIO
 from sglang_omni.platforms import current_platform
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.pipeline_state import build_usage
@@ -489,7 +490,8 @@ class _CosyVoice3Vocoder(BatchVocoderBase):
             raise RuntimeError(
                 "Fun-CosyVoice3 vocoder requires audio_codes from tts_engine"
             )
-
+        # note (guozhihao-224): AR stores one token per step, serialized as
+        # [T, 1]; Flow takes a single unbatched sequence.
         codes = torch.as_tensor(state.audio_codes, dtype=torch.long).reshape(-1)
         return state, codes
 
@@ -535,6 +537,79 @@ class _CosyVoice3Vocoder(BatchVocoderBase):
                 f"Fun-CosyVoice3 vocoder returned {len(results)} results for 1 input"
             )
         return results[0]
+
+    def token2wav(
+        self,
+        token: torch.Tensor,
+        prompt_token: torch.Tensor,
+        prompt_feat: torch.Tensor,
+        embedding: torch.Tensor,
+    ) -> torch.Tensor:
+        wav, _, _ = self.token2wav_chunk(
+            token=token,
+            prompt_token=prompt_token,
+            prompt_feat=prompt_feat,
+            embedding=embedding,
+            token_offset=0,
+            streaming=False,
+            finalize=True,
+            hift_mel=None,
+            speech_offset=0,
+        )
+        return wav
+
+    def token2wav_chunk(
+        self,
+        token: torch.Tensor,
+        prompt_token: torch.Tensor,
+        prompt_feat: torch.Tensor,
+        embedding: torch.Tensor,
+        *,
+        token_offset: int,
+        streaming: bool,
+        finalize: bool,
+        hift_mel: torch.Tensor | None,
+        speech_offset: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+        # note (guozhihao-224): causal hops use streaming=True, finalize=False;
+        # leftover uses streaming=False, finalize=True, matching CosyVoice3Model.
+        # FunCosyVoice3Flow.inference is the buffered batch adapter; hops must
+        # call CosyVoice's token/len/streaming signature on the wrapped module.
+        if token.shape[1] == 0:
+            raise RuntimeError(
+                "Fun-CosyVoice3 generation produced no usable speech tokens"
+            )
+        native_flow = getattr(self._flow, "_flow", self._flow)
+        device = next(native_flow.parameters()).device
+        offset = max(int(token_offset), 0)
+
+        with torch.autocast(
+            device_type=current_platform.device_type,
+            dtype=self._compute_dtype,
+            enabled=self._compute_dtype is not None,
+        ):
+            tts_mel, _ = native_flow.inference(
+                token=token.to(device, dtype=torch.int32),
+                token_len=torch.tensor([token.shape[1]], dtype=torch.int32).to(device),
+                prompt_token=prompt_token.to(device),
+                prompt_token_len=torch.tensor(
+                    [prompt_token.shape[1]], dtype=torch.int32
+                ).to(device),
+                prompt_feat=prompt_feat.to(device),
+                prompt_feat_len=torch.tensor(
+                    [prompt_feat.shape[1]], dtype=torch.int32
+                ).to(device),
+                embedding=embedding.to(device),
+                streaming=streaming,
+                finalize=finalize,
+            )
+        tts_mel = tts_mel[:, :, offset * TOKEN_MEL_RATIO :]
+        if hift_mel is not None:
+            tts_mel = torch.cat([hift_mel.to(device=tts_mel.device), tts_mel], dim=2)
+        tts_speech, _ = self._hift.inference(speech_feat=tts_mel, finalize=finalize)
+        held = max(int(speech_offset), 0)
+        delta = tts_speech[:, held:].detach().cpu()
+        return delta, tts_mel.detach(), int(tts_speech.shape[1])
 
     def _make_flow_input(
         self,
@@ -623,7 +698,11 @@ def create_vocoder_executor(
     flow_batch_bucket_frames: int = 50,
     flow_batch_admission_frames: int = _DEFAULT_FLOW_BATCH_ADMISSION_FRAMES,
     enable_dit_torch_compile: bool = False,
-) -> SimpleScheduler:
+) -> Any:
+    from sglang_omni.models.fun_cosyvoice3.streaming_vocoder import (
+        FunCosyVoice3StreamingVocoderScheduler,
+    )
+
     if flow_batch_admission_frames <= 0:
         raise ValueError("flow_batch_admission_frames must be greater than zero")
     device = resolve_device_spec(device, gpu_id)
@@ -649,9 +728,8 @@ def create_vocoder_executor(
         flow_batch_bucket_frames=flow_batch_bucket_frames,
     )
 
-    return SimpleScheduler(
-        vocoder.decode_payload,
-        batch_compute_fn=vocoder.decode_payloads,
+    return FunCosyVoice3StreamingVocoderScheduler(
+        vocoder,
         max_batch_size=max_batch_size,
         max_batch_wait_ms=max_batch_wait_ms,
         request_cost_fn=vocoder._flow_scheduler_cost,
