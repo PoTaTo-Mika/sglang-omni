@@ -285,9 +285,7 @@ def test_ar_to_vocoder_grows_hops_then_finalizes_remainder() -> None:
         IncomingMessage(
             request_id=request_id,
             type="new_request",
-            data=_stream_payload(
-                request_id, codes=generated, prompt_feat_frames=1
-            ),
+            data=_stream_payload(request_id, codes=generated, prompt_feat_frames=1),
         ),
         None,
     )
