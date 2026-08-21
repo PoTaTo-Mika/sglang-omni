@@ -53,3 +53,23 @@ def test_subtitle_response_rejects_markerless_text() -> None:
         adapter.build_timestamped_response(
             text="plain transcript", language="en", audio_duration_s=3.5
         )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "<|0.00|>hello<|1.20|> trailing unpaired text",
+        "hello <|1.20|>",
+        "<|0.00|> hello",
+        "<|2.00|>foo<|1.00|>",
+        "<|0.00|>hello<|1.20|><|1.00|>backwards<|2.00|>",
+        "<|0.00|>hello<|1.20|><|1.20|>",
+    ],
+)
+def test_subtitle_response_rejects_incomplete_timestamp_coverage(text: str) -> None:
+    adapter = WhisperASRAdapter()
+
+    with pytest.raises(ValueError, match="model did not produce segment timestamps"):
+        adapter.build_timestamped_response(
+            text=text, language="en", audio_duration_s=3.5
+        )

@@ -25,6 +25,15 @@ _PREFIX = [50258, 50259, 50359, 50363]
 _ENCODER_TOKEN_COUNT = 4
 
 
+def _generation_config() -> SimpleNamespace:
+    return SimpleNamespace(
+        suppress_tokens=None,
+        max_length=None,
+        no_timestamps_token_id=50363,
+        max_initial_timestamp_index=50,
+    )
+
+
 class _FakeTokenizer:
     eos_token_id = 2
     pad_token_id = 3
@@ -34,7 +43,7 @@ class _FakeTokenizer:
         return 51866
 
     def convert_tokens_to_ids(self, token: str) -> int:
-        return {"<|startoftranscript|>": 50258, "<|0.00|>": 50365}[token]
+        return {"<|startoftranscript|>": 50258}[token]
 
     def set_prefix_tokens(
         self, *, language: str, task: str, predict_timestamps: bool
@@ -68,7 +77,7 @@ def _make_request_builder(tokenizer: _FakeTokenizer | None = None):
     request_builder, _ = make_whisper_scheduler_adapters(
         processor=fake_processor,
         tokenizer=tokenizer if tokenizer is not None else _FakeTokenizer(),
-        generation_config=SimpleNamespace(suppress_tokens=None, max_length=None),
+        generation_config=_generation_config(),
         encoder_token_count=_ENCODER_TOKEN_COUNT,
         max_new_tokens=32,
     )
@@ -294,25 +303,35 @@ def test_concurrent_request_builds_serialize_mutable_tokenizer_state(
     }
 
 
-def test_request_builder_primes_first_timestamp_for_segment_formats(
+def test_request_builder_uses_generated_timestamps_for_segment_formats(
     monkeypatch,
 ) -> None:
     data = _build(monkeypatch, {"segment_timestamps": True})
 
-    assert data.prompt_token_ids[-1] == 50365
+    assert data.prompt_token_ids == _PREFIX[:-1]
+    assert 50364 not in data.prompt_token_ids
+    assert data.req.custom_logit_processor is not None
+    custom_params = data.req.sampling_params.custom_params
+    assert custom_params["segment_timestamps"] is True
+    assert custom_params["timestamp_begin_id"] == 50364
+    assert custom_params["no_timestamps_token_id"] == 50363
+    assert custom_params["eos_token_id"] == _FakeTokenizer.eos_token_id
+    assert custom_params["max_initial_timestamp_index"] == 50
 
 
 def test_request_builder_keeps_timestamp_off_prefix_by_default(monkeypatch) -> None:
     data = _build(monkeypatch)
 
     assert data.prompt_token_ids == list(_PREFIX)
+    assert data.req.custom_logit_processor is None
+    assert data.req.sampling_params.custom_params is None
 
 
 def test_timestamped_text_renders_markers_from_token_ids() -> None:
     tokenizer = _FakeTokenizer()
 
     text = whisper_request_builders._render_timestamped_text(
-        tokenizer, [50365, 7, 8, 50415, 50440, 9, 50465], timestamp_begin_id=50365
+        tokenizer, [50364, 7, 8, 50414, 50439, 9, 50464], timestamp_begin_id=50364
     )
 
     assert text == "<|0.00|>7 8<|1.00|><|1.50|>9<|2.00|>"
@@ -349,7 +368,7 @@ def test_request_builder_pre_lm_encode_attaches_embeddings(monkeypatch) -> None:
     request_builder, _ = make_whisper_scheduler_adapters(
         processor=fake_processor,
         tokenizer=_FakeTokenizer(),
-        generation_config=SimpleNamespace(suppress_tokens=None, max_length=None),
+        generation_config=_generation_config(),
         encoder_token_count=_ENCODER_TOKEN_COUNT,
         max_new_tokens=32,
         audio_encoder_service=_Service(),
@@ -395,7 +414,7 @@ def test_request_builder_pre_lm_cache_miss_extracts_and_encodes(monkeypatch) -> 
     request_builder, _ = make_whisper_scheduler_adapters(
         processor=fake_processor,
         tokenizer=_FakeTokenizer(),
-        generation_config=SimpleNamespace(suppress_tokens=None, max_length=None),
+        generation_config=_generation_config(),
         encoder_token_count=_ENCODER_TOKEN_COUNT,
         max_new_tokens=32,
         audio_encoder_service=_Service(),
@@ -437,7 +456,7 @@ def test_request_builder_pre_lm_cache_hit_skips_mel(monkeypatch) -> None:
     request_builder, _ = make_whisper_scheduler_adapters(
         processor=fake_processor,
         tokenizer=_FakeTokenizer(),
-        generation_config=SimpleNamespace(suppress_tokens=None, max_length=None),
+        generation_config=_generation_config(),
         encoder_token_count=_ENCODER_TOKEN_COUNT,
         max_new_tokens=32,
         audio_encoder_service=_Service(),

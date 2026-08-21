@@ -51,9 +51,7 @@ class WhisperASRAdapter(TranscriptionAdapter):
         language: str | None,
         audio_duration_s: float,
     ) -> TranscriptionVerboseResponse:
-        segments = self._parse_segments(text)
-        if not segments:
-            raise ValueError("model did not produce segment timestamps")
+        segments = self._parse_timestamped_segments(text)
         return self._build_response(
             self.postprocess_text(text), language, audio_duration_s, segments
         )
@@ -93,6 +91,37 @@ class WhisperASRAdapter(TranscriptionAdapter):
                     text=segment_text,
                 )
             )
+        return segments
+
+    @staticmethod
+    def _parse_timestamped_segments(text: str) -> list[TranscriptionSegment]:
+        segments: list[TranscriptionSegment] = []
+        cursor = 0
+        previous_end = 0.0
+        for match in _SEGMENT_RE.finditer(text):
+            if text[cursor : match.start()].strip():
+                raise ValueError("model did not produce segment timestamps")
+
+            start = float(match.group("start"))
+            end = float(match.group("end"))
+            if start < previous_end or end < start:
+                raise ValueError("model did not produce segment timestamps")
+
+            segment_text = match.group("text").strip()
+            if segment_text:
+                segments.append(
+                    TranscriptionSegment(
+                        id=len(segments),
+                        start=round(start, 2),
+                        end=round(end, 2),
+                        text=segment_text,
+                    )
+                )
+            previous_end = end
+            cursor = match.end()
+
+        if text[cursor:].strip() or not segments:
+            raise ValueError("model did not produce segment timestamps")
         return segments
 
     @staticmethod

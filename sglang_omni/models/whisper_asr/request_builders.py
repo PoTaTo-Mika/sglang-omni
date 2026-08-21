@@ -19,6 +19,9 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from transformers import GenerationConfig
 
 from sglang_omni.models.whisper_asr.config import WHISPER_MAX_INPUT_SECONDS
+from sglang_omni.models.whisper_asr.timestamp_logit_processor import (
+    WhisperTimestampLogitProcessor,
+)
 from sglang_omni.preprocessing.transcription import prepare_audio
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
@@ -165,7 +168,12 @@ def make_whisper_scheduler_adapters(
     # tokens above the base vocabulary, so the sampling vocab must cover them.
     vocab_size = len(tokenizer)
     sot_token_id = int(tokenizer.convert_tokens_to_ids("<|startoftranscript|>"))
-    timestamp_begin_id = int(tokenizer.convert_tokens_to_ids("<|0.00|>"))
+    no_timestamps_token_id = int(generation_config.no_timestamps_token_id)
+    timestamp_begin_id = no_timestamps_token_id + 1
+    timestamp_logit_processor = WhisperTimestampLogitProcessor.to_str()
+    max_initial_timestamp_index = getattr(
+        generation_config, "max_initial_timestamp_index", None
+    )
     # note (Junnan Li): a uniform positive bias keeps the relative order of the
     # language tokens while guaranteeing one of them wins the detection step.
     lang_to_id = getattr(generation_config, "lang_to_id", None) or {}
@@ -211,10 +219,6 @@ def make_whisper_scheduler_adapters(
                     task=task,
                     predict_timestamps=segment_timestamps,
                 )
-                if segment_timestamps:
-                    # Note (Akazaakane): Greedy Whisper needs <|0.00|> priming
-                    # to begin emitting timestamp token pairs.
-                    prefix_token_ids.append(timestamp_begin_id)
                 request_max_new_tokens, max_prev_tokens = _decoder_token_budgets(
                     decoder_context_len=decoder_context_len,
                     prefix_len=len(prefix_token_ids),
@@ -275,6 +279,17 @@ def make_whisper_scheduler_adapters(
             top_p=1.0,
             stop_token_ids=[eos_token_id],
             logit_bias=language_token_bias if detect_language else logit_bias,
+            custom_params=(
+                {
+                    "segment_timestamps": True,
+                    "timestamp_begin_id": timestamp_begin_id,
+                    "no_timestamps_token_id": no_timestamps_token_id,
+                    "eos_token_id": eos_token_id,
+                    "max_initial_timestamp_index": max_initial_timestamp_index,
+                }
+                if segment_timestamps
+                else None
+            ),
         )
         sampling_params.normalize(tokenizer=None)
 
@@ -285,6 +300,9 @@ def make_whisper_scheduler_adapters(
             sampling_params=sampling_params,
             vocab_size=vocab_size,
             extra_key=fingerprint,
+            custom_logit_processor=(
+                timestamp_logit_processor if segment_timestamps else None
+            ),
         )
         req.multimodal_inputs = mm_inputs
         req._codec_suppress_tokens = None
