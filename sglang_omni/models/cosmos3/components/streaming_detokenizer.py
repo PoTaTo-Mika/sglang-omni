@@ -146,8 +146,14 @@ class Cosmos3StreamingDetokenizer:
         with self._state_lock:
             if request_id in self._aborted:
                 return
-            token_id = int(item.data.item())
             state = self._ensure_state(request_id)
+            if item.metadata and item.metadata.get("terminal_flush"):
+                # Tokens held upstream as possible stop-string prefixes arrive
+                # in one finish-time chunk; buffer them for _finalize's
+                # matched-stop trim instead of emitting them live.
+                state.pending_tokens.extend(int(t) for t in item.data.tolist())
+                return
+            token_id = int(item.data.item())
             state.pending_tokens.append(token_id)
             candidate = self._tokenizer.decode(
                 state.pending_tokens,

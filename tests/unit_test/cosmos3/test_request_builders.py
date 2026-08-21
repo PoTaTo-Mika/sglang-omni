@@ -241,7 +241,7 @@ def test_stream_builder_emits_only_for_streaming_requests() -> None:
     req_data = SimpleNamespace(
         req=SimpleNamespace(
             inflight_middle_chunks=0,
-            sampling_params=SimpleNamespace(stop_token_ids=None),
+            sampling_params=SimpleNamespace(stop_token_ids=None, stop_strs=[]),
         ),
         stage_payload=payload,
     )
@@ -270,7 +270,7 @@ def test_stream_builder_filters_stop_token_ids() -> None:
     req_data = SimpleNamespace(
         req=SimpleNamespace(
             inflight_middle_chunks=0,
-            sampling_params=SimpleNamespace(stop_token_ids={7}),
+            sampling_params=SimpleNamespace(stop_token_ids={7}, stop_strs=[]),
         ),
         stage_payload=payload,
     )
@@ -280,6 +280,73 @@ def test_stream_builder_filters_stop_token_ids() -> None:
     messages = builder("stream-request", req_data, SimpleNamespace(data=42))
     assert len(messages) == 1
     assert messages[0].data.tolist() == [42]
+
+
+class _StreamTailTokenizer:
+    pieces = {1: "hello", 2: " gam", 3: "ma", 4: "bit"}
+
+    def decode(self, token_ids) -> str:
+        return "".join(self.pieces.get(int(token_id), "") for token_id in token_ids)
+
+
+def _stop_str_req_data(stop_strs: list[str]) -> SimpleNamespace:
+    payload = StagePayload(
+        request_id="stream-request",
+        request=OmniRequest(inputs=None, params={"stream": True}),
+        data={},
+    )
+    req = SimpleNamespace(
+        inflight_middle_chunks=0,
+        sampling_params=SimpleNamespace(
+            stop_token_ids=None,
+            stop_strs=stop_strs,
+            stop_str_max_len=max((len(stop) for stop in stop_strs), default=0),
+        ),
+        output_ids=[],
+        tokenizer=_StreamTailTokenizer(),
+    )
+    return SimpleNamespace(req=req, stage_payload=payload)
+
+
+def _stream_step(builder, req_data: SimpleNamespace, token_id: int):
+    # The builder runs before process_batch_result appends the token, so
+    # append to output_ids only after the call, matching scheduler ordering.
+    messages = builder("stream-request", req_data, SimpleNamespace(data=token_id))
+    req_data.req.output_ids.append(token_id)
+    return messages
+
+
+def test_stream_builder_holds_possible_stop_prefix_and_releases() -> None:
+    builder = make_text_stream_output_builder()
+    req_data = _stop_str_req_data([" gamma"])
+
+    messages = _stream_step(builder, req_data, 1)
+    assert [message.data.tolist() for message in messages] == [[1]]
+
+    assert _stream_step(builder, req_data, 2) == []
+
+    messages = _stream_step(builder, req_data, 4)
+    assert [message.data.tolist() for message in messages] == [[2], [4]]
+    assert [message.metadata for message in messages] == [
+        {"token_id": 2},
+        {"token_id": 4},
+    ]
+
+
+def test_stream_builder_flush_ships_held_stop_tokens_with_terminal_flag() -> None:
+    builder = make_text_stream_output_builder()
+    req_data = _stop_str_req_data([" gamma"])
+
+    assert [m.data.tolist() for m in _stream_step(builder, req_data, 1)] == [[1]]
+    assert _stream_step(builder, req_data, 2) == []
+    assert _stream_step(builder, req_data, 3) == []
+
+    messages = builder.flush("stream-request", req_data)
+    assert len(messages) == 1
+    assert messages[0].data.tolist() == [2, 3]
+    assert messages[0].metadata == {"terminal_flush": True}
+
+    assert builder.flush("stream-request", req_data) == []
 
 
 def test_apply_text_result_preserves_optional_metadata() -> None:

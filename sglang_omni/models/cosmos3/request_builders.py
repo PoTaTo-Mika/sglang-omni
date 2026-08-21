@@ -246,8 +246,42 @@ def make_text_scheduler_adapters(
     return request_builder, result_adapter
 
 
+_PENDING_STREAM_IDS_ATTR = "_cosmos3_pending_stream_ids"
+
+
+def _tail_matches_stop_str_prefix(tail_str: str, stop_strs: list[str]) -> bool:
+    """Mirror upstream ``Req.check_match_stop_str_prefix`` over an explicit tail."""
+    if not tail_str:
+        return False
+    for stop_str in stop_strs:
+        if not stop_str:
+            continue
+        if stop_str in tail_str:
+            return True
+        min_len = min(len(tail_str), len(stop_str))
+        for i in range(1, min_len + 1):
+            if tail_str[-i:] == stop_str[:i]:
+                return True
+    return False
+
+
 def make_text_stream_output_builder(*, decode_stage: str = DECODE_STAGE):
-    """Forward generated token ids to the stream-aware detokenizer."""
+    """Forward generated token ids to the stream-aware detokenizer.
+
+    Mirrors upstream SGLang's OutputStreamer stop handling: tokens whose
+    decoded tail could still complete a stop string are held on the request,
+    released once the text disambiguates, and otherwise shipped at finish in
+    a buffer-only terminal chunk for the detokenizer's matched-stop trim.
+    """
+
+    def _token_message(request_id: str, token_id: int) -> OutgoingMessage:
+        return OutgoingMessage(
+            request_id=request_id,
+            type="stream",
+            data=torch.tensor([token_id], dtype=torch.long),
+            target=decode_stage,
+            metadata={"token_id": token_id},
+        )
 
     def stream_output_builder(
         request_id: str,
@@ -268,16 +302,45 @@ def make_text_stream_output_builder(*, decode_stage: str = DECODE_STAGE):
         stop_token_ids = req.sampling_params.stop_token_ids
         if stop_token_ids and token_id in stop_token_ids:
             return []
-        return [
-            OutgoingMessage(
-                request_id=request_id,
-                type="stream",
-                data=torch.tensor([token_id], dtype=torch.long),
-                target=decode_stage,
-                metadata={"token_id": token_id},
-            )
-        ]
+        stop_strs = req.sampling_params.stop_strs
+        if not stop_strs:
+            return [_token_message(request_id, token_id)]
+        pending = getattr(req, _PENDING_STREAM_IDS_ATTR, None)
+        if pending is None:
+            pending = []
+            setattr(req, _PENDING_STREAM_IDS_ATTR, pending)
+        pending.append(token_id)
+        # This builder runs before process_batch_result appends token_id to
+        # req.output_ids, so req.check_match_stop_str_prefix() would test a
+        # stale tail; build the stop-check window explicitly instead.
+        tail_window = req.sampling_params.stop_str_max_len + 1
+        tail_ids = [*req.output_ids[-tail_window:], token_id][-tail_window:]
+        if _tail_matches_stop_str_prefix(req.tokenizer.decode(tail_ids), stop_strs):
+            return []
+        messages = [_token_message(request_id, held_id) for held_id in pending]
+        pending.clear()
+        return messages
 
+    def flush_stream_output(
+        request_id: str, req_data: SGLangARRequestData
+    ) -> list[OutgoingMessage]:
+        req = req_data.req
+        if req is None:
+            return []
+        pending = getattr(req, _PENDING_STREAM_IDS_ATTR, None)
+        if not pending:
+            return []
+        message = OutgoingMessage(
+            request_id=request_id,
+            type="stream",
+            data=torch.tensor(pending, dtype=torch.long),
+            target=decode_stage,
+            metadata={"terminal_flush": True},
+        )
+        pending.clear()
+        return [message]
+
+    stream_output_builder.flush = flush_stream_output  # type: ignore[attr-defined]
     return stream_output_builder
 
 

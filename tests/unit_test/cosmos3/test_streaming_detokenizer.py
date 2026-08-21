@@ -25,6 +25,8 @@ class _FakeTokenizer:
         3: "world",
         5: "hi###�",
         6: "�",
+        10: " gam",
+        11: "ma",
     }
 
     def decode(self, token_ids, skip_special_tokens: bool = True) -> str:
@@ -60,8 +62,16 @@ def _payload(
     )
 
 
-def _stream_item(token_id: int = 1) -> SimpleNamespace:
-    return SimpleNamespace(data=torch.tensor([token_id]))
+def _stream_item(
+    token_id: int = 1, metadata: dict[str, Any] | None = None
+) -> SimpleNamespace:
+    return SimpleNamespace(data=torch.tensor([token_id]), metadata=metadata)
+
+
+def _terminal_flush_item(token_ids: list[int]) -> SimpleNamespace:
+    return SimpleNamespace(
+        data=torch.tensor(token_ids), metadata={"terminal_flush": True}
+    )
 
 
 def _drain_outbox(
@@ -149,6 +159,40 @@ def test_streaming_terminal_flush_drops_matched_stop_token_id() -> None:
 
     messages = _drain_outbox(scheduler)
     assert [message.type for message in messages] == ["result"]
+
+
+def test_terminal_flush_chunk_buffers_and_matched_stop_is_never_streamed() -> None:
+    scheduler = Cosmos3StreamingDetokenizer(_FakeTokenizer())
+
+    scheduler._on_stream_chunk("decode-request", _stream_item(1))
+    live_message = scheduler.outbox.get_nowait()
+    assert live_message.data["text"] == "hello"
+
+    scheduler._on_stream_chunk("decode-request", _terminal_flush_item([10, 11]))
+    assert scheduler.outbox.empty()
+
+    scheduler._on_new_request(
+        "decode-request",
+        _payload(stream=True, matched_stop=" gamma"),
+    )
+    scheduler._on_stream_done("decode-request")
+
+    messages = _drain_outbox(scheduler)
+    assert [message.type for message in messages] == ["result"]
+
+
+def test_terminal_flush_chunk_emits_held_text_without_matched_stop() -> None:
+    scheduler = Cosmos3StreamingDetokenizer(_FakeTokenizer())
+
+    scheduler._on_stream_chunk("decode-request", _terminal_flush_item([10]))
+    assert scheduler.outbox.empty()
+
+    scheduler._on_new_request("decode-request", _payload(stream=True))
+    scheduler._on_stream_done("decode-request")
+
+    messages = _drain_outbox(scheduler)
+    assert [message.type for message in messages] == ["stream", "result"]
+    assert messages[0].data["text"] == " gam"
 
 
 def test_streaming_tokens_emit_deltas_and_slim_terminal_result() -> None:
