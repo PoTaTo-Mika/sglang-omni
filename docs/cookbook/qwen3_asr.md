@@ -129,7 +129,9 @@ Connect to `/v1/realtime?intent=transcription`, configure the session, and
 append base64-encoded mono 16 kHz PCM16 packets. `input_audio_buffer.commit`
 finalizes the active segment manually; server VAD also finalizes after the
 configured silence interval. Send `transcription.done` after the final packet
-to receive `transcription.completed`.
+to receive `transcription.completed`. `input_audio_buffer.clear` discards the
+current segment and any partial hypothesis derived from it while keeping the
+WebSocket session open for new audio.
 
 ```json
 {

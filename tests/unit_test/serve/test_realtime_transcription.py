@@ -15,6 +15,7 @@ from sglang_omni.serve.realtime import transcription_session as session_module
 from sglang_omni.serve.realtime.transcription_session import (
     RealtimeTranscriptionSession,
 )
+from sglang_omni.serve.realtime.vad import Emit, VADEvent
 
 
 class RecordingWebSocket:
@@ -33,10 +34,30 @@ class RecordingWebSocket:
 
 
 class FakeVAD:
+    def __init__(self) -> None:
+        self.reset_calls = 0
+
     def process(self, _pcm: bytes) -> list[Any]:
         return []
 
-    def reset(self) -> None: ...
+    def reset(self) -> None:
+        self.reset_calls += 1
+
+
+class StartOnNextAppendVAD(FakeVAD):
+    def __init__(self) -> None:
+        super().__init__()
+        self.should_start = True
+
+    def process(self, _pcm: bytes) -> list[Emit]:
+        if not self.should_start:
+            return []
+        self.should_start = False
+        return [Emit(VADEvent.SPEECH_STARTED, 0)]
+
+    def reset(self) -> None:
+        super().reset()
+        self.should_start = True
 
 
 class FakeStrategy:
@@ -88,6 +109,25 @@ class BlockingClient(FakeClient):
         if len(self.calls) == 1:
             self.started.set()
             await self.release.wait()
+        return CompletionResult(
+            request_id=request_id,
+            text=f"text-{len(self.calls)}",
+            language="English",
+        )
+
+
+class BlockingSecondClient(FakeClient):
+    def __init__(self) -> None:
+        super().__init__([])
+        self.second_started = asyncio.Event()
+
+    async def completion(
+        self, _request: GenerateRequest, *, request_id: str
+    ) -> CompletionResult:
+        self.calls.append(request_id)
+        if len(self.calls) == 2:
+            self.second_started.set()
+            await asyncio.Event().wait()
         return CompletionResult(
             request_id=request_id,
             text=f"text-{len(self.calls)}",
@@ -204,6 +244,71 @@ async def test_teardown_aborts_inflight_decode(
     assert client.aborted == [client.calls[0]]
     assert session._decode_worker_task.done()
     assert websocket.client_state == WebSocketState.DISCONNECTED
+
+
+@pytest.mark.asyncio
+async def test_clear_aborts_active_segment_and_session_remains_usable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vad = StartOnNextAppendVAD()
+    monkeypatch.setattr(session_module, "StreamingVAD", lambda _config: vad)
+    websocket = RecordingWebSocket()
+    client = BlockingSecondClient()
+    strategy = FakeStrategy()
+    session = RealtimeTranscriptionSession(
+        websocket,  # type: ignore[arg-type]
+        client=client,  # type: ignore[arg-type]
+        model_name="qwen3-asr",
+        capability=RealtimeTranscriptionConfig(
+            strategy_cls=FakeStrategy,
+            decode_interval_ms=2000,
+        ),
+        audio_chunking=AudioChunkingConfig(),
+        strategy=strategy,
+        session_id="sess-clear",
+    )
+
+    await session.dispatch(_audio_event(_pcm(2.0)))
+    for _ in range(10):
+        await asyncio.sleep(0)
+        if any(event["type"] == "transcription.segment" for event in websocket.events):
+            break
+    assert session.active_segment is not None
+    cleared_state = session.active_segment.strategy_state
+
+    await session.dispatch(_audio_event(_pcm(2.0)))
+    await client.second_started.wait()
+    await session.dispatch({"type": "input_audio_buffer.clear"})
+
+    assert client.aborted == [client.calls[1]]
+    assert session.audio_buffer.is_empty()
+    assert session.active_segment is None
+    assert vad.reset_calls == 1
+    assert not session._decode_worker_task.done()
+    assert not session._pending_finals
+    assert not session._final_waiters
+    assert websocket.events[-1]["type"] == "input_audio_buffer.cleared"
+    assert not any(
+        event["type"] == "transcription.segment"
+        and event["segment_id"] == 0
+        and event["is_final"]
+        for event in websocket.events
+    )
+
+    await session.dispatch(_audio_event(_pcm(1.0)))
+    assert session.active_segment is not None
+    assert session.active_segment.strategy_state is not cleared_state
+    await session.dispatch({"type": "input_audio_buffer.commit"})
+    await session.dispatch({"type": "transcription.done"})
+
+    finals = [
+        event
+        for event in websocket.events
+        if event["type"] == "transcription.segment" and event["is_final"]
+    ]
+    assert [(event["segment_id"], event["text"]) for event in finals] == [(1, "text-3")]
+    assert websocket.events[-1]["type"] == "transcription.completed"
+    assert websocket.events[-1]["text"] == "text-3"
 
 
 @pytest.mark.asyncio

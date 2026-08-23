@@ -18,6 +18,7 @@ from sglang_omni.config import AudioChunkingConfig, RealtimeTranscriptionConfig
 from sglang_omni.serve.realtime.audio_buffer import BufferOverflow, RealtimeAudioBuffer
 from sglang_omni.serve.realtime.events import (
     InputAudioBufferAppend,
+    InputAudioBufferClear,
     InputAudioBufferCommit,
     SessionUpdate,
     TranscriptionDone,
@@ -104,6 +105,7 @@ class RealtimeTranscriptionSession:
     handlers = {
         SessionUpdate: "handle_session_update",
         InputAudioBufferAppend: "handle_audio_append",
+        InputAudioBufferClear: "handle_audio_clear",
         InputAudioBufferCommit: "handle_audio_commit",
         TranscriptionDone: "handle_transcription_done",
     }
@@ -588,6 +590,31 @@ class RealtimeTranscriptionSession:
     async def handle_audio_commit(self, event: InputAudioBufferCommit) -> None:
         del event
         await self._commit_buffer("client_commit")
+
+    async def handle_audio_clear(self, event: InputAudioBufferClear) -> None:
+        del event
+        request_id = self._inflight_request_id
+        await self.cancel_and_abort(self._decode_worker_task, request_id)
+        for final in self._pending_finals:
+            if not final.done.done():
+                final.done.cancel()
+        for waiter in list(self._final_waiters):
+            if not waiter.done():
+                waiter.cancel()
+        self._pending_finals.clear()
+        self._final_waiters.clear()
+        self._decode_event.clear()
+
+        buffer_end = self._absolute_buffer_end()
+        self.audio_buffer.clear()
+        self.buffer_origin_samples = buffer_end
+        self.active_segment = None
+        if self.vad is not None:
+            self.vad.reset()
+        self.vad_origin_samples = self.buffer_origin_samples
+
+        self._decode_worker_task = asyncio.create_task(self._decode_worker())
+        await self.send(make_event("input_audio_buffer.cleared"))
 
     async def _commit_buffer(self, reason: str) -> None:
         end_sample = self._absolute_buffer_end()
