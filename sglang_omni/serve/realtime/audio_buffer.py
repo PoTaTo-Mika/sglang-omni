@@ -77,13 +77,15 @@ class RealtimeAudioBuffer:
         return f"data:audio/wav;base64,{b64}"
 
     def to_sliced_wav_bytes(self, *, start_byte: int, end_byte: int) -> bytes:
-        chunk = bytes(self.buf[start_byte:end_byte])
+        return self.pcm_to_wav_bytes(bytes(self.buf[start_byte:end_byte]))
+
+    def pcm_to_wav_bytes(self, pcm: bytes) -> bytes:
         buf = io.BytesIO()
         with wave.open(buf, "wb") as wf:
             wf.setnchannels(self.channels)
             wf.setsampwidth(2)
             wf.setframerate(self.source_sr)
-            wf.writeframes(chunk)
+            wf.writeframes(pcm)
         return buf.getvalue()
 
     def tail(self, num_bytes: int) -> bytes:

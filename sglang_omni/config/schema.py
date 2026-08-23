@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+if TYPE_CHECKING:
+    from sglang_omni.serve.realtime.transcription_session import StreamingASRStrategy
 
 REPLICA_SEPARATOR = "@r"
 
@@ -15,7 +18,7 @@ REPLICA_SEPARATOR = "@r"
 class RealtimeTranscriptionConfig:
     """Pipeline-owned declaration for live ASR over ``/v1/realtime``."""
 
-    strategy_cls: type[Any]
+    strategy_cls: type[StreamingASRStrategy]
     decode_interval_ms: int = 2000
 
     def __post_init__(self) -> None:

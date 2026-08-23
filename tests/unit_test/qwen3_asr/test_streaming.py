@@ -130,7 +130,8 @@ def test_request_builder_reconstructs_prefix_plus_continuation(
     result = result_adapter(data)
 
     assert data.prompt_token_ids[-4:] == [30, 31, 32, 33]
-    assert result.data["text"] == "language English<asr_text>abcdef"
+    assert result.data["text"] == "abcdef"
+    assert result.data["language"] == "English"
 
 
 def test_qwen_strategy_waits_for_unfixed_chunks_before_using_prefix() -> None:
@@ -144,14 +145,16 @@ def test_qwen_strategy_waits_for_unfixed_chunks_before_using_prefix() -> None:
         audio=b"wav", state=state, is_final=False, request_id="r0"
     )
     strategy.update_hypothesis(
-        generated_text="language English<asr_text>hello wor",
+        generated_text="hello wor",
+        language="English",
         state=state,
     )
     second = strategy.build_decode_request(
         audio=b"wav", state=state, is_final=False, request_id="r1"
     )
     strategy.update_hypothesis(
-        generated_text="language English<asr_text>hello world",
+        generated_text="hello world",
+        language="English",
         state=state,
     )
     third = strategy.build_decode_request(
@@ -171,7 +174,8 @@ def test_qwen_strategy_extracts_language_and_visible_transcript() -> None:
     )
 
     transcript = strategy.update_hypothesis(
-        generated_text="language English<asr_text>hello world",
+        generated_text="hello world",
+        language="English",
         state=state,
     )
 

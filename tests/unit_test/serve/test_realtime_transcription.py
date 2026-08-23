@@ -50,9 +50,11 @@ class FakeStrategy:
         self,
         *,
         generated_text: str,
+        language: str | None,
         state: object,
     ) -> str:
-        del state
+        assert isinstance(state, dict)
+        state["language"] = language
         return generated_text
 
 
@@ -67,7 +69,7 @@ class FakeClient:
     ) -> CompletionResult:
         self.calls.append(request_id)
         text = self.outputs.pop(0) if self.outputs else f"text-{len(self.calls)}"
-        return CompletionResult(request_id=request_id, text=text)
+        return CompletionResult(request_id=request_id, text=text, language="English")
 
     async def abort(self, request_id: str) -> None:
         self.aborted.append(request_id)
@@ -86,7 +88,11 @@ class BlockingClient(FakeClient):
         if len(self.calls) == 1:
             self.started.set()
             await self.release.wait()
-        return CompletionResult(request_id=request_id, text=f"text-{len(self.calls)}")
+        return CompletionResult(
+            request_id=request_id,
+            text=f"text-{len(self.calls)}",
+            language="English",
+        )
 
 
 def _pcm(seconds: float, amplitude: int = 1000) -> bytes:
@@ -159,6 +165,7 @@ async def test_partial_is_replaced_by_one_final_segment(
     completed = websocket.events[-1]
     assert completed["type"] == "transcription.completed"
     assert completed["text"] == "hello world"
+    assert session._decode_worker_task.done()
 
 
 @pytest.mark.asyncio
@@ -180,6 +187,41 @@ async def test_audio_during_decode_coalesces_to_one_followup_refresh(
 
     assert len(client.calls) == 2
     await session.teardown()
+
+
+@pytest.mark.asyncio
+async def test_teardown_aborts_inflight_decode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, websocket, _client = await _session(monkeypatch)
+    client = BlockingClient()
+    session.client = client  # type: ignore[assignment]
+
+    await session.dispatch(_audio_event(_pcm(2.0)))
+    await client.started.wait()
+    await session.teardown()
+
+    assert client.aborted == [client.calls[0]]
+    assert session._decode_worker_task.done()
+    assert websocket.client_state == WebSocketState.DISCONNECTED
+
+
+@pytest.mark.asyncio
+async def test_silent_final_does_not_reach_the_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, websocket, client = await _session(monkeypatch)
+
+    await session.dispatch(_audio_event(_pcm(0.5, amplitude=0)))
+    await session.dispatch({"type": "input_audio_buffer.commit"})
+    await session.dispatch({"type": "transcription.done"})
+
+    assert client.calls == []
+    assert websocket.events[-2]["type"] == "transcription.segment"
+    assert websocket.events[-2]["text"] == ""
+    assert websocket.events[-2]["is_final"] is True
+    assert websocket.events[-1]["type"] == "transcription.completed"
+    assert websocket.events[-1]["text"] == ""
 
 
 @pytest.mark.asyncio

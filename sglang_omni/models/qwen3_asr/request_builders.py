@@ -205,16 +205,7 @@ def make_qwen3_asr_scheduler_adapters(
         params = payload.request.params or {}
         is_streaming_refresh = params.get("_asr_streaming") is True
         streaming_prefix = params.get("_asr_streaming_prefix_text")
-        if streaming_prefix is not None and not is_streaming_refresh:
-            raise ValueError(
-                "Qwen3-ASR streaming prefixes are accepted only for realtime "
-                "transcription requests"
-            )
-        if streaming_prefix is not None and not isinstance(streaming_prefix, str):
-            raise ValueError("Qwen3-ASR streaming prefix must be text")
         rollback_tokens = int(params.get("_asr_streaming_rollback_tokens", 0))
-        if rollback_tokens < 0:
-            raise ValueError("Qwen3-ASR streaming rollback_tokens must be non-negative")
         streaming_prefix_token_ids, retained_streaming_prefix = (
             _retained_streaming_prefix(
                 tokenizer, streaming_prefix or "", rollback_tokens
@@ -477,19 +468,11 @@ def make_qwen3_asr_scheduler_adapters(
             time.perf_counter() - data.engine_start_s if data.engine_start_s else 0.0
         )
         resolved_language = data.language or detected_language
-        is_streaming_refresh = (payload.request.params or {}).get(
-            "_asr_streaming"
-        ) is True
-        text = (
-            f"language {resolved_language}{_ASR_TEXT}{transcript}"
-            if is_streaming_refresh and resolved_language
-            else transcript
-        )
         return StagePayload(
             request_id=payload.request_id,
             request=payload.request,
             data={
-                "text": text,
+                "text": transcript,
                 "language": resolved_language,
                 "duration_s": data.audio_duration_s,
                 "asr_latency_s": engine_time_s,

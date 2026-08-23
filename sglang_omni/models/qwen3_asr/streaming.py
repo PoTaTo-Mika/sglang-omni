@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from sglang_omni.client import GenerateRequest
 from sglang_omni.serve.speech_to_text import build_speech_to_text_generate_request
 
-_ASR_TEXT = "<asr_text>"
 _ROLLBACK_TOKENS = 5
 _UNFIXED_CHUNK_NUM = 2
 
@@ -24,22 +23,31 @@ class Qwen3ASRStreamingStrategy:
     ) -> Qwen3ASRStreamingState:
         return Qwen3ASRStreamingState(model_name=model_name, language=language)
 
+    @staticmethod
+    def _state(state: object) -> Qwen3ASRStreamingState:
+        if not isinstance(state, Qwen3ASRStreamingState):
+            raise TypeError("Qwen3-ASR received incompatible streaming state")
+        return state
+
     def build_decode_request(
         self,
         *,
         audio: bytes,
-        state: Qwen3ASRStreamingState,
+        state: object,
         is_final: bool,
         request_id: str,
     ) -> GenerateRequest:
         del is_final, request_id
-        use_prefix = state.chunk_id >= _UNFIXED_CHUNK_NUM and bool(state.transcript)
+        qwen_state = self._state(state)
+        use_prefix = qwen_state.chunk_id >= _UNFIXED_CHUNK_NUM and bool(
+            qwen_state.transcript
+        )
         request = build_speech_to_text_generate_request(
             audio_bytes=audio,
             filename="realtime-segment.wav",
             content_type="audio/wav",
-            model=state.model_name,
-            language=state.language,
+            model=qwen_state.model_name,
+            language=qwen_state.language,
             prompt=None,
             temperature=0.0,
             stream=False,
@@ -48,7 +56,7 @@ class Qwen3ASRStreamingStrategy:
             {
                 "_asr_streaming": True,
                 "_asr_streaming_prefix_text": (
-                    state.transcript if use_prefix else None
+                    qwen_state.transcript if use_prefix else None
                 ),
                 "_asr_streaming_rollback_tokens": (
                     _ROLLBACK_TOKENS if use_prefix else 0
@@ -61,19 +69,15 @@ class Qwen3ASRStreamingStrategy:
         self,
         *,
         generated_text: str,
-        state: Qwen3ASRStreamingState,
+        language: str | None,
+        state: object,
     ) -> str:
-        prefix, marker, transcript = generated_text.partition(_ASR_TEXT)
-        if marker:
-            label, separator, value = prefix.partition(" ")
-            if separator and label.casefold() == "language" and value.strip():
-                state.language = value.strip()
-            visible_text = transcript
-        else:
-            visible_text = generated_text
-        state.transcript = visible_text
-        state.chunk_id += 1
-        return visible_text
+        qwen_state = self._state(state)
+        if language:
+            qwen_state.language = language
+        qwen_state.transcript = generated_text
+        qwen_state.chunk_id += 1
+        return generated_text
 
 
 __all__ = ["Qwen3ASRStreamingState", "Qwen3ASRStreamingStrategy"]
