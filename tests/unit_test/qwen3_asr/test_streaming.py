@@ -14,7 +14,6 @@ from sglang_omni.models.qwen3_asr.request_builders import (
 )
 from sglang_omni.models.qwen3_asr.streaming import Qwen3ASRStreamingStrategy
 from sglang_omni.proto import OmniRequest, StagePayload
-from sglang_omni.serve.realtime.strategy import StreamingASRConfig
 
 
 class Tokenizer:
@@ -131,39 +130,29 @@ def test_request_builder_reconstructs_prefix_plus_continuation(
     result = result_adapter(data)
 
     assert data.prompt_token_ids[-4:] == [30, 31, 32, 33]
-    assert result.data["text"] == "abcdef"
-    assert result.data["metadata"]["streaming_prefix_text"] == "abcd"
+    assert result.data["text"] == "language English<asr_text>abcdef"
 
 
 def test_qwen_strategy_waits_for_unfixed_chunks_before_using_prefix() -> None:
     strategy = Qwen3ASRStreamingStrategy()
     state = strategy.create_state(
-        StreamingASRConfig(
-            model_name="qwen3-asr",
-            sample_rate=16000,
-            language="English",
-            rollback_tokens=5,
-            unfixed_chunk_num=2,
-        )
+        model_name="qwen3-asr",
+        language="English",
     )
 
     first = strategy.build_decode_request(
         audio=b"wav", state=state, is_final=False, request_id="r0"
     )
     strategy.update_hypothesis(
-        generated_text="hello wor",
-        metadata={"language": "English"},
+        generated_text="language English<asr_text>hello wor",
         state=state,
-        is_final=False,
     )
     second = strategy.build_decode_request(
         audio=b"wav", state=state, is_final=False, request_id="r1"
     )
     strategy.update_hypothesis(
-        generated_text="hello world",
-        metadata={"language": "English"},
+        generated_text="language English<asr_text>hello world",
         state=state,
-        is_final=False,
     )
     third = strategy.build_decode_request(
         audio=b"wav", state=state, is_final=False, request_id="r2"
@@ -174,28 +163,18 @@ def test_qwen_strategy_waits_for_unfixed_chunks_before_using_prefix() -> None:
     assert third.extra_params["_asr_streaming_prefix_text"] == "hello world"
 
 
-def test_qwen_strategy_reconstructs_full_hypothesis_from_backend_metadata() -> None:
+def test_qwen_strategy_extracts_language_and_visible_transcript() -> None:
     strategy = Qwen3ASRStreamingStrategy()
     state = strategy.create_state(
-        StreamingASRConfig(
-            model_name="qwen3-asr",
-            sample_rate=16000,
-            language=None,
-            rollback_tokens=5,
-            unfixed_chunk_num=2,
-        )
+        model_name="qwen3-asr",
+        language=None,
     )
 
-    hypothesis = strategy.update_hypothesis(
-        generated_text="hello world",
-        metadata={
-            "language": "English",
-            "streaming_prefix_text": "hello ",
-        },
+    transcript = strategy.update_hypothesis(
+        generated_text="language English<asr_text>hello world",
         state=state,
-        is_final=False,
     )
 
-    assert hypothesis.text == "hello world"
-    assert hypothesis.stable_text == "hello "
-    assert hypothesis.language == "English"
+    assert transcript == "hello world"
+    assert state.transcript == "hello world"
+    assert state.language == "English"

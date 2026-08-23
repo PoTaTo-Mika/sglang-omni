@@ -472,11 +472,19 @@ def make_qwen3_asr_scheduler_adapters(
         continuation = _decode_token_ids(
             tokenizer, transcript_ids, skip_special_tokens=True
         )
-        text = f"{data.streaming_prefix_text}{continuation}"
+        transcript = f"{data.streaming_prefix_text}{continuation}"
         engine_time_s = (
             time.perf_counter() - data.engine_start_s if data.engine_start_s else 0.0
         )
         resolved_language = data.language or detected_language
+        is_streaming_refresh = (payload.request.params or {}).get(
+            "_asr_streaming"
+        ) is True
+        text = (
+            f"language {resolved_language}{_ASR_TEXT}{transcript}"
+            if is_streaming_refresh and resolved_language
+            else transcript
+        )
         return StagePayload(
             request_id=payload.request_id,
             request=payload.request,
@@ -487,10 +495,6 @@ def make_qwen3_asr_scheduler_adapters(
                 "asr_latency_s": engine_time_s,
                 "usage": {"engine_time_s": engine_time_s},
                 "modality": "text",
-                "metadata": {
-                    "language": resolved_language,
-                    "streaming_prefix_text": data.streaming_prefix_text,
-                },
             },
         )
 

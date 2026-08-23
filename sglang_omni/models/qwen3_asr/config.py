@@ -12,6 +12,7 @@ from sglang_omni.config import (
     StageConfig,
 )
 from sglang_omni.models.qwen3_asr.audio_lengths import QWEN3_ASR_MAX_INPUT_SECONDS
+from sglang_omni.models.qwen3_asr.streaming import Qwen3ASRStreamingStrategy
 
 _PKG = "sglang_omni.models.qwen3_asr"
 
@@ -27,11 +28,7 @@ class Qwen3ASRPipelineConfig(PipelineConfig):
     )
     realtime_transcription: ClassVar[RealtimeTranscriptionConfig] = (
         RealtimeTranscriptionConfig(
-            strategy_factory=(
-                "sglang_omni.models.qwen3_asr.streaming." "Qwen3ASRStreamingStrategy"
-            ),
-            max_audio_clip_s=audio_chunking.max_audio_clip_s,
-            max_total_audio_s=audio_chunking.max_total_audio_s,
+            strategy_cls=Qwen3ASRStreamingStrategy,
         )
     )
 

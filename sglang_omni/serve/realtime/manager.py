@@ -5,12 +5,11 @@ import logging
 from fastapi import WebSocket
 
 from sglang_omni.client import Client
-from sglang_omni.config import RealtimeTranscriptionConfig
+from sglang_omni.config import AudioChunkingConfig, RealtimeTranscriptionConfig
 from sglang_omni.serve.realtime.session import RealtimeSession
 from sglang_omni.serve.realtime.transcription_session import (
     RealtimeTranscriptionSession,
 )
-from sglang_omni.utils.imports import import_string
 
 logger = logging.getLogger(__name__)
 
@@ -23,11 +22,13 @@ class RealtimeSessionManager:
         model_name: str,
         supports_audio_output: bool = False,
         transcription_config: RealtimeTranscriptionConfig | None = None,
+        audio_chunking: AudioChunkingConfig | None = None,
     ) -> None:
         self.client = client
         self.model_name = model_name
         self.supports_audio_output = supports_audio_output
         self.transcription_config = transcription_config
+        self.audio_chunking = audio_chunking or AudioChunkingConfig()
         self.sessions: dict[str, RealtimeSession | RealtimeTranscriptionSession] = {}
 
     def open(
@@ -46,13 +47,13 @@ class RealtimeSessionManager:
                 raise ValueError(
                     "This pipeline does not support realtime transcription."
                 )
-            strategy_cls = import_string(self.transcription_config.strategy_factory)
             session = RealtimeTranscriptionSession(
                 websocket,
                 client=self.client,
                 model_name=self.model_name,
                 capability=self.transcription_config,
-                strategy=strategy_cls(),
+                audio_chunking=self.audio_chunking,
+                strategy=self.transcription_config.strategy_cls(),
             )
         else:
             raise ValueError(

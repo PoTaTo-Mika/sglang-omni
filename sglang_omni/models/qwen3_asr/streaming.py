@@ -1,51 +1,45 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping
 
 from sglang_omni.client import GenerateRequest
-from sglang_omni.serve.realtime.strategy import StreamingASRConfig, StreamingHypothesis
 from sglang_omni.serve.speech_to_text import build_speech_to_text_generate_request
+
+_ASR_TEXT = "<asr_text>"
+_ROLLBACK_TOKENS = 5
+_UNFIXED_CHUNK_NUM = 2
 
 
 @dataclass(slots=True)
 class Qwen3ASRStreamingState:
-    config: StreamingASRConfig
-    chunk_id: int = 0
-    raw_decoded: str = ""
+    model_name: str
     language: str | None = None
+    chunk_id: int = 0
+    transcript: str = ""
 
 
 class Qwen3ASRStreamingStrategy:
-    def create_state(self, config: StreamingASRConfig) -> object:
-        return Qwen3ASRStreamingState(config=config, language=config.language)
-
-    @staticmethod
-    def _state(state: object) -> Qwen3ASRStreamingState:
-        if not isinstance(state, Qwen3ASRStreamingState):
-            raise TypeError("Qwen3-ASR received incompatible streaming state")
-        return state
+    def create_state(
+        self, *, model_name: str, language: str | None
+    ) -> Qwen3ASRStreamingState:
+        return Qwen3ASRStreamingState(model_name=model_name, language=language)
 
     def build_decode_request(
         self,
         *,
         audio: bytes,
-        state: object,
+        state: Qwen3ASRStreamingState,
         is_final: bool,
         request_id: str,
     ) -> GenerateRequest:
         del is_final, request_id
-        qwen_state = self._state(state)
-        use_prefix = (
-            qwen_state.chunk_id >= qwen_state.config.unfixed_chunk_num
-            and bool(qwen_state.raw_decoded)
-        )
+        use_prefix = state.chunk_id >= _UNFIXED_CHUNK_NUM and bool(state.transcript)
         request = build_speech_to_text_generate_request(
             audio_bytes=audio,
             filename="realtime-segment.wav",
             content_type="audio/wav",
-            model=qwen_state.config.model_name,
-            language=qwen_state.language,
+            model=state.model_name,
+            language=state.language,
             prompt=None,
             temperature=0.0,
             stream=False,
@@ -54,10 +48,10 @@ class Qwen3ASRStreamingStrategy:
             {
                 "_asr_streaming": True,
                 "_asr_streaming_prefix_text": (
-                    qwen_state.raw_decoded if use_prefix else None
+                    state.transcript if use_prefix else None
                 ),
                 "_asr_streaming_rollback_tokens": (
-                    qwen_state.config.rollback_tokens if use_prefix else 0
+                    _ROLLBACK_TOKENS if use_prefix else 0
                 ),
             }
         )
@@ -67,30 +61,19 @@ class Qwen3ASRStreamingStrategy:
         self,
         *,
         generated_text: str,
-        metadata: Mapping[str, Any],
-        state: object,
-        is_final: bool,
-    ) -> StreamingHypothesis:
-        qwen_state = self._state(state)
-        language = metadata.get("language")
-        if isinstance(language, str) and language:
-            qwen_state.language = language
-        stable_text = metadata.get("streaming_prefix_text")
-        if not isinstance(stable_text, str):
-            stable_text = ""
-        qwen_state.raw_decoded = generated_text
-        qwen_state.chunk_id += 1
-        return StreamingHypothesis(
-            text=generated_text,
-            stable_text=generated_text if is_final else stable_text,
-            language=qwen_state.language,
-        )
-
-    def reset_segment(self, state: object) -> None:
-        qwen_state = self._state(state)
-        qwen_state.chunk_id = 0
-        qwen_state.raw_decoded = ""
-        qwen_state.language = qwen_state.config.language
+        state: Qwen3ASRStreamingState,
+    ) -> str:
+        prefix, marker, transcript = generated_text.partition(_ASR_TEXT)
+        if marker:
+            label, separator, value = prefix.partition(" ")
+            if separator and label.casefold() == "language" and value.strip():
+                state.language = value.strip()
+            visible_text = transcript
+        else:
+            visible_text = generated_text
+        state.transcript = visible_text
+        state.chunk_id += 1
+        return visible_text
 
 
 __all__ = ["Qwen3ASRStreamingState", "Qwen3ASRStreamingStrategy"]

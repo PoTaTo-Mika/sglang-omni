@@ -153,7 +153,6 @@ class Client:
             ),
             omni_rollout=omni_rollout,
             weight_version=weight_version,
-            metadata=dict(last_chunk.metadata),
         )
 
     # ------------------------------------------------------------------
@@ -529,9 +528,6 @@ class Client:
             modality = result.get("modality")
             if modality is not None:
                 chunk.modality = modality
-            metadata = result.get("metadata")
-            if isinstance(metadata, dict):
-                chunk.metadata = dict(metadata)
             Client._set_audio_data(chunk, result)
             chunk.usage = Client._build_usage_info(result)
             return chunk

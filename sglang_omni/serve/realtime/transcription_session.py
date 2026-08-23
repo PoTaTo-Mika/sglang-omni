@@ -3,32 +3,27 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
-import hashlib
-import time
+import json
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
 from fastapi import WebSocket
+from starlette.websockets import WebSocketState
 
 from sglang_omni.client import Client
-from sglang_omni.config import RealtimeTranscriptionConfig
+from sglang_omni.config import AudioChunkingConfig, RealtimeTranscriptionConfig
 from sglang_omni.serve.realtime.audio_buffer import BufferOverflow, RealtimeAudioBuffer
-from sglang_omni.serve.realtime.base_session import BaseRealtimeSession
 from sglang_omni.serve.realtime.events import (
     InputAudioBufferAppend,
-    InputAudioBufferClear,
     InputAudioBufferCommit,
     SessionUpdate,
     TranscriptionDone,
     TurnDetection,
     TurnDetectionType,
     make_event,
-)
-from sglang_omni.serve.realtime.strategy import (
-    StreamingASRConfig,
-    StreamingASRStrategy,
-    StreamingHypothesis,
+    parse_client_event,
 )
 from sglang_omni.serve.realtime.vad import (
     VAD_SAMPLE_RATE,
@@ -39,13 +34,15 @@ from sglang_omni.serve.realtime.vad import (
 )
 from sglang_omni.serve.transcription_chunking import join_transcript_parts
 
-_SEQUENCE_GAP_TOLERANCE = 32
 _SILENT_PCM16_PEAK = 33
+
+
+def _new_id(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex}"
 
 
 @dataclass(slots=True)
 class TranscriptionSessionSettings:
-    response_format: str = "json"
     language: str | None = None
     decode_interval_ms: int = 2000
     turn_detection: TurnDetection | None = field(
@@ -64,7 +61,6 @@ class ActiveTranscriptionSegment:
     start_sample: int
     strategy_state: object
     next_refresh_sample: int
-    revision: int = 0
     decode_attempt: int = 0
     last_text: str = ""
     dirty: bool = False
@@ -76,21 +72,14 @@ class ActiveTranscriptionSegment:
 @dataclass(frozen=True, slots=True)
 class CommittedTranscriptionSegment:
     segment_id: int
-    start_sample: int
-    end_sample: int
     text: str
-    language: str | None
-    usage: dict[str, Any]
-    decode_time_s: float
-    boundary_reason: str
 
 
-class RealtimeTranscriptionSession(BaseRealtimeSession):
+class RealtimeTranscriptionSession:
     handlers = {
         SessionUpdate: "handle_session_update",
         InputAudioBufferAppend: "handle_audio_append",
         InputAudioBufferCommit: "handle_audio_commit",
-        InputAudioBufferClear: "handle_audio_clear",
         TranscriptionDone: "handle_transcription_done",
     }
 
@@ -101,32 +90,31 @@ class RealtimeTranscriptionSession(BaseRealtimeSession):
         client: Client,
         model_name: str,
         capability: RealtimeTranscriptionConfig,
-        strategy: StreamingASRStrategy,
+        audio_chunking: AudioChunkingConfig,
+        strategy: Any,
         session_id: str | None = None,
     ) -> None:
-        super().__init__(
-            websocket,
-            client=client,
-            model_name=model_name,
-            session_id=session_id,
-        )
-        if capability.sample_rate != VAD_SAMPLE_RATE:
-            raise ValueError(
-                "Realtime transcription currently requires 16 kHz PCM16 audio."
-            )
+        self.websocket = websocket
+        self.client = client
+        self.model_name = model_name
+        self.session_id = session_id or _new_id("sess")
+        self.closed = False
+        self.event_index = 0
+        self._send_lock = asyncio.Lock()
         self.capability = capability
+        self.audio_chunking = audio_chunking
         self.strategy = strategy
         self.settings = TranscriptionSessionSettings(
             decode_interval_ms=capability.decode_interval_ms
         )
         max_buffer_seconds = max(
-            capability.max_audio_clip_s * 4,
-            capability.max_audio_clip_s + 4,
+            audio_chunking.max_audio_clip_s * 4,
+            audio_chunking.max_audio_clip_s + 4,
         )
-        max_buffer_bytes = int(max_buffer_seconds * capability.sample_rate * 2)
+        max_buffer_bytes = int(max_buffer_seconds * VAD_SAMPLE_RATE * 2)
         self.audio_buffer = RealtimeAudioBuffer(
-            source_sr=capability.sample_rate,
-            target_sr=capability.sample_rate,
+            source_sr=VAD_SAMPLE_RATE,
+            target_sr=VAD_SAMPLE_RATE,
             max_bytes=max_buffer_bytes,
         )
         self.vad: StreamingVAD | None = self._new_vad(self.settings.turn_detection)
@@ -138,13 +126,77 @@ class RealtimeTranscriptionSession(BaseRealtimeSession):
         self._decode_lock = asyncio.Lock()
         self._final_tasks: set[asyncio.Task[None]] = set()
         self._inflight_request_ids: set[str] = set()
-        self._sequence_hashes: dict[int, bytes] = {}
-        self._highest_sequence: int | None = None
-        self._committed_sequence_watermark: int | None = None
-        self._decode_request_count = 0
-        self._coalesced_refresh_count = 0
-        self._cancelled_refresh_count = 0
         self._input_done = False
+
+    async def run(self) -> None:
+        await self.send(self.initial_event())
+        while not self.closed:
+            message = await self.websocket.receive()
+            if message["type"] == "websocket.disconnect":
+                break
+            if message["type"] != "websocket.receive":
+                continue
+            try:
+                payload = json.loads(message["text"])
+            except (KeyError, TypeError, json.JSONDecodeError):
+                await self.send_error(
+                    "invalid_request_error", "invalid_json", "Invalid JSON event."
+                )
+                continue
+            if not isinstance(payload, dict):
+                await self.send_error(
+                    "invalid_request_error",
+                    "invalid_event",
+                    "Top-level payload must be a JSON object.",
+                )
+                continue
+            await self.dispatch(payload)
+
+    async def dispatch(self, payload: dict[str, Any]) -> None:
+        try:
+            event = parse_client_event(payload)
+        except ValueError as exc:
+            await self.send_error("invalid_request_error", "invalid_event", str(exc))
+            return
+        if event is None or type(event) not in self.handlers:
+            await self.send_error(
+                "invalid_request_error",
+                "unsupported_event",
+                f"Unsupported event type: {payload.get('type')!r}",
+            )
+            return
+        await getattr(self, self.handlers[type(event)])(event)
+
+    async def send(self, event: dict[str, Any]) -> None:
+        if self.closed:
+            return
+        if self.websocket.application_state != WebSocketState.CONNECTED:
+            return
+        async with self._send_lock:
+            self.event_index += 1
+            event.setdefault("event_id", _new_id("evt"))
+            event.setdefault("event_index", self.event_index)
+            await self.websocket.send_text(json.dumps(event))
+
+    async def send_error(self, type_: str, code: str, message: str) -> None:
+        await self.send(
+            make_event(
+                "error",
+                error={"type": type_, "code": code, "message": message},
+            )
+        )
+
+    async def cancel_and_abort(
+        self, task: asyncio.Task[Any] | None, request_id: str | None
+    ) -> None:
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            if request_id is not None:
+                await self.client.abort(request_id)
+        finally:
+            await asyncio.gather(task, return_exceptions=True)
 
     def initial_event(self) -> dict[str, Any]:
         return make_event("session.created", session=self._session_payload())
@@ -158,7 +210,6 @@ class RealtimeTranscriptionSession(BaseRealtimeSession):
             "intent": "transcription",
             "modalities": ["text"],
             "input_audio_format": "pcm16",
-            "response_format": self.settings.response_format,
             "language": self.settings.language,
             "decode_interval_ms": self.settings.decode_interval_ms,
             "turn_detection": (
@@ -209,39 +260,19 @@ class RealtimeTranscriptionSession(BaseRealtimeSession):
             )
             return
         if not self.audio_buffer.is_empty() and any(
-            key in update
-            for key in ("language", "decode_interval_ms", "turn_detection")
+            key in update for key in ("language", "turn_detection")
         ):
             await self.send_error(
                 "invalid_request_error",
                 "session_active",
-                "Language, decode interval, and VAD settings cannot change "
+                "Language and VAD settings cannot change "
                 "while uncommitted audio is buffered.",
             )
             return
 
-        response_format = update.get("response_format")
-        if response_format is not None:
-            self.settings.response_format = response_format
         if "language" in update:
             language = update["language"]
             self.settings.language = language.strip() if language else None
-        decode_interval_ms = update.get("decode_interval_ms")
-        if decode_interval_ms is not None:
-            if not (
-                self.capability.min_decode_interval_ms
-                <= decode_interval_ms
-                <= self.capability.max_decode_interval_ms
-            ):
-                await self.send_error(
-                    "invalid_request_error",
-                    "invalid_decode_interval",
-                    "decode_interval_ms must be between "
-                    f"{self.capability.min_decode_interval_ms} and "
-                    f"{self.capability.max_decode_interval_ms}.",
-                )
-                return
-            self.settings.decode_interval_ms = decode_interval_ms
         if "turn_detection" in update:
             turn_detection = event.session.turn_detection
             if (
@@ -283,13 +314,10 @@ class RealtimeTranscriptionSession(BaseRealtimeSession):
                 "PCM16 audio must contain complete 16-bit samples.",
             )
             return
-        if await self._handle_sequence(event.sequence, pcm):
-            return
-
-        total_limit = self.capability.max_total_audio_s
+        total_limit = self.audio_chunking.max_total_audio_s
         absolute_end = self.buffer_origin_samples + self.audio_buffer.num_samples
         if total_limit is not None and absolute_end + len(pcm) // 2 > int(
-            total_limit * self.capability.sample_rate
+            total_limit * VAD_SAMPLE_RATE
         ):
             await self.send_error(
                 "invalid_request_error",
@@ -306,8 +334,6 @@ class RealtimeTranscriptionSession(BaseRealtimeSession):
                 "invalid_request_error", "audio_buffer_overflow", str(exc)
             )
             return
-        self._record_sequence(event.sequence, pcm)
-
         if self.vad is None:
             if self.active_segment is None and pcm:
                 self._start_segment(append_start_sample)
@@ -318,68 +344,6 @@ class RealtimeTranscriptionSession(BaseRealtimeSession):
 
         await self._enforce_hard_limit()
         self._maybe_schedule_partial()
-        if event.sequence is not None:
-            await self.send(
-                make_event(
-                    "input_audio_buffer.appended",
-                    sequence=event.sequence,
-                    duplicate=False,
-                )
-            )
-
-    async def _handle_sequence(self, sequence: int | None, pcm: bytes) -> bool:
-        if sequence is None:
-            return False
-        digest = hashlib.sha256(pcm).digest()
-        previous = self._sequence_hashes.get(sequence)
-        if previous is not None:
-            if previous != digest:
-                await self.send_error(
-                    "invalid_request_error",
-                    "idempotency_conflict",
-                    f"Audio sequence {sequence} was reused with different data.",
-                )
-            else:
-                await self.send(
-                    make_event(
-                        "input_audio_buffer.appended",
-                        sequence=sequence,
-                        duplicate=True,
-                    )
-                )
-            return True
-        watermark = self._committed_sequence_watermark
-        if watermark is not None and sequence <= watermark:
-            await self.send(
-                make_event(
-                    "input_audio_buffer.appended",
-                    sequence=sequence,
-                    duplicate=True,
-                )
-            )
-            return True
-        highest = self._highest_sequence
-        if highest is not None and sequence <= highest:
-            await self.send_error(
-                "invalid_request_error",
-                "out_of_order_sequence",
-                f"Audio sequence {sequence} arrived out of order.",
-            )
-            return True
-        if highest is not None and sequence - highest > _SEQUENCE_GAP_TOLERANCE:
-            await self.send_error(
-                "invalid_request_error",
-                "sequence_gap",
-                f"Audio sequence gap exceeds {_SEQUENCE_GAP_TOLERANCE}.",
-            )
-            return True
-        return False
-
-    def _record_sequence(self, sequence: int | None, pcm: bytes) -> None:
-        if sequence is None:
-            return
-        self._sequence_hashes[sequence] = hashlib.sha256(pcm).digest()
-        self._highest_sequence = sequence
 
     def _absolute_vad_sample(self, sample_offset: int) -> int:
         return self.vad_origin_samples + sample_offset
@@ -413,26 +377,20 @@ class RealtimeTranscriptionSession(BaseRealtimeSession):
                     segment_id=segment_id,
                 )
             )
-            await self._finalize_through(absolute_sample, "vad")
+            await self._finalize_through(absolute_sample)
 
     def _start_segment(self, start_sample: int) -> ActiveTranscriptionSegment:
         start_sample = min(
             max(start_sample, self.buffer_origin_samples), self._absolute_buffer_end()
         )
-        config = StreamingASRConfig(
-            model_name=self.model_name,
-            sample_rate=self.capability.sample_rate,
-            language=self.settings.language,
-            rollback_tokens=self.capability.rollback_tokens,
-            unfixed_chunk_num=self.capability.unfixed_chunk_num,
-        )
-        interval_samples = (
-            self.settings.decode_interval_ms * self.capability.sample_rate // 1000
-        )
+        interval_samples = self.settings.decode_interval_ms * VAD_SAMPLE_RATE // 1000
         segment = ActiveTranscriptionSegment(
             segment_id=self._next_segment_id,
             start_sample=start_sample,
-            strategy_state=self.strategy.create_state(config),
+            strategy_state=self.strategy.create_state(
+                model_name=self.model_name,
+                language=self.settings.language,
+            ),
             next_refresh_sample=start_sample + interval_samples,
         )
         self._next_segment_id += 1
@@ -440,36 +398,32 @@ class RealtimeTranscriptionSession(BaseRealtimeSession):
         return segment
 
     async def _enforce_hard_limit(self) -> None:
-        max_samples = int(
-            self.capability.max_audio_clip_s * self.capability.sample_rate
-        )
+        max_samples = int(self.audio_chunking.max_audio_clip_s * VAD_SAMPLE_RATE)
         end_sample = self._absolute_buffer_end()
         while (
             self.active_segment is not None
             and end_sample - self.active_segment.start_sample >= max_samples
         ):
             cut = self.active_segment.start_sample + max_samples
-            await self._queue_final(cut, "hard_limit")
+            await self._queue_final(cut)
             self._start_segment(cut)
 
-    async def _finalize_through(self, end_sample: int, reason: str) -> None:
+    async def _finalize_through(self, end_sample: int) -> None:
         if self.active_segment is None:
             return
         end_sample = min(end_sample, self._absolute_buffer_end())
-        max_samples = int(
-            self.capability.max_audio_clip_s * self.capability.sample_rate
-        )
+        max_samples = int(self.audio_chunking.max_audio_clip_s * VAD_SAMPLE_RATE)
         while end_sample - self.active_segment.start_sample > max_samples:
             cut = self.active_segment.start_sample + max_samples
-            await self._queue_final(cut, "hard_limit")
+            await self._queue_final(cut)
             self._start_segment(cut)
         if (
             self.active_segment is not None
             and end_sample > self.active_segment.start_sample
         ):
-            await self._queue_final(end_sample, reason)
+            await self._queue_final(end_sample)
 
-    async def _queue_final(self, end_sample: int, reason: str) -> None:
+    async def _queue_final(self, end_sample: int) -> None:
         segment = self.active_segment
         if segment is None or segment.finalizing or end_sample <= segment.start_sample:
             return
@@ -483,23 +437,17 @@ class RealtimeTranscriptionSession(BaseRealtimeSession):
             start_byte=start_byte, end_byte=end_byte
         )
         segment.finalizing = True
-        task = asyncio.create_task(
-            self._run_final(segment, wav_bytes, pcm, end_sample, reason)
-        )
+        task = asyncio.create_task(self._run_final(segment, wav_bytes, pcm))
         self._final_tasks.add(task)
         task.add_done_callback(self._handle_final_task_done)
 
         self.audio_buffer.drop_prefix(end_byte)
         self.buffer_origin_samples += end_byte // 2
         self.active_segment = None
-        if self._highest_sequence is not None:
-            self._committed_sequence_watermark = self._highest_sequence
-            self._sequence_hashes.clear()
         await self.send(
             make_event(
                 "input_audio_buffer.committed",
                 segment_id=segment.segment_id,
-                boundary_reason=reason,
             )
         )
 
@@ -517,9 +465,7 @@ class RealtimeTranscriptionSession(BaseRealtimeSession):
         end_sample = self._absolute_buffer_end()
         if end_sample < segment.next_refresh_sample:
             return
-        interval_samples = (
-            self.settings.decode_interval_ms * self.capability.sample_rate // 1000
-        )
+        interval_samples = self.settings.decode_interval_ms * VAD_SAMPLE_RATE // 1000
         while segment.next_refresh_sample <= end_sample:
             segment.next_refresh_sample += interval_samples
         if segment.decode_task is not None and not segment.decode_task.done():
@@ -531,8 +477,6 @@ class RealtimeTranscriptionSession(BaseRealtimeSession):
         segment.decode_task = asyncio.create_task(self._run_partial(segment))
 
     def _mark_dirty(self, segment: ActiveTranscriptionSegment) -> None:
-        if not segment.dirty:
-            self._coalesced_refresh_count += 1
         segment.dirty = True
 
     def _schedule_dirty_partial(self, segment: ActiveTranscriptionSegment) -> None:
@@ -554,13 +498,10 @@ class RealtimeTranscriptionSession(BaseRealtimeSession):
                     0, (segment.start_sample - self.buffer_origin_samples) * 2
                 )
                 end_byte = self.audio_buffer.num_bytes
-                end_sample = self._absolute_buffer_end()
                 audio = self.audio_buffer.to_sliced_wav_bytes(
                     start_byte=start_byte, end_byte=end_byte
                 )
-                await self._decode_and_emit(
-                    segment, audio, end_sample=end_sample, is_final=False
-                )
+                await self._decode_and_emit(segment, audio, is_final=False)
         finally:
             segment.decode_task = None
             if (
@@ -575,37 +516,13 @@ class RealtimeTranscriptionSession(BaseRealtimeSession):
         segment: ActiveTranscriptionSegment,
         audio: bytes,
         pcm: bytes,
-        end_sample: int,
-        reason: str,
     ) -> None:
-        if segment.decode_task is not None and not segment.decode_task.done():
-            self._cancelled_refresh_count += 1
         await self.cancel_and_abort(segment.decode_task, segment.request_id)
-        try:
-            async with self._decode_lock:
-                if self._is_silent(pcm):
-                    hypothesis = StreamingHypothesis(
-                        text="", stable_text="", language=self.settings.language
-                    )
-                    await self._emit_hypothesis(
-                        segment,
-                        hypothesis,
-                        end_sample=end_sample,
-                        is_final=True,
-                        usage={},
-                        decode_time_s=0.0,
-                        boundary_reason=reason,
-                    )
-                else:
-                    await self._decode_and_emit(
-                        segment,
-                        audio,
-                        end_sample=end_sample,
-                        is_final=True,
-                        boundary_reason=reason,
-                    )
-        finally:
-            self.strategy.reset_segment(segment.strategy_state)
+        async with self._decode_lock:
+            if self._is_silent(pcm):
+                await self._emit_hypothesis(segment, "", is_final=True)
+            else:
+                await self._decode_and_emit(segment, audio, is_final=True)
 
     @staticmethod
     def _is_silent(pcm: bytes) -> bool:
@@ -622,9 +539,7 @@ class RealtimeTranscriptionSession(BaseRealtimeSession):
         segment: ActiveTranscriptionSegment,
         audio: bytes,
         *,
-        end_sample: int,
         is_final: bool,
-        boundary_reason: str | None = None,
     ) -> None:
         segment.decode_attempt += 1
         request_id = f"{self.session_id}:{segment.segment_id}:{segment.decode_attempt}"
@@ -635,8 +550,6 @@ class RealtimeTranscriptionSession(BaseRealtimeSession):
             is_final=is_final,
             request_id=request_id,
         )
-        started = time.perf_counter()
-        self._decode_request_count += 1
         self._inflight_request_ids.add(request_id)
         try:
             result = await self.client.completion(request, request_id=request_id)
@@ -651,72 +564,35 @@ class RealtimeTranscriptionSession(BaseRealtimeSession):
                 segment.request_id = None
         if not is_final and (segment.finalizing or self.active_segment is not segment):
             return
-        decode_time_s = time.perf_counter() - started
-        hypothesis = self.strategy.update_hypothesis(
+        text = self.strategy.update_hypothesis(
             generated_text=result.text,
-            metadata=result.metadata,
             state=segment.strategy_state,
-            is_final=is_final,
         )
-        if not is_final and hypothesis.text == segment.last_text:
+        if not is_final and text == segment.last_text:
             return
-        usage = result.usage.to_dict() if result.usage is not None else {}
-        await self._emit_hypothesis(
-            segment,
-            hypothesis,
-            end_sample=end_sample,
-            is_final=is_final,
-            usage=usage,
-            decode_time_s=decode_time_s,
-            boundary_reason=boundary_reason,
-        )
+        await self._emit_hypothesis(segment, text, is_final=is_final)
 
     async def _emit_hypothesis(
         self,
         segment: ActiveTranscriptionSegment,
-        hypothesis: StreamingHypothesis,
+        text: str,
         *,
-        end_sample: int,
         is_final: bool,
-        usage: dict[str, Any],
-        decode_time_s: float,
-        boundary_reason: str | None,
     ) -> None:
-        segment.revision += 1
-        segment.last_text = hypothesis.text
-        fields: dict[str, Any] = {
-            "session_id": self.session_id,
-            "segment_id": segment.segment_id,
-            "revision": segment.revision,
-            "text": hypothesis.text,
-            "stable_text": hypothesis.stable_text,
-            "is_final": is_final,
-        }
-        if self.settings.response_format == "verbose_json":
-            fields.update(
-                {
-                    "language": hypothesis.language,
-                    "audio_start_ms": offsets_to_ms(segment.start_sample),
-                    "audio_end_ms": offsets_to_ms(end_sample),
-                    "duration_ms": offsets_to_ms(end_sample - segment.start_sample),
-                    "usage": usage,
-                    "decode_time_s": decode_time_s,
-                    "timestamp_source": "vad",
-                    "boundary_reason": boundary_reason,
-                }
+        segment.last_text = text
+        await self.send(
+            make_event(
+                "transcription.segment",
+                segment_id=segment.segment_id,
+                text=text,
+                is_final=is_final,
             )
-        await self.send(make_event("transcription.segment", **fields))
+        )
         if is_final:
             self.committed_segments.append(
                 CommittedTranscriptionSegment(
                     segment_id=segment.segment_id,
-                    start_sample=segment.start_sample,
-                    end_sample=end_sample,
-                    text=hypothesis.text,
-                    language=hypothesis.language,
-                    usage=usage,
-                    decode_time_s=decode_time_s,
-                    boundary_reason=boundary_reason or "unknown",
+                    text=text,
                 )
             )
 
@@ -734,26 +610,10 @@ class RealtimeTranscriptionSession(BaseRealtimeSession):
                 self.vad_origin_samples = self.buffer_origin_samples
                 return
             self._start_segment(self.buffer_origin_samples)
-        await self._finalize_through(end_sample, reason)
+        await self._finalize_through(end_sample)
         if self.vad is not None:
             self.vad.reset()
             self.vad_origin_samples = self.buffer_origin_samples
-
-    async def handle_audio_clear(self, event: InputAudioBufferClear) -> None:
-        del event
-        segment = self.active_segment
-        if segment is not None:
-            segment.finalizing = True
-            await self.cancel_and_abort(segment.decode_task, segment.request_id)
-            self.strategy.reset_segment(segment.strategy_state)
-        discarded = self.audio_buffer.num_samples
-        self.buffer_origin_samples += discarded
-        self.audio_buffer.clear()
-        self.active_segment = None
-        if self.vad is not None:
-            self.vad.reset()
-            self.vad_origin_samples = self.buffer_origin_samples
-        await self.send(make_event("input_audio_buffer.cleared"))
 
     async def handle_transcription_done(self, event: TranscriptionDone) -> None:
         del event
@@ -771,29 +631,12 @@ class RealtimeTranscriptionSession(BaseRealtimeSession):
             await asyncio.gather(*final_tasks, return_exceptions=True)
             self._final_tasks.difference_update(final_tasks)
         ordered = sorted(self.committed_segments, key=lambda item: item.segment_id)
-        segments = [
-            {
-                "id": item.segment_id,
-                "start": item.start_sample / self.capability.sample_rate,
-                "end": item.end_sample / self.capability.sample_rate,
-                "text": item.text,
-            }
-            for item in ordered
-        ]
-        fields: dict[str, Any] = {
-            "session_id": self.session_id,
-            "text": join_transcript_parts(item.text for item in ordered),
-            "segments": segments,
-        }
-        if self.settings.response_format == "verbose_json":
-            fields["usage"] = [item.usage for item in ordered]
-            fields["timestamp_source"] = "vad"
-            fields["statistics"] = {
-                "decode_requests": self._decode_request_count,
-                "coalesced_refreshes": self._coalesced_refresh_count,
-                "cancelled_refreshes": self._cancelled_refresh_count,
-            }
-        await self.send(make_event("transcription.completed", **fields))
+        await self.send(
+            make_event(
+                "transcription.completed",
+                text=join_transcript_parts(item.text for item in ordered),
+            )
+        )
 
     async def teardown(self) -> None:
         self.closed = True
@@ -813,7 +656,8 @@ class RealtimeTranscriptionSession(BaseRealtimeSession):
             )
         for task in final_tasks:
             await asyncio.gather(task, return_exceptions=True)
-        await super().teardown()
+        if self.websocket.client_state == WebSocketState.CONNECTED:
+            await self.websocket.close()
 
 
 __all__ = ["RealtimeTranscriptionSession"]
