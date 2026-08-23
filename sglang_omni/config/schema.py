@@ -3,11 +3,49 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, ClassVar
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 REPLICA_SEPARATOR = "@r"
+
+
+@dataclass(frozen=True, slots=True)
+class RealtimeTranscriptionConfig:
+    """Pipeline-owned declaration for live ASR over ``/v1/realtime``."""
+
+    strategy_factory: str
+    sample_rate: int = 16000
+    decode_interval_ms: int = 2000
+    min_decode_interval_ms: int = 500
+    max_decode_interval_ms: int = 4000
+    rollback_tokens: int = 5
+    unfixed_chunk_num: int = 2
+    max_audio_clip_s: float = 60.0
+    max_total_audio_s: float | None = 3600.0
+
+    def __post_init__(self) -> None:
+        if self.sample_rate <= 0:
+            raise ValueError("realtime transcription sample_rate must be positive")
+        if not 0 < self.min_decode_interval_ms <= self.decode_interval_ms:
+            raise ValueError(
+                "realtime transcription decode interval must be at least its minimum"
+            )
+        if self.decode_interval_ms > self.max_decode_interval_ms:
+            raise ValueError(
+                "realtime transcription decode interval must not exceed its maximum"
+            )
+        if self.rollback_tokens < 0 or self.unfixed_chunk_num < 0:
+            raise ValueError(
+                "realtime transcription rollback settings must be non-negative"
+            )
+        if self.max_audio_clip_s <= 0:
+            raise ValueError("realtime transcription max_audio_clip_s must be positive")
+        if self.max_total_audio_s is not None and self.max_total_audio_s <= 0:
+            raise ValueError(
+                "realtime transcription max_total_audio_s must be positive"
+            )
 
 
 def replica_instance_name(logical_name: str, replica_id: int) -> str:
@@ -392,6 +430,7 @@ class PipelineConfig(BaseModel):
     speech_reference_text_excludes_instructions: ClassVar[bool] = False
     additional_speech_languages: ClassVar[frozenset[str]] = frozenset()
     audio_chunking: ClassVar[AudioChunkingConfig] = AudioChunkingConfig()
+    realtime_transcription: ClassVar[RealtimeTranscriptionConfig | None] = None
 
     model_path: str
     stages: list[StageConfig]

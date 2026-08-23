@@ -5,7 +5,12 @@ from __future__ import annotations
 
 from typing import ClassVar
 
-from sglang_omni.config import AudioChunkingConfig, PipelineConfig, StageConfig
+from sglang_omni.config import (
+    AudioChunkingConfig,
+    PipelineConfig,
+    RealtimeTranscriptionConfig,
+    StageConfig,
+)
 from sglang_omni.models.qwen3_asr.audio_lengths import QWEN3_ASR_MAX_INPUT_SECONDS
 
 _PKG = "sglang_omni.models.qwen3_asr"
@@ -19,6 +24,15 @@ class Qwen3ASRPipelineConfig(PipelineConfig):
         allow_audio_chunking=True,
         max_audio_clip_s=60.0,
         max_native_clip_s=float(QWEN3_ASR_MAX_INPUT_SECONDS),
+    )
+    realtime_transcription: ClassVar[RealtimeTranscriptionConfig] = (
+        RealtimeTranscriptionConfig(
+            strategy_factory=(
+                "sglang_omni.models.qwen3_asr.streaming." "Qwen3ASRStreamingStrategy"
+            ),
+            max_audio_clip_s=audio_chunking.max_audio_clip_s,
+            max_total_audio_s=audio_chunking.max_total_audio_s,
+        )
     )
 
     @classmethod

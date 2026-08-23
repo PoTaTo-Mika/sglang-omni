@@ -142,6 +142,7 @@ class GenerateChunk:
     modality: str = "text"
     audio_data: Any = None
     sample_rate: int | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -205,6 +206,7 @@ class CompletionResult:
     output_token_logprobs: list[Any] | None = None
     omni_rollout: dict[str, Any] | None = None
     weight_version: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

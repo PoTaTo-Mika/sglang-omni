@@ -44,6 +44,9 @@ class SessionConfig(EventBase):
     turn_detection: TurnDetection | None = None
     temperature: float | None = None
     max_response_output_tokens: int | str | None = None
+    response_format: Literal["json", "verbose_json"] | None = None
+    language: str | None = None
+    decode_interval_ms: int | None = Field(default=None, ge=1)
 
 
 class SessionObject(EventBase):
@@ -72,10 +75,19 @@ class SessionUpdate(ClientEvent):
 class InputAudioBufferAppend(ClientEvent):
     type: Literal["input_audio_buffer.append"]
     audio: str  # base64-encoded raw PCM16 (or g711) per session.input_audio_format
+    sequence: int | None = Field(default=None, ge=0)
+
+
+class InputAudioBufferCommit(ClientEvent):
+    type: Literal["input_audio_buffer.commit"]
 
 
 class InputAudioBufferClear(ClientEvent):
     type: Literal["input_audio_buffer.clear"]
+
+
+class TranscriptionDone(ClientEvent):
+    type: Literal["transcription.done"]
 
 
 class ResponseCancel(ClientEvent):
@@ -103,7 +115,9 @@ def make_event(event_type: str, **fields: Any) -> dict[str, Any]:
 CLIENT_EVENT_TYPES: dict[str, type[ClientEvent]] = {
     "session.update": SessionUpdate,
     "input_audio_buffer.append": InputAudioBufferAppend,
+    "input_audio_buffer.commit": InputAudioBufferCommit,
     "input_audio_buffer.clear": InputAudioBufferClear,
+    "transcription.done": TranscriptionDone,
     "response.cancel": ResponseCancel,
     "conversation.item.truncate": ConversationItemTruncate,
 }

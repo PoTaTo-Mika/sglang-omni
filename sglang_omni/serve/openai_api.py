@@ -57,7 +57,7 @@ from sglang_omni.client.audio import (
     encode_pcm,
     select_audio_delta,
 )
-from sglang_omni.config import AudioChunkingConfig
+from sglang_omni.config import AudioChunkingConfig, RealtimeTranscriptionConfig
 from sglang_omni.http.admin_auth import (
     make_admin_auth_dependency,
     resolve_admin_api_key,
@@ -185,6 +185,7 @@ def create_app(
     additional_speech_languages: frozenset[str] = frozenset(),
     enable_realtime: bool = False,
     supports_realtime_audio_output: bool = False,
+    realtime_transcription: RealtimeTranscriptionConfig | None = None,
     allowed_local_media_path: str | None = None,
     allowed_media_domains: list[str] | None = None,
     admin_api_key: str | None = None,
@@ -214,6 +215,7 @@ def create_app(
             endpoint (OpenAI Realtime API).
         supports_realtime_audio_output: Whether the mounted realtime endpoint
             can request streamed audio from the configured pipeline.
+        realtime_transcription: Pipeline-owned live-ASR strategy declaration.
         allowed_local_media_path: Directory allowed for ``file://`` TTS
             reference audio.
         allowed_media_domains: Domains allowed for remote TTS reference audio.
@@ -250,6 +252,7 @@ def create_app(
     )  # allow_audio_chunking default false
     app.state.realtime_enabled = enable_realtime
     app.state.supports_realtime_audio_output = supports_realtime_audio_output
+    app.state.realtime_transcription = realtime_transcription
     app.state.speaker_sample_store = SpeakerSampleStore()
     app.state.speech_service = SpeechRequestValidator(
         default_model=app.state.model_name,
@@ -1193,13 +1196,31 @@ def _register_realtime(app: FastAPI) -> None:
         client=client,
         model_name=model_name,
         supports_audio_output=app.state.supports_realtime_audio_output,
+        transcription_config=app.state.realtime_transcription,
     )
     app.state.realtime_manager = manager
 
     @app.websocket("/v1/realtime")
     async def realtime(websocket: WebSocket) -> None:
         await websocket.accept()
-        session = manager.open(websocket)
+        try:
+            session = manager.open(
+                websocket,
+                intent=websocket.query_params.get("intent", "conversation"),
+            )
+        except ValueError as exc:
+            await websocket.send_json(
+                {
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "code": "unsupported_realtime_intent",
+                        "message": str(exc),
+                    },
+                }
+            )
+            await websocket.close(code=1008)
+            return
         try:
             await session.run()
         finally:

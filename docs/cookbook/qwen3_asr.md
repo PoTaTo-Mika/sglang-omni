@@ -112,6 +112,73 @@ data: [DONE]
 Qwen3-ASR batches deltas for up to 50 ms by default. EOS and other terminal
 conditions flush any buffered text before the final transcript event.
 
+### Live PCM transcription
+
+The SSE mode above starts decoding after a complete multipart upload. For live
+audio ingestion, mount the realtime WebSocket endpoint:
+
+```bash
+sgl-omni serve \
+  --model-path "${MODEL_PATH}" \
+  --model-name Qwen/Qwen3-ASR-1.7B \
+  --enable-realtime \
+  --port 8000
+```
+
+Connect to `/v1/realtime?intent=transcription`, configure the session, and
+append base64-encoded mono 16 kHz PCM16 packets. `input_audio_buffer.commit`
+finalizes the active segment manually; server VAD also finalizes after the
+configured silence interval. Send `transcription.done` after the final packet
+to receive `transcription.completed`.
+
+```json
+{
+  "type": "session.update",
+  "session": {
+    "response_format": "verbose_json",
+    "language": "English",
+    "decode_interval_ms": 2000,
+    "turn_detection": {
+      "type": "server_vad",
+      "threshold": 0.5,
+      "prefix_padding_ms": 300,
+      "silence_duration_ms": 500
+    }
+  }
+}
+```
+
+Each periodic decode is an ordinary stateless Qwen3-ASR request over all audio
+in the active segment. After the first two refreshes, the server rolls five
+tokens back from the prior hypothesis and uses the retained text as the next
+prompt prefix. No decoder KV cache or worker affinity is retained.
+
+Partial results are full replacements, not append-only deltas:
+
+```json
+{
+  "type": "transcription.segment",
+  "event_index": 7,
+  "segment_id": 0,
+  "revision": 2,
+  "text": "hello wor",
+  "stable_text": "hello ",
+  "is_final": false
+}
+```
+
+A later revision for the same `segment_id` replaces this text. An event with
+`is_final=true` is immutable. `verbose_json` also reports the language, VAD
+segment boundaries, duration, usage, decode time, and
+`"timestamp_source":"vad"`; these are segment timestamps, not model-derived
+word timestamps.
+
+The optional integer `sequence` on `input_audio_buffer.append` makes retries
+idempotent. Reusing a sequence with identical PCM is acknowledged without a
+second append; reusing it with different PCM is rejected. Reconnecting creates
+a new session: uncommitted audio, partial hypotheses, VAD state, and decode
+state are not resumed. Clients must retain already-finalized segment events.
+
 ## Request Parameters
 
 | Parameter | Type | Default | Description |
@@ -275,7 +342,8 @@ sgl-omni serve --model-path Qwen/Qwen3-ASR-1.7B \
 
 ## Known Limitations
 
-- The endpoint accepts one uploaded file per request.
+- The HTTP endpoint accepts one uploaded file per request. Live PCM uses
+  `/v1/realtime?intent=transcription` and requires `--enable-realtime`.
 - Non-streaming uploads up to `max_total_audio_s` (default one hour) are
   transcribed in full via chunking; see Long Audio above. Streaming requests
   are limited to `max_native_clip_s` (1,200s).
