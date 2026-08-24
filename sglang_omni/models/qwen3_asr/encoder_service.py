@@ -127,9 +127,8 @@ class Qwen3ASRPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.T
             if self._device.type == "cuda"
             else None
         )
-        # note (guozhihao-224): variable-length embeddings pin for async D2H,
-        # but do not prewarm a fixed-size host pool the way Whisper's 30s
-        # encoder states can.
+        # note (guozhihao-224): variable-length embeddings pin for async d2h,
+        # but do not prewarm a fixed-size host pool.
         self._pin_host_memory = bool(pin_host_memory) and self._device.type == "cuda"
         self._pin_failures = 0
         self._cache = StageOutputCache(

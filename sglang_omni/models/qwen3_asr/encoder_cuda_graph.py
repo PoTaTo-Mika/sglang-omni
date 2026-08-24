@@ -229,7 +229,7 @@ class Qwen3ASREncoderLayerStackGraphRunner:
         if out.dim() == 3:  # attention backends emit [1, tokens, dim]
             out = out.squeeze(0)
         # note (guozhihao-224): view into the static graph buffer.
-        # get_audio_feature clones before returning to LM embed / pre-LM
+        # get_audio_feature clones before returning to lm embed / pre-lm
         # encode; callers that keep this tensor across runs must copy.
         return out[:total]
 
@@ -269,8 +269,8 @@ def eager_preamble(
     import torch.nn.functional as F
 
     chunk_width = tower.n_window * 2
-    # note (guozhihao-224): one small D2H of the length vector, then the chunk
-    # plan stays on the host so conv preamble does not .item()/.tolist()
+    # note (guozhihao-224): one small d2h of the length vector, then the chunk
+    # plan stays on the host so conv preamble does not call item() or tolist()
     # mid-kernel.
     lengths = [int(x) for x in feature_lens.detach().cpu().tolist()]
     chunk_lengths_py: list[int] = []

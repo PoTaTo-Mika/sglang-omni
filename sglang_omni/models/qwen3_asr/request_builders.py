@@ -214,10 +214,10 @@ def make_qwen3_asr_scheduler_adapters(
             )
 
         hop_length = _require_hop_length(feature_extractor)
-        # note (guozhihao-224): HuggingFace Whisper STFT drops the Nyquist bin
-        # (stft[..., :-1]), so frames == samples // hop_length. Qwen3's
-        # encoder is variable-length; do not pad or truncate to Whisper's
-        # 30s window (transformers#26241).
+        # note (guozhihao-224): the checkpoint extractor stft drops the Nyquist
+        # bin, so the frame count is samples divided by hop length. Qwen3's
+        # encoder is variable-length; do not pad or truncate to a 30s window
+        # (transformers issue 26241).
         estimated_mel_frames = len(audio) // hop_length
         estimated_audio_tokens = qwen3_asr_num_audio_tokens(estimated_mel_frames)
 
@@ -243,9 +243,9 @@ def make_qwen3_asr_scheduler_adapters(
             _validate_context_budget(estimated_input_ids, request_max_new_tokens)
 
         if cached_embedding is None:
-            # note (guozhihao-224): skip the CPU WhisperFeatureExtractor STFT;
-            # the encoder stream runs GPU log-mel from this waveform. pin when
-            # CUDA is present so waveform H2D is non-blocking.
+            # note (guozhihao-224): skip the CPU extractor STFT; the encoder
+            # stream runs GPU log-mel from this waveform. pin when CUDA is
+            # present so waveform H2D is non-blocking.
             waveform = torch.as_tensor(audio, dtype=torch.float32)
             if not waveform.is_contiguous():
                 waveform = waveform.contiguous()

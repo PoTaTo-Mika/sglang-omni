@@ -3,8 +3,8 @@
 
 Cache-miss request building used to run the checkpoint feature extractor
 on the host (STFT + mel) and then H2D the fbank. That CPU FFT is the unique-input
-c=8–32 limiter. This module keeps the same numerics as the extractor's
-``_torch_extract_fbank_features`` but runs them on the encoder stream from a
+limiter at concurrency 8 to 32. This module keeps the same numerics as the
+extractor's torch fbank helper but runs them on the encoder stream from a
 pinned waveform.
 """
 
@@ -24,12 +24,13 @@ class AudioFrontend:
     hop_length: int
     n_mels: int
     dither: float
-    # Stored as HuggingFace does: (n_freq, n_mels). log_mel does filters.T @ mag.
+    # note (guozhihao-224): layout is (n_freq, n_mels); log_mel does
+    # filters.T @ mag.
     mel_filters: torch.Tensor
     hann_window: torch.Tensor | None = None
 
     def materialize(self, device: torch.device, dtype: torch.dtype) -> None:
-        """Keep filters and the Hann window on ``waveform``'s device."""
+        """Keep filters and the Hann window on the waveform device."""
         if self.mel_filters.device != device or self.mel_filters.dtype != dtype:
             self.mel_filters = self.mel_filters.to(device=device, dtype=dtype)
         if (
@@ -89,10 +90,10 @@ def log_mel_spectrogram(
     waveform: torch.Tensor,
     frontend: AudioFrontend,
 ) -> torch.Tensor:
-    """Return log-mel ``[n_mels, n_frames]`` on ``waveform``'s device.
+    """Return log-mel of shape n_mels by n_frames on the waveform device.
 
     Matches the checkpoint feature extractor's fbank for a 1-D float32
-    waveform: ``stft[..., :-1]``, Slaney mel, log10, max-8, (x+4)/4.
+    waveform: drop the Nyquist STFT bin, Slaney mel, log10, max-8, then (x+4)/4.
     """
     wave = waveform.reshape(-1).to(dtype=torch.float32)
     frontend.materialize(wave.device, wave.dtype)
@@ -107,10 +108,10 @@ def log_mel_spectrogram(
         window=frontend.hann_window,
         return_complex=True,
     )
-    # note (guozhihao-224): stft[..., :-1] drops the Nyquist bin, so frames
-    # == samples // hop_length. the request builder estimates tokens from hop
-    # length instead of running the CPU extractor, and must not pad or
-    # truncate to a 30s window (transformers#26241).
+    # note (guozhihao-224): dropping the Nyquist stft bin makes the frame
+    # count equal to samples divided by hop length. the request builder
+    # estimates tokens from hop length instead of running the cpu extractor,
+    # and must not pad or truncate to a 30s window (transformers issue 26241).
     magnitudes = stft[..., :-1].abs() ** 2
     mel_spec = frontend.mel_filters.T @ magnitudes
     log_spec = torch.clamp(mel_spec, min=1e-10).log10()

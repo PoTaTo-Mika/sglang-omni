@@ -288,11 +288,11 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
                 )
                 graphed = runner.run(hidden, window_lens)
                 if graphed is not None:
-                    # note (guozhihao-224): run() returns a view of the static
-                    # graph buffer. clone before leaving get_audio_feature so a
-                    # later replay cannot mutate LM embeddings (pre-LM off) or
-                    # any caller that holds this tensor across encodes.
-                    # split_embeddings still copies packed slices for the LRU.
+                    # note (guozhihao-224): graph run returns a view of the static
+                    # buffer. clone before leaving get_audio_feature so a later
+                    # replay cannot mutate lm embeddings (pre-lm off) or any
+                    # caller that holds this tensor across encodes.
+                    # split_embeddings still copies packed slices for the lru.
                     return graphed.unsqueeze(0).clone()
 
         audio_outputs = self.audio_tower(
