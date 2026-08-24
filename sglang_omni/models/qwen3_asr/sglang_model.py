@@ -31,6 +31,7 @@ from .encoder_cuda_graph import (
     eager_preamble,
     window_lens_from_token_counts,
 )
+from .gpu_mel import AudioFrontend, log_mel_spectrogram
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +152,7 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
         _enable_fused_asr_qk_norm_rope(self.language_model)
         self.pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         self._encoder_graph_runner: Qwen3ASREncoderLayerStackGraphRunner | None = None
+        self._audio_frontend: AudioFrontend | None = None
 
     def init_encoder_graphs(
         self, *, max_batch_size: int, max_tokens_per_clip: int
@@ -166,11 +168,52 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         return self.pattern.pad_input_tokens(input_ids, mm_inputs)
 
+    def _item_feature_and_mask(
+        self, item: MultimodalDataItem, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        extra = item.model_specific_data if isinstance(
+            getattr(item, "model_specific_data", None), dict
+        ) else None
+        waveform = extra.get("waveform") if extra else None
+        if waveform is None:
+            waveform = getattr(item, "waveform", None)
+        if waveform is not None:
+            frontend = getattr(self, "_audio_frontend", None)
+            if frontend is None:
+                raise RuntimeError(
+                    "Qwen3-ASR received a raw waveform but the GPU audio "
+                    "frontend is not bound"
+                )
+            wave = waveform
+            if not torch.is_tensor(wave):
+                wave = torch.as_tensor(wave, dtype=torch.float32)
+            wave = wave.to(
+                device=device, dtype=torch.float32, non_blocking=True
+            ).reshape(-1)
+            feature = log_mel_spectrogram(wave, frontend).unsqueeze(0)
+            mask = getattr(item, "feature_attention_mask", None)
+            if mask is None and extra is not None:
+                mask = extra.get("feature_attention_mask")
+            if mask is None:
+                mask = torch.ones(
+                    (1, feature.shape[-1]), dtype=torch.long, device=device
+                )
+            return feature, mask
+        return item.feature, getattr(item, "feature_attention_mask", None)
+
     def get_audio_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         device = next(self.audio_tower.parameters()).device
 
-        features = [item.feature for item in items]
-        masks = [getattr(item, "feature_attention_mask", None) for item in items]
+        features = []
+        masks = []
+        for item in items:
+            # note (guozhihao-224): look up on the class; unit tests call this
+            # as an unbound method on a SimpleNamespace stand-in for the module.
+            feature, mask = Qwen3ASRForConditionalGeneration._item_feature_and_mask(
+                self, item, device
+            )
+            features.append(feature)
+            masks.append(mask)
 
         # SGLang batches every cache miss in the forward batch into a single
         # data_embedding_func call (_batch_encode_per_image_misses), so
@@ -243,7 +286,12 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
                 )
                 graphed = runner.run(hidden, window_lens)
                 if graphed is not None:
-                    return graphed.unsqueeze(0)
+                    # note (guozhihao-224): run() returns a view of the static
+                    # graph buffer. clone before leaving get_audio_feature so a
+                    # later replay cannot mutate LM embeddings (pre-LM off) or
+                    # any caller that holds this tensor across encodes.
+                    # split_embeddings still copies packed slices for the LRU.
+                    return graphed.unsqueeze(0).clone()
 
         audio_outputs = self.audio_tower(
             input_features,

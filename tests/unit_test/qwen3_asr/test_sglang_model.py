@@ -198,3 +198,32 @@ def test_get_audio_feature_normalizes_cpu_masks_for_cuda_features() -> None:
         tower.seen_features.cpu(),
         torch.tensor([[1.0, 2.0, 3.0, 4.0]]),
     )
+
+
+def test_get_audio_feature_runs_gpu_mel_from_waveform() -> None:
+    from sglang_omni.models.qwen3_asr.gpu_mel import bind_audio_frontend
+    from transformers import WhisperFeatureExtractor
+
+    extractor = WhisperFeatureExtractor(
+        feature_size=128,
+        sampling_rate=16000,
+        hop_length=160,
+        n_fft=400,
+    )
+    rng = torch.Generator().manual_seed(0)
+    waveform = torch.randn(16000, generator=rng)
+    tower = _RecordingAudioTower()
+    model = SimpleNamespace(_encoder_graph_runner=None, audio_tower=tower)
+    bind_audio_frontend(model, extractor)
+    items = [
+        SimpleNamespace(
+            feature=None,
+            model_specific_data={"waveform": waveform},
+        )
+    ]
+
+    Qwen3ASRForConditionalGeneration.get_audio_feature(model, items)
+
+    assert tower.seen_features is not None
+    assert tower.seen_features.shape[-1] == 100
+    assert torch.equal(tower.seen_lengths, torch.tensor([100]))

@@ -62,6 +62,7 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
         pre_lm_max_batch_size: int = 8,
         pre_lm_max_batch_wait_ms: int = 0,
         enable_encoder_cuda_graph: bool = True,
+        pre_lm_cache_pin_host_memory: bool = True,
     ) -> None:
         if pre_lm_max_batch_size < 1:
             raise ValueError(
@@ -98,6 +99,7 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
         self.pre_lm_max_batch_size = pre_lm_max_batch_size
         self.pre_lm_max_batch_wait_ms = pre_lm_max_batch_wait_ms
         self.enable_encoder_cuda_graph = enable_encoder_cuda_graph
+        self.pre_lm_cache_pin_host_memory = bool(pre_lm_cache_pin_host_memory)
         self.tokenizer: Any = None
         self.feature_extractor: Any = None
         self.context_length = 0
@@ -201,6 +203,9 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
         generation_cuda_graph_enabled: bool,
     ) -> None:
         del generation_cuda_graph_enabled
+        from sglang_omni.models.qwen3_asr.gpu_mel import bind_audio_frontend
+
+        bind_audio_frontend(model, self.feature_extractor)
         self._log_memory_checkpoint("post_cuda_graph_capture")
         if self.enable_encoder_cuda_graph:
             from sglang_omni.models.qwen3_asr.audio_lengths import (
@@ -234,6 +239,7 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
                 cache_max_bytes=self.pre_lm_cache_size_bytes,
                 max_batch_size=self.pre_lm_max_batch_size,
                 max_batch_wait_ms=self.pre_lm_max_batch_wait_ms,
+                pin_host_memory=self.pre_lm_cache_pin_host_memory,
             )
 
     def should_wait_for_encode(self) -> bool:

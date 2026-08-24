@@ -6,7 +6,7 @@ dedicated worker thread and CUDA stream. Request building submits encode
 and admits only after the future completes with the LM-ready embedding
 attached.
 
-A cache hit is still resolved before mel extraction in the request builder,
+A cache hit is still resolved before GPU mel in the request builder,
 so repeated audio never enters this queue.
 """
 
@@ -115,6 +115,7 @@ class Qwen3ASRPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.T
         cache_max_bytes: int = _CACHE_MAX_BYTES,
         max_batch_size: int = 8,
         max_batch_wait_ms: int = 0,
+        pin_host_memory: bool = True,
     ) -> None:
         self._model = model
         reference = next(model.audio_tower.parameters())
@@ -126,10 +127,16 @@ class Qwen3ASRPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.T
             if self._device.type == "cuda"
             else None
         )
+        # note (guozhihao-224): variable-length embeddings pin for async D2H,
+        # but do not prewarm a fixed-size host pool the way Whisper's 30s
+        # encoder states can.
+        self._pin_host_memory = bool(pin_host_memory) and self._device.type == "cuda"
+        self._pin_failures = 0
         self._cache = StageOutputCache(
             max_size=cache_max_entries,
             max_bytes=cache_max_bytes,
             cache_device="cpu",
+            pin_memory=self._pin_host_memory,
         )
         self._namespace = cache_namespace
         self._max_batch_size = max(int(max_batch_size), 1)
@@ -288,6 +295,30 @@ class Qwen3ASRPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.T
             if self._inflight.get(key) is future:
                 del self._inflight[key]
 
+    @property
+    def pin_host_memory(self) -> bool:
+        """Whether cached embeddings are held in page-locked host memory."""
+        return self._pin_host_memory
+
+    def _new_pinned_host(self, tokens: int) -> torch.Tensor:
+        return torch.empty(
+            (tokens, self._hidden_size),
+            dtype=self._dtype,
+            device="cpu",
+            pin_memory=True,
+        )
+
+    def _disable_pinning(self, exc: Exception) -> None:
+        if not self._pin_host_memory:
+            return
+        self._pin_host_memory = False
+        self._cache.pin_memory = False
+        logger.warning(
+            "Qwen3-ASR pre-LM cache: pinned host allocation failed (%s); "
+            "switching this cache to pageable host memory",
+            exc,
+        )
+
     def lookup_cached_embedding(
         self,
         audio_fingerprint: str | None,
@@ -336,6 +367,8 @@ class Qwen3ASRPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.T
                 "cache_entries": len(self._cache),
                 "cache_bytes": self._cache.current_bytes,
                 "cache_evictions": self._cache.eviction_count,
+                "pin_host_memory": self._pin_host_memory,
+                "pin_failures": self._pin_failures,
             }
 
     def _cache_key(self, item: Any) -> str | None:
@@ -445,7 +478,30 @@ class Qwen3ASRPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.T
                 f"{sum(token_counts)}x{self._hidden_size} ({self._dtype})"
             )
         parts = torch.split(embedding, token_counts, dim=0)
+        # note (guozhihao-224): graph replay returns a view of a static buffer;
+        # clone here once so the next capture does not overwrite an in-flight
+        # embedding.
         return [part.clone() for part in parts]
+
+    def stage_host_copy(
+        self, item: Any, embedding: torch.Tensor
+    ) -> torch.Tensor | None:
+        """Queue a non-blocking GPU->CPU copy into a pinned host buffer.
+
+        Called on the encoder stream before synchronize_batch. The copy
+        rides behind the encoder kernels; by cache_embedding the data is
+        complete and already pinned, so the LRU does not pay a blocking D2H.
+        """
+        if not self._pin_host_memory or self._cache_key(item) is None:
+            return None
+        try:
+            host = self._new_pinned_host(int(embedding.shape[0]))
+        except RuntimeError as exc:
+            self._pin_failures += 1
+            self._disable_pinning(exc)
+            return None
+        host.copy_(embedding, non_blocking=True)
+        return host
 
     def synchronize_batch(self) -> None:
         if self._stream is not None:
@@ -457,10 +513,12 @@ class Qwen3ASRPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.T
         embedding: torch.Tensor,
         host_copy: torch.Tensor | None = None,
     ) -> None:
-        del host_copy
         key = self._cache_key(item)
-        if key is not None:
-            self._cache.put(key, embedding)
+        if key is None:
+            return
+        # note (guozhihao-224): host_copy is complete here (synchronize_batch ran in
+        # between) and already pinned, so the cache stores it without another copy.
+        self._cache.put(key, host_copy if host_copy is not None else embedding)
 
     def _retry_batch(self, batch: list[QueueEntry[Any]], _exc: Exception) -> bool:
         return len(batch) > 1
