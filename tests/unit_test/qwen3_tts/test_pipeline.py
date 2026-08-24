@@ -1422,6 +1422,33 @@ def test_qwen3_tts_initial_decode_graphs_noop_on_cpu() -> None:
     assert decoder.decode_inputs == []
 
 
+def test_qwen3_tts_decode_graphs_key_by_frames_and_batch_bucket() -> None:
+    decoder = _FakeQwen3TTSDecoder()
+    graphs = _Qwen3TTSInitialDecodeGraphs(
+        decoder,
+        device=torch.device("cpu"),
+        num_quantizers=2,
+        input_frames=(24, 32, 24),
+        batch_sizes=(4, 1),
+    )
+
+    assert graphs._input_frames == (24, 32)
+    assert graphs._batch_sizes == (1, 4)
+    graphs.capture()
+    assert graphs.decode(torch.zeros((1, 2, 24), dtype=torch.long)) is None
+
+
+def test_qwen3_tts_streaming_vocoder_followup_graphs_can_be_disabled() -> None:
+    scheduler = Qwen3TTSStreamingVocoderScheduler(
+        _FakeQwen3TTSTokenizer(),
+        device="cpu",
+        followup_cuda_graph=False,
+    )
+
+    assert scheduler._followup_decode_graphs._enabled is False
+    assert scheduler._initial_decode_graphs is not scheduler._followup_decode_graphs
+
+
 def test_qwen3_tts_deterministic_streaming_vocoder_decodes_each_plan_at_b1() -> None:
     """Match each streaming row to its independent batch-one decode."""
     tokenizer = _FakeQwen3TTSTokenizer()
@@ -1495,9 +1522,11 @@ def test_qwen3_tts_streaming_vocoder_default_initial_chunk_is_continuity_safe() 
     )
 
     assert scheduler.create_stream_state("request").initial_chunk_frames == 8
-    assert (
-        scheduler._initial_decode_graphs._input_frames
-        == scheduler._stream_left_context_frames + 8
+    assert scheduler._initial_decode_graphs._input_frames == (
+        scheduler._stream_left_context_frames + 8,
+    )
+    assert scheduler._followup_decode_graphs._input_frames == (
+        scheduler._stream_left_context_frames + 8,
     )
 
 
