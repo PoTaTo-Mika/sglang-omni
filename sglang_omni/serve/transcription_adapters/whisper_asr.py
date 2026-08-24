@@ -10,10 +10,8 @@ from sglang_omni.serve.protocol import (
     TranscriptionSegment,
     TranscriptionVerboseResponse,
 )
-from sglang_omni.serve.transcription_adapters.base import (
-    TranscriptionAdapter,
-    register_transcription_adapter,
-)
+from sglang_omni.serve.transcription_adapters.base import register_transcription_adapter
+from sglang_omni.serve.transcription_adapters.whisper import WhisperTranscriptionAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +23,7 @@ _SEGMENT_RE = re.compile(
 
 
 @register_transcription_adapter("Whisper")
-class WhisperASRAdapter(TranscriptionAdapter):
+class WhisperASRAdapter(WhisperTranscriptionAdapter):
     @property
     def supports_segment_timestamps(self) -> bool:
         return True
