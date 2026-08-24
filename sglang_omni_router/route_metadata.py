@@ -15,6 +15,8 @@ from sglang_omni_router.config import DEFAULT_CAPABILITIES, Capability
 from sglang_omni_router.worker import ServiceClass
 
 ROUTE_METADATA_JSON_LIMIT_BYTES = 1024 * 1024
+MULTIPART_PART_HEADER_LIMIT_BYTES = 8 * 1024
+MULTIPART_MODEL_VALUE_LIMIT_BYTES = 4 * 1024
 ROUTE_MODEL_HEADER = "x-sglang-omni-route-model"
 ROUTE_STREAM_HEADER = "x-sglang-omni-route-stream"
 ROUTE_CAPABILITIES_HEADER = "x-sglang-omni-route-capabilities"
@@ -185,6 +187,15 @@ def extract_route_metadata(
             model = route_model
     else:
         model = route_model
+        if route_kind in {RouteKind.TRANSCRIPTION, RouteKind.TRANSLATION}:
+            form_model = _multipart_form_model(request, body)
+            if form_model is not None:
+                if has_route_model_header and route_model != form_model:
+                    raise RouteMetadataError(
+                        f"{ROUTE_MODEL_HEADER} conflicts with the multipart "
+                        "form model"
+                    )
+                model = form_model
         stream = route_stream
         required_capabilities = _required_capabilities(
             route_kind,
@@ -479,6 +490,85 @@ class _JsonTopLevelScanner:
         if not isinstance(value, (int, float)):
             raise ValueError("invalid JSON value")
         return index + consumed
+
+
+def _multipart_form_model(request: Request, body: bytes) -> str | None:
+    if not body:
+        return None
+    boundary = _multipart_boundary(request)
+    if boundary is None:
+        return None
+    return _scan_multipart_model(body, boundary)
+
+
+def _multipart_boundary(request: Request) -> bytes | None:
+    content_type = request.headers.get("content-type", "")
+    if "multipart/form-data" not in content_type.lower():
+        return None
+    for param in content_type.split(";"):
+        key, _, value = param.strip().partition("=")
+        if key.strip().lower() != "boundary":
+            continue
+        value = value.strip().strip('"')
+        try:
+            return value.encode("ascii") if value else None
+        except UnicodeEncodeError:
+            return None
+    return None
+
+
+def _scan_multipart_model(body: bytes, boundary: bytes) -> str | None:
+    delimiter = b"--" + boundary
+    position = body.find(delimiter)
+    if position < 0:
+        return None
+    position += len(delimiter)
+    while True:
+        if body.startswith(b"--", position):
+            return None  # closing delimiter: no model field in the form
+        if not body.startswith(b"\r\n", position):
+            return None
+        position += 2
+        headers_end = body.find(
+            b"\r\n\r\n", position, position + MULTIPART_PART_HEADER_LIMIT_BYTES
+        )
+        if headers_end < 0:
+            return None
+        name, has_filename = _content_disposition_name(body[position:headers_end])
+        value_start = headers_end + 4
+        value_end = body.find(b"\r\n" + delimiter, value_start)
+        if value_end < 0:
+            return None
+        if name == "model" and not has_filename:
+            if value_end - value_start > MULTIPART_MODEL_VALUE_LIMIT_BYTES:
+                return None
+            try:
+                value = body[value_start:value_end].decode("utf-8").strip()
+            except UnicodeDecodeError:
+                return None
+            return value or None
+        position = value_end + 2 + len(delimiter)
+
+
+def _content_disposition_name(header_block: bytes) -> tuple[str | None, bool]:
+    for raw_line in header_block.split(b"\r\n"):
+        try:
+            line = raw_line.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        if not line.lower().startswith("content-disposition:"):
+            continue
+        name: str | None = None
+        has_filename = False
+        for param in line.split(";")[1:]:
+            key, _, value = param.strip().partition("=")
+            key = key.strip().lower()
+            if key == "name":
+                name = value.strip().strip('"')
+            elif key == "filename":
+                has_filename = True
+        return name, has_filename
+    return None, False
 
 
 def _required_capabilities(

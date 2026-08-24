@@ -382,11 +382,13 @@ The router infers required capabilities from each request:
 - `/v1/audio/voices` management and synthesis using an uploaded voice require
   the owner worker, which has both `speech` and `audio_input`
 - `/v1/audio/transcriptions` and `/v1/audio/translations` require
-  `audio_input`. These are multipart uploads, so the router does not read the
-  `model` form field; in a pool that mixes ASR models (for example Whisper
-  next to Qwen3-ASR), send `X-SGLang-Omni-Route-Model` so the request lands on
-  a worker that serves that model. Translation support is per model, and a
-  worker that does not support it answers `400`.
+  `audio_input`. These are multipart uploads, so the router reads the `model`
+  form field with a single linear pass that skips the uploaded file to avoid cpu overhead, so in a
+  pool that mixes ASR models the request lands on a worker registered with
+  that model name. When the router cannot read the field it falls back to
+  `X-SGLang-Omni-Route-Model`; when both are present they must agree or the
+  router answers `400`. Translation support is per model, and a worker that
+  does not support it answers `400`.
 
 Register narrower worker capabilities only when a worker cannot serve one of
 those request classes.

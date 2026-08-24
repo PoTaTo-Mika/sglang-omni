@@ -3614,6 +3614,106 @@ def test_speech_to_text_routes_select_audio_input_workers(path: str) -> None:
     }
 
 
+_ASR_BOUNDARY = "omni-test-boundary"
+
+
+def _speech_to_text_multipart(
+    model: str | None, *, model_first: bool = True
+) -> tuple[bytes, dict[str, str]]:
+    """Build a raw multipart body so tests control the field order."""
+    file_part = (
+        f"--{_ASR_BOUNDARY}\r\n"
+        'Content-Disposition: form-data; name="file"; filename="a.wav"\r\n'
+        "Content-Type: audio/wav\r\n\r\n"
+    ).encode() + b"RIFF....WAVE\r\n"
+    parts = [file_part]
+    if model is not None:
+        model_part = (
+            f"--{_ASR_BOUNDARY}\r\n"
+            'Content-Disposition: form-data; name="model"\r\n\r\n'
+            f"{model}\r\n"
+        ).encode()
+        parts = [model_part, file_part] if model_first else [file_part, model_part]
+    body = b"".join(parts) + f"--{_ASR_BOUNDARY}--\r\n".encode()
+    headers = {"content-type": f"multipart/form-data; boundary={_ASR_BOUNDARY}"}
+    return body, headers
+
+
+def _mixed_asr_pool_app(seen_workers: list[str]) -> FastAPI:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "healthy"}, request=request)
+        seen_workers.append(_request_netloc(request))
+        return httpx.Response(200, json={"text": "hi"}, request=request)
+
+    worker_configs = [
+        WorkerConfig(
+            url="http://qwen3-asr:8101", model="qwen3-asr", capabilities={"audio_input"}
+        ),
+        WorkerConfig(
+            url="http://whisper:8102", model="whisper", capabilities={"audio_input"}
+        ),
+    ]
+    return create_app(
+        _router_config(worker_configs=worker_configs),
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+
+@pytest.mark.parametrize("path", ["/v1/audio/transcriptions", "/v1/audio/translations"])
+@pytest.mark.parametrize("model_first", [True, False])
+def test_multipart_form_model_selects_matching_worker(
+    path: str, model_first: bool
+) -> None:
+    # The model field must route correctly whether it comes before or after
+    # the file part — after means the scan has to skip the file bytes.
+    seen_workers: list[str] = []
+    app = _mixed_asr_pool_app(seen_workers)
+    body, headers = _speech_to_text_multipart("whisper", model_first=model_first)
+
+    with TestClient(app) as client:
+        for _ in range(4):
+            response = client.post(path, content=body, headers=headers)
+            assert response.status_code == 200, response.text
+
+    assert seen_workers == ["whisper:8102"] * 4
+
+
+def test_multipart_form_model_conflicting_route_header_is_rejected() -> None:
+    seen_workers: list[str] = []
+    app = _mixed_asr_pool_app(seen_workers)
+    body, headers = _speech_to_text_multipart("whisper")
+    headers["x-sglang-omni-route-model"] = "qwen3-asr"
+
+    with TestClient(app) as client:
+        response = client.post("/v1/audio/translations", content=body, headers=headers)
+
+    assert response.status_code == 400, response.text
+    assert "conflicts with the multipart form model" in response.text
+    assert seen_workers == []
+
+
+def test_multipart_body_router_cannot_parse_falls_back_to_route_header() -> None:
+    # The worker's form parser is authoritative: a body our scan cannot read
+    # must still be forwarded (here pinned by the header), never rejected.
+    seen_workers: list[str] = []
+    app = _mixed_asr_pool_app(seen_workers)
+    headers = {
+        "content-type": f"multipart/form-data; boundary={_ASR_BOUNDARY}",
+        "x-sglang-omni-route-model": "whisper",
+    }
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/audio/translations",
+            content=b"not really multipart",
+            headers=headers,
+        )
+
+    assert response.status_code == 200, response.text
+    assert seen_workers == ["whisper:8102"]
+
+
 def test_worker_crud_stays_unauthenticated_even_with_admin_key() -> None:
     # Note (Jiaxin Deng): current behavior, frozen: worker CRUD carries no admin auth
     # while the weight-update/broadcast routes do; the route split must not change this.
