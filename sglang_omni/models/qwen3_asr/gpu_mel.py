@@ -37,9 +37,7 @@ class AudioFrontend:
             or self.hann_window.device != device
             or self.hann_window.dtype != dtype
         ):
-            self.hann_window = torch.hann_window(
-                self.n_fft, device=device, dtype=dtype
-            )
+            self.hann_window = torch.hann_window(self.n_fft, device=device, dtype=dtype)
 
 
 def bind_audio_frontend(model: Any, extractor: Any) -> AudioFrontend:

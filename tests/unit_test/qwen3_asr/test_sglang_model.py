@@ -201,8 +201,9 @@ def test_get_audio_feature_normalizes_cpu_masks_for_cuda_features() -> None:
 
 
 def test_get_audio_feature_runs_gpu_mel_from_waveform() -> None:
-    from sglang_omni.models.qwen3_asr.gpu_mel import bind_audio_frontend
     from transformers import WhisperFeatureExtractor
+
+    from sglang_omni.models.qwen3_asr.gpu_mel import bind_audio_frontend
 
     extractor = WhisperFeatureExtractor(
         feature_size=128,

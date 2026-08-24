@@ -171,9 +171,11 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
     def _item_feature_and_mask(
         self, item: MultimodalDataItem, device: torch.device
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        extra = item.model_specific_data if isinstance(
-            getattr(item, "model_specific_data", None), dict
-        ) else None
+        extra = (
+            item.model_specific_data
+            if isinstance(getattr(item, "model_specific_data", None), dict)
+            else None
+        )
         waveform = extra.get("waveform") if extra else None
         if waveform is None:
             waveform = getattr(item, "waveform", None)

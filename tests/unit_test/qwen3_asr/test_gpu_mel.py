@@ -25,7 +25,9 @@ def _extractor() -> WhisperFeatureExtractor:
     )
 
 
-def _reference_mel(extractor: WhisperFeatureExtractor, audio: np.ndarray) -> torch.Tensor:
+def _reference_mel(
+    extractor: WhisperFeatureExtractor, audio: np.ndarray
+) -> torch.Tensor:
     extracted = extractor(
         audio,
         sampling_rate=16000,
@@ -62,9 +64,7 @@ def test_gpu_mel_matches_cpu_on_cuda() -> None:
     model = type("M", (), {})()
     bind_audio_frontend(model, extractor)
     cpu = log_mel_spectrogram(torch.from_numpy(audio), model._audio_frontend)
-    gpu = log_mel_spectrogram(
-        torch.from_numpy(audio).cuda(), model._audio_frontend
-    )
+    gpu = log_mel_spectrogram(torch.from_numpy(audio).cuda(), model._audio_frontend)
     assert torch.allclose(cpu, gpu.cpu(), atol=1e-4, rtol=1e-4)
 
 
