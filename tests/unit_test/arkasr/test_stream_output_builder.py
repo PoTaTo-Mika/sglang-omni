@@ -7,9 +7,7 @@ from typing import Any
 
 import pytest
 
-from sglang_omni.models.arkasr.request_builders import (
-    make_arkasr_stream_output_builder,
-)
+from sglang_omni.models.arkasr.request_builders import make_arkasr_stream_output_builder
 from sglang_omni.proto import OmniRequest, StagePayload
 
 _EOS = 999
