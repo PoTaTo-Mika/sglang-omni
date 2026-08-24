@@ -68,7 +68,7 @@ def bind_audio_frontend(model: Any, extractor: Any) -> AudioFrontend:
     try:
         device = next(model.parameters()).device
     except (StopIteration, AttributeError):
-        device = mel_filters.device
+        pass
     else:
         mel_filters = mel_filters.to(device)
     frontend = AudioFrontend(
