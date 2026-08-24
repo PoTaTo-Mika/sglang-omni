@@ -3618,9 +3618,20 @@ _ASR_BOUNDARY = "omni-test-boundary"
 
 
 def _speech_to_text_multipart(
-    model: str | None, *, model_first: bool = True
+    model: str | None,
+    *,
+    model_first: bool = True,
+    stream: str | None = None,
 ) -> tuple[bytes, dict[str, str]]:
     """Build a raw multipart body so tests control the field order."""
+
+    def _field(name: str, value: str) -> bytes:
+        return (
+            f"--{_ASR_BOUNDARY}\r\n"
+            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+            f"{value}\r\n"
+        ).encode()
+
     file_part = (
         f"--{_ASR_BOUNDARY}\r\n"
         'Content-Disposition: form-data; name="file"; filename="a.wav"\r\n'
@@ -3628,12 +3639,10 @@ def _speech_to_text_multipart(
     ).encode() + b"RIFF....WAVE\r\n"
     parts = [file_part]
     if model is not None:
-        model_part = (
-            f"--{_ASR_BOUNDARY}\r\n"
-            'Content-Disposition: form-data; name="model"\r\n\r\n'
-            f"{model}\r\n"
-        ).encode()
+        model_part = _field("model", model)
         parts = [model_part, file_part] if model_first else [file_part, model_part]
+    if stream is not None:
+        parts.append(_field("stream", stream))
     body = b"".join(parts) + f"--{_ASR_BOUNDARY}--\r\n".encode()
     headers = {"content-type": f"multipart/form-data; boundary={_ASR_BOUNDARY}"}
     return body, headers
@@ -3712,6 +3721,51 @@ def test_multipart_body_router_cannot_parse_falls_back_to_route_header() -> None
 
     assert response.status_code == 200, response.text
     assert seen_workers == ["whisper:8102"]
+
+
+def test_multipart_form_stream_requires_streaming_capability() -> None:
+    seen_workers: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "healthy"}, request=request)
+        seen_workers.append(_request_netloc(request))
+        return httpx.Response(200, json={"text": "hi"}, request=request)
+
+    worker_configs = [
+        WorkerConfig(url="http://batch-asr:8101", capabilities={"audio_input"}),
+        WorkerConfig(
+            url="http://sse-asr:8102", capabilities={"audio_input", "streaming"}
+        ),
+    ]
+    app = create_app(
+        _router_config(worker_configs=worker_configs),
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    body, headers = _speech_to_text_multipart("whisper", stream="true")
+
+    with TestClient(app) as client:
+        for _ in range(4):
+            response = client.post(
+                "/v1/audio/translations", content=body, headers=headers
+            )
+            assert response.status_code == 200, response.text
+
+    assert seen_workers == ["sse-asr:8102"] * 4
+
+
+def test_multipart_form_stream_conflicting_route_header_is_rejected() -> None:
+    seen_workers: list[str] = []
+    app = _mixed_asr_pool_app(seen_workers)
+    body, headers = _speech_to_text_multipart("whisper", stream="true")
+    headers["x-sglang-omni-route-stream"] = "false"
+
+    with TestClient(app) as client:
+        response = client.post("/v1/audio/translations", content=body, headers=headers)
+
+    assert response.status_code == 400, response.text
+    assert "conflicts with the multipart form stream" in response.text
+    assert seen_workers == []
 
 
 def test_worker_crud_stays_unauthenticated_even_with_admin_key() -> None:
