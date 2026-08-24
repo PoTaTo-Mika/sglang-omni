@@ -158,7 +158,8 @@ tests/
     │   └── test_streaming_client.py
     ├── arkasr/
     │   ├── test_encoder_service.py
-    │   └── test_pipeline.py
+    │   ├── test_pipeline.py
+    │   └── test_stream_output_builder.py
     ├── moss_transcribe_diarize/
     │   ├── test_encoder_cache.py
     │   ├── test_encoder_service.py
@@ -504,6 +505,8 @@ that happened to contain an older version of the test.
     capture, async-decode default, and `--decode-mode async|sync` CLI overrides
   - audio-token count formula, audio-tower forward shape, marker-token
     suppression, and the fp16 encoder residual clamp.
+  - streaming output: request-contract validation, chunked-prefill gating,
+    rate-limited and terminal flushes, UTF-8 boundaries, and per-request state.
 - `unit_test/fun_asr/`: Fun-ASR-Nano unit tests:
   - pipeline config and stage factory: single `asr` stage, `max_running_requests=32`,
     auto static KV budget, pre-LM encoder/cache defaults, scheduler-owned
