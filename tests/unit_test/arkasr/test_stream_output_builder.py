@@ -194,9 +194,7 @@ def test_concatenated_deltas_strip_matches_result_adapter_text() -> None:
         def get_added_vocab(self):
             return {"<tool_call>": 3}
 
-    tokenizer = _Tok(
-        {1: b" hello", 2: b" world ", 3: b"<tool_call>", _EOS: b"<eos>"}
-    )
+    tokenizer = _Tok({1: b" hello", 2: b" world ", 3: b"<tool_call>", _EOS: b"<eos>"})
     _, result_adapter = make_arkasr_scheduler_adapters(
         tokenizer=tokenizer,
         max_new_tokens=16,
