@@ -135,6 +135,12 @@ by one `transcript.text.done` event with the complete post-processed
 transcript, then `data: [DONE]`. Streaming primarily reduces time to first
 text; it does not change the final transcript.
 
+Treat `transcript.text.done` as the authoritative transcript: it is the same
+post-processed string as the non-stream `text` field. Incremental
+`transcript.text.delta` events are a live preview. Concatenating them may
+differ from `done` by leading or trailing whitespace (the final adapter
+`.strip()`s the full decode). Persist `done.text`, not `"".join(deltas)`.
+
 ## Request Parameters
 
 | Parameter | Type | Default | Description |

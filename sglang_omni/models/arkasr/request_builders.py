@@ -280,6 +280,10 @@ def make_arkasr_stream_output_builder(
     def _decode_stream_ids(ids: list[int]) -> str:
         if suppressed:
             ids = [tid for tid in ids if tid not in suppressed]
+        # note (guozhihao): do not strip each delta; that would eat spaces
+        # between words. result_adapter strips the full transcript, so
+        # transcript.text.done is authoritative and
+        # "".join(deltas).strip() equals that final text.
         return _decode_token_ids(tokenizer, ids, skip_special_tokens=True)
 
     return make_token_text_stream_output_builder(

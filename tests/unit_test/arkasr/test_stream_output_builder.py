@@ -7,7 +7,10 @@ from typing import Any
 
 import pytest
 
-from sglang_omni.models.arkasr.request_builders import make_arkasr_stream_output_builder
+from sglang_omni.models.arkasr.request_builders import (
+    make_arkasr_scheduler_adapters,
+    make_arkasr_stream_output_builder,
+)
 from sglang_omni.proto import OmniRequest, StagePayload
 
 _EOS = 999
@@ -178,3 +181,46 @@ def test_suppressed_marker_tokens_do_not_appear_in_deltas() -> None:
     assert [m.data["text"] for m in builder("r", rd, _make_req_output(1))] == ["hello"]
     assert builder("r", rd, _make_req_output(2)) == []
     assert builder("r", rd, _make_req_output(3)) == []
+
+
+def test_concatenated_deltas_strip_matches_result_adapter_text() -> None:
+    """done.text is authoritative; join(deltas) may differ only by strip()."""
+
+    class _Tok(_ByteTokenizer):
+        vocab_size = 1000
+        all_special_ids = [_EOS]
+        eos_token_id = _EOS
+
+        def get_added_vocab(self):
+            return {"<tool_call>": 3}
+
+    tokenizer = _Tok(
+        {1: b" hello", 2: b" world ", 3: b"<tool_call>", _EOS: b"<eos>"}
+    )
+    _, result_adapter = make_arkasr_scheduler_adapters(
+        tokenizer=tokenizer,
+        max_new_tokens=16,
+        feature_extractor=object(),
+    )
+    builder = make_arkasr_stream_output_builder(tokenizer)
+    rd = _make_req_data()
+
+    deltas: list[str] = []
+    for token_id in (1, 3, 2, _EOS):
+        deltas.extend(
+            m.data["text"] for m in builder("r", rd, _make_req_output(token_id))
+        )
+
+    done = result_adapter(
+        SimpleNamespace(
+            stage_payload=rd.stage_payload,
+            output_ids=[1, 3, 2],
+            engine_start_s=None,
+            language="en",
+            audio_duration_s=0.0,
+        )
+    )
+    joined = "".join(deltas)
+    assert joined == " hello world "
+    assert joined != done.data["text"]
+    assert joined.strip() == done.data["text"] == "hello world"
