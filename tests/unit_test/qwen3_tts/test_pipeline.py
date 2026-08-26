@@ -272,6 +272,7 @@ def test_qwen3_tts_deterministic_inference_configures_pipeline() -> None:
     assert tts_engine["server_args_overrides"]["enable_deterministic_inference"]
     assert vocoder["enable_deterministic_inference"]
     assert vocoder["initial_cuda_graph"] is False
+    assert vocoder["followup_cuda_graph"] is False
 
 
 @pytest.mark.parametrize(
@@ -1444,6 +1445,16 @@ class _FakeCudaEvent:
             raise self.sync_error
 
 
+class _FakeCudaGraph:
+    """Stand-in for torch.cuda.CUDAGraph that counts replays."""
+
+    def __init__(self) -> None:
+        self.replays = 0
+
+    def replay(self) -> None:
+        self.replays += 1
+
+
 def _fake_allocate_pinned(numel: int, dtype: torch.dtype) -> torch.Tensor:
     # Mirror the real allocator: an ordinary (non-inference) tensor even when
     # the slot grows under torch.inference_mode(), just not pinned.
@@ -1533,6 +1544,57 @@ def test_qwen3_tts_decode_graphs_key_by_frames_and_batch_bucket() -> None:
     assert graphs._batch_sizes == (1, 4)
     graphs.capture()
     assert graphs.decode(torch.zeros((1, 2, 24), dtype=torch.long)) is None
+
+
+def test_qwen3_tts_decode_graphs_replay_pads_batch_and_slices_output() -> None:
+    decoder = _FakeQwen3TTSDecoder()
+    graphs = _Qwen3TTSInitialDecodeGraphs(
+        decoder,
+        device=torch.device("cpu"),
+        num_quantizers=2,
+        input_frames=(24, 32),
+        batch_sizes=(1, 4),
+    )
+    for frames, batch in ((24, 1), (24, 4), (32, 1)):
+        graphs._graphs[(frames, batch)] = _FakeCudaGraph()
+        graphs._inputs[(frames, batch)] = torch.full(
+            (batch, 2, frames), -1, dtype=torch.long
+        )
+        graphs._outputs[(frames, batch)] = torch.arange(
+            batch * frames * 4, dtype=torch.float32
+        ).view(batch, 1, frames * 4)
+
+    codes = torch.arange(3 * 2 * 24, dtype=torch.long).view(3, 2, 24) + 1
+    waveform = graphs.decode(codes)
+
+    assert graphs._graphs[(24, 4)].replays == 1
+    assert graphs._graphs[(24, 1)].replays == 0
+    assert graphs._graphs[(32, 1)].replays == 0
+    static_input = graphs._inputs[(24, 4)]
+    assert torch.equal(static_input[:3], codes)
+    assert torch.equal(static_input[3], torch.zeros((2, 24), dtype=torch.long))
+    assert waveform is not None
+    assert waveform.shape == (3, 1, 96)
+    assert torch.equal(waveform, graphs._outputs[(24, 4)][:3])
+    assert (
+        waveform.untyped_storage().data_ptr()
+        != graphs._outputs[(24, 4)].untyped_storage().data_ptr()
+    )
+
+    waveform = graphs.decode(torch.ones((1, 2, 32), dtype=torch.long))
+    assert waveform is not None
+    assert waveform.shape == (1, 1, 128)
+    assert graphs._graphs[(32, 1)].replays == 1
+    assert graphs._graphs[(24, 4)].replays == 1
+
+    assert graphs.decode(torch.zeros((3, 2, 32), dtype=torch.long)) is None
+    assert graphs.decode(torch.zeros((5, 2, 24), dtype=torch.long)) is None
+    assert graphs.decode(torch.zeros((1, 2, 20), dtype=torch.long)) is None
+    assert graphs.decode(torch.zeros((1, 3, 24), dtype=torch.long)) is None
+    assert graphs.decode(torch.zeros((2, 24), dtype=torch.long)) is None
+    assert graphs._graphs[(24, 4)].replays == 1
+    assert graphs._graphs[(32, 1)].replays == 1
+    assert decoder.decode_inputs == []
 
 
 def test_qwen3_tts_streaming_vocoder_followup_graphs_can_be_disabled() -> None:

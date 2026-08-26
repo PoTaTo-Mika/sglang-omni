@@ -286,6 +286,7 @@ class _Qwen3TTSInitialDecodeGraphs:
                     dtype=torch.long,
                     device=self._device,
                 )
+                capture_stream.wait_stream(torch.cuda.current_stream(self._device))
                 with torch.inference_mode(), torch.cuda.stream(capture_stream):
                     for _ in range(2):
                         self._decoder(static_input)
