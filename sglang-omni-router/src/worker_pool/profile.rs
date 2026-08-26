@@ -20,6 +20,8 @@ pub(crate) enum ServiceClass {
     SpeechHttp,
     SpeechBatch,
     TranscriptionHttp,
+    SpeechWebsocket,
+    RealtimeWebsocket,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -28,7 +30,11 @@ pub(crate) enum CapacityClass {
     SpeechHttp,
     SpeechBatch,
     TranscriptionHttp,
+    SpeechWebsocket,
+    RealtimeWebsocket,
 }
+
+pub(super) const CAPACITY_CLASS_COUNT: usize = 6;
 
 impl CapacityClass {
     pub(super) const fn index(self) -> usize {
@@ -37,6 +43,8 @@ impl CapacityClass {
             Self::SpeechHttp => 1,
             Self::SpeechBatch => 2,
             Self::TranscriptionHttp => 3,
+            Self::SpeechWebsocket => 4,
+            Self::RealtimeWebsocket => 5,
         }
     }
 }
@@ -48,6 +56,8 @@ impl ServiceClass {
             Self::SpeechHttp => CapacityClass::SpeechHttp,
             Self::SpeechBatch => CapacityClass::SpeechBatch,
             Self::TranscriptionHttp => CapacityClass::TranscriptionHttp,
+            Self::SpeechWebsocket => CapacityClass::SpeechWebsocket,
+            Self::RealtimeWebsocket => CapacityClass::RealtimeWebsocket,
         }
     }
 }
@@ -108,6 +118,8 @@ pub(crate) struct WorkerCapacityConfig {
     pub(crate) speech_http: Option<u32>,
     pub(crate) speech_batch: Option<u32>,
     pub(crate) transcription_http: Option<u32>,
+    pub(crate) speech_websocket: Option<u32>,
+    pub(crate) realtime_websocket: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq)]
@@ -221,6 +233,12 @@ pub(crate) enum MediaProfile {
     AudioVideo,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RealtimeProtocol {
+    OpenaiRealtimeV1,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(tag = "service", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ServiceProfile {
@@ -256,6 +274,17 @@ pub(crate) enum ServiceProfile {
         response_formats: Vec<TranscriptionResponseFormat>,
         media_profiles: Vec<MediaProfile>,
         stream_modes: Vec<StreamMode>,
+    },
+    SpeechWebsocket {
+        model_ids: Vec<String>,
+        response_formats: Vec<SpeechResponseFormat>,
+        stream_modes: Vec<StreamMode>,
+        tasks: Vec<SpeechTask>,
+        reference_forms: Vec<ReferenceForm>,
+        managed_voice: bool,
+    },
+    RealtimeWebsocket {
+        protocols: Vec<RealtimeProtocol>,
     },
 }
 
@@ -299,6 +328,18 @@ pub(crate) enum ProfileRequirement {
         response_format: TranscriptionResponseFormat,
         media_profile: MediaProfile,
         stream_mode: StreamMode,
+    },
+    SpeechWebsocket {
+        model: ModelSelection,
+        response_format: SpeechResponseFormat,
+        stream_mode: StreamMode,
+        task: SpeechTask,
+        reference_forms: Vec<ReferenceForm>,
+        managed_voice: bool,
+    },
+    RealtimeWebsocket {
+        protocol: RealtimeProtocol,
+        expected_default_model_id: String,
     },
 }
 
@@ -355,6 +396,8 @@ impl ProfileRequirement {
             Self::SpeechHttp { .. } => ServiceClass::SpeechHttp,
             Self::SpeechBatch { .. } => ServiceClass::SpeechBatch,
             Self::TranscriptionHttp { .. } => ServiceClass::TranscriptionHttp,
+            Self::SpeechWebsocket { .. } => ServiceClass::SpeechWebsocket,
+            Self::RealtimeWebsocket { .. } => ServiceClass::RealtimeWebsocket,
         }
     }
 }
@@ -382,6 +425,11 @@ impl ProfileRequirement {
                 model,
                 reference_forms,
                 ..
+            }
+            | Self::SpeechWebsocket {
+                model,
+                reference_forms,
+                ..
             } => valid_model_id(model.model_id()) && valid_requirement_set(reference_forms, false),
             Self::SpeechBatch {
                 models,
@@ -401,6 +449,10 @@ impl ProfileRequirement {
                     && valid_requirement_set(effective_features, true)
             }
             Self::TranscriptionHttp { model, .. } => valid_model_id(model.model_id()),
+            Self::RealtimeWebsocket {
+                expected_default_model_id,
+                ..
+            } => valid_model_id(expected_default_model_id),
         }
     }
 }
@@ -549,6 +601,41 @@ impl ServiceProfile {
                 }
                 Ok(())
             }
+            Self::SpeechWebsocket {
+                model_ids,
+                response_formats,
+                stream_modes,
+                tasks,
+                reference_forms,
+                ..
+            } => {
+                validate_models(model_ids)?;
+                validate_set(
+                    response_formats,
+                    "workers.service_profiles.response_formats",
+                    false,
+                )?;
+                validate_set(stream_modes, "workers.service_profiles.stream_modes", false)?;
+                validate_set(tasks, "workers.service_profiles.tasks", false)?;
+                validate_set(
+                    reference_forms,
+                    "workers.service_profiles.reference_forms",
+                    false,
+                )?;
+                if stream_modes.contains(&StreamMode::Streaming)
+                    && (response_formats.len() != 1
+                        || response_formats[0] != SpeechResponseFormat::Pcm)
+                {
+                    return Err(ConfigError::invalid(
+                        "workers.service_profiles.response_formats",
+                        "a streaming speech row may contain only pcm",
+                    ));
+                }
+                Ok(())
+            }
+            Self::RealtimeWebsocket { protocols } => {
+                validate_set(protocols, "workers.service_profiles.protocols", false)
+            }
         }
     }
 
@@ -651,6 +738,35 @@ impl ServiceProfile {
                     stream_modes: bsm,
                 },
             ) => at == bt && set_eq(am, bm) && set_eq(af, bf) && set_eq(ap, bp) && set_eq(asm, bsm),
+            (
+                Self::SpeechWebsocket {
+                    model_ids: am,
+                    response_formats: af,
+                    stream_modes: asm,
+                    tasks: at,
+                    reference_forms: ar,
+                    managed_voice: av,
+                },
+                Self::SpeechWebsocket {
+                    model_ids: bm,
+                    response_formats: bf,
+                    stream_modes: bsm,
+                    tasks: bt,
+                    reference_forms: br,
+                    managed_voice: bv,
+                },
+            ) => {
+                av == bv
+                    && set_eq(am, bm)
+                    && set_eq(af, bf)
+                    && set_eq(asm, bsm)
+                    && set_eq(at, bt)
+                    && set_eq(ar, br)
+            }
+            (
+                Self::RealtimeWebsocket { protocols: a },
+                Self::RealtimeWebsocket { protocols: b },
+            ) => set_eq(a, b),
             _ => false,
         }
     }
@@ -777,6 +893,45 @@ impl ServiceProfile {
                     && media_profiles.contains(media_profile)
                     && stream_modes.contains(stream_mode)
             }
+            (
+                Self::SpeechWebsocket {
+                    model_ids,
+                    response_formats,
+                    stream_modes,
+                    tasks,
+                    reference_forms,
+                    managed_voice,
+                },
+                ProfileRequirement::SpeechWebsocket {
+                    model,
+                    response_format,
+                    stream_mode,
+                    task,
+                    reference_forms: required_references,
+                    managed_voice: required_voice,
+                },
+            ) => {
+                model.matches_worker_default(worker_default)
+                    && model_ids
+                        .iter()
+                        .any(|candidate| candidate == model.model_id())
+                    && response_formats.contains(response_format)
+                    && stream_modes.contains(stream_mode)
+                    && tasks.contains(task)
+                    && contains_all(reference_forms, required_references)
+                    && managed_voice == required_voice
+            }
+            (
+                Self::RealtimeWebsocket { protocols },
+                ProfileRequirement::RealtimeWebsocket {
+                    protocol,
+                    expected_default_model_id,
+                },
+            ) => {
+                valid_model_id(expected_default_model_id)
+                    && worker_default == Some(expected_default_model_id.as_str())
+                    && protocols.contains(protocol)
+            }
             _ => false,
         }
     }
@@ -786,9 +941,9 @@ impl ServiceProfile {
             Self::GenerationHttp { model_ids, .. }
             | Self::SpeechHttp { model_ids, .. }
             | Self::SpeechBatch { model_ids, .. }
-            | Self::TranscriptionHttp { model_ids, .. } => {
-                model_ids.iter().any(|item| item == model)
-            }
+            | Self::TranscriptionHttp { model_ids, .. }
+            | Self::SpeechWebsocket { model_ids, .. } => model_ids.iter().any(|item| item == model),
+            Self::RealtimeWebsocket { .. } => true,
         }
     }
 
@@ -798,6 +953,8 @@ impl ServiceProfile {
             Self::SpeechHttp { .. } => ServiceClass::SpeechHttp,
             Self::SpeechBatch { .. } => ServiceClass::SpeechBatch,
             Self::TranscriptionHttp { .. } => ServiceClass::TranscriptionHttp,
+            Self::SpeechWebsocket { .. } => ServiceClass::SpeechWebsocket,
+            Self::RealtimeWebsocket { .. } => ServiceClass::RealtimeWebsocket,
         }
     }
 }
@@ -873,6 +1030,14 @@ pub(crate) fn validate_workers(workers: &[WorkerConfig]) -> Result<(), ConfigErr
                 "workers.capacity.transcription_http",
                 worker.capacity.transcription_http,
             ),
+            (
+                "workers.capacity.speech_websocket",
+                worker.capacity.speech_websocket,
+            ),
+            (
+                "workers.capacity.realtime_websocket",
+                worker.capacity.realtime_websocket,
+            ),
         ] {
             if value.is_some_and(|limit| limit == 0 || limit > 65_535) {
                 return Err(ConfigError::invalid(field, "must be between 1 and 65535"));
@@ -906,6 +1071,8 @@ pub(crate) fn validate_workers(workers: &[WorkerConfig]) -> Result<(), ConfigErr
                 CapacityClass::SpeechHttp => worker.capacity.speech_http,
                 CapacityClass::SpeechBatch => worker.capacity.speech_batch,
                 CapacityClass::TranscriptionHttp => worker.capacity.transcription_http,
+                CapacityClass::SpeechWebsocket => worker.capacity.speech_websocket,
+                CapacityClass::RealtimeWebsocket => worker.capacity.realtime_websocket,
             };
             if configured.is_none() {
                 return Err(ConfigError::invalid(
@@ -921,6 +1088,17 @@ pub(crate) fn validate_workers(workers: &[WorkerConfig]) -> Result<(), ConfigErr
                     "must not exceed workers.capacity.speech_batch",
                 ));
             }
+        }
+        if worker
+            .service_profiles
+            .iter()
+            .any(|profile| matches!(profile, ServiceProfile::RealtimeWebsocket { .. }))
+            && worker.default_model_id.is_none()
+        {
+            return Err(ConfigError::invalid(
+                "workers.default_model_id",
+                "is required for realtime WebSocket workers",
+            ));
         }
         if let Some(default) = worker.default_model_id.as_deref() {
             for advertised in &worker.service_profiles {
@@ -1023,7 +1201,7 @@ fn validate_identifier(value: &str, field: &'static str) -> Result<(), ConfigErr
     Ok(())
 }
 
-fn valid_model_id(value: &str) -> bool {
+pub(crate) fn valid_model_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= MAX_MODEL_ID_BYTES && !value.chars().any(char::is_control)
 }
 
@@ -1061,6 +1239,8 @@ mod tests {
                 speech_http: None,
                 speech_batch: None,
                 transcription_http: None,
+                speech_websocket: None,
+                realtime_websocket: None,
             },
             service_profiles: vec![profile("omni")],
         }
@@ -1115,6 +1295,24 @@ mod tests {
         assert!(speech(vec![SpeechResponseFormat::Pcm]).validate().is_ok());
         assert!(
             speech(vec![SpeechResponseFormat::Pcm, SpeechResponseFormat::Wav])
+                .validate()
+                .is_err()
+        );
+        let websocket = |response_formats| ServiceProfile::SpeechWebsocket {
+            model_ids: vec![String::from("tts")],
+            response_formats,
+            stream_modes: vec![StreamMode::NonStreaming, StreamMode::Streaming],
+            tasks: vec![SpeechTask::TextToSpeech],
+            reference_forms: vec![ReferenceForm::None],
+            managed_voice: false,
+        };
+        assert!(
+            websocket(vec![SpeechResponseFormat::Pcm])
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            websocket(vec![SpeechResponseFormat::Pcm, SpeechResponseFormat::Wav])
                 .validate()
                 .is_err()
         );
@@ -1233,6 +1431,8 @@ mod tests {
                 speech_http: None,
                 speech_batch: None,
                 transcription_http: Some(2),
+                speech_websocket: None,
+                realtime_websocket: None,
             },
             service_profiles: vec![profile(SpeechToTextTask::Transcribe)],
         };

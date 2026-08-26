@@ -3,6 +3,7 @@ use std::sync::{Arc, RwLock};
 use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use super::profile::CAPACITY_CLASS_COUNT;
 use super::{CapacityClass, ResolvedTarget, WorkerRecord};
 
 /// One read/write gate linearizes fail-fast admission and exact reservation
@@ -100,11 +101,15 @@ impl RequestLease {
 pub(super) struct AdmissionController {
     gate: Arc<RwLock<Gate>>,
     global: Arc<Semaphore>,
-    classes: [Option<Arc<Semaphore>>; 4],
+    classes: [Option<Arc<Semaphore>>; CAPACITY_CLASS_COUNT],
 }
 
 impl AdmissionController {
-    pub(super) fn new(gate: Arc<RwLock<Gate>>, global: usize, limits: [Option<usize>; 4]) -> Self {
+    pub(super) fn new(
+        gate: Arc<RwLock<Gate>>,
+        global: usize,
+        limits: [Option<usize>; CAPACITY_CLASS_COUNT],
+    ) -> Self {
         Self {
             gate,
             global: Arc::new(Semaphore::new(global)),
@@ -168,7 +173,7 @@ impl AdmissionController {
     }
 
     #[cfg(test)]
-    pub(super) fn available(&self) -> (usize, [Option<usize>; 4]) {
+    pub(super) fn available(&self) -> (usize, [Option<usize>; CAPACITY_CLASS_COUNT]) {
         let classes = std::array::from_fn(|index| {
             self.classes[index]
                 .as_ref()

@@ -45,7 +45,7 @@ impl ResolvedTarget {
         )
     }
 
-    pub(super) fn from_parts(
+    pub(crate) fn from_parts(
         base_url: &str,
         health_path: &str,
         resolved_ip: Option<IpAddr>,
@@ -102,6 +102,20 @@ impl ResolvedTarget {
 
     pub(crate) fn socket_addr(&self) -> SocketAddr {
         self.socket_addr
+    }
+
+    /// Builds a WebSocket endpoint while retaining the configured authority.
+    pub(crate) fn websocket_uri(&self, path: &str, query: Option<&str>) -> Option<Url> {
+        let mut url = self.base_url.clone();
+        url.set_scheme(match self.base_url.scheme() {
+            "http" => "ws",
+            "https" => "wss",
+            _ => return None,
+        })
+        .ok()?;
+        url.set_path(path);
+        url.set_query(query);
+        Some(url)
     }
 
     fn canonical_hostname(&self) -> Option<&str> {

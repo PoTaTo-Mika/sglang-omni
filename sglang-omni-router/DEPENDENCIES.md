@@ -1,6 +1,6 @@
 # Direct dependency decisions
 
-The entries below record five packages used directly by the transport and
+The entries below record seven packages used directly by the transport and
 classification layers. Versions are exact and the lockfile remains
 authoritative.
 
@@ -46,8 +46,8 @@ becomes `Sync` or Reqwest no longer requires this boundary.
 
 ## `serde_json` 1.0.150
 
-Purpose and semantic owner: `http_generation::classify` performs one bounded
-Serde pass only when the startup manifest cannot prove content-blind routing.
+Purpose and semantic owner: HTTP and WebSocket classifiers perform one bounded
+Serde pass only when request content determines routing.
 The standard library and TOML parser cannot classify JSON request facts.
 Defaults are disabled and only `std` is enabled. Classification runs in a
 bounded blocking slot and is absent from the homogeneous hot path. The crate
@@ -55,6 +55,27 @@ is MIT OR Apache-2.0, from crates.io, already present in the selected ecosystem,
 and adds no runtime, TLS stack, native code, or build script. Remove it only if
 the heterogeneous JSON route is removed or an equivalent bounded parser owns
 the complete classification contract.
+
+## `tokio-tungstenite` 0.29.0
+
+Purpose and semantic owner: `websocket::upstream` performs one pinned
+TCP/rustls WebSocket handshake while preserving the configured authority for
+Host, certificate identity, and SNI. Defaults are disabled; only WebPKI rustls
+TLS is enabled, so it shares the existing rustls stack and introduces no native
+TLS, resolver, proxy, retry, or second runtime. `websocket::session` owns the
+resulting stream until terminal cleanup. The crate is MIT licensed and from
+crates.io. Remove it if the terminating WebSocket routes are removed or an
+equivalent reviewed protocol implementation owns the full handshake and frame
+contract.
+
+## `futures-util` 0.3.32
+
+Purpose and semantic owner: `websocket::session` splits each socket into
+borrowing stream/sink halves and awaits every destination send directly. Only
+`sink` and `std` are enabled. It adds no runtime, TLS stack, native code,
+resolver, or application channel and is already part of the Axum ecosystem.
+The crate is MIT OR Apache-2.0 and from crates.io. Remove it when the WebSocket
+libraries expose equivalent borrowing stream/sink operations directly.
 
 Run `cargo tree --locked --duplicates` after every dependency change. No direct
 dependency is accepted for future-only use.
