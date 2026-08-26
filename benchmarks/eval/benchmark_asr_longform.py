@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
+# Author:
+# Yuhao Chen: https://github.com/AkazaAkane
 """ASR concurrency benchmark on registered long-form English datasets.
 
 The registered workloads are the 30 s and 60 s LongLibriHeavy test splits and
 the complete Meanwhile test split. Audio is normalized to mono 16 kHz PCM WAV
 before the timed sweep, then sent through the same request, WER, performance,
-resource-monitoring, and reporting path as ``benchmark_asr_seedtts``.
+resource-monitoring, and reporting path as benchmark_asr_seedtts.
 
 Usage:
 
@@ -23,9 +25,9 @@ Usage:
         --dataset meanwhile --port 8000 \
         --concurrencies 1,8,32 --repeats 3 --warmup
 
-``--stream`` still uploads each complete file; it does not simulate real-time
+--stream still uploads each complete file; it does not simulate real-time
 audio arrival. The dataset is English only, so WER uses the Whisper English
-normalizer and the request language is fixed to ``en``.
+normalizer and the request language is fixed to en.
 """
 
 from __future__ import annotations
