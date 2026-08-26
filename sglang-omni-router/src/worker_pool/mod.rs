@@ -9,7 +9,7 @@ use std::sync::{Arc, RwLock};
 
 use tokio::sync::{Notify, Semaphore};
 
-use crate::config::{Config, RoutingStrategy};
+use crate::config::{Config, HttpMediaConfig, RoutingStrategy};
 
 pub(crate) use health::{HealthState, HealthSupervisor, HealthTaskError};
 pub(crate) use permit::{
@@ -97,6 +97,7 @@ impl WorkerRecord {
 /// deterministic policy state, and independently owned health.
 pub(crate) struct WorkerPool {
     records: Vec<Arc<WorkerRecord>>,
+    voice_owner: Option<Arc<WorkerRecord>>,
     gate: Arc<RwLock<Gate>>,
     admission: AdmissionController,
     selector: Selector,
@@ -166,8 +167,14 @@ impl WorkerPool {
             })
             .transpose()
             .map_err(crate::error::RouterError::GenerationClient)?;
-        let media_client = config
-            .http_media
+        let media_policy = config.http_media.clone().or_else(|| {
+            config
+                .router
+                .voice_owner_worker_id
+                .as_ref()
+                .map(|_| HttpMediaConfig::default())
+        });
+        let media_client = media_policy
             .as_ref()
             .map(|media| {
                 build_http_client(
@@ -197,6 +204,7 @@ impl WorkerPool {
                 admission_limit(config.admission.transcription_http)?,
                 admission_limit(config.admission.speech_websocket)?,
                 admission_limit(config.admission.realtime_websocket)?,
+                admission_limit(config.admission.control)?,
             ],
         );
         let mut records = Vec::with_capacity(config.workers.len());
@@ -214,10 +222,24 @@ impl WorkerPool {
                 immediate_probe: Notify::new(),
             }));
         }
+        let voice_owner = config
+            .router
+            .voice_owner_worker_id
+            .as_ref()
+            .map(|owner_id| {
+                records
+                    .iter()
+                    .find(|record| record.worker_id.as_str() == owner_id)
+                    .cloned()
+                    .ok_or(crate::error::RouterError::WorkerPoolInvariant)
+            })
+            .transpose()?;
         let homogeneous_generation_http = build_content_blind_generation_cohorts(&records);
-        let homogeneous_media_http = build_content_blind_media_cohorts(&records);
+        let homogeneous_media_http =
+            build_content_blind_media_cohorts(&records, voice_owner.as_ref());
         Ok(Self {
             records,
+            voice_owner,
             gate,
             admission,
             selector: Selector::new(config.router.strategy),
@@ -280,6 +302,15 @@ impl WorkerPool {
         if admission.class() != requirement.capacity_class() {
             return Err(DispatchError::Internal);
         }
+        if requirement.profile.requires_voice_owner()
+            && let Some(owner) = self.voice_owner.as_ref()
+        {
+            if &owner.trust_domain != requirement.trust_domain() || !owner.has_profile(requirement)
+            {
+                return Err(DispatchError::NoEligibleProfile);
+            }
+            return self.dispatch_owner(admission, owner);
+        }
         let class = admission.class();
         let credits = admission.credits();
         let profile_found = self
@@ -289,6 +320,43 @@ impl WorkerPool {
         self.dispatch_matching(admission, class, credits, profile_found, |record| {
             &record.trust_domain == requirement.trust_domain() && record.has_profile(requirement)
         })
+    }
+
+    pub(crate) fn voice_state_enabled(&self) -> bool {
+        self.voice_owner.is_some()
+    }
+
+    pub(crate) fn dispatch_voice_control(
+        &self,
+        admission: AdmissionLease,
+    ) -> Result<RequestLease, DispatchError> {
+        if admission.class() != CapacityClass::Control || admission.credits() != 1 {
+            return Err(DispatchError::Internal);
+        }
+        let owner = self.voice_owner.as_ref().ok_or(DispatchError::Internal)?;
+        self.dispatch_owner(admission, owner)
+    }
+
+    fn dispatch_owner(
+        &self,
+        admission: AdmissionLease,
+        owner: &Arc<WorkerRecord>,
+    ) -> Result<RequestLease, DispatchError> {
+        let class = admission.class();
+        let credits = admission.credits();
+        let gate = self.gate.read().map_err(|_| DispatchError::Internal)?;
+        if !gate.open {
+            return Err(DispatchError::Draining);
+        }
+        if !owner.available_for_dispatch() {
+            return Err(DispatchError::Unavailable);
+        }
+        let slot = owner.slot(class).ok_or(DispatchError::Internal)?;
+        let exact = Arc::clone(&slot.semaphore)
+            .try_acquire_many_owned(credits)
+            .map_err(|_| DispatchError::Overloaded)?;
+        drop(gate);
+        Ok(RequestLease::new(admission, exact, Arc::clone(owner)))
     }
 
     fn dispatch_matching(
@@ -521,6 +589,15 @@ impl WorkerPool {
         })
     }
 
+    pub(crate) fn voice_owner_ready(&self) -> bool {
+        let Some(owner) = self.voice_owner.as_ref() else {
+            return true;
+        };
+        self.gate
+            .read()
+            .is_ok_and(|gate| gate.open && owner.available_for_dispatch())
+    }
+
     pub(crate) fn service_ready(&self, trust: &TrustDomain, service: ServiceClass) -> bool {
         self.gate.read().is_ok_and(|gate| {
             gate.open
@@ -625,12 +702,18 @@ fn build_content_blind_generation_cohorts(
     result
 }
 
-fn build_content_blind_media_cohorts(records: &[Arc<WorkerRecord>]) -> Vec<HomogeneousMediaCohort> {
+fn build_content_blind_media_cohorts(
+    records: &[Arc<WorkerRecord>],
+    voice_owner: Option<&Arc<WorkerRecord>>,
+) -> Vec<HomogeneousMediaCohort> {
     let mut result = Vec::new();
     for record in records {
         for profile in &record.profiles {
             let service = profile.service_class();
-            if service == ServiceClass::GenerationHttp || service == ServiceClass::SpeechBatch {
+            if !matches!(
+                service,
+                ServiceClass::SpeechHttp | ServiceClass::TranscriptionHttp
+            ) {
                 continue;
             }
             let task = match profile {
@@ -667,6 +750,12 @@ fn build_content_blind_media_cohorts(records: &[Arc<WorkerRecord>]) -> Vec<Homog
             let Some(first) = members.first() else {
                 continue;
             };
+            if service == ServiceClass::SpeechHttp
+                && let Some(owner) = voice_owner
+                && !members.iter().all(|member| Arc::ptr_eq(member, owner))
+            {
+                continue;
+            }
             if first.default_model_id.is_some()
                 && members.iter().all(|candidate| {
                     candidate.default_model_id == first.default_model_id
@@ -724,6 +813,7 @@ fn build_capacity(
         config.transcription_http,
         config.speech_websocket,
         config.realtime_websocket,
+        config.control,
     ];
     let mut result: [Option<CapacitySlot>; CAPACITY_CLASS_COUNT] = std::array::from_fn(|_| None);
     for (index, value) in values.into_iter().enumerate() {
@@ -809,6 +899,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             ],
             health,
             disposition: AtomicU8::new(Disposition::Serving as u8),
@@ -836,13 +927,14 @@ mod tests {
         .expect("test client");
         WorkerPool {
             homogeneous_generation_http: build_content_blind_generation_cohorts(&records),
-            homogeneous_media_http: build_content_blind_media_cohorts(&records),
+            homogeneous_media_http: build_content_blind_media_cohorts(&records, None),
+            voice_owner: None,
             records,
             gate: Arc::clone(&gate),
             admission: AdmissionController::new(
                 gate,
                 admission,
-                [Some(admission), None, None, None, None, None],
+                [Some(admission), None, None, None, None, None, None],
             ),
             selector: Selector::new(strategy),
             health_client: client.clone(),
@@ -1125,7 +1217,7 @@ mod tests {
             .expect("dispatch");
         assert_eq!(
             pool.admission.available(),
-            (0, [Some(0), None, None, None, None, None])
+            (0, [Some(0), None, None, None, None, None, None])
         );
         assert_eq!(
             pool.records[0]
@@ -1138,7 +1230,7 @@ mod tests {
         drop(lease);
         assert_eq!(
             pool.admission.available(),
-            (1, [Some(1), None, None, None, None, None])
+            (1, [Some(1), None, None, None, None, None, None])
         );
         assert_eq!(
             pool.records[0]
@@ -1207,13 +1299,14 @@ mod tests {
         .expect("media client");
         WorkerPool {
             homogeneous_generation_http: build_content_blind_generation_cohorts(&records),
-            homogeneous_media_http: build_content_blind_media_cohorts(&records),
+            homogeneous_media_http: build_content_blind_media_cohorts(&records, None),
+            voice_owner: None,
             records,
             gate: Arc::clone(&gate),
             admission: AdmissionController::new(
                 gate,
                 8,
-                [Some(8), Some(8), Some(8), Some(8), None, None],
+                [Some(8), Some(8), Some(8), Some(8), None, None, None],
             ),
             selector: Selector::new(RoutingStrategy::RoundRobin),
             health_client: client.clone(),
@@ -1243,6 +1336,208 @@ mod tests {
             reference_forms: vec![ReferenceForm::None],
             managed_voice: false,
         }
+    }
+
+    fn voice_speech_record(ordinal: usize, managed_voice: bool) -> Arc<WorkerRecord> {
+        let health = HealthCell::unknown();
+        health.store(HealthState::Healthy);
+        let mut capacity = std::array::from_fn(|_| None);
+        for class in [
+            CapacityClass::SpeechHttp,
+            CapacityClass::SpeechBatch,
+            CapacityClass::SpeechWebsocket,
+            CapacityClass::Control,
+        ] {
+            capacity[class.index()] = Some(CapacitySlot {
+                limit: 1,
+                semaphore: Arc::new(Semaphore::new(1)),
+            });
+        }
+        Arc::new(WorkerRecord {
+            worker_id: WorkerId::new(format!("voice-{ordinal}")),
+            default_model_id: Some(String::from("tts")),
+            registration_id: RegistrationId::from_startup_ordinal(ordinal),
+            target: ResolvedTarget::from_parts(
+                &format!("http://127.0.0.1:{}/", 13_000 + ordinal),
+                "/health",
+                None,
+            )
+            .expect("voice target"),
+            trust_domain: TrustDomain::new(String::from("local")),
+            profiles: vec![
+                ServiceProfile::SpeechHttp {
+                    model_ids: vec![String::from("tts")],
+                    response_formats: vec![SpeechResponseFormat::Wav],
+                    stream_modes: vec![StreamMode::NonStreaming],
+                    tasks: vec![SpeechTask::TextToSpeech],
+                    reference_forms: vec![ReferenceForm::None],
+                    managed_voice,
+                },
+                ServiceProfile::SpeechBatch {
+                    model_ids: vec![String::from("tts")],
+                    response_formats: vec![SpeechResponseFormat::Wav],
+                    tasks: vec![SpeechTask::TextToSpeech],
+                    reference_forms: vec![ReferenceForm::None],
+                    managed_voice,
+                    max_batch_size: 1,
+                    effective_features: Vec::new(),
+                },
+                ServiceProfile::SpeechWebsocket {
+                    model_ids: vec![String::from("tts")],
+                    response_formats: vec![SpeechResponseFormat::Pcm],
+                    stream_modes: vec![StreamMode::NonStreaming],
+                    tasks: vec![SpeechTask::TextToSpeech],
+                    reference_forms: vec![ReferenceForm::None],
+                    managed_voice,
+                },
+                ServiceProfile::VoiceControl,
+            ],
+            capacity,
+            health,
+            disposition: AtomicU8::new(Disposition::Serving as u8),
+            immediate_probe: Notify::new(),
+        })
+    }
+
+    fn speech_requirement(managed_voice: bool) -> RouteRequirement {
+        RouteRequirement::new(
+            ProfileRequirement::SpeechHttp {
+                model: ModelSelection::Explicit(String::from("tts")),
+                response_format: SpeechResponseFormat::Wav,
+                stream_mode: StreamMode::NonStreaming,
+                task: SpeechTask::TextToSpeech,
+                reference_forms: vec![ReferenceForm::None],
+                managed_voice,
+            },
+            TrustDomain::new(String::from("local")),
+        )
+    }
+
+    fn batch_requirement(managed_voice: bool) -> RouteRequirement {
+        RouteRequirement::new(
+            ProfileRequirement::SpeechBatch {
+                models: vec![ModelSelection::Explicit(String::from("tts"))],
+                response_formats: vec![SpeechResponseFormat::Wav],
+                tasks: vec![SpeechTask::TextToSpeech],
+                reference_forms: vec![ReferenceForm::None],
+                managed_voice,
+                batch_size: 1,
+                effective_features: Vec::new(),
+            },
+            TrustDomain::new(String::from("local")),
+        )
+    }
+
+    fn speech_websocket_requirement(managed_voice: bool) -> RouteRequirement {
+        RouteRequirement::new(
+            ProfileRequirement::SpeechWebsocket {
+                model: ModelSelection::Explicit(String::from("tts")),
+                response_format: SpeechResponseFormat::Pcm,
+                stream_mode: StreamMode::NonStreaming,
+                task: SpeechTask::TextToSpeech,
+                reference_forms: vec![ReferenceForm::None],
+                managed_voice,
+            },
+            TrustDomain::new(String::from("local")),
+        )
+    }
+
+    #[test]
+    fn voice_owner_dispatch_is_exact_and_mixed_speech_requires_classification() {
+        for strategy in [RoutingStrategy::RoundRobin, RoutingStrategy::LeastRequests] {
+            let owner = voice_speech_record(0, true);
+            let non_owner = voice_speech_record(1, false);
+            let mut pool = media_pool(vec![Arc::clone(&owner), Arc::clone(&non_owner)]);
+            pool.selector = Selector::new(strategy);
+            pool.voice_owner = Some(Arc::clone(&owner));
+            pool.homogeneous_media_http =
+                build_content_blind_media_cohorts(&pool.records, pool.voice_owner.as_ref());
+            pool.admission = AdmissionController::new(
+                Arc::clone(&pool.gate),
+                8,
+                [None, Some(4), Some(4), None, Some(4), None, Some(4)],
+            );
+
+            assert!(pool.voice_owner_ready());
+            assert!(
+                pool.content_blind_media_http(
+                    &TrustDomain::new(String::from("local")),
+                    crate::config::HttpMediaRoute::Speech,
+                )
+                .is_none()
+            );
+            for (class, managed, stateless) in [
+                (
+                    CapacityClass::SpeechHttp,
+                    speech_requirement(true),
+                    speech_requirement(false),
+                ),
+                (
+                    CapacityClass::SpeechBatch,
+                    batch_requirement(true),
+                    batch_requirement(false),
+                ),
+                (
+                    CapacityClass::SpeechWebsocket,
+                    speech_websocket_requirement(true),
+                    speech_websocket_requirement(false),
+                ),
+            ] {
+                let managed = pool
+                    .dispatch(
+                        pool.try_admit(class, 1).expect("managed admission"),
+                        &managed,
+                    )
+                    .expect("managed dispatch");
+                assert_eq!(managed.registration_ordinal(), 0);
+                drop(managed);
+
+                let stateless = pool
+                    .dispatch(
+                        pool.try_admit(class, 1).expect("stateless admission"),
+                        &stateless,
+                    )
+                    .expect("stateless policy dispatch");
+                assert_eq!(stateless.registration_ordinal(), 1);
+                drop(stateless);
+            }
+
+            let control = pool
+                .dispatch_voice_control(
+                    pool.try_admit(CapacityClass::Control, 1)
+                        .expect("control admission"),
+                )
+                .expect("exact control dispatch");
+            assert_eq!(control.registration_ordinal(), 0);
+            drop(control);
+
+            owner.health.store(HealthState::Unhealthy);
+            assert!(!pool.voice_owner_ready());
+            assert_eq!(
+                pool.dispatch_voice_control(
+                    pool.try_admit(CapacityClass::Control, 1)
+                        .expect("unhealthy owner admission"),
+                )
+                .err(),
+                Some(DispatchError::Unavailable)
+            );
+        }
+    }
+
+    #[test]
+    fn owner_only_speech_keeps_content_blind_proof() {
+        let owner = voice_speech_record(0, true);
+        let mut pool = media_pool(vec![Arc::clone(&owner)]);
+        pool.voice_owner = Some(owner);
+        pool.homogeneous_media_http =
+            build_content_blind_media_cohorts(&pool.records, pool.voice_owner.as_ref());
+        assert!(
+            pool.content_blind_media_http(
+                &TrustDomain::new(String::from("local")),
+                crate::config::HttpMediaRoute::Speech,
+            )
+            .is_some()
+        );
     }
 
     #[test]

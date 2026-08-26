@@ -121,6 +121,34 @@ pub(super) fn validate_request(
     })
 }
 
+pub(super) fn validate_bodyless_request(headers: &HeaderMap) -> Result<(), HttpFault> {
+    let mut encodings = headers.get_all(CONTENT_ENCODING).iter();
+    let encoding = encodings.next();
+    if encodings.next().is_some()
+        || encoding.is_some_and(|value| {
+            !value
+                .to_str()
+                .is_ok_and(|text| text.eq_ignore_ascii_case("identity"))
+        })
+    {
+        return Err(HttpFault::UnsupportedContentEncoding);
+    }
+    if headers.contains_key(EXPECT) {
+        return Err(HttpFault::ExpectationFailed);
+    }
+    if headers.contains_key(TRAILER) || headers.contains_key(TRANSFER_ENCODING) {
+        return Err(HttpFault::MalformedRequest);
+    }
+    let mut lengths = headers.get_all(CONTENT_LENGTH).iter();
+    let length = lengths.next();
+    if lengths.next().is_some()
+        || length.is_some_and(|value| parse_content_length(value) != Some(0))
+    {
+        return Err(HttpFault::MalformedRequest);
+    }
+    Ok(())
+}
+
 fn one_route_header<'a>(
     headers: &'a HeaderMap,
     name: &'static str,

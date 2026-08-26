@@ -261,6 +261,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             ],
             health: HealthCell::unknown(),
             disposition: AtomicU8::new(Disposition::Serving as u8),

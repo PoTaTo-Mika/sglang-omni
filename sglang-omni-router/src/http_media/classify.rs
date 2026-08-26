@@ -75,7 +75,7 @@ pub(super) fn speech_with_hints(
     )
     .ok_or(HttpFault::MalformedRequest)?;
     let references = reference_forms(&fields);
-    let managed_voice = classify_managed_voice(&fields, &references);
+    let managed_voice = pool.voice_state_enabled() && classify_managed_voice(&fields, &references);
     Ok(Classified {
         requirement: RouteRequirement::new(
             ProfileRequirement::SpeechHttp {
@@ -124,8 +124,8 @@ pub(super) fn batch_with_hints(
     let mut tasks = Vec::new();
     let mut references = Vec::new();
     let mut features = Vec::new();
-    let default_references = reference_forms(&defaults);
-    let mut managed_voice = classify_managed_voice(&defaults, &default_references);
+    let voice_state_enabled = pool.voice_state_enabled();
+    let mut managed_voice = false;
     for item in items {
         if item.model.as_ref().is_some_and(Option::is_some) {
             insert_once(&mut features, BatchFeature::Model);
@@ -187,7 +187,8 @@ pub(super) fn batch_with_hints(
             .clone()
             .flatten()
             .or_else(|| defaults.voice.clone().flatten());
-        managed_voice |= !explicit_reference
+        managed_voice |= voice_state_enabled
+            && !explicit_reference
             && voice
                 .is_some_and(|value| !value.is_empty() && !value.eq_ignore_ascii_case("default"));
     }
@@ -536,6 +537,10 @@ mod tests {
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
     fn pool() -> WorkerPool {
+        configured_pool(true)
+    }
+
+    fn configured_pool(voice_state_enabled: bool) -> WorkerPool {
         let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
             "sgl-omni-media-classify-{}-{sequence}.toml",
@@ -552,12 +557,14 @@ format = "json"
 filter = "error"
 [router]
 strategy = "round_robin"
+voice_owner_worker_id = "worker"
 [admission]
 global = 8
 generation_http = 1
 speech_http = 4
 transcription_http = 4
 speech_batch = 16
+control = 1
 [health]
 interval_ms = 100
 timeout_ms = 50
@@ -583,6 +590,7 @@ generation_http = 1
 speech_http = 4
 speech_batch = 16
 transcription_http = 4
+control = 1
 [[workers.service_profiles]]
 service = "generation_http"
 model_ids = ["tts"]
@@ -624,11 +632,40 @@ task = "transcribe"
 response_formats = ["json", "text", "verbose_json", "srt", "vtt", "sse"]
 media_profiles = ["audio", "audio_video"]
 stream_modes = ["non_streaming", "streaming"]
+[[workers.service_profiles]]
+service = "voice_control"
 "#;
+        let config = if voice_state_enabled {
+            config.to_owned()
+        } else {
+            config
+                .replace("voice_owner_worker_id = \"worker\"\n", "")
+                .replace("control = 1\n", "")
+                .replace(
+                    "[[workers.service_profiles]]\nservice = \"voice_control\"\n",
+                    "",
+                )
+        };
         fs::write(&path, config).expect("write classifier config");
         let parsed = Config::load(&path).expect("load classifier config");
         let _removed = fs::remove_file(path);
         WorkerPool::build(&parsed).expect("build classifier pool")
+    }
+
+    #[test]
+    fn managed_voice_is_gated_by_voice_state_enablement() {
+        let trust = TrustDomain::new(String::from("local"));
+        let body = br#"{"model":"tts","input":"x","voice":"named"}"#;
+        for (enabled, expected) in [(false, false), (true, true)] {
+            let pool = configured_pool(enabled);
+            let classified = speech(body, &pool, &trust).expect("classify named voice");
+            let ProfileRequirement::SpeechHttp { managed_voice, .. } =
+                classified.requirement.profile()
+            else {
+                panic!("speech requirement")
+            };
+            assert_eq!(*managed_voice, expected);
+        }
     }
 
     #[test]
@@ -744,24 +781,43 @@ stream_modes = ["non_streaming", "streaming"]
     }
 
     #[test]
-    fn batch_default_named_voice_is_required_before_item_reference_overrides() {
+    fn batch_affinity_uses_each_items_effective_voice_and_references() {
         let pool = pool();
         let trust = TrustDomain::new(String::from("local"));
-        let body = br#"{
-            "model":"tts",
-            "voice":"named-default",
-            "items":[
-                {"input":"first","ref_audio":"direct"},
-                {"input":"second","references":[{"audio":"list"}]}
-            ]
-        }"#;
-        let classified = batch(body, &pool, &trust).expect("classify default managed voice");
-        let ProfileRequirement::SpeechBatch { managed_voice, .. } =
-            classified.requirement.profile()
-        else {
-            panic!("batch requirement")
-        };
-        assert!(*managed_voice);
+        for (body, expected) in [
+            (
+                br#"{
+                    "model":"tts",
+                    "voice":"named-default",
+                    "items":[
+                        {"input":"first","ref_audio":"direct"},
+                        {"input":"second","references":[{"audio":"list"}]}
+                    ]
+                }"#
+                .as_slice(),
+                false,
+            ),
+            (
+                br#"{
+                    "model":"tts",
+                    "voice":"named-default",
+                    "items":[
+                        {"input":"first","ref_audio":"direct"},
+                        {"input":"second"}
+                    ]
+                }"#
+                .as_slice(),
+                true,
+            ),
+        ] {
+            let classified = batch(body, &pool, &trust).expect("classify effective batch facts");
+            let ProfileRequirement::SpeechBatch { managed_voice, .. } =
+                classified.requirement.profile()
+            else {
+                panic!("batch requirement")
+            };
+            assert_eq!(*managed_voice, expected);
+        }
     }
 
     #[test]

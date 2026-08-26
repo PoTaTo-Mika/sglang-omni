@@ -22,6 +22,7 @@ pub(crate) enum ServiceClass {
     TranscriptionHttp,
     SpeechWebsocket,
     RealtimeWebsocket,
+    VoiceControl,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -32,9 +33,10 @@ pub(crate) enum CapacityClass {
     TranscriptionHttp,
     SpeechWebsocket,
     RealtimeWebsocket,
+    Control,
 }
 
-pub(super) const CAPACITY_CLASS_COUNT: usize = 6;
+pub(super) const CAPACITY_CLASS_COUNT: usize = 7;
 
 impl CapacityClass {
     pub(super) const fn index(self) -> usize {
@@ -45,6 +47,7 @@ impl CapacityClass {
             Self::TranscriptionHttp => 3,
             Self::SpeechWebsocket => 4,
             Self::RealtimeWebsocket => 5,
+            Self::Control => 6,
         }
     }
 }
@@ -58,6 +61,7 @@ impl ServiceClass {
             Self::TranscriptionHttp => CapacityClass::TranscriptionHttp,
             Self::SpeechWebsocket => CapacityClass::SpeechWebsocket,
             Self::RealtimeWebsocket => CapacityClass::RealtimeWebsocket,
+            Self::VoiceControl => CapacityClass::Control,
         }
     }
 }
@@ -120,6 +124,7 @@ pub(crate) struct WorkerCapacityConfig {
     pub(crate) transcription_http: Option<u32>,
     pub(crate) speech_websocket: Option<u32>,
     pub(crate) realtime_websocket: Option<u32>,
+    pub(crate) control: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq)]
@@ -286,6 +291,7 @@ pub(crate) enum ServiceProfile {
     RealtimeWebsocket {
         protocols: Vec<RealtimeProtocol>,
     },
+    VoiceControl,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -453,6 +459,17 @@ impl ProfileRequirement {
                 expected_default_model_id,
                 ..
             } => valid_model_id(expected_default_model_id),
+        }
+    }
+
+    pub(super) const fn requires_voice_owner(&self) -> bool {
+        match self {
+            Self::SpeechHttp { managed_voice, .. }
+            | Self::SpeechBatch { managed_voice, .. }
+            | Self::SpeechWebsocket { managed_voice, .. } => *managed_voice,
+            Self::GenerationHttp { .. }
+            | Self::TranscriptionHttp { .. }
+            | Self::RealtimeWebsocket { .. } => false,
         }
     }
 }
@@ -636,6 +653,7 @@ impl ServiceProfile {
             Self::RealtimeWebsocket { protocols } => {
                 validate_set(protocols, "workers.service_profiles.protocols", false)
             }
+            Self::VoiceControl => Ok(()),
         }
     }
 
@@ -767,6 +785,7 @@ impl ServiceProfile {
                 Self::RealtimeWebsocket { protocols: a },
                 Self::RealtimeWebsocket { protocols: b },
             ) => set_eq(a, b),
+            (Self::VoiceControl, Self::VoiceControl) => true,
             _ => false,
         }
     }
@@ -944,6 +963,7 @@ impl ServiceProfile {
             | Self::TranscriptionHttp { model_ids, .. }
             | Self::SpeechWebsocket { model_ids, .. } => model_ids.iter().any(|item| item == model),
             Self::RealtimeWebsocket { .. } => true,
+            Self::VoiceControl => false,
         }
     }
 
@@ -955,6 +975,7 @@ impl ServiceProfile {
             Self::TranscriptionHttp { .. } => ServiceClass::TranscriptionHttp,
             Self::SpeechWebsocket { .. } => ServiceClass::SpeechWebsocket,
             Self::RealtimeWebsocket { .. } => ServiceClass::RealtimeWebsocket,
+            Self::VoiceControl => ServiceClass::VoiceControl,
         }
     }
 }
@@ -1038,6 +1059,7 @@ pub(crate) fn validate_workers(workers: &[WorkerConfig]) -> Result<(), ConfigErr
                 "workers.capacity.realtime_websocket",
                 worker.capacity.realtime_websocket,
             ),
+            ("workers.capacity.control", worker.capacity.control),
         ] {
             if value.is_some_and(|limit| limit == 0 || limit > 65_535) {
                 return Err(ConfigError::invalid(field, "must be between 1 and 65535"));
@@ -1073,6 +1095,7 @@ pub(crate) fn validate_workers(workers: &[WorkerConfig]) -> Result<(), ConfigErr
                 CapacityClass::TranscriptionHttp => worker.capacity.transcription_http,
                 CapacityClass::SpeechWebsocket => worker.capacity.speech_websocket,
                 CapacityClass::RealtimeWebsocket => worker.capacity.realtime_websocket,
+                CapacityClass::Control => worker.capacity.control,
             };
             if configured.is_none() {
                 return Err(ConfigError::invalid(
@@ -1102,6 +1125,9 @@ pub(crate) fn validate_workers(workers: &[WorkerConfig]) -> Result<(), ConfigErr
         }
         if let Some(default) = worker.default_model_id.as_deref() {
             for advertised in &worker.service_profiles {
+                if matches!(advertised, ServiceProfile::VoiceControl) {
+                    continue;
+                }
                 let service = advertised.service_class();
                 if !worker.service_profiles.iter().any(|profile| {
                     profile.service_class() == service
@@ -1241,6 +1267,7 @@ mod tests {
                 transcription_http: None,
                 speech_websocket: None,
                 realtime_websocket: None,
+                control: None,
             },
             service_profiles: vec![profile("omni")],
         }
@@ -1249,6 +1276,12 @@ mod tests {
     #[test]
     fn stable_worker_shape_and_correlated_generation_row_validate() {
         assert!(validate_workers(&[worker()]).is_ok());
+        let mut voice_control = worker();
+        voice_control.capacity.control = Some(1);
+        voice_control
+            .service_profiles
+            .push(ServiceProfile::VoiceControl);
+        assert!(validate_workers(&[voice_control]).is_ok());
         let mut maximum = Vec::new();
         for index in 0..MAX_WORKERS {
             let mut item = worker();
@@ -1433,6 +1466,7 @@ mod tests {
                 transcription_http: Some(2),
                 speech_websocket: None,
                 realtime_websocket: None,
+                control: None,
             },
             service_profiles: vec![profile(SpeechToTextTask::Transcribe)],
         };
