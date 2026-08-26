@@ -157,8 +157,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
                 or tuple(spk.shape) != tuple(state.embedding.shape)
             ):
                 raise ValueError(
-                    f"Fun-CosyVoice3 stream prompt tensors changed for "
-                    f"{request_id!r}"
+                    f"Fun-CosyVoice3 stream prompt tensors changed for {request_id!r}"
                 )
             return
         state.prompt_token = token
@@ -299,12 +298,15 @@ class FunCosyVoice3StreamingVocoderScheduler(
         del request_id, state
         pipeline_state = FunCosyVoice3State.from_dict(payload.data)
         if pipeline_state.audio_codes is None:
-            return None
-        codes = torch.as_tensor(pipeline_state.audio_codes, dtype=torch.long).reshape(
-            -1
-        )
+            codes = torch.zeros(0, dtype=torch.long)
+        else:
+            codes = torch.as_tensor(
+                pipeline_state.audio_codes, dtype=torch.long
+            ).reshape(-1)
         if codes.numel() == 0:
-            return None
+            raise RuntimeError(
+                "Fun-CosyVoice3 generation produced no usable speech tokens"
+            )
         prompt_token = as_flow_prompt_token(pipeline_state.flow_prompt_speech_token)
         prompt_feat = as_flow_prompt_feat(pipeline_state.flow_prompt_speech_feat)
         embedding = as_flow_embedding(pipeline_state.flow_embedding)

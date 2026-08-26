@@ -16,10 +16,20 @@ STREAM_SCALE_FACTOR = 2
 TOKEN_MAX_HOP_LEN = TOKEN_HOP_LEN * 4
 SAMPLE_RATE = 24000
 
-# note (guozhihao-224): first AR flush is hop+lookahead with prompt_pad=0;
-# vocoder applies prompt_token_pad on the prompt token length.
+# note (guozhihao-224): pad=0 first flush is hop+lookahead; producer adds
+# prompt_token_pad so the first message matches the vocoder causal boundary.
 AR_INITIAL_FLUSH_TOKENS = TOKEN_HOP_LEN + PRE_LOOKAHEAD_LEN
 AR_FOLLOWUP_FLUSH_TOKENS = TOKEN_HOP_LEN
+
+
+def prompt_token_len(prompt_token: Any) -> int:
+    """Time-axis length of a Flow prompt-token tensor, or 0 when missing."""
+    if prompt_token is None:
+        return 0
+    token = torch.as_tensor(prompt_token)
+    if token.ndim == 0:
+        return int(token.numel())
+    return int(token.shape[-1])
 
 
 def prompt_token_pad(prompt_token_len: int, *, hop_len: int = TOKEN_HOP_LEN) -> int:
@@ -75,6 +85,15 @@ def tokens_needed_for_causal_chunk(
     hop = stream_hop_len(token_offset, hop_len=hop_len, prompt_pad=prompt_pad)
     extra = max(int(lookahead), 0)
     return int(token_offset) + hop + extra
+
+
+def first_ar_flush_tokens(prompt_len: int) -> int:
+    """Generated-token count for the first causal AR flush."""
+    return tokens_needed_for_causal_chunk(
+        0,
+        hop_len=TOKEN_HOP_LEN,
+        prompt_pad=prompt_token_pad(int(prompt_len)),
+    )
 
 
 def as_flow_prompt_token(value: Any | None) -> torch.Tensor:

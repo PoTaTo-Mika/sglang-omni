@@ -12,7 +12,8 @@ from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.model_runner.sglang_execution import attn_forward_context
 from sglang_omni.models.fun_cosyvoice3.streaming import (
     AR_FOLLOWUP_FLUSH_TOKENS,
-    AR_INITIAL_FLUSH_TOKENS,
+    first_ar_flush_tokens,
+    prompt_token_len,
 )
 from sglang_omni.scheduling.messages import OutgoingMessage
 
@@ -114,7 +115,11 @@ class FunCosyVoice3ModelRunner(ModelRunner):
         data.stream_code_buffer.append(token)
         data.stream_code_seen += 1
         if int(data.stream_code_next_flush) <= 0:
-            data.stream_code_next_flush = AR_INITIAL_FLUSH_TOKENS
+            # note (guozhihao-224): first flush is 28 + prompt_pad so the
+            # vocoder can decode the first causal hop without waiting for 53.
+            data.stream_code_next_flush = first_ar_flush_tokens(
+                prompt_token_len(data.flow_prompt_speech_token)
+            )
         if data.stream_code_seen >= data.stream_code_next_flush:
             self._flush_code_chunks(sched_req.request_id, data, force=False)
 

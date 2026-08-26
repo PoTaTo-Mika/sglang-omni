@@ -6,6 +6,7 @@ from queue import Empty, Queue
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from sglang_omni.models.fun_cosyvoice3 import stages
@@ -21,6 +22,7 @@ from sglang_omni.models.fun_cosyvoice3.streaming import (
     PRE_LOOKAHEAD_LEN,
     TOKEN_HOP_LEN,
     TOKEN_MEL_RATIO,
+    first_ar_flush_tokens,
     next_stream_hop_len,
     prompt_token_pad,
     stream_hop_len,
@@ -45,6 +47,10 @@ def test_stream_hop_math_matches_cosyvoice3() -> None:
     assert next_stream_hop_len(50) == 100
     assert next_stream_hop_len(100) == 100
     assert tokens_needed_for_causal_chunk(0, hop_len=25, prompt_pad=0) == 28
+    assert tokens_needed_for_causal_chunk(0, hop_len=25, prompt_pad=15) == 43
+    assert first_ar_flush_tokens(0) == AR_INITIAL_FLUSH_TOKENS
+    assert first_ar_flush_tokens(10) == 43
+    assert first_ar_flush_tokens(25) == AR_INITIAL_FLUSH_TOKENS
 
 
 class _FakeFlow(torch.nn.Module):
@@ -205,6 +211,31 @@ def test_model_runner_flushes_speech_tokens_and_skips_control_ids() -> None:
     assert runner._outbox.empty()
 
 
+def test_model_runner_first_flush_includes_prompt_pad() -> None:
+    runner = object.__new__(FunCosyVoice3ModelRunner)
+    runner._outbox = Queue()
+    runner._vocoder_target = "vocoder"
+    prompt_len = 10
+    data = CosyVoice3SGLangRequestData(
+        stream_metadata={"modality": "audio_codes", "stream": True},
+        flow_prompt_speech_token=torch.zeros(1, prompt_len, dtype=torch.int32),
+        flow_prompt_speech_feat=torch.zeros(1, 1, 80),
+        flow_embedding=torch.ones(1, 192),
+    )
+    request = SimpleNamespace(request_id="req-pad", data=data)
+    first_flush = first_ar_flush_tokens(prompt_len)
+    assert first_flush == 43
+
+    early = _feed_tokens(runner, request, list(range(first_flush - 1)))
+    assert early == []
+    assert data.stream_code_next_flush == first_flush
+
+    ready = _feed_tokens(runner, request, [7])
+    assert len(ready) == 1
+    assert tuple(ready[0].data.tolist()) == tuple(range(first_flush - 1)) + (7,)
+    assert data.stream_code_next_flush == first_flush + AR_FOLLOWUP_FLUSH_TOKENS
+
+
 def _feed_tokens(
     runner: FunCosyVoice3ModelRunner,
     request: SimpleNamespace,
@@ -297,3 +328,15 @@ def test_ar_to_vocoder_grows_hops_then_finalizes_remainder() -> None:
     assert flow.calls[-1]["finalize"] is True
     total = np.concatenate(pcm_chunks + [remainder])
     assert total.shape == (len(generated) * TOKEN_MEL_RATIO,)
+
+
+def test_streaming_vocoder_fallback_raises_on_empty_audio_codes() -> None:
+    _, scheduler = _scheduler()
+    scheduler._on_streaming_new_request("req-empty", _stream_payload(codes=None))
+    with pytest.raises(RuntimeError, match="no usable speech tokens"):
+        scheduler._on_done("req-empty")
+
+    _, scheduler = _scheduler()
+    scheduler._on_streaming_new_request("req-empty-list", _stream_payload(codes=[]))
+    with pytest.raises(RuntimeError, match="no usable speech tokens"):
+        scheduler._on_done("req-empty-list")

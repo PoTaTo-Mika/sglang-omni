@@ -244,9 +244,11 @@ generation finishes.
 
 The vocoder follows CosyVoice3's causal chunk loop: 25 speech tokens per hop
 (`pre_lookahead_len=3`, 25 Hz → about 1 s of audio per chunk). The first PCM
-chunk is emitted once the AR stage has produced 28 tokens; later hops grow
-25 → 50 → 100 tokens like the upstream `CosyVoice3Model`. Non-streaming
-requests still decode the whole utterance in one Flow + HiFT pass.
+chunk is emitted once the AR stage has produced `28 + prompt_pad` tokens,
+where `prompt_pad` (0–24) rounds the Flow prompt-token length up to a
+multiple of 25. Later hops grow 25 → 50 → 100 tokens like the upstream
+`CosyVoice3Model`. Non-streaming requests still decode the whole utterance
+in one Flow + HiFT pass.
 
 ```bash
 curl -X POST http://localhost:8000/v1/audio/speech \
@@ -278,7 +280,7 @@ curl -X POST http://localhost:8000/v1/audio/speech \
 | `repetition_penalty` | `1.1` | Repetition penalty |
 | `max_new_tokens` | `min(2048, 20x target text tokens)` | Maximum number of generated speech tokens. If omitted, derived from the target text length (capped at 2048); stop tokens are also suppressed until at least `2x` that length has been generated |
 | `seed` | `null` | Random seed for reproducibility |
-| `stream` | `false` | Incremental causal Flow + HiFT; first PCM chunk after 28 speech tokens |
+| `stream` | `false` | Incremental causal Flow + HiFT; first PCM chunk after `28 + prompt_pad` speech tokens (`prompt_pad` rounds the prompt length to a multiple of 25) |
 
 ## Benchmarking
 
