@@ -203,9 +203,6 @@ def test_terminal_failure_abort_compacts_finished_schedule_batch_row() -> None:
     batch.reqs[0].finished = lambda: True
     scheduler = _make_row_removal_abort_scheduler(batch)
 
-    # This is the coordinator terminal-failure path: the request is already
-    # finished, so deferred running-abort marking declines it and abort falls
-    # through to immediate ScheduleBatch removal.
     scheduler.abort("req-0")
 
     _assert_row_aligned_batch(batch, [11])

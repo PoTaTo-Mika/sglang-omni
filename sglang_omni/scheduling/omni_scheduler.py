@@ -2724,13 +2724,12 @@ def _remove_from_batch(batch: Any, request_id: str) -> None:
     for index in remove_indices:
         _detach_request_data(batch.reqs[index])
 
-    # ScheduleBatch owns the row-alignment contract. In particular, never
-    # rewrite only ``batch.reqs``: FutureMap keys, sequence lengths, sampling
-    # state, and every other per-row field must be compacted in lockstep.
+    # Note (Akazaakane): ScheduleBatch.filter_batch preserves alignment across
+    # per-request state; mutating reqs alone corrupts downstream relay indices.
     filter_batch = getattr(batch, "filter_batch", None)
     if not callable(filter_batch):
-        # Some scheduler unit tests use request-only stand-ins. Never permit
-        # this fallback for a row-bearing production batch.
+        # Note (Akazaakane): Request-only test doubles lack filter_batch;
+        # production batches with row state must not silently use this fallback.
         aligned_fields = (
             "req_pool_indices",
             "req_pool_indices_cpu",
@@ -2754,10 +2753,8 @@ def _remove_from_batch(batch: Any, request_id: str) -> None:
 
     filter_batch(keep_indices=keep_indices)
     if not keep_indices:
-        # Upstream intentionally leaves tensors stale when all requests are
-        # filtered because its callers immediately drop an empty batch. Omni
-        # retains aliases in running_batch/cur_batch/last_batch, so make the
-        # empty state structurally aligned as well.
+        # Note (Akazaakane): Upstream leaves empty-batch tensors stale because
+        # callers discard the batch, but Omni retains aliases that require alignment.
         _clear_empty_schedule_batch_rows(batch)
         batch.batch_is_full = False
     _validate_schedule_batch_row_alignment(batch)
