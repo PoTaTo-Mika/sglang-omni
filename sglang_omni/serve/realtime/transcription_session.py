@@ -215,6 +215,11 @@ class RealtimeTranscriptionSession:
     async def _cancel_and_abort(
         self, task: asyncio.Task[Any] | None, request_id: str | None
     ) -> None:
+        """Cancel the decode worker, abort its engine request, and absorb the result.
+
+        Gathering with ``return_exceptions=True`` prevents a normal cancellation
+        from surfacing as a WebSocket handler failure.
+        """
         if task is None or task.done():
             return
         task.cancel()
