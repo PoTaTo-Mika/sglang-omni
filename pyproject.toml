@@ -42,6 +42,11 @@ dependencies = [
     "logger",
     "httpx",
     "xxhash>=3.0.0",
+    # Note: (Jiaxin Deng) the documented install line for the Qwen3-TTS model
+    # package is `--no-deps qwen-tts==0.1.1`, and --no-deps is exactly what drops
+    # sox, so `import qwen_tts` raises ModuleNotFoundError before a worker binds
+    # a port.
+    "sox>=1.4.1",
     "av>=16.1.0",
     "qwen-vl-utils==0.0.11",
     "numba==0.65.1",  # Match SGLang 0.5.16
@@ -90,10 +95,23 @@ audar-tts = [
     "llama-cpp-python==0.3.34",
     "neucodec==0.0.6",
 ]
+fun-cosyvoice3 = [
+    "conformer==0.3.2",
+    "HyperPyYAML==1.2.3",
+    "pyworld==0.3.4",
+    "wetext==0.0.4",
+    "inflect==7.3.1",
+    "gdown==5.1.0",
+    "lightning==2.6.5",
+    "matplotlib",
+]
 
 [project.scripts]
 sgl-omni = "sglang_omni.cli:app"
 sgl-omni-router = "sglang_omni_router.serve:main"
+
+[project.entry-points."sglang.serve_backends"]
+omni = "sglang_omni.cli.sglang_backend:create_backend"
 
 [project.urls]
 Documentation = "https://sgl-project.github.io/sglang-omni/"
@@ -101,6 +119,12 @@ Issues = "https://github.com/sgl-project/sglang-omni/issues"
 Repository = "https://github.com/sgl-project/sglang-omni"
 
 [tool.uv]
+# The dependency set pins CUDA-13-only wheels (mooncake-transfer-engine-cuda13,
+# nixl-cu13, flash-attn-4); without this, uv's universal resolution also
+# solves for platforms those wheels do not support and fails.
+environments = [
+    "sys_platform == 'linux'",
+]
 override-dependencies = [
     "protobuf>=6.31.1,<7.0.0",
 ]
@@ -110,7 +134,7 @@ pythonpath = ["."]
 markers = [
     "benchmark: performance benchmark tests (may require GPU and long runtime)",
     "tts_stage(name): select an in-file TTS benchmark CI stage",
-    "gpu: requires a CUDA device (auto-skipped without one)",
+    "accelerator: requires accelerator hardware",
 ]
 
 [tool.setuptools.packages.find]

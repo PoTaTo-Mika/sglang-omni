@@ -8,6 +8,7 @@ from typing import Any
 
 from sglang_omni.models.qwen3_tts import request_builders
 from sglang_omni.models.qwen3_tts import stages as qwen3_stages
+from sglang_omni.platforms import current_platform
 from sglang_omni.scheduling.engine_factory import TtsEngineBuilder
 from sglang_omni.vendor.sglang.server_args import override_server_args
 
@@ -42,6 +43,7 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder):
     ) -> dict[str, Any]:
         return {
             "max_running_requests": 16,
+            "max_queued_requests": 16,
             "cuda_graph_max_bs": 32,
             "torch_compile_max_bs": 32,
             "dtype": dtype,
@@ -92,6 +94,20 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder):
         )
 
     def compile_model(self, model: Any, server_args: Any) -> None:
+        if current_platform.is_rocm():
+            override_server_args(
+                server_args,
+                "sglang_omni.qwen3_tts.rocm",
+                enable_torch_compile=False,
+            )
+            return
+        if server_args.enable_deterministic_inference:
+            override_server_args(
+                server_args,
+                "sglang_omni.qwen3_tts.deterministic_inference",
+                enable_torch_compile=False,
+            )
+            return
         if bool(server_args.enable_torch_compile):
             qwen3_stages._compile_qwen3_tts_backbone(model)
             override_server_args(
@@ -117,7 +133,11 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder):
         return request_builder, result_adapter
 
     def extra_scheduler_kwargs(self) -> dict[str, Any]:
-        return {"stream_output_builder": self._stream_output_builder}
+        return {
+            "stream_output_builder": self._stream_output_builder,
+            "request_build_max_workers": 4,
+            "request_build_max_pending": 16,
+        }
 
     def make_abort_callback(self) -> Any | None:
         return request_builders.cleanup_prepared_qwen3_tts_request
