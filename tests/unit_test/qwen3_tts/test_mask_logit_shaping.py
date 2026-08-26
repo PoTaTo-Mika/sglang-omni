@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import types
 
+import pytest
 import torch
 
 from sglang_omni.models.qwen3_tts.model_runner import Qwen3TTSModelRunner
@@ -16,6 +17,9 @@ def _runner() -> Qwen3TTSModelRunner:
     runner._mask_prep_rids = None
     runner._mask_rep_active = False
     runner._mask_sup_active = False
+    runner._mask_true = None
+    runner._mask_rows = None
+    runner._mask_staging = None
     return runner
 
 
@@ -145,3 +149,43 @@ def test_mask_shaping_empty_history_after_retract():
     logits2 = torch.randn(1, vocab)
     got = _apply(runner, logits2.clone(), reqs)
     assert torch.equal(got, logits2), "no history means no penalty anywhere"
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="mask staging needs CUDA")
+def test_mask_shaping_staged_copies_match_reference_on_cuda():
+    """Long history rebuild, fast path steps, and a batch shrink through the
+    pinned staging path, bit for bit against the scalar reference, with no
+    stream synchronize allowed inside the shaping calls."""
+    torch.manual_seed(13)
+    vocab = 8192
+    device = torch.device("cuda")
+    runner = _runner()
+    reqs = [
+        _request("a", 1, 1.3, list(range(6000)), [5, 90]),
+        _request("b", 2, 1.1, [4], [5, 90]),
+        _request("c", 3, 1.0, [8], []),
+    ]
+
+    def apply_without_sync(logits, requests):
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            return _apply(runner, logits, requests)
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+
+    for step in range(5):
+        logits = torch.randn(3, vocab, dtype=torch.float32, device=device)
+        got = apply_without_sync(logits.clone(), reqs)
+        if step == 0:
+            assert runner._mask_staging is not None
+        expected = _reference(logits.cpu(), reqs).to(device)
+        assert torch.equal(got, expected), step
+        new = [6000 + step, 40 + step, 70 + step]
+        for req, tok in zip(reqs, new):
+            req.data.req.output_ids = req.data.req.output_ids + [tok]
+        runner._mask_last_sampled = torch.tensor(new, device=device)
+    survivors = [reqs[1], reqs[2]]
+    logits2 = torch.randn(2, vocab, device=device)
+    got = apply_without_sync(logits2.clone(), survivors)
+    assert torch.equal(got, _reference(logits2.cpu(), survivors).to(device))

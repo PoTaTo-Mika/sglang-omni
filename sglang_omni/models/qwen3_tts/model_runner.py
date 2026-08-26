@@ -14,6 +14,28 @@ from sglang_omni.models.qwen3_omni.talker_model_runner import QwenTalkerModelRun
 from sglang_omni.scheduling.types import RequestOutput
 
 
+class _MaskStaging:
+    """Pinned host staging for the mask rebuild.
+
+    A pageable torch.tensor(list, device=cuda) synchronizes the stream on
+    every call. Pinned tensors from the caching host allocator are not reused
+    until the asynchronous copy that reads them has completed.
+    """
+
+    def __init__(self, device: torch.device) -> None:
+        self._device = device
+
+    def stage(
+        self, indices: list[int], penalties: list[float]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        pairs = torch.tensor(indices, dtype=torch.long, pin_memory=True)
+        pen = torch.tensor(penalties, dtype=torch.float32, pin_memory=True)
+        return (
+            pairs.to(self._device, non_blocking=True),
+            pen.to(self._device, non_blocking=True),
+        )
+
+
 class Qwen3TTSModelRunner(ModelRunner):
     """Runs Qwen3-TTS AR steps and stores generated codec frames per request."""
 
@@ -25,6 +47,9 @@ class Qwen3TTSModelRunner(ModelRunner):
         self._mask_prep_rids: list | None = None
         self._mask_rep_active = False
         self._mask_sup_active = False
+        self._mask_true: torch.Tensor | None = None
+        self._mask_rows: torch.Tensor | None = None
+        self._mask_staging: _MaskStaging | None = None
 
     def before_prefill(
         self,
@@ -161,6 +186,13 @@ class Qwen3TTSModelRunner(ModelRunner):
             torch.ones(rows, 1, dtype=torch.float32, device=device),
         )
         self._mask_prep_rids = None
+        self._mask_true = torch.ones((), dtype=torch.bool, device=device)
+        self._mask_rows = torch.arange(rows, device=device)
+        self._mask_staging = (
+            _MaskStaging(torch.device(device))
+            if torch.device(device).type == "cuda"
+            else None
+        )
 
     def _rebuild_masks(self, requests: list, vocab: int, device: Any) -> None:
         rep_mask, sup_mask, pen_col = self._shape_masks
@@ -191,15 +223,21 @@ class Qwen3TTSModelRunner(ModelRunner):
                     if 0 <= tok < vocab:
                         sup_rows.append(row_idx)
                         sup_toks.append(tok)
-        if rep_rows:
-            pairs = torch.tensor(rep_rows + rep_toks, dtype=torch.long, device=device)
-            rep_mask[pairs[: len(rep_rows)], pairs[len(rep_rows) :]] = True
-        if sup_rows:
-            pairs = torch.tensor(sup_rows + sup_toks, dtype=torch.long, device=device)
-            sup_mask[pairs[: len(sup_rows)], pairs[len(sup_rows) :]] = True
-        pen_col[:batch_size, 0] = torch.tensor(
-            penalties, dtype=torch.float32, device=device
-        )
+        flat = rep_rows + rep_toks + sup_rows + sup_toks
+        if self._mask_staging is None:
+            pairs = torch.tensor(flat, dtype=torch.long, device=device)
+            pen = torch.tensor(penalties, dtype=torch.float32, device=device)
+        else:
+            pairs, pen = self._mask_staging.stage(flat, penalties)
+        n_rep = len(rep_rows)
+        n_sup = len(sup_rows)
+        if n_rep:
+            rep_mask[pairs[:n_rep], pairs[n_rep : 2 * n_rep]] = self._mask_true
+        if n_sup:
+            base = 2 * n_rep
+            sup_rows_t = pairs[base : base + n_sup]
+            sup_mask[sup_rows_t, pairs[base + n_sup :]] = self._mask_true
+        pen_col[:batch_size, 0] = pen
         self._mask_rep_active = bool(rep_rows) or any(p != 1.0 for p in penalties)
         self._mask_sup_active = bool(sup_rows)
 
@@ -226,8 +264,10 @@ class Qwen3TTSModelRunner(ModelRunner):
             # not grow by one (retract, restart) can need bits cleared, which the
             # scatter cannot do, so those steps rebuild.
             if self._mask_rep_active:
-                rows = torch.arange(batch_size, device=logits.device)
-                rep_mask[rows, last_sampled[:batch_size].clamp(0, vocab - 1)] = True
+                rows = self._mask_rows[:batch_size]
+                rep_mask[rows, last_sampled[:batch_size].clamp(0, vocab - 1)] = (
+                    self._mask_true
+                )
                 for sched_req in requests:
                     data = sched_req.data
                     output_ids = sched_req.data.req.output_ids
