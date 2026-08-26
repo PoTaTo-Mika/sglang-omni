@@ -1,14 +1,15 @@
 #![cfg(unix)]
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
-//! Real-socket proof for the one-worker direct chat relay.
+//! Real-socket proof for direct chat relay, replica routing, and health filtering.
 
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -26,24 +27,48 @@ struct Captured {
 struct Worker {
     address: SocketAddr,
     stop: Arc<AtomicBool>,
+    healthy: Arc<AtomicBool>,
+    health_requests: Arc<AtomicUsize>,
     captured: Arc<Mutex<Vec<Captured>>>,
     thread: Option<JoinHandle<()>>,
-    _guard: MutexGuard<'static, ()>,
+    _guard: Rc<MutexGuard<'static, ()>>,
 }
 
 impl Worker {
     fn start() -> Self {
-        let guard = SOCKET_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = Rc::new(
+            SOCKET_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        Self::start_with_guard(guard)
+    }
+
+    fn start_pair() -> (Self, Self) {
+        let guard = Rc::new(
+            SOCKET_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        (
+            Self::start_with_guard(Rc::clone(&guard)),
+            Self::start_with_guard(guard),
+        )
+    }
+
+    fn start_with_guard(guard: Rc<MutexGuard<'static, ()>>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind worker fixture");
         listener
             .set_nonblocking(true)
             .expect("set worker nonblocking");
         let address = listener.local_addr().expect("read worker address");
         let stop = Arc::new(AtomicBool::new(false));
+        let healthy = Arc::new(AtomicBool::new(true));
+        let health_requests = Arc::new(AtomicUsize::new(0));
         let captured = Arc::new(Mutex::new(Vec::new()));
         let thread_stop = Arc::clone(&stop);
+        let thread_healthy = Arc::clone(&healthy);
+        let thread_health_requests = Arc::clone(&health_requests);
         let thread_captured = Arc::clone(&captured);
         let thread = thread::spawn(move || {
             let mut connections = Vec::new();
@@ -51,7 +76,11 @@ impl Worker {
                 match listener.accept() {
                     Ok((stream, _peer)) if !thread_stop.load(Ordering::Acquire) => {
                         let captures = Arc::clone(&thread_captured);
-                        connections.push(thread::spawn(move || serve_connection(stream, captures)));
+                        let healthy = Arc::clone(&thread_healthy);
+                        let health_requests = Arc::clone(&thread_health_requests);
+                        connections.push(thread::spawn(move || {
+                            serve_connection(stream, captures, healthy, health_requests);
+                        }));
                     }
                     Ok((_stream, _peer)) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -76,6 +105,8 @@ impl Worker {
         Self {
             address,
             stop,
+            healthy,
+            health_requests,
             captured,
             thread: Some(thread),
             _guard: guard,
@@ -93,6 +124,22 @@ impl Worker {
             thread::sleep(Duration::from_millis(2));
         }
     }
+
+    fn set_healthy(&self, healthy: bool) -> usize {
+        self.healthy.store(healthy, Ordering::Release);
+        self.health_requests.load(Ordering::Acquire)
+    }
+
+    fn wait_for_health_requests(&self, count: usize) {
+        let deadline = Instant::now() + DEADLINE;
+        while self.health_requests.load(Ordering::Acquire) < count {
+            assert!(
+                Instant::now() < deadline,
+                "worker did not receive health probe"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
 }
 
 impl Drop for Worker {
@@ -105,7 +152,12 @@ impl Drop for Worker {
     }
 }
 
-fn serve_connection(mut stream: TcpStream, captured: Arc<Mutex<Vec<Captured>>>) {
+fn serve_connection(
+    mut stream: TcpStream,
+    captured: Arc<Mutex<Vec<Captured>>>,
+    healthy: Arc<AtomicBool>,
+    health_requests: Arc<AtomicUsize>,
+) {
     stream
         .set_nonblocking(false)
         .expect("set worker connection blocking");
@@ -116,6 +168,21 @@ fn serve_connection(mut stream: TcpStream, captured: Arc<Mutex<Vec<Captured>>>) 
         .set_write_timeout(Some(DEADLINE))
         .expect("bound worker write");
     while let Some((head, body)) = read_request(&mut stream) {
+        if head.starts_with("GET /health HTTP/1.1") {
+            if healthy.load(Ordering::Acquire) {
+                write_response(
+                    &mut stream,
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n",
+                );
+            } else {
+                write_response(
+                    &mut stream,
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n",
+                );
+            }
+            health_requests.fetch_add(1, Ordering::AcqRel);
+            continue;
+        }
         captured.lock().expect("record request").push(Captured {
             head,
             body: body.clone(),
@@ -186,6 +253,8 @@ fn read_request(stream: &mut TcpStream) -> Option<(String, Vec<u8>)> {
             body.extend_from_slice(&chunk[..count]);
         }
         body = decode_chunks(&body)?;
+    } else if head.starts_with("GET /health HTTP/1.1") {
+        body.clear();
     } else {
         return None;
     }
@@ -234,8 +303,39 @@ struct RouterProcess {
     directory: PathBuf,
 }
 
+#[derive(Clone, Copy)]
+enum GenerationProfile {
+    Text,
+    TypedImage,
+}
+
+impl GenerationProfile {
+    const fn manifest_fields(self) -> &'static str {
+        match self {
+            Self::Text => {
+                "message_content_forms = [\"string\"]\nmedia_placements = []\ninput_modalities = [\"text\"]"
+            }
+            Self::TypedImage => {
+                "message_content_forms = [\"string\", \"typed_parts\"]\nmedia_placements = [\"typed_parts\"]\ninput_modalities = [\"text\", \"image\"]"
+            }
+        }
+    }
+}
+
 impl RouterProcess {
     fn start(worker: SocketAddr, global: u32, timeout_ms: u64, hostname: bool) -> Self {
+        Self::start_workers(
+            &[("worker-a", worker, hostname, GenerationProfile::Text)],
+            global,
+            timeout_ms,
+        )
+    }
+
+    fn start_workers(
+        workers: &[(&str, SocketAddr, bool, GenerationProfile)],
+        global: u32,
+        timeout_ms: u64,
+    ) -> Self {
         let reservation = TcpListener::bind("127.0.0.1:0").expect("reserve router address");
         let address = reservation.local_addr().expect("read router address");
         drop(reservation);
@@ -246,18 +346,25 @@ impl RouterProcess {
         ));
         fs::create_dir(&directory).expect("create router test directory");
         let config = directory.join("router.toml");
-        let (base_url, resolved_ip) = if hostname {
-            (
-                format!("http://worker.invalid:{}/", worker.port()),
-                String::from("resolved_ip = \"127.0.0.1\"\n"),
-            )
-        } else {
-            (format!("http://{worker}/"), String::new())
-        };
+        let mut worker_config = String::new();
+        for (worker_id, worker, hostname, profile) in workers {
+            let (base_url, resolved_ip) = if *hostname {
+                (
+                    format!("http://worker.invalid:{}/", worker.port()),
+                    String::from("resolved_ip = \"127.0.0.1\"\n"),
+                )
+            } else {
+                (format!("http://{worker}/"), String::new())
+            };
+            let profile_fields = profile.manifest_fields();
+            worker_config.push_str(&format!(
+                "\n[[workers]]\nworker_id = \"{worker_id}\"\nbase_url = \"{base_url}\"\n{resolved_ip}trust_domain = \"local\"\ndefault_model_id = \"omni\"\nhealth_path = \"/health\"\n\n[workers.capacity]\ngeneration_http = {global}\n\n[[workers.service_profiles]]\nservice = \"generation_http\"\nmodel_ids = [\"omni\"]\n{profile_fields}\noutput_modalities = [\"text\"]\nchat_audio_formats = []\nstream_modes = [\"non_streaming\"]\n"
+            ));
+        }
         fs::write(
             &config,
             format!(
-                "schema_version = 1\n\n[server]\nlisten = \"{address}\"\nmax_connections = 128\n\n[shutdown]\ndrain_timeout_ms = 2000\n\n[logging]\nformat = \"json\"\nfilter = \"info\"\n\n[admission]\nglobal = {global}\n\n[http_generation]\nstreamed_request_max_bytes = 1048576\nconnect_timeout_ms = 2000\nrequest_timeout_ms = {timeout_ms}\npool_idle_timeout_ms = 30000\npool_max_idle_per_host = 8\n\n[[workers]]\nworker_id = \"worker-a\"\nbase_url = \"{base_url}\"\n{resolved_ip}"
+                "schema_version = 1\n\n[server]\nlisten = \"{address}\"\nmax_connections = 128\n\n[shutdown]\ndrain_timeout_ms = 2000\n\n[logging]\nformat = \"json\"\nfilter = \"info\"\n\n[router]\nstrategy = \"round_robin\"\nmax_concurrent_classifications = 2\n\n[admission]\nglobal = {global}\ngeneration_http = {global}\n\n[health]\ninterval_ms = 100\ntimeout_ms = 50\nsuccess_threshold = 1\nfailure_threshold = 1\nmax_concurrent_probes = 2\n\n[http_generation]\ntrust_domain = \"local\"\nbuffered_request_max_bytes = 65536\nbuffered_request_total_bytes = 1048576\nstreamed_request_max_bytes = 1048576\nconnect_timeout_ms = 100\nrequest_timeout_ms = {timeout_ms}\npool_idle_timeout_ms = 30000\npool_max_idle_per_host = 8\n{worker_config}"
             ),
         )
         .expect("write router config");
@@ -275,6 +382,7 @@ impl RouterProcess {
             directory,
         };
         process.wait_live();
+        process.wait_ready();
         process
     }
 
@@ -292,6 +400,24 @@ impl RouterProcess {
                 panic!("router exited before liveness: {status}");
             }
             assert!(Instant::now() < deadline, "router did not become live");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn wait_ready(&mut self) {
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            if let Ok(response) = raw_request(
+                self.address,
+                b"GET /ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            ) && response.starts_with(b"HTTP/1.1 200")
+            {
+                return;
+            }
+            if let Some(status) = self.child.try_wait().expect("poll router readiness") {
+                panic!("router exited before readiness: {status}");
+            }
+            assert!(Instant::now() < deadline, "router did not become ready");
             thread::sleep(Duration::from_millis(5));
         }
     }
@@ -386,6 +512,24 @@ fn worker_owns_body_semantics_and_receives_exact_bytes_and_request_id() {
 }
 
 #[test]
+fn small_and_large_homogeneous_bodies_use_the_same_direct_worker_path() {
+    let worker = Worker::start();
+    let router = RouterProcess::start(worker.address, 8, 2_000, false);
+    let small = b"{}".to_vec();
+    let mut large = Vec::with_capacity(70_000);
+    large.extend_from_slice(b"{\"messages\":[{\"role\":\"user\",\"content\":\"");
+    large.resize(69_998, b'x');
+    large.extend_from_slice(b"\"}]}");
+
+    assert_eq!(status(&post(router.address, &small, None)), 200);
+    assert_eq!(status(&post(router.address, &large, None)), 200);
+    worker.wait_for_requests(2);
+    let captures = worker.captures();
+    assert_eq!(captures[0].body, small);
+    assert_eq!(captures[1].body, large);
+}
+
+#[test]
 fn strict_envelopes_fail_before_dispatch_and_missing_ids_are_generated() {
     let worker = Worker::start();
     let router = RouterProcess::start(worker.address, 8, 2_000, false);
@@ -406,11 +550,6 @@ fn strict_envelopes_fail_before_dispatch_and_missing_ids_are_generated() {
             Some("live-id"),
         ),
         (
-            b"GET /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nX-Request-ID: method-id\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice(),
-            405,
-            Some("method-id"),
-        ),
-        (
             b"GET /missing HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".as_slice(),
             404,
             None,
@@ -426,6 +565,26 @@ fn strict_envelopes_fail_before_dispatch_and_missing_ids_are_generated() {
             assert!(response_id.starts_with("sglang-omni-"));
         }
     }
+
+    let get = raw_request(
+        router.address,
+        b"GET /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nX-Request-ID: method-id\r\nConnection: close\r\n\r\n",
+    )
+    .expect("canonical method response");
+    assert_eq!(status(&get), 405);
+    let method_code = b"\"method_not_allowed\"";
+    assert!(
+        get.windows(method_code.len())
+            .any(|part| part == method_code)
+    );
+    assert_eq!(
+        header(response_head(&get), "x-request-id"),
+        Some("method-id")
+    );
+    assert_eq!(
+        header(response_head(&get), "content-type"),
+        Some("application/json")
+    );
 
     for (request, expected) in [
         (b"POST /v1/chat/completions?x=1 HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".as_slice(), 400),
@@ -462,6 +621,12 @@ fn relay_holds_admission_and_is_not_cut_off_after_commitment() {
     let address = router.address;
     let slow = thread::spawn(move || post(address, b"slow", Some("slow-id")));
     worker.wait_for_requests(1);
+    let oversized = raw_request(
+        router.address,
+        b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 1048577\r\nConnection: close\r\n\r\n",
+    )
+    .expect("oversized response while admission is full");
+    assert_eq!(status(&oversized), 413);
     let overloaded = post(router.address, b"{}", None);
     assert_eq!(status(&overloaded), 429);
 
@@ -478,6 +643,64 @@ fn relay_holds_admission_and_is_not_cut_off_after_commitment() {
     let head = response_head(&first).to_ascii_lowercase();
     assert_eq!(head.matches("cache-control:").count(), 2);
     assert!(!head.contains("set-cookie:"));
+}
+
+#[test]
+fn homogeneous_replicas_rotate_and_unhealthy_workers_are_filtered() {
+    let (first, second) = Worker::start_pair();
+    let router = RouterProcess::start_workers(
+        &[
+            ("worker-a", first.address, false, GenerationProfile::Text),
+            ("worker-b", second.address, false, GenerationProfile::Text),
+        ],
+        8,
+        2_000,
+    );
+
+    for _ in 0..6 {
+        assert_eq!(status(&post(router.address, b"{}", None)), 200);
+    }
+    first.wait_for_requests(3);
+    second.wait_for_requests(3);
+    assert_eq!(first.captures().len(), 3);
+    assert_eq!(second.captures().len(), 3);
+
+    let prior_health = first.set_healthy(false);
+    first.wait_for_health_requests(prior_health + 2);
+    let first_before = first.captures().len();
+    let second_before = second.captures().len();
+    for _ in 0..4 {
+        assert_eq!(status(&post(router.address, b"{}", None)), 200);
+    }
+    assert_eq!(first.captures().len(), first_before);
+    assert_eq!(second.captures().len(), second_before + 4);
+}
+
+#[test]
+fn heterogeneous_typed_image_request_reaches_only_the_compatible_worker() {
+    let (text, image) = Worker::start_pair();
+    let router = RouterProcess::start_workers(
+        &[
+            ("worker-a", text.address, false, GenerationProfile::Text),
+            (
+                "worker-b",
+                image.address,
+                false,
+                GenerationProfile::TypedImage,
+            ),
+        ],
+        8,
+        2_000,
+    );
+    let body = br#"{"model":"omni","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]}]}"#;
+
+    assert_eq!(status(&post(router.address, body, Some("image-id"))), 200);
+    image.wait_for_requests(1);
+    assert!(text.captures().is_empty());
+    let captures = image.captures();
+    assert_eq!(captures.len(), 1);
+    assert_eq!(captures[0].body, body);
+    assert_eq!(header(&captures[0].head, "x-request-id"), Some("image-id"));
 }
 
 #[test]

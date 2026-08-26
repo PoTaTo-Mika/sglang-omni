@@ -39,7 +39,7 @@ impl TestDir {
     ) -> PathBuf {
         let path = self.0.join("router.toml");
         let contents = format!(
-            "schema_version = 1\n\n[server]\nlisten = \"{address}\"\nmax_connections = {max_connections}\n\n[shutdown]\ndrain_timeout_ms = {drain_timeout_ms}\n\n[logging]\nformat = \"json\"\nfilter = \"info\"\n\n[admission]\nglobal = 128\n\n[http_generation]\nstreamed_request_max_bytes = 1048576\nconnect_timeout_ms = 1000\nrequest_timeout_ms = 5000\npool_idle_timeout_ms = 30000\npool_max_idle_per_host = 8\n\n[[workers]]\nworker_id = \"worker-a\"\nbase_url = \"http://127.0.0.1:1/\"\n"
+            "schema_version = 1\n\n[server]\nlisten = \"{address}\"\nmax_connections = {max_connections}\n\n[shutdown]\ndrain_timeout_ms = {drain_timeout_ms}\n\n[logging]\nformat = \"json\"\nfilter = \"info\"\n\n[router]\nstrategy = \"round_robin\"\nmax_concurrent_classifications = 2\n\n[admission]\nglobal = 128\ngeneration_http = 64\n\n[health]\ninterval_ms = 100\ntimeout_ms = 50\nsuccess_threshold = 1\nfailure_threshold = 1\nmax_concurrent_probes = 2\n\n[http_generation]\ntrust_domain = \"local\"\nbuffered_request_max_bytes = 65536\nbuffered_request_total_bytes = 1048576\nstreamed_request_max_bytes = 1048576\nconnect_timeout_ms = 1000\nrequest_timeout_ms = 5000\npool_idle_timeout_ms = 30000\npool_max_idle_per_host = 8\n\n[[workers]]\nworker_id = \"worker-a\"\nbase_url = \"http://127.0.0.1:1/\"\ntrust_domain = \"local\"\ndefault_model_id = \"omni\"\nhealth_path = \"/health\"\n\n[workers.capacity]\ngeneration_http = 8\n\n[[workers.service_profiles]]\nservice = \"generation_http\"\nmodel_ids = [\"omni\"]\nmessage_content_forms = [\"string\"]\nmedia_placements = []\ninput_modalities = [\"text\"]\noutput_modalities = [\"text\"]\nchat_audio_formats = []\nstream_modes = [\"non_streaming\"]\n"
         );
         fs::write(&path, contents).expect("write isolated process config");
         path
@@ -384,8 +384,8 @@ fn serves_only_exact_local_liveness_route_and_shuts_down_cleanly() {
         ("POST", "/live", "405"),
         ("HEAD", "/live", "405"),
         ("GET", "/live/", "404"),
-        ("GET", "/ready", "404"),
-        ("PUT", "/ready", "404"),
+        ("GET", "/ready", "503"),
+        ("PUT", "/ready", "405"),
         ("GET", "/ready/", "404"),
         ("GET", "/health", "404"),
         ("GET", "/metrics", "404"),

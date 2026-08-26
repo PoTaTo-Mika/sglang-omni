@@ -5,7 +5,7 @@ use bytes::Bytes;
 use http_body::{Frame, SizeHint};
 use thiserror::Error;
 
-use crate::admission::AdmissionLease;
+use crate::worker_pool::RequestLease;
 
 #[derive(Debug, Error)]
 #[error("upstream response body terminated")]
@@ -14,12 +14,12 @@ pub(crate) struct RelayError;
 /// Direct upstream response body whose terminal owner retains admission.
 pub(crate) struct DirectResponseBody {
     inner: Option<reqwest::Body>,
-    lease: Option<AdmissionLease>,
+    lease: Option<RequestLease>,
     terminal: bool,
 }
 
 impl DirectResponseBody {
-    pub(crate) fn new(inner: reqwest::Body, lease: AdmissionLease) -> Self {
+    pub(crate) fn new(inner: reqwest::Body, lease: RequestLease) -> Self {
         Self {
             inner: Some(inner),
             lease: Some(lease),
@@ -27,24 +27,27 @@ impl DirectResponseBody {
         }
     }
 
-    fn terminalize(&mut self) {
+    fn terminalize(&mut self, upstream_failure: bool) {
         if self.terminal {
             return;
         }
         self.terminal = true;
+        if upstream_failure && let Some(lease) = self.lease.as_ref() {
+            lease.request_immediate_probe();
+        }
         drop(self.inner.take());
         drop(self.lease.take());
     }
 
     fn fail(&mut self) -> Poll<Option<Result<Frame<Bytes>, RelayError>>> {
-        self.terminalize();
+        self.terminalize(true);
         Poll::Ready(Some(Err(RelayError)))
     }
 }
 
 impl Drop for DirectResponseBody {
     fn drop(&mut self) {
-        self.terminalize();
+        self.terminalize(false);
     }
 }
 
@@ -69,7 +72,7 @@ impl http_body::Body for DirectResponseBody {
             },
             Poll::Ready(Some(Err(_source))) => self.fail(),
             Poll::Ready(None) => {
-                self.terminalize();
+                self.terminalize(false);
                 Poll::Ready(None)
             }
             Poll::Pending => Poll::Pending,

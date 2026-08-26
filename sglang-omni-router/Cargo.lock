@@ -925,6 +925,7 @@ dependencies = [
  "http-body",
  "reqwest",
  "serde",
+ "serde_json",
  "sync_wrapper",
  "thiserror",
  "tokio",

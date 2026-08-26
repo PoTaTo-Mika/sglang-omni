@@ -1,3 +1,4 @@
+use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -8,6 +9,7 @@ use bytes::Bytes;
 use http_body::{Frame, SizeHint};
 use sync_wrapper::SyncWrapper;
 use thiserror::Error;
+use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::Sleep;
 
 use crate::error::HttpFault;
@@ -20,6 +22,43 @@ pub(crate) enum UploadState {
 }
 
 pub(crate) type SharedUploadState = Arc<Mutex<UploadState>>;
+
+/// One already-classified request body retaining its aggregate byte budget
+/// until Reqwest consumes or drops the body.
+pub(crate) struct BufferedBody {
+    data: Option<Bytes>,
+    _budget: OwnedSemaphorePermit,
+}
+
+impl BufferedBody {
+    pub(crate) fn new(data: Bytes, budget: OwnedSemaphorePermit) -> Self {
+        Self {
+            data: Some(data),
+            _budget: budget,
+        }
+    }
+}
+
+impl http_body::Body for BufferedBody {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        Poll::Ready(self.data.take().map(|data| Ok(Frame::data(data))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.data.is_none()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        let remaining = self.data.as_ref().map_or(0, |data| data.len() as u64);
+        SizeHint::with_exact(remaining)
+    }
+}
 
 #[derive(Debug, Error)]
 #[error("request upload failed")]

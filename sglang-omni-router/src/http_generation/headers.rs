@@ -7,6 +7,8 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 
 use crate::error::HttpFault;
 
+use super::classify::ExpectedSuccess;
+
 pub(crate) struct RequestFraming {
     pub(crate) content_length: u64,
 }
@@ -56,6 +58,7 @@ pub(crate) fn validate_request(headers: &HeaderMap) -> Result<RequestFraming, Ht
 pub(crate) fn sanitize_response(
     status: StatusCode,
     source: &HeaderMap,
+    expected: Option<ExpectedSuccess>,
 ) -> Result<HeaderMap, HttpFault> {
     let connection_tokens = connection_tokens(source)?;
     if !(status.is_success() || status.is_client_error() || status.is_server_error()) {
@@ -91,6 +94,11 @@ pub(crate) fn sanitize_response(
         let json = is_media_type(value, "application/json");
         let sse = is_media_type(value, "text/event-stream");
         if !json && !sse {
+            return Err(HttpFault::UpstreamProtocolError);
+        }
+        if matches!(expected, Some(ExpectedSuccess::Json)) && !json
+            || matches!(expected, Some(ExpectedSuccess::Sse)) && !sse
+        {
             return Err(HttpFault::UpstreamProtocolError);
         }
     }
@@ -319,6 +327,7 @@ mod tests {
     };
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
 
+    use super::super::classify::ExpectedSuccess;
     use super::{HttpFault, sanitize_response, validate_request};
 
     fn valid_request_headers() -> HeaderMap {
@@ -387,7 +396,8 @@ mod tests {
         source.insert("connection", HeaderValue::from_static("x-private"));
         source.insert("x-private", HeaderValue::from_static("secret"));
 
-        let sanitized = sanitize_response(StatusCode::OK, &source).expect("valid worker response");
+        let sanitized =
+            sanitize_response(StatusCode::OK, &source, None).expect("valid worker response");
         assert_eq!(sanitized.get_all(CACHE_CONTROL).iter().count(), 2);
         assert_eq!(
             sanitized.get(CONTENT_ENCODING),
@@ -402,11 +412,11 @@ mod tests {
         let mut plain = HeaderMap::new();
         plain.insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
         assert_eq!(
-            sanitize_response(StatusCode::OK, &plain).err(),
+            sanitize_response(StatusCode::OK, &plain, None).err(),
             Some(HttpFault::UpstreamProtocolError)
         );
         assert_eq!(
-            sanitize_response(StatusCode::TEMPORARY_REDIRECT, &HeaderMap::new()).err(),
+            sanitize_response(StatusCode::TEMPORARY_REDIRECT, &HeaderMap::new(), None).err(),
             Some(HttpFault::UpstreamProtocolError)
         );
 
@@ -414,7 +424,7 @@ mod tests {
         duplicate_type.append(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         duplicate_type.append(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         assert_eq!(
-            sanitize_response(StatusCode::OK, &duplicate_type).err(),
+            sanitize_response(StatusCode::OK, &duplicate_type, None).err(),
             Some(HttpFault::UpstreamProtocolError)
         );
         let mut duplicate_length = HeaderMap::new();
@@ -422,7 +432,7 @@ mod tests {
         duplicate_length.append(CONTENT_LENGTH, HeaderValue::from_static("2"));
         duplicate_length.append(CONTENT_LENGTH, HeaderValue::from_static("2"));
         assert_eq!(
-            sanitize_response(StatusCode::OK, &duplicate_length).err(),
+            sanitize_response(StatusCode::OK, &duplicate_length, None).err(),
             Some(HttpFault::UpstreamProtocolError)
         );
     }
@@ -430,8 +440,26 @@ mod tests {
     #[test]
     fn worker_errors_relay_without_a_success_content_type() {
         let headers = HeaderMap::new();
-        let sanitized = sanitize_response(StatusCode::UNPROCESSABLE_ENTITY, &headers)
+        let sanitized = sanitize_response(StatusCode::UNPROCESSABLE_ENTITY, &headers, None)
             .expect("worker error response is relayable");
         assert!(sanitized.is_empty());
+    }
+
+    #[test]
+    fn classified_success_must_match_the_body_selected_stream_mode() {
+        let mut json = HeaderMap::new();
+        json.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let mut sse = HeaderMap::new();
+        sse.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+        assert!(sanitize_response(StatusCode::OK, &json, Some(ExpectedSuccess::Json)).is_ok());
+        assert!(sanitize_response(StatusCode::OK, &sse, Some(ExpectedSuccess::Sse)).is_ok());
+        assert_eq!(
+            sanitize_response(StatusCode::OK, &json, Some(ExpectedSuccess::Sse)).err(),
+            Some(HttpFault::UpstreamProtocolError)
+        );
+        assert_eq!(
+            sanitize_response(StatusCode::OK, &sse, Some(ExpectedSuccess::Json)).err(),
+            Some(HttpFault::UpstreamProtocolError)
+        );
     }
 }

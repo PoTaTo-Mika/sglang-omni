@@ -4,42 +4,62 @@ use axum::Router;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::middleware;
-use axum::routing::any;
-use axum::routing::get;
-use tokio::sync::oneshot;
+use axum::routing::{any, get};
+use tokio::sync::{Semaphore, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{error, info};
 
-use crate::admission::Admission;
 use crate::config::Config;
 use crate::error::RouterError;
 use crate::http_generation::{self, HttpGeneration};
 use crate::lifecycle::Lifecycle;
 use crate::request_id::{self, RequestIds};
 use crate::shutdown;
+use crate::worker_pool::{HealthSupervisor, HealthTaskError, WorkerPool};
 
 mod bounded_listener;
 
 use bounded_listener::BoundedTcpListener;
 
 const LIVE_BODY: &str = "live\n";
+const NOT_READY_BODY: &str = "not ready\n";
+const READY_BODY: &str = "ready\n";
+
+#[derive(Clone)]
+struct AppState {
+    lifecycle: Arc<Lifecycle>,
+    generation: Arc<HttpGeneration>,
+}
 
 pub(crate) async fn serve(config: Config) -> Result<(), RouterError> {
     let lifecycle = Arc::new(Lifecycle::starting());
-    let global_limit = config.admission.global_usize()?;
-    let admission = Arc::new(Admission::new(Arc::clone(&lifecycle), global_limit));
-    let generation = HttpGeneration::build(&config, Arc::clone(&admission))?;
+    let pool = Arc::new(WorkerPool::build(&config)?);
+    let classification_slots = Arc::new(Semaphore::new(
+        config.router.max_concurrent_classifications(),
+    ));
+    let generation = HttpGeneration::build(
+        &config,
+        Arc::clone(&pool),
+        Arc::clone(&classification_slots),
+    )?;
     let request_ids = RequestIds::new();
     let mut signal_observer = shutdown::SignalObserver::install().map_err(RouterError::Signal)?;
-    let app = route_table(Arc::clone(&lifecycle), generation, request_ids);
+    let app = route_table(
+        AppState {
+            lifecycle: Arc::clone(&lifecycle),
+            generation: Arc::clone(&generation),
+        },
+        generation,
+        request_ids,
+    );
     let listener = tokio::net::TcpListener::bind(config.server.listen)
         .await
         .map_err(RouterError::Bind)?;
     let listener = BoundedTcpListener::new(listener, config.server.max_connections);
     let (shutdown_sender, shutdown_receiver) = oneshot::channel::<()>();
-
     lifecycle.enter_serving()?;
-    info!(state = "serving", "local service started");
+    let mut health = pool.start_health(&config);
+    info!(state = "serving", ready = false, "local service started");
 
     let mut server_task = tokio::spawn(async move {
         axum::serve(listener, app)
@@ -52,90 +72,148 @@ pub(crate) async fn serve(config: Config) -> Result<(), RouterError> {
     let first_signal = tokio::select! {
         biased;
         task_result = &mut server_task => {
+            health.cancel();
+            health.abort_and_join_all().await;
             lifecycle.enter_failed()?;
             return unexpected_server_exit(task_result);
+        }
+        health_result = health.join_next(), if !health.is_empty() => {
+            abort_all(&mut server_task, &mut health).await?;
+            lifecycle.enter_failed()?;
+            return unexpected_health_exit(health_result);
         }
         signal_result = signal_observer.next() => match signal_result {
             Ok(signal) => signal,
             Err(source) => {
-                abort_and_join(&mut server_task).await?;
+                abort_all(&mut server_task, &mut health).await?;
                 lifecycle.enter_failed()?;
                 return Err(RouterError::Signal(source));
             }
         },
     };
 
-    if let Err(error) = lifecycle.enter_draining() {
-        abort_and_join(&mut server_task).await?;
-        return Err(error);
+    if lifecycle.enter_draining().is_err() || pool.drain().is_err() {
+        abort_all(&mut server_task, &mut health).await?;
+        lifecycle.enter_failed()?;
+        return Err(RouterError::Lifecycle);
     }
-    admission.close();
+    health.cancel();
     info!(state = "draining", reason = ?first_signal, "graceful shutdown started");
     if shutdown_sender.send(()).is_err() {
-        abort_and_join(&mut server_task).await?;
+        abort_all(&mut server_task, &mut health).await?;
         lifecycle.enter_failed()?;
         return Err(RouterError::ShutdownNotify);
     }
 
-    let drain_timeout = config.shutdown.drain_timeout();
-    let drain_result = tokio::select! {
-        biased;
-        task_result = &mut server_task => finish_graceful(task_result, &lifecycle),
-        second_signal = signal_observer.next() => {
-            match second_signal {
-                Ok(signal) => {
-                    error!(state = "draining", reason = ?signal, "second signal forced shutdown");
-                    abort_and_join(&mut server_task).await?;
-                    lifecycle.enter_failed()?;
-                    Err(RouterError::ForcedShutdown)
-                }
-                Err(source) => {
-                    abort_and_join(&mut server_task).await?;
-                    lifecycle.enter_failed()?;
-                    Err(RouterError::Signal(source))
+    let deadline = tokio::time::Instant::now() + config.shutdown.drain_timeout();
+    let mut server_done = false;
+    while !server_done || !health.is_empty() {
+        tokio::select! {
+            biased;
+            task_result = &mut server_task, if !server_done => {
+                match task_result {
+                    Ok(Ok(())) => server_done = true,
+                    Ok(Err(source)) => {
+                        health.abort_and_join_all().await;
+                        lifecycle.enter_failed()?;
+                        return Err(RouterError::Server(source));
+                    }
+                    Err(source) => {
+                        health.abort_and_join_all().await;
+                        lifecycle.enter_failed()?;
+                        return Err(RouterError::ServerTask(source));
+                    }
                 }
             }
+            health_result = health.join_next(), if !health.is_empty() => {
+                if !expected_health_shutdown(health_result) {
+                    if !server_done {
+                        let server_result = abort_and_join_server(&mut server_task).await;
+                        health.abort_and_join_all().await;
+                        server_result?;
+                    } else {
+                        health.abort_and_join_all().await;
+                    }
+                    lifecycle.enter_failed()?;
+                    return Err(RouterError::HealthTask);
+                }
+            }
+            second_signal = signal_observer.next() => {
+                let signal = match second_signal {
+                    Ok(signal) => signal,
+                    Err(source) => {
+                        if !server_done {
+                            let server_result = abort_and_join_server(&mut server_task).await;
+                            health.abort_and_join_all().await;
+                            server_result?;
+                        } else {
+                            health.abort_and_join_all().await;
+                        }
+                        lifecycle.enter_failed()?;
+                        return Err(RouterError::Signal(source));
+                    }
+                };
+                error!(state = "draining", reason = ?signal, "second signal forced shutdown");
+                if !server_done {
+                    abort_and_join_server(&mut server_task).await?;
+                }
+                health.abort_and_join_all().await;
+                lifecycle.enter_failed()?;
+                return Err(RouterError::ForcedShutdown);
+            }
+            () = tokio::time::sleep_until(deadline) => {
+                error!(state = "draining", "graceful shutdown deadline elapsed");
+                if !server_done {
+                    abort_and_join_server(&mut server_task).await?;
+                }
+                health.abort_and_join_all().await;
+                lifecycle.enter_failed()?;
+                return Err(RouterError::DrainTimeout);
+            }
         }
-        () = tokio::time::sleep(drain_timeout) => {
-            error!(state = "draining", "graceful shutdown deadline elapsed");
-            abort_and_join(&mut server_task).await?;
-            lifecycle.enter_failed()?;
-            Err(RouterError::DrainTimeout)
-        }
-    };
-
-    if drain_result.is_ok() {
-        info!(
-            state = "stopped",
-            remaining_tasks = 0_u8,
-            "shutdown complete"
-        );
     }
-    drain_result
+
+    lifecycle.enter_stopped()?;
+    info!(
+        state = "stopped",
+        remaining_tasks = 0_u8,
+        "shutdown complete"
+    );
+    Ok(())
 }
 
 fn route_table(
-    lifecycle: Arc<Lifecycle>,
+    state: AppState,
     generation: Arc<HttpGeneration>,
     request_ids: Arc<RequestIds>,
 ) -> Router {
-    let local = Router::new()
+    Router::new()
         .route("/live", get(live).head(reject_head))
-        .with_state(lifecycle);
-    let inference = Router::new()
-        .route(http_generation::CHAT_PATH, any(http_generation::chat))
-        .with_state(generation);
-    local.merge(inference).layer(middleware::from_fn_with_state(
-        request_ids,
-        request_id::canonicalize,
-    ))
+        .route("/ready", get(ready).head(reject_head))
+        .with_state(state)
+        .route(
+            http_generation::CHAT_PATH,
+            any(http_generation::chat).with_state(generation),
+        )
+        .layer(middleware::from_fn_with_state(
+            request_ids,
+            request_id::canonicalize,
+        ))
 }
 
-async fn live(State(lifecycle): State<Arc<Lifecycle>>) -> (StatusCode, &'static str) {
-    if lifecycle.is_live() {
+async fn live(State(state): State<AppState>) -> (StatusCode, &'static str) {
+    if state.lifecycle.is_live() {
         (StatusCode::OK, LIVE_BODY)
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, "not live\n")
+    }
+}
+
+async fn ready(State(state): State<AppState>) -> (StatusCode, &'static str) {
+    if state.lifecycle.is_serving() && state.generation.is_ready() {
+        (StatusCode::OK, READY_BODY)
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, NOT_READY_BODY)
     }
 }
 
@@ -153,24 +231,30 @@ fn unexpected_server_exit(
     }
 }
 
-fn finish_graceful(
-    task_result: Result<Result<(), std::io::Error>, tokio::task::JoinError>,
-    lifecycle: &Lifecycle,
+fn unexpected_health_exit(
+    result: Option<Result<Result<(), HealthTaskError>, tokio::task::JoinError>>,
 ) -> Result<(), RouterError> {
-    match task_result {
-        Ok(Ok(())) => lifecycle.enter_stopped(),
-        Ok(Err(source)) => {
-            lifecycle.enter_failed()?;
-            Err(RouterError::Server(source))
-        }
-        Err(source) => {
-            lifecycle.enter_failed()?;
-            Err(RouterError::ServerTask(source))
-        }
-    }
+    let _result = result;
+    Err(RouterError::HealthTask)
 }
 
-async fn abort_and_join(
+fn expected_health_shutdown(
+    result: Option<Result<Result<(), HealthTaskError>, tokio::task::JoinError>>,
+) -> bool {
+    matches!(result, Some(Ok(Ok(()))))
+}
+
+async fn abort_all(
+    server_task: &mut JoinHandle<std::io::Result<()>>,
+    health: &mut HealthSupervisor,
+) -> Result<(), RouterError> {
+    health.cancel();
+    let server_result = abort_and_join_server(server_task).await;
+    health.abort_and_join_all().await;
+    server_result
+}
+
+async fn abort_and_join_server(
     server_task: &mut JoinHandle<std::io::Result<()>>,
 ) -> Result<(), RouterError> {
     server_task.abort();

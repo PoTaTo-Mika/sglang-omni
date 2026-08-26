@@ -87,9 +87,15 @@ pub enum RouterError {
     /// The generation data-plane client failed to build.
     #[error("failed to initialize the generation HTTP client")]
     GenerationClient(#[source] reqwest::Error),
-    /// Validated core-HTTP configuration could not be reconstructed.
-    #[error("the core HTTP configuration invariant failed")]
-    CoreHttpInvariant,
+    /// The isolated health client failed to build.
+    #[error("failed to initialize the isolated health client")]
+    HealthClient(#[source] reqwest::Error),
+    /// Validated worker-pool configuration could not be reconstructed.
+    #[error("the validated worker-pool invariant failed")]
+    WorkerPoolInvariant,
+    /// A health worker exited before cancellation or failed during shutdown.
+    #[error("an owned health task failed")]
+    HealthTask,
 }
 
 impl RouterError {
@@ -109,7 +115,9 @@ impl RouterError {
             | Self::ShutdownNotify
             | Self::Signal(_)
             | Self::GenerationClient(_)
-            | Self::CoreHttpInvariant => 1,
+            | Self::HealthClient(_)
+            | Self::WorkerPoolInvariant
+            | Self::HealthTask => 1,
         }
     }
 }
@@ -124,12 +132,14 @@ impl ConfigError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HttpFault {
     MalformedRequest,
+    AmbiguousModel,
     MethodNotAllowed,
     RequestTimeout,
     RequestBodyTooLarge,
     UnsupportedMediaType,
     UnsupportedContentEncoding,
     ExpectationFailed,
+    NoCompatibleWorker,
     RouterOverloaded,
     InternalError,
     UpstreamProtocolError,
@@ -141,7 +151,7 @@ pub(crate) enum HttpFault {
 impl HttpFault {
     const fn status(self) -> StatusCode {
         match self {
-            Self::MalformedRequest => StatusCode::BAD_REQUEST,
+            Self::MalformedRequest | Self::AmbiguousModel => StatusCode::BAD_REQUEST,
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             Self::RequestTimeout => StatusCode::REQUEST_TIMEOUT,
             Self::RequestBodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
@@ -149,6 +159,7 @@ impl HttpFault {
                 StatusCode::UNSUPPORTED_MEDIA_TYPE
             }
             Self::ExpectationFailed => StatusCode::EXPECTATION_FAILED,
+            Self::NoCompatibleWorker => StatusCode::UNPROCESSABLE_ENTITY,
             Self::RouterOverloaded => StatusCode::TOO_MANY_REQUESTS,
             Self::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
             Self::UpstreamProtocolError => StatusCode::BAD_GATEWAY,
@@ -161,12 +172,14 @@ impl HttpFault {
     const fn code(self) -> &'static str {
         match self {
             Self::MalformedRequest => "malformed_request",
+            Self::AmbiguousModel => "ambiguous_model",
             Self::MethodNotAllowed => "method_not_allowed",
             Self::RequestTimeout => "request_timeout",
             Self::RequestBodyTooLarge => "request_body_too_large",
             Self::UnsupportedMediaType => "unsupported_media_type",
             Self::UnsupportedContentEncoding => "unsupported_content_encoding",
             Self::ExpectationFailed => "expectation_failed",
+            Self::NoCompatibleWorker => "no_compatible_worker",
             Self::RouterOverloaded => "router_overloaded",
             Self::InternalError => "internal_error",
             Self::UpstreamProtocolError => "upstream_protocol_error",
@@ -179,12 +192,14 @@ impl HttpFault {
     const fn message(self) -> &'static str {
         match self {
             Self::MalformedRequest => "The request is malformed.",
+            Self::AmbiguousModel => "An explicit model is required.",
             Self::MethodNotAllowed => "POST is required for this route.",
             Self::RequestTimeout => "The request body timed out.",
             Self::RequestBodyTooLarge => "The request body is too large.",
             Self::UnsupportedMediaType => "The content type is unsupported.",
             Self::UnsupportedContentEncoding => "The content encoding is unsupported.",
             Self::ExpectationFailed => "Request expectations are unsupported.",
+            Self::NoCompatibleWorker => "No compatible worker is configured.",
             Self::RouterOverloaded => "The router is overloaded.",
             Self::InternalError => "The router encountered an internal error.",
             Self::UpstreamProtocolError => "The upstream response is invalid.",
