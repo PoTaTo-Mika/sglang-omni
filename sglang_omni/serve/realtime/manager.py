@@ -20,15 +20,15 @@ class RealtimeSessionManager:
         *,
         client: Client,
         model_name: str,
+        audio_chunking: AudioChunkingConfig,
         supports_audio_output: bool = False,
         transcription_config: RealtimeTranscriptionConfig | None = None,
-        audio_chunking: AudioChunkingConfig | None = None,
     ) -> None:
         self.client = client
         self.model_name = model_name
         self.supports_audio_output = supports_audio_output
         self.transcription_config = transcription_config
-        self.audio_chunking = audio_chunking or AudioChunkingConfig()
+        self.audio_chunking = audio_chunking
         self.sessions: dict[str, RealtimeSession | RealtimeTranscriptionSession] = {}
 
     def open(

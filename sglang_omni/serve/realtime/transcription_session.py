@@ -212,7 +212,7 @@ class RealtimeTranscriptionSession:
             )
         )
 
-    async def cancel_and_abort(
+    async def _cancel_and_abort(
         self, task: asyncio.Task[Any] | None, request_id: str | None
     ) -> None:
         if task is None or task.done():
@@ -221,6 +221,14 @@ class RealtimeTranscriptionSession:
         try:
             if request_id is not None:
                 await self.client.abort(request_id)
+        except Exception as exc:
+            asyncio.get_running_loop().call_exception_handler(
+                {
+                    "message": "Realtime transcription abort failed",
+                    "exception": exc,
+                    "task": task,
+                }
+            )
         finally:
             await asyncio.gather(task, return_exceptions=True)
 
@@ -594,7 +602,7 @@ class RealtimeTranscriptionSession:
     async def handle_audio_clear(self, event: InputAudioBufferClear) -> None:
         del event
         request_id = self._inflight_request_id
-        await self.cancel_and_abort(self._decode_worker_task, request_id)
+        await self._cancel_and_abort(self._decode_worker_task, request_id)
         for final in self._pending_finals:
             if not final.done.done():
                 final.done.cancel()
@@ -646,7 +654,7 @@ class RealtimeTranscriptionSession:
         await self._commit_buffer("session_end")
         if self._final_waiters:
             await asyncio.gather(*list(self._final_waiters))
-        await self.cancel_and_abort(self._decode_worker_task, None)
+        await self._cancel_and_abort(self._decode_worker_task, None)
         ordered = sorted(self.committed_segments, key=lambda item: item.segment_id)
         await self.send(
             make_event(
@@ -659,7 +667,7 @@ class RealtimeTranscriptionSession:
         self.closed = True
         self.active_segment = None
         request_id = self._inflight_request_id
-        await self.cancel_and_abort(self._decode_worker_task, request_id)
+        await self._cancel_and_abort(self._decode_worker_task, request_id)
         for final in self._pending_finals:
             if not final.done.done():
                 final.done.cancel()

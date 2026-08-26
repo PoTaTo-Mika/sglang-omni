@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""H200 end-to-end coverage for Qwen3-ASR realtime transcription.
+"""End-to-end coverage for Qwen3-ASR realtime transcription.
 
 Usage:
     CUDA_VISIBLE_DEVICES=0 pytest -s -x \
