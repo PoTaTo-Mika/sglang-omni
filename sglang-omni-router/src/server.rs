@@ -9,9 +9,10 @@ use tokio::sync::{Semaphore, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{error, info};
 
-use crate::config::Config;
+use crate::config::{Config, HttpMediaRoute};
 use crate::error::RouterError;
 use crate::http_generation::{self, HttpGeneration};
+use crate::http_media::{self, HttpMedia};
 use crate::lifecycle::Lifecycle;
 use crate::request_id::{self, RequestIds};
 use crate::shutdown;
@@ -28,7 +29,8 @@ const READY_BODY: &str = "ready\n";
 #[derive(Clone)]
 struct AppState {
     lifecycle: Arc<Lifecycle>,
-    generation: Arc<HttpGeneration>,
+    generation: Option<Arc<HttpGeneration>>,
+    media: Option<Arc<HttpMedia>>,
 }
 
 pub(crate) async fn serve(config: Config) -> Result<(), RouterError> {
@@ -42,14 +44,21 @@ pub(crate) async fn serve(config: Config) -> Result<(), RouterError> {
         Arc::clone(&pool),
         Arc::clone(&classification_slots),
     )?;
+    let media = HttpMedia::build(
+        &config,
+        Arc::clone(&pool),
+        Arc::clone(&classification_slots),
+    )?;
     let request_ids = RequestIds::new();
     let mut signal_observer = shutdown::SignalObserver::install().map_err(RouterError::Signal)?;
     let app = route_table(
         AppState {
             lifecycle: Arc::clone(&lifecycle),
-            generation: Arc::clone(&generation),
+            generation: generation.clone(),
+            media: media.clone(),
         },
         generation,
+        media,
         request_ids,
     );
     let listener = tokio::net::TcpListener::bind(config.server.listen)
@@ -184,21 +193,53 @@ pub(crate) async fn serve(config: Config) -> Result<(), RouterError> {
 
 fn route_table(
     state: AppState,
-    generation: Arc<HttpGeneration>,
+    generation: Option<Arc<HttpGeneration>>,
+    media: Option<Arc<HttpMedia>>,
     request_ids: Arc<RequestIds>,
 ) -> Router {
-    Router::new()
+    let mut app = Router::new()
         .route("/live", get(live).head(reject_head))
         .route("/ready", get(ready).head(reject_head))
-        .with_state(state)
-        .route(
+        .with_state(state);
+    if let Some(generation) = generation {
+        app = app.route(
             http_generation::CHAT_PATH,
             any(http_generation::chat).with_state(generation),
-        )
-        .layer(middleware::from_fn_with_state(
-            request_ids,
-            request_id::canonicalize,
-        ))
+        );
+    }
+    if let Some(media) = media {
+        for route in [
+            HttpMediaRoute::Speech,
+            HttpMediaRoute::SpeechBatch,
+            HttpMediaRoute::Transcription,
+            HttpMediaRoute::Translation,
+        ] {
+            if !media.enables(route) {
+                continue;
+            }
+            let path = route.path();
+            app = match route {
+                HttpMediaRoute::Speech => {
+                    app.route(path, any(http_media::speech).with_state(Arc::clone(&media)))
+                }
+                HttpMediaRoute::SpeechBatch => {
+                    app.route(path, any(http_media::batch).with_state(Arc::clone(&media)))
+                }
+                HttpMediaRoute::Transcription => app.route(
+                    path,
+                    any(http_media::transcription).with_state(Arc::clone(&media)),
+                ),
+                HttpMediaRoute::Translation => app.route(
+                    path,
+                    any(http_media::translation).with_state(Arc::clone(&media)),
+                ),
+            };
+        }
+    }
+    app.layer(middleware::from_fn_with_state(
+        request_ids,
+        request_id::canonicalize,
+    ))
 }
 
 async fn live(State(state): State<AppState>) -> (StatusCode, &'static str) {
@@ -210,7 +251,13 @@ async fn live(State(state): State<AppState>) -> (StatusCode, &'static str) {
 }
 
 async fn ready(State(state): State<AppState>) -> (StatusCode, &'static str) {
-    if state.lifecycle.is_serving() && state.generation.is_ready() {
+    if state.lifecycle.is_serving()
+        && state
+            .generation
+            .as_ref()
+            .is_none_or(|generation| generation.is_ready())
+        && state.media.as_ref().is_none_or(|media| media.is_ready())
+    {
         (StatusCode::OK, READY_BODY)
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, NOT_READY_BODY)

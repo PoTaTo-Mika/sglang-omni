@@ -192,7 +192,7 @@ pub(super) fn build_health_client(
         .build()
 }
 
-pub(super) fn build_generation_client(
+pub(super) fn build_http_client(
     resolver: Arc<StaticResolver>,
     connect_timeout: Duration,
     pool_idle_timeout: Duration,

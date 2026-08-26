@@ -67,7 +67,7 @@ pub(crate) fn classify(
     let model = match facts.model.flatten() {
         Some(model) if model.is_empty() => return Err(HttpFault::MalformedRequest),
         Some(model) => ModelSelection::Explicit(model),
-        None => match pool.resolve_default_model_id(trust, ServiceClass::GenerationHttp) {
+        None => match pool.resolve_default_model_id(trust, ServiceClass::GenerationHttp, None) {
             DefaultModelResolution::Unique(model) => ModelSelection::WorkerDefault {
                 expected_model_id: model.to_owned(),
             },

@@ -87,6 +87,9 @@ pub enum RouterError {
     /// The generation data-plane client failed to build.
     #[error("failed to initialize the generation HTTP client")]
     GenerationClient(#[source] reqwest::Error),
+    /// The media data-plane client failed to build.
+    #[error("failed to initialize the media HTTP client")]
+    MediaClient(#[source] reqwest::Error),
     /// The isolated health client failed to build.
     #[error("failed to initialize the isolated health client")]
     HealthClient(#[source] reqwest::Error),
@@ -115,6 +118,7 @@ impl RouterError {
             | Self::ShutdownNotify
             | Self::Signal(_)
             | Self::GenerationClient(_)
+            | Self::MediaClient(_)
             | Self::HealthClient(_)
             | Self::WorkerPoolInvariant
             | Self::HealthTask => 1,
