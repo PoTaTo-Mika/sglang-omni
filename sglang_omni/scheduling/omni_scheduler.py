@@ -2711,12 +2711,153 @@ class OmniScheduler:
 def _remove_from_batch(batch: Any, request_id: str) -> None:
     if batch is None:
         return
-    remaining_reqs = []
-    for req in batch.reqs:
-        if req.rid == request_id:
-            _detach_request_data(req)
-        else:
-            remaining_reqs.append(req)
-    batch.reqs = remaining_reqs
-    if not batch.reqs:
+    remove_indices = [
+        index for index, req in enumerate(batch.reqs) if req.rid == request_id
+    ]
+    if not remove_indices:
+        return
+
+    remove_set = set(remove_indices)
+    keep_indices = [
+        index for index in range(len(batch.reqs)) if index not in remove_set
+    ]
+    for index in remove_indices:
+        _detach_request_data(batch.reqs[index])
+
+    # ScheduleBatch owns the row-alignment contract. In particular, never
+    # rewrite only ``batch.reqs``: FutureMap keys, sequence lengths, sampling
+    # state, and every other per-row field must be compacted in lockstep.
+    filter_batch = getattr(batch, "filter_batch", None)
+    if not callable(filter_batch):
+        # Some scheduler unit tests use request-only stand-ins. Never permit
+        # this fallback for a row-bearing production batch.
+        aligned_fields = (
+            "req_pool_indices",
+            "req_pool_indices_cpu",
+            "seq_lens",
+            "orig_seq_lens",
+            "seq_lens_cpu",
+            "sampling_info",
+        )
+        populated = [
+            field for field in aligned_fields if getattr(batch, field, None) is not None
+        ]
+        if populated:
+            raise TypeError(
+                "Row-bearing scheduler batch has no filter_batch method: "
+                f"fields={populated}"
+            )
+        batch.reqs = [batch.reqs[index] for index in keep_indices]
+        if not batch.reqs:
+            batch.batch_is_full = False
+        return
+
+    filter_batch(keep_indices=keep_indices)
+    if not keep_indices:
+        # Upstream intentionally leaves tensors stale when all requests are
+        # filtered because its callers immediately drop an empty batch. Omni
+        # retains aliases in running_batch/cur_batch/last_batch, so make the
+        # empty state structurally aligned as well.
+        _clear_empty_schedule_batch_rows(batch)
         batch.batch_is_full = False
+    _validate_schedule_batch_row_alignment(batch)
+
+
+def _clear_empty_schedule_batch_rows(batch: Any) -> None:
+    tensor_fields = (
+        "req_pool_indices",
+        "req_pool_indices_cpu",
+        "seq_lens",
+        "orig_seq_lens",
+        "seq_lens_cpu",
+        "input_ids",
+        "prefill_input_ids_cpu",
+        "input_embeds",
+        "replace_embeds",
+        "replace_positions",
+        "ne_skip_token_table_update",
+        "encoder_lens",
+        "encoder_out_cache_loc",
+        "extend_input_logprob_token_ids",
+    )
+    for field in tensor_fields:
+        value = getattr(batch, field, None)
+        if isinstance(value, torch.Tensor):
+            setattr(batch, field, value[:0])
+
+    list_fields = (
+        "multimodal_inputs",
+        "top_logprobs_nums",
+        "token_ids_logprobs",
+        "encoder_cached",
+        "encoder_lens_cpu",
+        "prefix_lens",
+        "extend_lens",
+        "extend_logprob_start_lens",
+    )
+    for field in list_fields:
+        if isinstance(getattr(batch, field, None), list):
+            setattr(batch, field, [])
+
+    sampling_info = getattr(batch, "sampling_info", None)
+    if sampling_info is not None:
+        device = batch.req_pool_indices.device
+        empty_device_indices = torch.empty(0, dtype=torch.long, device=device)
+        sampling_info.filter_batch([], empty_device_indices)
+
+    spec_info = getattr(batch, "spec_info", None)
+    if spec_info is not None:
+        device = batch.req_pool_indices.device
+        empty_device_indices = torch.empty(0, dtype=torch.long, device=device)
+        spec_info.filter_batch(
+            new_indices=empty_device_indices,
+            has_been_filtered=False,
+            new_indices_cpu=[],
+        )
+
+    batch.out_cache_loc = None
+    batch.mamba_track_indices = None
+    batch.mamba_track_mask = None
+    batch.mamba_track_seqlens = None
+    batch.mamba_cow_src_indices = None
+    batch.mamba_cow_dst_indices = None
+    batch.mamba_clear_indices = None
+    batch.seq_lens_sum = 0
+    if batch.extend_num_tokens is not None:
+        batch.extend_num_tokens = 0
+
+
+def _validate_schedule_batch_row_alignment(batch: Any) -> None:
+    expected = len(batch.reqs)
+    row_fields = (
+        "req_pool_indices",
+        "req_pool_indices_cpu",
+        "seq_lens",
+        "orig_seq_lens",
+        "seq_lens_cpu",
+        "multimodal_inputs",
+        "top_logprobs_nums",
+        "token_ids_logprobs",
+        "encoder_cached",
+        "encoder_lens",
+        "encoder_lens_cpu",
+    )
+    mismatches = {}
+    for field in row_fields:
+        value = getattr(batch, field, None)
+        if value is not None and len(value) != expected:
+            mismatches[field] = len(value)
+
+    forward_mode = getattr(batch, "forward_mode", None)
+    is_decode = forward_mode is not None and forward_mode.is_decode()
+    if is_decode:
+        for field in ("input_ids", "input_embeds"):
+            value = getattr(batch, field, None)
+            if value is not None and len(value) != expected:
+                mismatches[field] = len(value)
+
+    if mismatches:
+        raise RuntimeError(
+            "ScheduleBatch row alignment violated after request removal: "
+            f"requests={expected}, fields={mismatches}"
+        )
