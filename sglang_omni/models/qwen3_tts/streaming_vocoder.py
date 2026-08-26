@@ -363,6 +363,7 @@ class Qwen3TTSStreamingVocoderScheduler(
         initial_cuda_graph: bool = True,
         enable_deterministic_inference: bool = False,
         followup_cuda_graph: bool = True,
+        fused_snake_activation: bool = False,
     ) -> None:
         if stream_stride <= 0 or stream_followup_stride <= 0:
             raise ValueError("stream strides must be > 0")
@@ -382,6 +383,15 @@ class Qwen3TTSStreamingVocoderScheduler(
         self._tokenizer = tokenizer
         self._device = torch.device(device)
         self._decoder = tokenizer.model.decoder
+        if fused_snake_activation:
+            from sglang_omni.models.qwen3_tts.vocoder_kernels import (
+                fuse_vocoder_decoder,
+            )
+
+            logger.info(
+                "Qwen3-TTS vocoder fused SnakeBeta modules: %d",
+                fuse_vocoder_decoder(self._decoder),
+            )
         tokenizer_config = getattr(tokenizer.model, "config", None)
         decoder_config = getattr(tokenizer_config, "decoder_config", tokenizer_config)
         num_quantizers = int(getattr(decoder_config, "num_quantizers", 0) or 0)
