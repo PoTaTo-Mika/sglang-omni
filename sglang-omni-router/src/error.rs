@@ -3,6 +3,10 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+use axum::body::Body;
+use axum::http::header::{ALLOW, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE};
+use axum::http::{HeaderValue, Response, StatusCode};
+
 /// Strict configuration loading and validation failures.
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -80,6 +84,12 @@ pub enum RouterError {
     /// Signal observation could not be installed or completed.
     #[error("failed to observe process termination signals")]
     Signal(#[source] io::Error),
+    /// The generation data-plane client failed to build.
+    #[error("failed to initialize the generation HTTP client")]
+    GenerationClient(#[source] reqwest::Error),
+    /// Validated core-HTTP configuration could not be reconstructed.
+    #[error("the core HTTP configuration invariant failed")]
+    CoreHttpInvariant,
 }
 
 impl RouterError {
@@ -97,7 +107,115 @@ impl RouterError {
             | Self::ForcedShutdown
             | Self::Lifecycle
             | Self::ShutdownNotify
-            | Self::Signal(_) => 1,
+            | Self::Signal(_)
+            | Self::GenerationClient(_)
+            | Self::CoreHttpInvariant => 1,
         }
+    }
+}
+
+impl ConfigError {
+    pub(crate) const fn invalid(field: &'static str, reason: &'static str) -> Self {
+        Self::InvalidField { field, reason }
+    }
+}
+
+/// Stable topology-free failures generated before response commitment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HttpFault {
+    MalformedRequest,
+    MethodNotAllowed,
+    RequestTimeout,
+    RequestBodyTooLarge,
+    UnsupportedMediaType,
+    UnsupportedContentEncoding,
+    ExpectationFailed,
+    RouterOverloaded,
+    InternalError,
+    UpstreamProtocolError,
+    RouterUnavailable,
+    UpstreamTimeout,
+    HttpVersionNotSupported,
+}
+
+impl HttpFault {
+    const fn status(self) -> StatusCode {
+        match self {
+            Self::MalformedRequest => StatusCode::BAD_REQUEST,
+            Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
+            Self::RequestTimeout => StatusCode::REQUEST_TIMEOUT,
+            Self::RequestBodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::UnsupportedMediaType | Self::UnsupportedContentEncoding => {
+                StatusCode::UNSUPPORTED_MEDIA_TYPE
+            }
+            Self::ExpectationFailed => StatusCode::EXPECTATION_FAILED,
+            Self::RouterOverloaded => StatusCode::TOO_MANY_REQUESTS,
+            Self::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::UpstreamProtocolError => StatusCode::BAD_GATEWAY,
+            Self::RouterUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::UpstreamTimeout => StatusCode::GATEWAY_TIMEOUT,
+            Self::HttpVersionNotSupported => StatusCode::HTTP_VERSION_NOT_SUPPORTED,
+        }
+    }
+
+    const fn code(self) -> &'static str {
+        match self {
+            Self::MalformedRequest => "malformed_request",
+            Self::MethodNotAllowed => "method_not_allowed",
+            Self::RequestTimeout => "request_timeout",
+            Self::RequestBodyTooLarge => "request_body_too_large",
+            Self::UnsupportedMediaType => "unsupported_media_type",
+            Self::UnsupportedContentEncoding => "unsupported_content_encoding",
+            Self::ExpectationFailed => "expectation_failed",
+            Self::RouterOverloaded => "router_overloaded",
+            Self::InternalError => "internal_error",
+            Self::UpstreamProtocolError => "upstream_protocol_error",
+            Self::RouterUnavailable => "router_unavailable",
+            Self::UpstreamTimeout => "upstream_timeout",
+            Self::HttpVersionNotSupported => "http_version_not_supported",
+        }
+    }
+
+    const fn message(self) -> &'static str {
+        match self {
+            Self::MalformedRequest => "The request is malformed.",
+            Self::MethodNotAllowed => "POST is required for this route.",
+            Self::RequestTimeout => "The request body timed out.",
+            Self::RequestBodyTooLarge => "The request body is too large.",
+            Self::UnsupportedMediaType => "The content type is unsupported.",
+            Self::UnsupportedContentEncoding => "The content encoding is unsupported.",
+            Self::ExpectationFailed => "Request expectations are unsupported.",
+            Self::RouterOverloaded => "The router is overloaded.",
+            Self::InternalError => "The router encountered an internal error.",
+            Self::UpstreamProtocolError => "The upstream response is invalid.",
+            Self::RouterUnavailable => "The router is unavailable.",
+            Self::UpstreamTimeout => "The upstream request timed out.",
+            Self::HttpVersionNotSupported => "HTTP/1.1 is required.",
+        }
+    }
+
+    pub(crate) fn into_response(self) -> Response<Body> {
+        let body = format!(
+            "{{\"error\":{{\"code\":\"{}\",\"message\":\"{}\"}}}}",
+            self.code(),
+            self.message()
+        );
+        let mut response = Response::new(Body::from(body.clone()));
+        *response.status_mut() = self.status();
+        response
+            .headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        response
+            .headers_mut()
+            .insert(CONTENT_LENGTH, HeaderValue::from(body.len()));
+        response
+            .headers_mut()
+            .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        if self == Self::MethodNotAllowed {
+            response
+                .headers_mut()
+                .insert(ALLOW, HeaderValue::from_static("POST"));
+        }
+        response
     }
 }

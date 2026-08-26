@@ -3,14 +3,19 @@ use std::sync::Arc;
 use axum::Router;
 use axum::extract::State;
 use axum::http::StatusCode;
+use axum::middleware;
+use axum::routing::any;
 use axum::routing::get;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tracing::{error, info};
 
+use crate::admission::Admission;
 use crate::config::Config;
 use crate::error::RouterError;
+use crate::http_generation::{self, HttpGeneration};
 use crate::lifecycle::Lifecycle;
+use crate::request_id::{self, RequestIds};
 use crate::shutdown;
 
 mod bounded_listener;
@@ -21,8 +26,12 @@ const LIVE_BODY: &str = "live\n";
 
 pub(crate) async fn serve(config: Config) -> Result<(), RouterError> {
     let lifecycle = Arc::new(Lifecycle::starting());
+    let global_limit = config.admission.global_usize()?;
+    let admission = Arc::new(Admission::new(Arc::clone(&lifecycle), global_limit));
+    let generation = HttpGeneration::build(&config, Arc::clone(&admission))?;
+    let request_ids = RequestIds::new();
     let mut signal_observer = shutdown::SignalObserver::install().map_err(RouterError::Signal)?;
-    let app = route_table(Arc::clone(&lifecycle));
+    let app = route_table(Arc::clone(&lifecycle), generation, request_ids);
     let listener = tokio::net::TcpListener::bind(config.server.listen)
         .await
         .map_err(RouterError::Bind)?;
@@ -60,6 +69,7 @@ pub(crate) async fn serve(config: Config) -> Result<(), RouterError> {
         abort_and_join(&mut server_task).await?;
         return Err(error);
     }
+    admission.close();
     info!(state = "draining", reason = ?first_signal, "graceful shutdown started");
     if shutdown_sender.send(()).is_err() {
         abort_and_join(&mut server_task).await?;
@@ -104,10 +114,21 @@ pub(crate) async fn serve(config: Config) -> Result<(), RouterError> {
     drain_result
 }
 
-fn route_table(lifecycle: Arc<Lifecycle>) -> Router {
-    Router::new()
+fn route_table(
+    lifecycle: Arc<Lifecycle>,
+    generation: Arc<HttpGeneration>,
+    request_ids: Arc<RequestIds>,
+) -> Router {
+    let local = Router::new()
         .route("/live", get(live).head(reject_head))
-        .with_state(lifecycle)
+        .with_state(lifecycle);
+    let inference = Router::new()
+        .route(http_generation::CHAT_PATH, any(http_generation::chat))
+        .with_state(generation);
+    local.merge(inference).layer(middleware::from_fn_with_state(
+        request_ids,
+        request_id::canonicalize,
+    ))
 }
 
 async fn live(State(lifecycle): State<Arc<Lifecycle>>) -> (StatusCode, &'static str) {

@@ -38,7 +38,7 @@ impl Drop for TestDir {
 
 fn valid_config(listen: &str, drain_timeout_ms: u64, filter: &str) -> String {
     format!(
-        "schema_version = 1\n\n[server]\nlisten = \"{listen}\"\n\n[shutdown]\ndrain_timeout_ms = {drain_timeout_ms}\n\n[logging]\nformat = \"json\"\nfilter = \"{filter}\"\n"
+        "schema_version = 1\n\n[server]\nlisten = \"{listen}\"\n\n[shutdown]\ndrain_timeout_ms = {drain_timeout_ms}\n\n[logging]\nformat = \"json\"\nfilter = \"{filter}\"\n\n[admission]\nglobal = 128\n\n[http_generation]\nstreamed_request_max_bytes = 1048576\nconnect_timeout_ms = 1000\nrequest_timeout_ms = 5000\npool_idle_timeout_ms = 30000\npool_max_idle_per_host = 8\n\n[[workers]]\nworker_id = \"worker-a\"\nbase_url = \"http://127.0.0.1:8000/\"\n"
     )
 }
 
@@ -168,4 +168,43 @@ fn parse_errors_include_path_and_cause_without_echoing_contents() {
     assert!(message.contains("router.toml"));
     assert!(message.contains("unknown field"));
     assert!(!message.contains("do-not-log"));
+}
+
+#[test]
+fn core_http_schema_rejects_unknowns_invalid_bounds_and_nonexact_workers() {
+    let base = valid_config("127.0.0.1:30000", 30_000, "info");
+    let cases = [
+        base.replace("global = 128", "global = 0"),
+        base.replace(
+            "streamed_request_max_bytes = 1048576",
+            "streamed_request_max_bytes = 0",
+        ),
+        base.replace("connect_timeout_ms = 1000", "connect_timeout_ms = 0"),
+        base.replace("pool_max_idle_per_host = 8", "pool_max_idle_per_host = 0"),
+        base.replace(
+            "pool_max_idle_per_host = 8",
+            "pool_max_idle_per_host = 1025",
+        ),
+        base.replace("worker_id = \"worker-a\"", "worker_id = \"bad worker\""),
+        base.replace(
+            "base_url = \"http://127.0.0.1:8000/\"",
+            "base_url = \"http://worker.invalid:8000/\"",
+        ),
+        format!(
+            "{base}\n[[workers]]\nworker_id = \"worker-b\"\nbase_url = \"http://127.0.0.1:8001/\"\n"
+        ),
+        base.replace("global = 128", "global = 128\nfuture_limit = 1"),
+    ];
+    for contents in cases {
+        assert!(load_bytes(contents.as_bytes()).is_err());
+    }
+}
+
+#[test]
+fn hostname_worker_requires_and_accepts_one_pinned_ip() {
+    let base = valid_config("127.0.0.1:30000", 30_000, "info").replace(
+        "base_url = \"http://127.0.0.1:8000/\"",
+        "base_url = \"http://worker.invalid:8000/\"\nresolved_ip = \"127.0.0.1\"",
+    );
+    assert!(load_bytes(base.as_bytes()).is_ok());
 }

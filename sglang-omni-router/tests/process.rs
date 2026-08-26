@@ -39,7 +39,7 @@ impl TestDir {
     ) -> PathBuf {
         let path = self.0.join("router.toml");
         let contents = format!(
-            "schema_version = 1\n\n[server]\nlisten = \"{address}\"\nmax_connections = {max_connections}\n\n[shutdown]\ndrain_timeout_ms = {drain_timeout_ms}\n\n[logging]\nformat = \"json\"\nfilter = \"info\"\n"
+            "schema_version = 1\n\n[server]\nlisten = \"{address}\"\nmax_connections = {max_connections}\n\n[shutdown]\ndrain_timeout_ms = {drain_timeout_ms}\n\n[logging]\nformat = \"json\"\nfilter = \"info\"\n\n[admission]\nglobal = 128\n\n[http_generation]\nstreamed_request_max_bytes = 1048576\nconnect_timeout_ms = 1000\nrequest_timeout_ms = 5000\npool_idle_timeout_ms = 30000\npool_max_idle_per_host = 8\n\n[[workers]]\nworker_id = \"worker-a\"\nbase_url = \"http://127.0.0.1:1/\"\n"
         );
         fs::write(&path, contents).expect("write isolated process config");
         path

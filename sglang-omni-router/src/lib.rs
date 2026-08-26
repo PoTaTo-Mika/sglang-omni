@@ -1,14 +1,17 @@
-//! Process foundation for the standalone SGLang-Omni Rust router.
+//! Standalone SGLang-Omni Rust router.
 //!
 //! This crate owns strict startup configuration, the router-local liveness
-//! route, and joined process shutdown. It intentionally contains no worker,
-//! readiness, or inference behavior.
+//! route, one-worker byte-preserving chat relay, and joined process shutdown.
 
+mod admission;
 mod config;
 mod error;
+mod http_generation;
 mod lifecycle;
+mod request_id;
 mod server;
 mod shutdown;
+mod upstream;
 
 use std::path::Path;
 
