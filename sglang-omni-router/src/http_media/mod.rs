@@ -23,6 +23,7 @@ use crate::worker_pool::{
 };
 
 use classify::Classified;
+pub(crate) use headers::validate_bodyless_request;
 use headers::{RequestKind, SuccessProfile};
 
 const SPEECH_PATH: &str = "/v1/audio/speech";

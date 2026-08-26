@@ -10,6 +10,7 @@ mod error;
 mod http_generation;
 mod http_media;
 mod lifecycle;
+mod operations;
 mod request_id;
 mod server;
 mod shutdown;
