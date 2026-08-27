@@ -5,8 +5,9 @@ from typing import Annotated, Literal, NoReturn
 
 import typer
 import yaml
+from pydantic import ValidationError
 
-from sglang_omni.config import PipelineConfig, StageConfig
+from sglang_omni.config import AudioChunkingConfig, PipelineConfig, StageConfig
 from sglang_omni.config.manager import ConfigManager
 from sglang_omni.preprocessing.resource_connector import (
     resolve_allowed_local_media_path,
@@ -61,6 +62,11 @@ _PREFILL_COALESCE_SUPPORTED_MODELS = (
 )
 _QWEN_PARTIAL_START_TALKER_FACTORY = (
     "sglang_omni.models.qwen3_omni.stages.create_talker_ar_executor_from_config"
+)
+# Stage factories that size engine resources (the encoder CUDA-graph ladder)
+# from the chunk length and so take a max_audio_clip_s factory arg.
+_AUDIO_CLIP_FACTORY_CONSUMERS = frozenset(
+    {"sglang_omni.models.qwen3_asr.stages.create_sglang_qwen3_asr_executor"}
 )
 
 
@@ -963,6 +969,49 @@ def apply_prefill_coalesce_cli_overrides(
     return pipeline_config
 
 
+def apply_audio_chunking_cli_overrides(
+    pipeline_config: PipelineConfig,
+    *,
+    max_audio_clip_s: float | None,
+    max_concurrent_chunks: int | None,
+) -> PipelineConfig:
+    updates: dict[str, object] = {}
+    if max_audio_clip_s is not None:
+        updates["max_audio_clip_s"] = float(max_audio_clip_s)
+    if max_concurrent_chunks is not None:
+        updates["max_concurrent_chunks"] = int(max_concurrent_chunks)
+    if not updates:
+        return pipeline_config
+
+    chunking = pipeline_config.audio_chunking
+    if not chunking.allow_audio_chunking:
+        raise typer.BadParameter(
+            "--max-audio-clip-s/--max-concurrent-chunks require a pipeline "
+            "that supports audio chunking; "
+            f"{type(pipeline_config).__name__} keeps chunking off"
+        )
+    try:
+        pipeline_config.audio_chunking = AudioChunkingConfig(
+            **{**chunking.model_dump(), **updates}
+        )
+    except (ValueError, ValidationError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    if max_audio_clip_s is not None:
+        clip_stages = [
+            stage
+            for stage in pipeline_config.stages
+            if stage.factory in _AUDIO_CLIP_FACTORY_CONSUMERS
+        ]
+        if clip_stages:
+            _apply_factory_args_updates(
+                pipeline_config,
+                clip_stages,
+                {"max_audio_clip_s": float(max_audio_clip_s)},
+            )
+    return pipeline_config
+
+
 def apply_torch_compile_cli_overrides(
     pipeline_config: PipelineConfig,
     *,
@@ -1414,6 +1463,33 @@ def serve(
             ),
         ),
     ] = None,
+    max_audio_clip_s: Annotated[
+        float | None,
+        typer.Option(
+            "--max-audio-clip-s",
+            "--max_audio_clip_s",
+            help=(
+                "Chunk length in seconds for long-audio transcription: uploads "
+                "past this are split into chunks of at most this length. Capped "
+                "at the model's native clip limit (e.g. 1,200 for Qwen3-ASR, 30 "
+                "for Whisper). Requires a pipeline that supports audio chunking."
+            ),
+        ),
+    ] = None,
+    max_concurrent_chunks: Annotated[
+        int | None,
+        typer.Option(
+            "--max-concurrent-chunks",
+            "--max_concurrent_chunks",
+            min=1,
+            help=(
+                "How many chunks of one transcription request may run in the "
+                "engine at once. This is a fairness cap: it keeps a single "
+                "long upload from taking every batch slot. Requires a pipeline "
+                "that supports audio chunking."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Serve the pipeline."""
     logging.basicConfig(
@@ -1497,6 +1573,11 @@ def serve(
         merged_config,
         prefill_coalesce_requests=prefill_coalesce_requests,
         prefill_coalesce_wait_ms=prefill_coalesce_wait_ms,
+    )
+    merged_config = apply_audio_chunking_cli_overrides(
+        merged_config,
+        max_audio_clip_s=max_audio_clip_s,
+        max_concurrent_chunks=max_concurrent_chunks,
     )
     generation_server_args_overrides: dict[str, object] = {}
     if max_running_requests is not None:

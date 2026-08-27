@@ -393,9 +393,9 @@ class PipelineConfig(BaseModel):
     speech_reference_text_required: ClassVar[bool] = False
     speech_reference_text_excludes_instructions: ClassVar[bool] = False
     additional_speech_languages: ClassVar[frozenset[str]] = frozenset()
-    audio_chunking: ClassVar[AudioChunkingConfig] = AudioChunkingConfig()
 
     model_path: str
+    audio_chunking: AudioChunkingConfig = Field(default_factory=AudioChunkingConfig)
     stages: list[StageConfig]
     name: str | None = None
     entry_stage: str | None = None

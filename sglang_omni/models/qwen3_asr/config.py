@@ -10,16 +10,29 @@ from sglang_omni.models.qwen3_asr.audio_lengths import QWEN3_ASR_MAX_INPUT_SECON
 
 _PKG = "sglang_omni.models.qwen3_asr"
 
+_ASR_STAGE_FACTORY = f"{_PKG}.stages.create_sglang_qwen3_asr_executor"
+
+QWEN3_ASR_AUDIO_CHUNKING = AudioChunkingConfig(
+    allow_audio_chunking=True,
+    max_audio_clip_s=60.0,
+    max_native_clip_s=float(QWEN3_ASR_MAX_INPUT_SECONDS),
+)
+
 
 class Qwen3ASRPipelineConfig(PipelineConfig):
     """Single-stage batched ASR pipeline for Qwen3-ASR checkpoints."""
 
     architecture: ClassVar[str] = "Qwen3ASRForConditionalGeneration"
-    audio_chunking: ClassVar[AudioChunkingConfig] = AudioChunkingConfig(
-        allow_audio_chunking=True,
-        max_audio_clip_s=60.0,
-        max_native_clip_s=float(QWEN3_ASR_MAX_INPUT_SECONDS),
-    )
+    audio_chunking: AudioChunkingConfig = QWEN3_ASR_AUDIO_CHUNKING
+
+    def model_post_init(self, __context=None) -> None:
+        super().model_post_init(__context)
+        for stage in self.stages:
+            if stage.factory != _ASR_STAGE_FACTORY:
+                continue
+            factory_args = dict(stage.factory_args or {})
+            factory_args["max_audio_clip_s"] = self.audio_chunking.max_audio_clip_s
+            stage.factory_args = factory_args
 
     @classmethod
     def mem_fraction_role_to_stage(cls) -> dict[str, str]:
@@ -35,7 +48,7 @@ class Qwen3ASRPipelineConfig(PipelineConfig):
         StageConfig(
             name="asr",
             process="asr",
-            factory=f"{_PKG}.stages.create_sglang_qwen3_asr_executor",
+            factory=_ASR_STAGE_FACTORY,
             factory_args={
                 "device": None,
                 "max_running_requests": 64,
