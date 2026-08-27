@@ -459,6 +459,11 @@ that happened to contain an older version of the test.
 - `unit_test/utils/`: Shared utility tests:
   - audio loading helpers for data URIs, file URIs, HTTP URLs, timeout fallback,
     and mono/channel preservation.
+  - pinned CUDA staging primitives (`cuda_staging`): exact-size growth that
+    keeps the old storage on allocation failure, allocation outside inference
+    mode, one reusable completion event per transfer slot, and record/sync
+    error propagation with same-device stream checks, using CPU stand-ins
+    where no GPU is present.
 - `unit_test/model_runner/`: Shared model-runner contract tests:
   - graph-safe hidden-state capture: stable registered buffers refreshed by
     decoder-layer pre-hooks, capacity validation, graph-replay row reads, and
@@ -484,7 +489,7 @@ that happened to contain an older version of the test.
 - `unit_test/qwen3_asr/`: Qwen3-ASR unit tests:
   - pipeline config and stage factory `max_running_requests=64` default,
     async-decode default,
-    and `--decode-mode async|sync` CLI overrides
+    and the dotted `factory.enable_async_decode` CLI override
   - RTX 4090 profile config resolution, SM-specific multimodal-attention
     defaults, and resolved decode CUDA Graph bucket diagnostics
   - single-source audio token length formula used by both processor and
@@ -503,7 +508,7 @@ that happened to contain an older version of the test.
   - asynchronous pre-LM encoder submission, bounded queue backpressure,
     single-flight deduplication, CPU cache validation, and failure recovery
   - pipeline config, stage factory concurrency defaults, deferred CUDA-graph
-    capture, async-decode default, and `--decode-mode async|sync` CLI overrides
+    capture, async-decode default, and the dotted `factory.enable_async_decode` CLI override
   - audio-token count formula, audio-tower forward shape, marker-token
     suppression, and the fp16 encoder residual clamp.
 - `unit_test/fun_asr/`: Fun-ASR-Nano unit tests:
@@ -635,6 +640,10 @@ that happened to contain an older version of the test.
   - request mapping for `ref_audio` / `ref_text` and `references`
   - incremental codec-to-vocoder ordering, priority batching, fallback parity,
     CUDA stream handoff, and abort/failure cleanup
+  - streaming vocoder decode slots: per-thread pinned staging with one reused
+    completion event, bad rows raised from `resolve()`, pageable fallback after
+    pinned allocation failure, and slot retirement or process-lifetime
+    retention when a launch or event wait fails (with a real CUDA reuse case)
   - model-owned default preservation for language and sampling parameters
   - Base, CustomVoice, and VoiceDesign request validation
   - voice-clone reference validation
@@ -649,7 +658,7 @@ that happened to contain an older version of the test.
   - request builder sampling normalization and server-side token caps
   - model slot cleanup and engine timing in scheduler result adapters
   - async-decode one-step-lookahead parity with the synchronous collect path
-  - async-decode default-on config + `--decode-mode async|sync` CLI override.
+  - async-decode default-on config + the dotted `factory.enable_async_decode` CLI override.
 
 - `unit_test/moss_tts/`: MOSS-TTS unit tests:
   - pipeline config and registry contracts

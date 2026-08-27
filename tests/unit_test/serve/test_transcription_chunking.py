@@ -75,7 +75,7 @@ def test_pipeline_config_leaves_chunking_off_by_default() -> None:
         model_path="dummy",
         stages=[
             StageConfig(
-                name="asr", factory="pkg.make_stage", process="asr", terminal=True
+                name="asr", factory_path="pkg.make_stage", process="asr", terminal=True
             )
         ],
     )

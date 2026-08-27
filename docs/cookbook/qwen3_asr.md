@@ -20,8 +20,8 @@ the checkpoint configuration (BF16 for Qwen3-ASR-1.7B); pass
 `--stages.asr.factory-args.dtype float16` to force FP16.
 Async decode is enabled by default for all decode batch sizes, allowing the
 shared one-step-lookahead path to overlap host-side result processing with the
-next GPU decode forward even for a single request. Use `--decode-mode sync` to
-disable it, or tune the crossover with `--async-lookahead-min-batch-size`.
+next GPU decode forward even for a single request. Use `--asr.factory.enable_async_decode false` to
+disable it, or tune the crossover with `--asr.factory.async_decode_min_batch_size`.
 The request builders also use the shared LM prefill-admission gate: prefill
 starts when 16 built requests are ready or after the oldest ready request waits
 40 ms. Once request-build work drains, a ready prefill is released immediately
@@ -53,7 +53,7 @@ For example, force synchronous decode when comparing modes:
 ```bash
 sgl-omni serve \
   --model-path Qwen/Qwen3-ASR-1.7B \
-  --decode-mode sync \
+  --asr.factory.enable_async_decode false \
   --port 8000
 ```
 
@@ -161,13 +161,13 @@ launch, the rest are fixed model defaults:
 
 | Name | Value | Meaning |
 |---|---|---|
-| `max_audio_clip_s` | `60` | Longest clip we send to the engine in one request, and therefore the chunk length. It sits well below the model's native 1,200s on purpose: shorter chunks batch better, and the output-token budget scales with clip length on its own. Override with `--max-audio-clip-s` (up to `max_native_clip_s`). |
-| `max_concurrent_chunks` | `8` | How many chunks of one request run in the engine at once. A per-request cap so one long upload can't crowd out everyone else's requests. Override with `--max-concurrent-chunks`. |
+| `max_audio_clip_s` | `60` | Longest clip we send to the engine in one request, and therefore the chunk length. It sits well below the model's native 1,200s on purpose: shorter chunks batch better, and the output-token budget scales with clip length on its own. Override with `--audio_chunking.max_audio_clip_s` (up to `max_native_clip_s`). |
+| `max_concurrent_chunks` | `8` | How many chunks of one request run in the engine at once. A per-request cap so one long upload can't crowd out everyone else's requests. Override with `--audio_chunking.max_concurrent_chunks`. |
 | `max_native_clip_s` | `1200` | Longest clip the model takes as one request (its native limit). Streaming cannot chunk, so this is the streaming cutoff. |
 | `max_total_audio_s` | `3600` | Upper limit on the whole upload; you get HTTP 400 above it. This is a memory guard: we keep the decoded waveform in memory while its chunks run. |
 | `min_tail_s` | `0.5` | Shortest final chunk worth transcribing; if the tail would be shorter, we move the previous cut earlier to absorb it. This matches the model's own minimum input length. |
 
-Note: Raising `--max-audio-clip-s` also resizes the encoder CUDA-graph bucket
+Note: Raising `audio_chunking.max_audio_clip_s` also resizes the encoder CUDA-graph bucket
 ladder, which is derived from the chunk length: a longer chunk means more and
 larger captured graphs, and their static buffers stay resident for the life of
 the server (roughly 6.6 KB per token of ladder ceiling; at 1,200s the ceiling
@@ -274,7 +274,7 @@ Reading, and the resulting defaults:
 
 ```bash
 sgl-omni serve --model-path Qwen/Qwen3-ASR-1.7B \
-  --max-running-requests 32
+  --asr.engine.max_running_requests 32
 ```
 
 - Corpus WER stayed 0.0122 for every configuration at every level.
