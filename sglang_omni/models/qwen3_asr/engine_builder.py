@@ -126,6 +126,7 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
 
     def generation_defaults(self, *, dtype: str) -> dict[str, Any]:
         defaults: dict[str, Any] = {
+            "disable_radix_cache": True,
             "max_running_requests": self.max_running_requests,
             "disable_cuda_graph": False,
             "disable_overlap_schedule": True,
