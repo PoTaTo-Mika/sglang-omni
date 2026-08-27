@@ -69,15 +69,23 @@ def _silence(num_samples: int) -> np.ndarray:
 
 
 def test_pipeline_config_leaves_chunking_off_by_default() -> None:
-    from sglang_omni.config import PipelineConfig
+    from sglang_omni.config import PipelineConfig, StageConfig
 
-    assert PipelineConfig.audio_chunking.allow_audio_chunking is False
+    config = PipelineConfig(
+        model_path="dummy",
+        stages=[
+            StageConfig(
+                name="asr", factory="pkg.make_stage", process="asr", terminal=True
+            )
+        ],
+    )
+    assert config.audio_chunking.allow_audio_chunking is False
 
 
 def test_qwen3_asr_pipeline_declares_chunking() -> None:
     from sglang_omni.models.qwen3_asr.config import Qwen3ASRPipelineConfig
 
-    declared = Qwen3ASRPipelineConfig.audio_chunking
+    declared = Qwen3ASRPipelineConfig(model_path="dummy").audio_chunking
     assert declared.allow_audio_chunking is True
     # 60s is a scheduling choice, not a context limit (the context is sized
     # for the model's native 1,200s): short chunks batch well and keep one
@@ -91,7 +99,7 @@ def test_qwen3_asr_pipeline_declares_chunking() -> None:
 def test_whisper_asr_pipeline_declares_chunking() -> None:
     from sglang_omni.models.whisper_asr.config import WhisperASRPipelineConfig
 
-    declared = WhisperASRPipelineConfig.audio_chunking
+    declared = WhisperASRPipelineConfig(model_path="dummy").audio_chunking
     assert declared.allow_audio_chunking is True
     # For Whisper the chunk length IS the native limit: the feature extractor
     # truncates everything past its 30s mel window, so without chunking a
