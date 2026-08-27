@@ -149,7 +149,10 @@ TED-LIUM evaluation did not show an accuracy or throughput advantage from enabli
 Changing the default or implementing token-level parity should be evaluated in a separate PR.
 
 The behavior follows these values, which Whisper
-declares in code (`WhisperASRPipelineConfig.audio_chunking`). They are fixed model defaults in this release:
+declares in code (`WhisperASRPipelineConfig.audio_chunking`). `max_concurrent_chunks`
+is tunable at launch with `--max-concurrent-chunks`; the rest are fixed model
+defaults (`--max-audio-clip-s` exists too, but for Whisper it can only lower the
+chunk length -- 30s is the model's hard mel-window edge):
 
 | Name | Value | Meaning                                                                                                                                                                     |
 |---|---|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
