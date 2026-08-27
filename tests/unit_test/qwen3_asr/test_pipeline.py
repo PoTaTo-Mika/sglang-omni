@@ -26,7 +26,6 @@ from sglang_omni.scheduling.generation_batch_policy import (
     build_generation_batch_overrides,
     validate_generation_batch_policy,
 )
-from tests.unit_test.fakes import FakeServerArgs
 
 
 def _fake_server_args_builder(build_kwargs: dict[str, object]):
@@ -46,7 +45,7 @@ def _fake_server_args_builder(build_kwargs: dict[str, object]):
             ("moe_a2a_backend", "none"),
         ):
             flat.setdefault(name, default)
-        server_args = FakeServerArgs(context_length=context_length, **flat)
+        server_args = SimpleNamespace(context_length=context_length, **flat)
         prefill_bs = overrides.get("cuda_graph_bs_prefill")
         server_args.cuda_graph_config = SimpleNamespace(
             decode=SimpleNamespace(
@@ -151,6 +150,65 @@ def test_qwen3_asr_explicit_mm_attention_backend_overrides_sm_default(
     defaults = builder.generation_defaults(dtype="bfloat16")
 
     assert defaults["mm_attention_backend"] == "fa3"
+
+
+@pytest.mark.parametrize(
+    ("is_rocm", "gfx95_supported", "hip_version", "expected_backend"),
+    [
+        (True, True, (7, 2, 0), "triton"),
+        (False, True, (7, 2, 0), None),
+        (True, False, (7, 2, 0), None),
+        (True, True, (7, 1, 0), None),
+        (True, True, (7, 3, 0), None),
+    ],
+)
+def test_qwen3_asr_defaults_prefill_to_triton_only_on_rocm_72_gfx95(
+    monkeypatch: pytest.MonkeyPatch,
+    is_rocm: bool,
+    gfx95_supported: bool,
+    hip_version: tuple[int, int, int],
+    expected_backend: str | None,
+) -> None:
+    monkeypatch.setattr(
+        qwen3_asr_builder.current_platform,
+        "is_rocm",
+        lambda: is_rocm,
+    )
+    monkeypatch.setattr(
+        qwen3_asr_builder,
+        "is_gfx95_supported",
+        lambda: gfx95_supported,
+    )
+    monkeypatch.setattr(
+        qwen3_asr_builder,
+        "get_hip_version",
+        lambda: hip_version,
+    )
+
+    defaults = _make_engine_builder(mm_attention_backend="fa3").generation_defaults(
+        dtype="bfloat16"
+    )
+
+    if expected_backend is None:
+        assert "prefill_attention_backend" not in defaults
+    else:
+        assert defaults["prefill_attention_backend"] == expected_backend
+
+
+def test_qwen3_asr_explicit_prefill_backend_overrides_rocm_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(qwen3_asr_builder.current_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(qwen3_asr_builder, "is_gfx95_supported", lambda: True)
+    monkeypatch.setattr(qwen3_asr_builder, "get_hip_version", lambda: (7, 2, 0))
+    builder = _make_engine_builder(mm_attention_backend="fa3")
+
+    overrides = build_generation_batch_overrides(
+        **builder.generation_defaults(dtype="bfloat16"),
+        server_args_overrides={"prefill_attention_backend": "aiter"},
+    )
+
+    assert overrides["prefill_attention_backend"] == "aiter"
 
 
 def test_qwen3_asr_config_uses_batched_stage_with_64_running_requests() -> None:
@@ -383,8 +441,6 @@ def _patch_engine_dependencies(
         )
         return want_cuda_graph, (
             model_worker,
-            object(),
-            object(),
             object(),
             object(),
             object(),
