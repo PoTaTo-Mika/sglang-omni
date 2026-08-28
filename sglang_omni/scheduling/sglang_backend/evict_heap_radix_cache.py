@@ -65,7 +65,8 @@ class EvictHeapRadixCache(RadixCache):
                 self._evict_heap_push(x)
                 continue
 
-            self.token_to_kv_pool_allocator.free(x.value)
+            # Tree values are page-aligned copies of a kv row: page-exact segment.
+            self.token_to_kv_pool_allocator.free_segment(x.value, start_pos=0)
             num_evicted += len(x.value)
             # note (Junnan Li): _delete_leaf relands the parent via _update_leaf_status.
             self._delete_leaf(x)
