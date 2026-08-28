@@ -112,6 +112,7 @@ class Stage:
         tp_fanout: TPLeaderFanout | None = None,
         is_terminal: bool = False,
         replica_topology: dict[str, list[str]] | None = None,
+        kv_registrations: tuple[tuple[Any, Any | None], ...] = (),
     ):
         self.name = name
         self.role = role
@@ -151,7 +152,7 @@ class Stage:
             rank_endpoints=rank_endpoints,
             task_done_callback=self._on_background_task_done,
         )
-        for pool, receiver in getattr(scheduler, "kv_registrations", ()):
+        for pool, receiver in kv_registrations:
             self._comm.register_kv_pool(pool)
             if receiver is not None:
                 self._comm.register_kv_receiver(pool.pool_id, receiver)
@@ -1114,7 +1115,7 @@ class Stage:
                         self._active_requests.add(out.request_id)
                 elif out.type == "kv_transfer":
                     if out.request_id in self._active_requests:
-                        await self._send_kv_transfer(out.data)
+                        self._launch_kv_transfer(out.data)
                     else:
                         self._discard_kv_transfer(out.data)
                 elif out.request_id in self._active_requests:
@@ -1185,6 +1186,16 @@ class Stage:
                     f"TP follower stage {self.name} received scheduler error: {out.data}"
                 )
 
+    def _launch_kv_transfer(self, transfer: KVPageTransfer) -> None:
+        task = asyncio.create_task(self._send_kv_transfer(transfer))
+        self._receive_tasks.add(task)
+        task.add_done_callback(self._receive_tasks.discard)
+        task.add_done_callback(
+            lambda done: self._on_background_task_done(
+                done, f"KV transfer {transfer.request_id}"
+            )
+        )
+
     async def _send_kv_transfer(self, transfer: KVPageTransfer) -> None:
         if not isinstance(transfer, KVPageTransfer):
             raise TypeError(
@@ -1210,7 +1221,8 @@ class Stage:
             )
             await self._send_failure(transfer.request_id, _error_text(exc))
             return
-        self._clear_request_state(transfer.request_id)
+        finally:
+            self._clear_request_state(transfer.request_id)
 
     @staticmethod
     def _discard_kv_transfer(transfer: Any) -> None:

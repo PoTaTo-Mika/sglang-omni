@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -215,6 +215,46 @@ class ProcessConfig(BaseModel):
             raise ValueError("processes.num_replicas must be >= 1")
 
 
+class PDStagePlacement(BaseModel):
+    """Placement for one physical half of a disaggregated AR stage."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    gpu: int | list[int] | None = None
+    process: str | None = None
+
+    def model_post_init(self, __context: Any = None) -> None:
+        if self.process is not None:
+            self.process = self.process.strip()
+            if not self.process:
+                raise ValueError("PD process must not be empty")
+        if self.gpu is None:
+            return
+        gpu_ids = [self.gpu] if isinstance(self.gpu, int) else self.gpu
+        if not gpu_ids or any(gpu_id < 0 for gpu_id in gpu_ids):
+            raise ValueError("PD GPU ids must be non-empty and >= 0")
+        if len(set(gpu_ids)) != len(gpu_ids):
+            raise ValueError("PD GPU ids must be unique")
+
+
+class PDConfig(BaseModel):
+    """Compile one logical AR stage into independently placed PD halves."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    prefill: PDStagePlacement = Field(default_factory=PDStagePlacement)
+    decode: PDStagePlacement = Field(default_factory=PDStagePlacement)
+
+
+class PDExecution(BaseModel):
+    """Compiler-owned identity for one physical PD scheduler."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    role: Literal["prefill", "decode"]
+    partner: str = Field(min_length=1)
+
+
 class StageConfig(BaseModel):
     """Single pipeline stage configuration.
 
@@ -300,6 +340,9 @@ class StageConfig(BaseModel):
 
     # --- Communication pool tuning ---
     comm: CommConfig | None = None
+
+    pd_disaggregation: PDConfig | None = None
+    pd_execution: PDExecution | None = None
 
     def model_post_init(self, __context: Any = None) -> None:
         if isinstance(self.gpu, int) and self.tp_size > 1:
@@ -500,6 +543,7 @@ class PipelineConfig(BaseModel):
     def model_post_init(self, __context: Any = None) -> None:
         self._validate_general()
         self._validate_processes()
+        self._validate_pd()
         self.config_cls = self.__class__.__name__
         if self.name is None:
             self.name = self.model_path
@@ -728,6 +772,43 @@ class PipelineConfig(BaseModel):
                 f"Declared process names: {sorted(members)}"
             )
 
+    def _validate_pd(self) -> None:
+        existing_names = {stage.name for stage in self.stages}
+        for stage in self.stages:
+            pd = stage.pd_disaggregation
+            if pd is None:
+                continue
+            if pd.prefill.gpu is None or pd.decode.gpu is None:
+                raise ValueError(
+                    f"Stage {stage.name!r} pd_disaggregation requires explicit "
+                    "prefill.gpu and decode.gpu"
+                )
+            if _pd_gpu_set(pd.prefill.gpu) & _pd_gpu_set(pd.decode.gpu):
+                raise ValueError(
+                    f"Stage {stage.name!r} pd_disaggregation prefill and decode "
+                    "cannot share the same GPU"
+                )
+            for role, placement in (("prefill", pd.prefill), ("decode", pd.decode)):
+                if (
+                    isinstance(placement.gpu, list)
+                    and len(placement.gpu) != stage.tp_size
+                ):
+                    raise ValueError(
+                        f"Stage {stage.name!r} pd_disaggregation {role}.gpu has "
+                        f"{len(placement.gpu)} entries but tp_size={stage.tp_size}"
+                    )
+            for suffix in ("_prefill", "_decode"):
+                generated = f"{stage.name}{suffix}"
+                if generated in existing_names:
+                    raise ValueError(
+                        f"Stage {stage.name!r} pd_disaggregation would generate "
+                        f"{generated!r}, which collides with an existing stage"
+                    )
+
     @staticmethod
     def from_dict(data: dict[str, Any]) -> PipelineConfig:
         return PipelineConfig(**data)
+
+
+def _pd_gpu_set(gpu: int | list[int]) -> set[int]:
+    return {gpu} if isinstance(gpu, int) else set(gpu)

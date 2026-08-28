@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from sglang_omni.config.pd_capability import pd_disaggregation_capable
 from sglang_omni.models.ming_omni.io import MingOmniPipelineState
 from sglang_omni.models.ming_omni.pipeline.next_stage import AUDIO_STAGE, IMAGE_STAGE
 from sglang_omni.models.ming_omni.tp_utils import validate_stage_tp_support
@@ -281,6 +282,7 @@ def create_image_encoder_executor(
     return SimpleScheduler(_encode)
 
 
+@pd_disaggregation_capable
 def create_sglang_thinker_executor_from_config(
     model_path: str,
     *,
@@ -291,6 +293,8 @@ def create_sglang_thinker_executor_from_config(
     thinker_max_seq_len: int = 8192,
     server_args_overrides: dict[str, Any] | None = None,
     enable_streaming_tts: bool = False,
+    scheduler_cls: type | None = None,
+    scheduler_kwargs: dict[str, Any] | None = None,
 ):
     validate_stage_tp_support(stage_name="thinker", tp_size=tp_size)
 
@@ -317,6 +321,8 @@ def create_sglang_thinker_executor_from_config(
         tp_size=tp_size,
         nccl_port=nccl_port,
         enable_streaming_tts=enable_streaming_tts,
+        scheduler_cls=scheduler_cls,
+        scheduler_kwargs=scheduler_kwargs,
     )
 
 

@@ -1,0 +1,143 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Compile logical Prefill/Decode stages into physical scheduler stages."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from sglang_omni.config.schema import PDExecution, StageConfig
+
+
+@dataclass(frozen=True)
+class PDExpansion:
+    stages: list[StageConfig]
+    entry_stage: str
+    routing_map: dict[str, str]
+    output_map: dict[str, str]
+
+
+def expand_pd_stages(stages: list[StageConfig], *, entry_stage: str) -> PDExpansion:
+    pd_names = {stage.name for stage in stages if stage.pd_disaggregation is not None}
+    if not pd_names:
+        routing_map, output_map = _compiled_pd_maps(stages)
+        return PDExpansion(
+            list(stages),
+            routing_map.get(entry_stage, entry_stage),
+            routing_map,
+            output_map,
+        )
+
+    inbound = {name: f"{name}_prefill" for name in pd_names}
+    output = {name: f"{name}_decode" for name in pd_names}
+    physical: list[StageConfig] = []
+    for stage in stages:
+        if stage.pd_disaggregation is None:
+            physical.append(_rewrite_refs(stage, inbound, output))
+            continue
+        physical.extend(_split(stage, inbound, output))
+    return PDExpansion(
+        physical,
+        inbound.get(entry_stage, entry_stage),
+        inbound,
+        output,
+    )
+
+
+def _compiled_pd_maps(
+    stages: list[StageConfig],
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Recover compiler maps when an already-expanded graph is compiled again."""
+
+    routing: dict[str, str] = {}
+    output: dict[str, str] = {}
+    for stage in stages:
+        execution = stage.pd_execution
+        suffix = f"_{execution.role}" if execution is not None else ""
+        if execution is None or not stage.name.endswith(suffix):
+            continue
+        logical_name = stage.name[: -len(suffix)]
+        (routing if execution.role == "prefill" else output)[logical_name] = stage.name
+    return routing, output
+
+
+def _rename(value: str | list[str] | None, names: dict[str, str]):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return names.get(value, value)
+    return [names.get(item, item) for item in value]
+
+
+def _rewrite_refs(
+    stage: StageConfig,
+    inbound: dict[str, str],
+    output: dict[str, str],
+) -> StageConfig:
+    return stage.model_copy(
+        deep=True,
+        update={
+            "next": _rename(stage.next, inbound),
+            "stream_to": [inbound.get(name, name) for name in stage.stream_to],
+            "wait_for": (
+                [output.get(name, name) for name in stage.wait_for]
+                if stage.wait_for
+                else stage.wait_for
+            ),
+            "project_payload": {
+                inbound.get(name, name): path
+                for name, path in stage.project_payload.items()
+            },
+        },
+    )
+
+
+def _split(
+    stage: StageConfig,
+    inbound: dict[str, str],
+    output: dict[str, str],
+) -> tuple[StageConfig, StageConfig]:
+    pd = stage.pd_disaggregation
+    assert pd is not None
+    prefill_name = f"{stage.name}_prefill"
+    decode_name = f"{stage.name}_decode"
+    prefill = stage.model_copy(
+        deep=True,
+        update={
+            "name": prefill_name,
+            "gpu": pd.prefill.gpu,
+            "process": pd.prefill.process or prefill_name,
+            "next": None,
+            "terminal": False,
+            "route_fn": None,
+            "stream_to": [],
+            "stream_done_to_fn": None,
+            "project_payload": {},
+            "wait_for": (
+                [output.get(name, name) for name in stage.wait_for]
+                if stage.wait_for
+                else stage.wait_for
+            ),
+            "pd_disaggregation": None,
+            "pd_execution": PDExecution(role="prefill", partner=decode_name),
+        },
+    )
+    decode = stage.model_copy(
+        deep=True,
+        update={
+            "name": decode_name,
+            "gpu": pd.decode.gpu,
+            "process": pd.decode.process or decode_name,
+            "next": _rename(stage.next, inbound),
+            "stream_to": [inbound.get(name, name) for name in stage.stream_to],
+            "project_payload": {
+                inbound.get(name, name): path
+                for name, path in stage.project_payload.items()
+            },
+            "wait_for": None,
+            "wait_for_fn": None,
+            "merge_fn": None,
+            "pd_disaggregation": None,
+            "pd_execution": PDExecution(role="decode", partner=prefill_name),
+        },
+    )
+    return prefill, decode

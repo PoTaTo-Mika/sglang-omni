@@ -66,6 +66,20 @@ class DecodeContinuation:
             raise ValueError("decode continuation requires the Prefill token")
         if self.vocab_size <= 0:
             raise ValueError("decode continuation vocab_size must be positive")
+        if not isinstance(self.sampling_params, dict):
+            raise TypeError("decode continuation sampling_params must be a mapping")
+        if not isinstance(self.stage_payload, dict):
+            raise TypeError("decode continuation stage_payload must be a mapping")
+        if self.multimodal_resume is not None and not isinstance(
+            self.multimodal_resume, dict
+        ):
+            raise TypeError("decode continuation multimodal_resume must be a mapping")
+        try:
+            msgspec.msgpack.encode(self.sampling_params)
+        except Exception as exc:
+            raise ValueError(
+                "decode continuation sampling state is not serializable"
+            ) from exc
 
     def encode(self) -> bytes:
         return msgspec.msgpack.encode(dataclasses.asdict(self))
@@ -105,6 +119,22 @@ StateBuilder = Callable[[Any], tuple[dict[str, Any], dict[str, Any] | None, list
 StateRestorer = Callable[[Any, SGLangARRequestData, dict[str, Any] | None], None]
 
 
+def default_state_builder(
+    req: Any,
+) -> tuple[dict[str, Any], dict[str, Any] | None, list[int]]:
+    return req._omni_data.stage_payload.to_dict(), None, list(req.origin_input_ids)
+
+
+def default_state_restorer(
+    req: Any,
+    data: SGLangARRequestData,
+    resume: dict[str, Any] | None,
+) -> None:
+    del req, data
+    if resume is not None:
+        raise ValueError("generic PD resume does not accept model-specific state")
+
+
 def continuation_from_req(
     req: Any,
     transfer_id: str,
@@ -116,19 +146,42 @@ def continuation_from_req(
         raise ValueError(f"Prefill request {req.rid!r} produced no token")
     if req.custom_logit_processor:
         raise NotImplementedError("PD does not support custom logit processors")
+    data = req._omni_data
+    if data.input_embeds_are_projected or getattr(
+        req, "_input_embeds_are_projected", False
+    ):
+        raise NotImplementedError("PD does not support projected input embeddings")
     sampling = _sampling_params_to_dict(req.sampling_params)
     if any(
-        sampling.get(key) for key in ("json_schema", "regex", "ebnf", "structural_tag")
+        sampling.get(key)
+        for key in (
+            "grammar",
+            "json_schema",
+            "regex",
+            "ebnf",
+            "structural_tag",
+        )
     ):
         raise NotImplementedError("PD does not support structured-output sampling")
+    try:
+        msgspec.msgpack.encode(sampling)
+    except Exception as exc:
+        raise ValueError("PD sampling state is not serializable") from exc
 
     payload, multimodal_resume, origin_input_ids = state_builder(req)
-    data = req._omni_data
+    if not isinstance(payload, dict):
+        raise TypeError("PD state builder must return a payload mapping")
+    if multimodal_resume is not None and not isinstance(multimodal_resume, dict):
+        raise TypeError("PD state builder must return a resume mapping")
     return DecodeContinuation(
         request_id=req.rid,
         transfer_id=transfer_id,
         origin_input_ids=origin_input_ids,
-        origin_input_ids_unpadded=list(origin_input_ids),
+        origin_input_ids_unpadded=(
+            list(req.origin_input_ids_unpadded)
+            if req.origin_input_ids_unpadded is not None
+            else None
+        ),
         output_ids=list(req.output_ids),
         vocab_size=int(req.vocab_size),
         sampling_params=sampling,
@@ -345,14 +398,16 @@ class DecodeKVReceiver:
         pool_id: str,
         allocator: Any,
         admissions: queue.SimpleQueue[DecodeAdmission],
-        resume_schema: str,
+        allowed_resume_schemas: frozenset[str],
     ) -> None:
         self.pool_id = pool_id
         self._allocator = allocator
         self._admissions = admissions
-        self._resume_schema = resume_schema
+        self._allowed_resume_schemas = allowed_resume_schemas
         self._lock = threading.Lock()
         self._reservations: dict[str, _Reservation] = {}
+        self._transfer_ids: set[str] = set()
+        self._closed = False
 
     def reserve(self, request: KVTransferPrepareMessage) -> KVPageDestination:
         if request.target_pool_id != self.pool_id:
@@ -367,16 +422,18 @@ class DecodeKVReceiver:
         ):
             raise ValueError("KV transfer and decode continuation ids differ")
         resume = continuation.multimodal_resume
-        if resume is not None and resume.get("schema") != self._resume_schema:
-            raise ValueError(
-                f"unsupported multimodal resume schema {resume.get('schema')!r}"
-            )
+        if resume is not None:
+            schema = resume.get("schema")
+            if schema not in self._allowed_resume_schemas:
+                raise ValueError(f"unsupported multimodal resume schema {schema!r}")
 
         count = len(request.source_page_indices)
         if count <= 0:
             raise ValueError("KV transfer contains no pages")
         with self._lock:
-            if request.transfer_id in self._reservations:
+            if self._closed:
+                raise RuntimeError("decode KV receiver is closed")
+            if request.transfer_id in self._transfer_ids:
                 raise RuntimeError(f"duplicate KV transfer {request.transfer_id!r}")
             if int(self._allocator.available_size()) < count:
                 raise RuntimeError(
@@ -394,6 +451,7 @@ class DecodeKVReceiver:
             self._reservations[request.transfer_id] = _Reservation(
                 continuation, allocation
             )
+            self._transfer_ids.add(request.transfer_id)
         return KVPageDestination(self.pool_id, allocation.page_indices)
 
     def commit(
@@ -403,16 +461,27 @@ class DecodeKVReceiver:
     ) -> None:
         with self._lock:
             reservation = self._reservations.pop(request.transfer_id, None)
-        if reservation is None:
-            raise RuntimeError(
-                f"commit for unknown KV transfer {request.transfer_id!r}"
-            )
-        if reservation.allocation.page_indices != destination.page_indices:
-            self._allocator.free(reservation.allocation.slots)
-            raise RuntimeError("committed KV pages differ from the reservation")
-        self._admissions.put(
-            DecodeAdmission(reservation.continuation, reservation.allocation)
-        )
+            if reservation is None:
+                raise RuntimeError(
+                    f"commit for unknown KV transfer {request.transfer_id!r}"
+                )
+            if (
+                self._closed
+                or request.request_id != reservation.continuation.request_id
+                or request.target_pool_id != self.pool_id
+                or destination.pool_id != self.pool_id
+                or len(request.source_page_indices) != reservation.allocation.seq_len
+                or reservation.allocation.page_indices != destination.page_indices
+            ):
+                self._allocator.free(reservation.allocation.slots)
+                raise RuntimeError("KV commit does not match its reservation")
+            try:
+                self._admissions.put(
+                    DecodeAdmission(reservation.continuation, reservation.allocation)
+                )
+            except Exception:
+                self._allocator.free(reservation.allocation.slots)
+                raise
 
     def abort(
         self,
@@ -426,6 +495,16 @@ class DecodeKVReceiver:
         if reservation is not None:
             self._allocator.free(reservation.allocation.slots)
         logger.warning("KV receive aborted for %s: %s", request.request_id, error)
+
+    def close(self) -> None:
+        """Release every receiver-owned reservation exactly once."""
+
+        with self._lock:
+            self._closed = True
+            reservations = list(self._reservations.values())
+            self._reservations.clear()
+        for reservation in reservations:
+            self._allocator.free(reservation.allocation.slots)
 
 
 class SGLangKVLease:

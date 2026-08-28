@@ -414,7 +414,7 @@ def test_pd_continuation_is_admitted_after_comm_engine_handoff() -> None:
                     pool_id="decode:kv",
                     allocator=allocator,
                     admissions=admissions,
-                    resume_schema="test-v1",
+                    allowed_resume_schemas=frozenset({"test-v1"}),
                 ),
             )
             continuation = DecodeContinuation(

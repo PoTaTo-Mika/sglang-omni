@@ -6,7 +6,7 @@ from __future__ import annotations
 import queue
 import threading
 import types
-from typing import Callable
+from typing import Any, Callable, Literal
 from uuid import uuid4
 
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
@@ -21,23 +21,53 @@ from sglang_omni.scheduling.pd_utils import (
     SGLangKVLease,
     build_kv_pool,
     continuation_from_req,
+    default_state_builder,
+    default_state_restorer,
     defer_first_token_finish,
     req_from_continuation,
     request_page_indices,
 )
 
 
+def scheduler_class_for_role(role: Literal["prefill", "decode"]) -> type[OmniScheduler]:
+    """The single compiler role-to-concrete-scheduler mapping."""
+
+    return {
+        "prefill": OmniPrefillScheduler,
+        "decode": OmniDecodeScheduler,
+    }[role]
+
+
+def model_pd_scheduler_kwargs(
+    scheduler_cls: type,
+    *,
+    state_builder: Callable,
+    state_restorer: Callable,
+    resume_schema: str,
+) -> dict[str, Any]:
+    """Select the model seam required by one concrete PD scheduler."""
+
+    if scheduler_cls is OmniPrefillScheduler:
+        return {"state_builder": state_builder}
+    if scheduler_cls is OmniDecodeScheduler:
+        return {
+            "state_restorer": state_restorer,
+            "allowed_resume_schemas": frozenset({resume_schema}),
+        }
+    if scheduler_cls is OmniScheduler:
+        return {}
+    raise TypeError(f"unsupported scheduler class {scheduler_cls!r}")
+
+
 class OmniPrefillScheduler(OmniScheduler):
     """Omni scheduler whose generated requests stop after Prefill."""
-
-    scheduler_role = "prefill"
 
     def __init__(
         self,
         *args,
         stage_name: str,
         partner_stage: str,
-        state_builder: Callable,
+        state_builder: Callable = default_state_builder,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -146,16 +176,16 @@ class OmniPrefillScheduler(OmniScheduler):
 class OmniDecodeScheduler(OmniScheduler):
     """Omni scheduler that admits transferred Prefill state for Decode."""
 
-    scheduler_role = "decode"
-
     def __init__(
         self,
         *args,
         stage_name: str,
-        state_restorer: Callable,
-        resume_schema: str,
+        state_restorer: Callable = default_state_restorer,
+        allowed_resume_schemas: frozenset[str] = frozenset(),
+        partner_stage: str | None = None,
         **kwargs,
     ) -> None:
+        del partner_stage
         self._pd_admissions = queue.SimpleQueue()
         self._pd_deferred_admission = None
         self._pd_admission_lock = threading.Lock()
@@ -172,8 +202,9 @@ class OmniDecodeScheduler(OmniScheduler):
             pool_id=pool_id,
             allocator=self.token_to_kv_pool_allocator,
             admissions=self._pd_admissions,
-            resume_schema=resume_schema,
+            allowed_resume_schemas=allowed_resume_schemas,
         )
+        self._pd_receiver = receiver
         self.kv_registrations = ((pool, receiver),)
         self.disagg_decode_prealloc_queue = types.SimpleNamespace(
             queue=[], retracted_queue=[], num_tokens_pre_allocated=0
@@ -237,6 +268,7 @@ class OmniDecodeScheduler(OmniScheduler):
 
     def _discard_pending_request_admissions(self) -> None:
         super()._discard_pending_request_admissions()
+        self._pd_receiver.close()
         with self._pd_admission_lock:
             admission = self._pd_deferred_admission
             self._pd_deferred_admission = None
@@ -249,17 +281,6 @@ class OmniDecodeScheduler(OmniScheduler):
                     return
                 self.token_to_kv_pool_allocator.free(admission.allocation.slots)
 
-    def abort(self, request_id: str, *, defer_running_cleanup: bool = True) -> None:
-        with self._pd_admission_lock:
-            for req in self.waiting_queue:
-                if req.rid == request_id:
-                    self._release_request_kv_cache(req)
-                    break
-            super().abort(
-                request_id,
-                defer_running_cleanup=defer_running_cleanup,
-            )
-
 
 def _validate_pd_runtime(scheduler: OmniScheduler) -> None:
     if scheduler.tp_size != 1:
@@ -268,3 +289,5 @@ def _validate_pd_runtime(scheduler: OmniScheduler) -> None:
         raise NotImplementedError("PD currently requires page_size == 1")
     if not scheduler.server_args.disable_radix_cache:
         raise NotImplementedError("PD currently requires RadixCache disabled")
+    if not scheduler.spec_algorithm.is_none():
+        raise NotImplementedError("PD does not support speculative decoding")

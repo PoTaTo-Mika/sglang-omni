@@ -1803,6 +1803,11 @@ class OmniScheduler:
             waiting_queue = []
             for req in self.waiting_queue:
                 if req.rid == request_id:
+                    if (
+                        getattr(req, "req_pool_idx", None) is not None
+                        or getattr(req, "mamba_pool_idx", None) is not None
+                    ):
+                        self._release_request_kv_cache(req)
                     _detach_request_data(req)
                 else:
                     waiting_queue.append(req)
