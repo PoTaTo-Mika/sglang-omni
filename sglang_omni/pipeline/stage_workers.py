@@ -842,6 +842,7 @@ def _construct_scheduler(
         factory_args["scheduler_kwargs"] = {
             "stage_name": spec.stage_name,
             "partner_stage": spec.pd_execution.partner,
+            "decode_targets": spec.pd_execution.decode_targets,
         }
 
     def construct() -> Any:

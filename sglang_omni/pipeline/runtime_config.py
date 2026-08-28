@@ -12,7 +12,10 @@ from pathlib import Path
 
 import zmq
 
-from sglang_omni.config.pd_capability import validate_pd_capabilities
+from sglang_omni.config.pd_capability import (
+    validate_pd_capabilities,
+    validate_pd_engine_args,
+)
 from sglang_omni.config.pd_rewrite import expand_pd_stages
 from sglang_omni.config.placement import StagePlacementPlan, build_stage_placement_plan
 from sglang_omni.config.schema import PipelineConfig, StageConfig
@@ -129,6 +132,7 @@ def prepare_pipeline_runtime(
     expansion = expand_pd_stages(source_stages, entry_stage=entry_stage)
     entry_stage = expansion.entry_stage
     validate_pd_capabilities(expansion.stages)
+    validate_pd_engine_args(expansion.stages)
     terminal_stages = [stage.name for stage in expansion.stages if stage.terminal]
     expanded_config = config.model_copy(
         update={"stages": expansion.stages, "entry_stage": entry_stage}

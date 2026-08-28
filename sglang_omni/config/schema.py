@@ -222,6 +222,17 @@ class PDStagePlacement(BaseModel):
 
     gpu: int | list[int] | None = None
     process: str | None = None
+    # Note (Audrey Zheng): this half's share of its card, as a fraction of
+    # total physical memory. Required when the halves share a GPU, because
+    # `gpu_memory_fraction` on the logical stage describes one occupant and
+    # copying it to both would have each half size itself against the whole
+    # card. Unlike `mem_fraction_static` it does not depend on which half wins
+    # the startup lock.
+    memory_fraction: float | None = Field(default=None, gt=0.0, le=1.0)
+    # Note (Audrey Zheng): engine arguments for this half alone. The two halves
+    # want different settings -- Prefill sizes batches for one forward, Decode
+    # for many steps -- and without this they share the logical stage's.
+    engine: dict[str, Any] = Field(default_factory=dict)
 
     def model_post_init(self, __context: Any = None) -> None:
         if self.process is not None:
@@ -253,6 +264,13 @@ class PDExecution(BaseModel):
 
     role: Literal["prefill", "decode"]
     partner: str = Field(min_length=1)
+    # Note (Audrey Zheng): the Decode halves this Prefill may hand off to. One
+    # entry today, and `partner` stays the name a 1:1 reader expects. Carrying
+    # a sequence means a second Decode half does not migrate this schema or
+    # change `OmniPrefillScheduler`'s signature, and the choice of which one
+    # receives a given request can move to admission without touching the send
+    # path. Empty means "just `partner`".
+    decode_targets: tuple[str, ...] = ()
 
 
 class StageConfig(BaseModel):
@@ -783,11 +801,33 @@ class PipelineConfig(BaseModel):
                     f"Stage {stage.name!r} pd_disaggregation requires explicit "
                     "prefill.gpu and decode.gpu"
                 )
+            # Note (Audrey Zheng): the halves may share a card. What PD needs
+            # is the process split, and that happens either way -- the prefill
+            # step leaves the decode scheduler thread whichever card it runs
+            # on. Sharing also makes PD runnable on a one-GPU box, which is
+            # what CI has, and it is the only shape in which the two halves can
+            # share one copy of the weights.
+            #
+            # It is only safe with explicit budgets. `_validate_memory_budgets`
+            # caps the sum of *declared* fractions, and `_build_gpu_placement`
+            # skips a None, so two undeclared halves on one card each size
+            # themselves against the whole of it: whichever wins the startup
+            # lock takes the memory and the other fails to start. Require both.
             if _pd_gpu_set(pd.prefill.gpu) & _pd_gpu_set(pd.decode.gpu):
-                raise ValueError(
-                    f"Stage {stage.name!r} pd_disaggregation prefill and decode "
-                    "cannot share the same GPU"
-                )
+                undeclared = [
+                    role
+                    for role, placement in (
+                        ("prefill", pd.prefill),
+                        ("decode", pd.decode),
+                    )
+                    if placement.memory_fraction is None
+                ]
+                if undeclared:
+                    raise ValueError(
+                        f"Stage {stage.name!r} pd_disaggregation puts both "
+                        f"halves on one GPU, so {' and '.join(undeclared)} "
+                        "must declare memory_fraction"
+                    )
             for role, placement in (("prefill", pd.prefill), ("decode", pd.decode)):
                 if (
                     isinstance(placement.gpu, list)

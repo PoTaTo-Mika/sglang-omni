@@ -90,7 +90,7 @@ def test_pd_rewrite_assigns_input_to_prefill_and_output_to_decode() -> None:
     assert stages["thinker_decode"].stream_to == ["sink"]
     assert stages["thinker_decode"].route_fn == fake_factory_path("identity_route")
     assert stages["thinker_prefill"].pd_execution == PDExecution(
-        role="prefill", partner="thinker_decode"
+        decode_targets=("thinker_decode",), role="prefill", partner="thinker_decode"
     )
     assert stages["thinker_decode"].pd_execution == PDExecution(
         role="decode", partner="thinker_prefill"
@@ -262,7 +262,14 @@ def test_pd_factory_wrong_type_and_missing_capability_fail_at_startup(tmp_path) 
                 prefill=PDStagePlacement(gpu=0),
                 decode=PDStagePlacement(gpu=0),
             ),
-            "cannot share",
+            "must declare memory_fraction",
+        ),
+        (
+            PDConfig(
+                prefill=PDStagePlacement(gpu=0, memory_fraction=0.45),
+                decode=PDStagePlacement(gpu=0),
+            ),
+            "decode must declare memory_fraction",
         ),
     ],
 )
@@ -272,3 +279,116 @@ def test_invalid_pd_placement_fails_in_config(pd, message) -> None:
             model_path="model",
             stages=[stage("thinker", terminal=True, pd_disaggregation=pd)],
         )
+
+
+def test_two_halves_may_share_a_gpu_when_both_declare_a_budget() -> None:
+    """The split PD needs is between processes, not between cards.
+
+    Sharing is also the only shape in which the halves can share one copy of
+    the weights, and the only one a one-GPU CI box can run.
+    """
+    config = PipelineConfig(
+        model_path="model",
+        stages=[
+            stage(
+                "thinker",
+                terminal=True,
+                pd_disaggregation=PDConfig(
+                    prefill=PDStagePlacement(gpu=0, memory_fraction=0.45),
+                    decode=PDStagePlacement(gpu=0, memory_fraction=0.45),
+                ),
+            )
+        ],
+    )
+    expansion = expand_pd_stages(
+        list(config.stages), entry_stage=config.resolved_entry_stage
+    )
+    halves = {item.name: item for item in expansion.stages}
+
+    assert halves["thinker_prefill"].gpu == 0
+    assert halves["thinker_decode"].gpu == 0
+    assert halves["thinker_prefill"].gpu_memory_fraction == 0.45
+    assert halves["thinker_decode"].gpu_memory_fraction == 0.45
+
+
+def test_each_half_may_override_the_engine_arguments() -> None:
+    """Prefill sizes batches for one forward, Decode for many steps."""
+    config = PipelineConfig(
+        model_path="model",
+        stages=[
+            stage(
+                "thinker",
+                terminal=True,
+                pd_disaggregation=PDConfig(
+                    prefill=PDStagePlacement(gpu=0, engine={"max_running_requests": 8}),
+                    decode=PDStagePlacement(gpu=1, engine={"max_running_requests": 64}),
+                ),
+            )
+        ],
+    )
+    expansion = expand_pd_stages(
+        list(config.stages), entry_stage=config.resolved_entry_stage
+    )
+    halves = {item.name: item for item in expansion.stages}
+
+    assert halves["thinker_prefill"].engine.max_running_requests == 8
+    assert halves["thinker_decode"].engine.max_running_requests == 64
+
+
+def test_an_unsplit_budget_still_reaches_both_halves() -> None:
+    """Separate cards need no per-half budget; the logical one stands."""
+    logical = stage(
+        "thinker",
+        terminal=True,
+        pd_disaggregation=PDConfig(
+            prefill=PDStagePlacement(gpu=0),
+            decode=PDStagePlacement(gpu=1),
+        ),
+    )
+    logical.gpu_memory_fraction = 0.8
+    expansion = expand_pd_stages([logical], entry_stage="thinker")
+    halves = {item.name: item for item in expansion.stages}
+
+    assert halves["thinker_prefill"].gpu_memory_fraction == 0.8
+    assert halves["thinker_decode"].gpu_memory_fraction == 0.8
+
+
+@pytest.mark.parametrize(
+    "engine,message",
+    [
+        ({"page_size": 32}, "requires 1"),
+        ({"disable_radix_cache": False}, "requires True"),
+    ],
+)
+def test_a_pd_stage_is_rejected_for_what_the_runtime_cannot_do(engine, message) -> None:
+    """The scheduler refuses these in its constructor, after the model loads."""
+    from sglang_omni.config.pd_capability import validate_pd_engine_args
+
+    logical = stage(
+        "thinker",
+        terminal=True,
+        pd_disaggregation=PDConfig(
+            prefill=PDStagePlacement(gpu=0, engine=engine),
+            decode=PDStagePlacement(gpu=1),
+        ),
+    )
+    expansion = expand_pd_stages([logical], entry_stage="thinker")
+
+    with pytest.raises(ValueError, match=message):
+        validate_pd_engine_args(expansion.stages)
+
+
+def test_a_supported_engine_argument_passes() -> None:
+    from sglang_omni.config.pd_capability import validate_pd_engine_args
+
+    logical = stage(
+        "thinker",
+        terminal=True,
+        pd_disaggregation=PDConfig(
+            prefill=PDStagePlacement(gpu=0, engine={"page_size": 1}),
+            decode=PDStagePlacement(gpu=1, engine={"max_running_requests": 64}),
+        ),
+    )
+    expansion = expand_pd_stages([logical], entry_stage="thinker")
+
+    validate_pd_engine_args(expansion.stages)

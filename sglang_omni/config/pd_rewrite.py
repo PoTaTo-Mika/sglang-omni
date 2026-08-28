@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from sglang_omni.config.schema import PDExecution, StageConfig
+from sglang_omni.config.schema import EngineArgs, PDExecution, StageConfig
 
 
 @dataclass(frozen=True)
@@ -91,6 +91,34 @@ def _rewrite_refs(
     )
 
 
+def _half_memory_fraction(stage: StageConfig, placement) -> float | None:
+    """This half's share of its card.
+
+    `gpu_memory_fraction` on the logical stage describes one occupant. Copying
+    it to both halves would have each size itself against the whole card, and
+    `_validate_memory_budgets` sums declared fractions per GPU, so two halves
+    on one card would read as double. An explicit per-half share replaces it;
+    otherwise the logical value stands, which is right when the halves are on
+    separate cards.
+    """
+    if placement.memory_fraction is not None:
+        return placement.memory_fraction
+    return stage.gpu_memory_fraction
+
+
+def _half_engine(stage: StageConfig, placement) -> EngineArgs | None:
+    """The logical stage's engine arguments with this half's overrides on top.
+
+    The two halves want different settings: Prefill sizes batches for one
+    forward, Decode for many steps. Without an override they share whatever the
+    logical stage declared.
+    """
+    if not placement.engine:
+        return stage.engine
+    base = stage.engine if stage.engine is not None else EngineArgs()
+    return base.model_copy(update=dict(placement.engine))
+
+
 def _split(
     stage: StageConfig,
     inbound: dict[str, str],
@@ -106,6 +134,8 @@ def _split(
             "name": prefill_name,
             "gpu": pd.prefill.gpu,
             "process": pd.prefill.process or prefill_name,
+            "gpu_memory_fraction": _half_memory_fraction(stage, pd.prefill),
+            "engine": _half_engine(stage, pd.prefill),
             "next": None,
             "terminal": False,
             "route_fn": None,
@@ -118,7 +148,11 @@ def _split(
                 else stage.wait_for
             ),
             "pd_disaggregation": None,
-            "pd_execution": PDExecution(role="prefill", partner=decode_name),
+            "pd_execution": PDExecution(
+                role="prefill",
+                partner=decode_name,
+                decode_targets=(decode_name,),
+            ),
         },
     )
     decode = stage.model_copy(
@@ -127,6 +161,8 @@ def _split(
             "name": decode_name,
             "gpu": pd.decode.gpu,
             "process": pd.decode.process or decode_name,
+            "gpu_memory_fraction": _half_memory_fraction(stage, pd.decode),
+            "engine": _half_engine(stage, pd.decode),
             "next": _rename(stage.next, inbound),
             "stream_to": [inbound.get(name, name) for name in stage.stream_to],
             "project_payload": {

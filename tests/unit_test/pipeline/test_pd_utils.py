@@ -576,6 +576,7 @@ def test_prefill_queues_one_real_token_handoff_and_source_lease_is_idempotent(
     scheduler._pd_state_builder = _state_builder
     scheduler._pd_stage_name = "thinker_prefill"
     scheduler._pd_partner_stage = "thinker_decode"
+    scheduler._pd_decode_targets = ("thinker_decode",)
     scheduler._pd_pool_id = "thinker_prefill:kv"
     scheduler.req_to_token_pool = req_pool
     scheduler.tree_cache = "tree"
