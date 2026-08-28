@@ -23,6 +23,7 @@ from sglang_omni.scheduling.sglang_backend.request_data import SGLangARRequestDa
 logger = logging.getLogger(__name__)
 
 CONTINUATION_VERSION = 1
+_TRANSFER_TOMBSTONE_LIMIT = 10000
 
 
 @dataclasses.dataclass(frozen=True)
@@ -406,8 +407,17 @@ class DecodeKVReceiver:
         self._allowed_resume_schemas = allowed_resume_schemas
         self._lock = threading.Lock()
         self._reservations: dict[str, _Reservation] = {}
-        self._transfer_ids: set[str] = set()
+        self._transfer_tombstones: dict[str, None] = {}
         self._closed = False
+
+    def _remember_finished_transfer(self, transfer_id: str) -> None:
+        """Keep a bounded dedup window for transfers we no longer own."""
+
+        if transfer_id in self._transfer_tombstones:
+            return
+        if len(self._transfer_tombstones) >= _TRANSFER_TOMBSTONE_LIMIT:
+            del self._transfer_tombstones[next(iter(self._transfer_tombstones))]
+        self._transfer_tombstones[transfer_id] = None
 
     def reserve(self, request: KVTransferPrepareMessage) -> KVPageDestination:
         if request.target_pool_id != self.pool_id:
@@ -433,7 +443,10 @@ class DecodeKVReceiver:
         with self._lock:
             if self._closed:
                 raise RuntimeError("decode KV receiver is closed")
-            if request.transfer_id in self._transfer_ids:
+            if (
+                request.transfer_id in self._reservations
+                or request.transfer_id in self._transfer_tombstones
+            ):
                 raise RuntimeError(f"duplicate KV transfer {request.transfer_id!r}")
             if int(self._allocator.available_size()) < count:
                 raise RuntimeError(
@@ -451,7 +464,6 @@ class DecodeKVReceiver:
             self._reservations[request.transfer_id] = _Reservation(
                 continuation, allocation
             )
-            self._transfer_ids.add(request.transfer_id)
         return KVPageDestination(self.pool_id, allocation.page_indices)
 
     def commit(
@@ -465,6 +477,7 @@ class DecodeKVReceiver:
                 raise RuntimeError(
                     f"commit for unknown KV transfer {request.transfer_id!r}"
                 )
+            self._remember_finished_transfer(request.transfer_id)
             if (
                 self._closed
                 or request.request_id != reservation.continuation.request_id
@@ -492,6 +505,8 @@ class DecodeKVReceiver:
         del destination
         with self._lock:
             reservation = self._reservations.pop(request.transfer_id, None)
+            if reservation is not None:
+                self._remember_finished_transfer(request.transfer_id)
         if reservation is not None:
             self._allocator.free(reservation.allocation.slots)
         logger.warning("KV receive aborted for %s: %s", request.request_id, error)

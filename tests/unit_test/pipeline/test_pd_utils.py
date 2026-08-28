@@ -24,6 +24,7 @@ from sglang_omni.proto import (
     OmniRequest,
     StagePayload,
 )
+from sglang_omni.scheduling import pd_utils as pd_utils_module
 from sglang_omni.scheduling.pd_utils import (
     DecodeAdmission,
     DecodeContinuation,
@@ -411,12 +412,43 @@ def test_receiver_commit_transfers_ownership_to_admission() -> None:
     message = _message()
     destination = receiver.reserve(message)
     receiver.commit(message, destination)
+    with pytest.raises(RuntimeError, match="duplicate KV transfer"):
+        receiver.reserve(message)
     receiver.abort(message, destination, RuntimeError("late"))
     receiver.close()
 
     admission = admissions.get_nowait()
     assert admission.allocation.page_indices == destination.page_indices
     assert allocator.freed == []
+
+
+def test_receiver_transfer_tombstones_are_bounded_and_evict_oldest(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(pd_utils_module, "_TRANSFER_TOMBSTONE_LIMIT", 2)
+    allocator = _KVAllocator()
+    receiver = _receiver(allocator=allocator)
+
+    def abort_transfer(transfer_id: str) -> None:
+        message = _message(transfer_id=transfer_id)
+        destination = receiver.reserve(message)
+        receiver.abort(message, destination, RuntimeError("test abort"))
+
+    abort_transfer("transfer-0")
+    abort_transfer("transfer-1")
+    with pytest.raises(RuntimeError, match="duplicate KV transfer"):
+        receiver.reserve(_message(transfer_id="transfer-1"))
+
+    abort_transfer("transfer-2")
+
+    assert list(receiver._transfer_tombstones) == ["transfer-1", "transfer-2"]
+    with pytest.raises(RuntimeError, match="duplicate KV transfer"):
+        receiver.reserve(_message(transfer_id="transfer-2"))
+
+    # Once the oldest ID leaves the bounded window, it can be reused.
+    abort_transfer("transfer-0")
+    assert list(receiver._transfer_tombstones) == ["transfer-2", "transfer-0"]
+    assert allocator.alloc_calls == 4
 
 
 def test_decode_pool_exhaustion_defers_without_losing_committed_kv(monkeypatch) -> None:
