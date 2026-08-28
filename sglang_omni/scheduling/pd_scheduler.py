@@ -107,6 +107,7 @@ class OmniPrefillScheduler(OmniScheduler):
             if len(req.output_ids) > output_lengths[id(req)]
         }
         self._handoff_prefilled_requests(batch, sampled)
+        return None
 
     def stream_output(self, reqs, return_logprob=False, skip_req=None):
         # A Prefill result must never become a normal StagePayload edge. Normal
