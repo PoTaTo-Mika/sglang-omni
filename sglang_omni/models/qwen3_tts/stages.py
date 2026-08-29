@@ -194,7 +194,7 @@ def create_vocoder_executor(
         attn_implementation=attn_implementation,
     )
 
-    return Qwen3TTSStreamingVocoderScheduler(
+    scheduler = Qwen3TTSStreamingVocoderScheduler(
         tokenizer,
         device=device,
         stream_stride=stream_stride,
@@ -213,3 +213,8 @@ def create_vocoder_executor(
         followup_cuda_graph=followup_cuda_graph,
         fused_snake_activation=fused_snake_activation,
     )
+    # note (ratish): Factory construction completes before the stage process
+    # publishes readiness, so CUDA capture cannot overlap request-time GPU work
+    # from colocated stages.
+    scheduler.warmup_now()
+    return scheduler
