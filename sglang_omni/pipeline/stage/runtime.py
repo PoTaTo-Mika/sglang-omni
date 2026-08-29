@@ -1202,13 +1202,28 @@ class Stage:
                 "kv_transfer outbox messages require KVPageTransfer data, got "
                 f"{type(transfer).__name__}"
             )
+        # Note (Audrey Zheng): the scheduler names a logical Decode stage. If
+        # that process is replicated, which physical instance a request goes to
+        # is the coordinator's binding, assigned once at admission and carried
+        # on the envelope -- the same decision every other edge out of this
+        # stage already resolves through. Resolving it here rather than in the
+        # scheduler keeps one request to one answer instead of two policies
+        # deciding the same question, and keeps physical identity in the one
+        # layer that has it.
+        #
+        # The pool id has to follow: OmniDecodeScheduler builds its pool as
+        # f"{stage_name}:kv" from its own physical name.
+        to_stage = self._resolve_target_instance(transfer.request_id, transfer.to_stage)
+        target_pool_id = transfer.target_pool_id
+        if to_stage != transfer.to_stage:
+            target_pool_id = f"{to_stage}:kv"
         try:
             await self._comm.send_kv_pages(
                 request_id=transfer.request_id,
                 source_pool_id=transfer.source_pool_id,
                 source_page_indices=transfer.source_page_indices,
-                target_pool_id=transfer.target_pool_id,
-                to_stage=transfer.to_stage,
+                target_pool_id=target_pool_id,
+                to_stage=to_stage,
                 metadata=transfer.metadata,
                 transfer_id=transfer.transfer_id,
                 lease=transfer.lease,

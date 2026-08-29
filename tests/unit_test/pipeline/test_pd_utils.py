@@ -16,6 +16,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.sampling.sampling_params import SamplingParams
 
 from sglang_omni.comm import KVPageTransfer
+from sglang_omni.pipeline.replicas import ReplicaTopology
 from sglang_omni.pipeline.stage.runtime import Stage
 from sglang_omni.proto import (
     KVBufferSpec,
@@ -646,6 +647,9 @@ def test_slow_ack_does_not_block_an_unrelated_transfer() -> None:
                     lease.release()
 
         stage = object.__new__(Stage)
+        # The send resolves a replicated target through the request's binding.
+        stage._replica_topology = ReplicaTopology(replicas={})
+        stage._replica_bindings = {}
         stage._comm = _Comm()
         stage._receive_tasks = set()
         stage._clear_request_state = lambda request_id: completed.append(
@@ -697,6 +701,8 @@ def test_send_failure_releases_source_and_reports_request_failure() -> None:
 
         stage = object.__new__(Stage)
         stage.name = "prefill"
+        stage._replica_topology = ReplicaTopology(replicas={})
+        stage._replica_bindings = {}
         stage._comm = _Comm()
         stage._clear_request_state = lambda request_id: None
 

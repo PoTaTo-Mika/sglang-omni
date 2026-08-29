@@ -251,3 +251,49 @@ def test_one_failed_release_does_not_strand_the_rest(monkeypatch) -> None:
 
     assert pd_utils.drain_due_releases(due, object()) == 2
     assert freed == ["good"]
+
+
+def _prefill_stage(topology, bindings):
+    """A Stage with only what the KV send path reads."""
+    from sglang_omni.pipeline.stage.runtime import Stage
+
+    stage = Stage.__new__(Stage)
+    stage.name = "thinker_prefill"
+    stage._replica_topology = topology
+    stage._replica_bindings = bindings
+    return stage
+
+
+def test_an_unreplicated_decode_target_is_sent_to_unchanged() -> None:
+    from sglang_omni.pipeline.replicas import ReplicaTopology
+
+    stage = _prefill_stage(ReplicaTopology(replicas={}), {})
+
+    assert stage._resolve_target_instance("req-1", "thinker_decode") == "thinker_decode"
+
+
+def test_a_replicated_decode_target_follows_the_admission_binding() -> None:
+    """The coordinator chose once; the send must not choose again."""
+    from sglang_omni.pipeline.replicas import ReplicaTopology
+
+    topology = ReplicaTopology(
+        replicas={"thinker_decode": ("thinker_decode@r0", "thinker_decode@r1")}
+    )
+    stage = _prefill_stage(topology, {"req-1": {"thinker_decode": 1}})
+
+    assert (
+        stage._resolve_target_instance("req-1", "thinker_decode") == "thinker_decode@r1"
+    )
+
+
+def test_a_replicated_target_without_a_binding_is_an_error() -> None:
+    """Guessing here would send KV where the request is not expected."""
+    from sglang_omni.pipeline.replicas import ReplicaTopology
+
+    topology = ReplicaTopology(
+        replicas={"thinker_decode": ("thinker_decode@r0", "thinker_decode@r1")}
+    )
+    stage = _prefill_stage(topology, {})
+
+    with pytest.raises(RuntimeError, match="no replica binding"):
+        stage._resolve_target_instance("req-1", "thinker_decode")
