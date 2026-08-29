@@ -255,6 +255,13 @@ class PDConfig(BaseModel):
 
     prefill: PDStagePlacement = Field(default_factory=PDStagePlacement)
     decode: PDStagePlacement = Field(default_factory=PDStagePlacement)
+    # Note (Audrey Zheng): how many handoffs the Prefill half may have in
+    # flight. Each one holds that request's prompt KV on the Prefill card
+    # until Decode acknowledges the copy, so this bounds how much of the
+    # Prefill pool sits in leases. Unset leaves the count where it lands
+    # today, which is Prefill's max_running_requests -- a number chosen to
+    # size batches, not to bound leases.
+    max_inflight_handoffs: int | None = Field(default=None, gt=0)
 
 
 class PDExecution(BaseModel):
@@ -264,6 +271,7 @@ class PDExecution(BaseModel):
 
     role: Literal["prefill", "decode"]
     partner: str = Field(min_length=1)
+    max_inflight_handoffs: int | None = None
     # Note (Audrey Zheng): the Decode halves this Prefill may hand off to. One
     # entry today, and `partner` stays the name a 1:1 reader expects. Carrying
     # a sequence means a second Decode half does not migrate this schema or

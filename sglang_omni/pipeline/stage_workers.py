@@ -786,6 +786,11 @@ def _construct_stage(
         tp_fanout=tp_fanout,
         is_terminal=spec.is_terminal,
         replica_topology=spec.replica_topology or None,
+        max_inflight_handoffs=(
+            spec.pd_execution.max_inflight_handoffs
+            if spec.pd_execution is not None
+            else None
+        ),
         kv_registrations=kv_registrations,
     )
 
