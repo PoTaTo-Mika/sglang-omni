@@ -187,9 +187,9 @@ class FusedSnakeBeta(torch.nn.Module):
         beta = self.beta.unsqueeze(0).unsqueeze(-1)
         alpha = torch.exp(alpha)
         beta = torch.exp(beta)
-        hidden_states = hidden_states + (1.0 / (beta + self.no_div_by_zero)) * torch.pow(
-            torch.sin(hidden_states * alpha), 2
-        )
+        hidden_states = hidden_states + (
+            1.0 / (beta + self.no_div_by_zero)
+        ) * torch.pow(torch.sin(hidden_states * alpha), 2)
         return hidden_states
 
 
