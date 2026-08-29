@@ -32,7 +32,6 @@ class Qwen3ASRFactoryArgs(FactoryArgs):
     pre_lm_cache_size_bytes: int | None = Field(default=None, ge=1)
     pre_lm_max_batch_size: int | None = Field(default=None, ge=1)
     pre_lm_max_batch_wait_ms: int | None = Field(default=None, ge=0)
-    max_audio_clip_s: float | None = Field(default=None, gt=0)
 
 
 class Qwen3ASRStageConfig(EngineStageConfig):
@@ -46,16 +45,6 @@ class Qwen3ASRPipelineConfig(PipelineConfig):
     allow_audio_chunking: ClassVar[bool] = True
     max_native_clip_s: ClassVar[float] = float(QWEN3_ASR_MAX_INPUT_SECONDS)
     audio_chunking: AudioChunkingConfig = QWEN3_ASR_AUDIO_CHUNKING
-
-    def model_post_init(self, __context=None) -> None:
-        super().model_post_init(__context)
-        # Note (Jeffro): the engine stage sizes its encoder CUDA-graph ladder from the chunk
-        # length, and it only sees factory kwargs, so we copy the field
-        # there. We always overwrite: a factory value that differs from the
-        # field has no meaning, and the field carries the validation.
-        for stage in self.stages:
-            if isinstance(stage, Qwen3ASRStageConfig):
-                stage.factory.max_audio_clip_s = self.audio_chunking.max_audio_clip_s
 
     stage_config_types: ClassVar[dict[str, type[StageConfig]]] = {
         "asr": Qwen3ASRStageConfig,
