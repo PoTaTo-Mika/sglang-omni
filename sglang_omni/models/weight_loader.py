@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 from functools import lru_cache
 from pathlib import Path
 
@@ -42,6 +43,14 @@ def resolve_model_path(model_path: str, *, local_files_only: bool = False) -> Pa
     if local_files_only:
         config_path = cached_file(model_path, "config.json", local_files_only=True)
         return Path(config_path).parent
+    if os.environ.get("SGLANG_OMNI_ALWAYS_CHECK_HUB", "0") != "1":
+        # Serve an already-complete cache without asking the Hub whether it
+        # moved. Startup otherwise pays a round trip per config file even when
+        # every byte is on disk, which on a laptop is seconds of cold start.
+        try:
+            return Path(snapshot_download(model_path, local_files_only=True))
+        except Exception:  # noqa: BLE001 - any cache miss falls through
+            pass
     return Path(snapshot_download(model_path, local_files_only=False))
 
 
