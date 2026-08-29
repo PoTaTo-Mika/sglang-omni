@@ -192,11 +192,13 @@ tests/
     │   ├── test_stop_run_id.py
     │   └── test_views.py
     ├── serve/
+    │   ├── test_cli_audio_chunking.py
     │   ├── test_generation_batch_policy.py
     │   ├── test_generation_server_args.py
     │   ├── test_openai_api.py
     │   ├── test_speech_to_text.py
     │   ├── test_subtitles.py
+    │   ├── test_transcription_chunking.py
     │   ├── test_translation_capability.py
     │   └── test_translations.py
     ├── scheduling/
