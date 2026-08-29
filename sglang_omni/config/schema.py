@@ -367,6 +367,19 @@ class StageConfig(BaseModel):
     # --- Communication pool tuning ---
     comm: CommConfig | None = None
 
+    # Note (Audrey Zheng): the model saying it wrote this stage for PD. It is
+    # a field rather than a marker on the factory because the compiler has to
+    # answer "is this config valid" from the config: reading an attribute off
+    # the factory meant importing a model module -- and torch, transformers
+    # and the model registry with it -- into the launcher, and it made the
+    # answer depend on something outside the config that the config cannot
+    # show you.
+    #
+    # This is the declaration, not the proof. `_construct_scheduler` still
+    # checks that the factory takes the compiler's arguments and returns the
+    # scheduler class for its role, so a stage that declares this and did not
+    # do the work still fails -- just later, and in the process that owns it.
+    pd_capable: bool = False
     pd_disaggregation: PDConfig | None = None
     pd_execution: PDExecution | None = None
 
