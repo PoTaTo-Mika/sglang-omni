@@ -186,6 +186,7 @@ async def run_mmmu_eval(
         "temperature": config.temperature,
         "max_concurrency": config.max_concurrency,
         "warmup": resolve_warmup(config.warmup, config.max_concurrency),
+        "request_rate": config.request_rate,
         "enable_audio": config.enable_audio,
         "asr_concurrency": config.asr_concurrency,
     }

@@ -206,6 +206,7 @@ async def run_video_eval(
             "video_total_pixels": config.video_total_pixels,
             "max_concurrency": config.max_concurrency,
             "warmup": resolve_warmup(config.warmup, config.max_concurrency),
+            "request_rate": config.request_rate,
             "enable_audio": config.enable_audio,
             "asr_device": config.asr_device,
             "asr_concurrency": config.asr_concurrency,
