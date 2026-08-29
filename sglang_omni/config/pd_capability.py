@@ -46,7 +46,10 @@ _PD_UNSUPPORTED_ENGINE_ARGS: tuple[tuple[str, Any, str], ...] = (
     (
         "disable_radix_cache",
         True,
-        "a shared prefix makes the handed-off pages not solely this request's",
+        "a shared prefix makes the handed-off pages not solely this "
+        "request's, and DecodeContinuation carries neither extra_key nor "
+        "cache_salt, so the Decode half would insert under a key that "
+        "collides with a different request holding the same token ids",
     ),
 )
 

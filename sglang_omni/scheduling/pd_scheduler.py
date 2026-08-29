@@ -7,7 +7,6 @@ import queue
 import threading
 import types
 from typing import Any, Callable, Literal
-from uuid import uuid4
 
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler as _Upstream
@@ -26,6 +25,7 @@ from sglang_omni.scheduling.pd_utils import (
     default_state_builder,
     default_state_restorer,
     defer_first_token_finish,
+    drain_due_releases,
     req_from_continuation,
     request_page_indices,
 )
@@ -85,6 +85,10 @@ class OmniPrefillScheduler(OmniScheduler):
         # it. Empty falls back to `partner`, which is 1:1.
         self._pd_decode_targets = tuple(sorted(decode_targets)) or (partner_stage,)
         self._pd_state_builder = state_builder
+        self._pd_handoff_seq = 0
+        # Requests whose copy Decode has acknowledged. The comm thread puts
+        # them here; this thread releases them. See SGLangKVLease.
+        self._pd_due_releases: queue.SimpleQueue = queue.SimpleQueue()
         self._pd_pool_id = f"{stage_name}:kv"
         pool = build_kv_pool(
             self.token_to_kv_pool_allocator.get_kvcache(),
@@ -102,6 +106,7 @@ class OmniPrefillScheduler(OmniScheduler):
         return select_decode_stage(self._pd_decode_targets, str(req.rid))
 
     def get_next_batch_to_run(self):
+        drain_due_releases(self._pd_due_releases, self.tree_cache)
         if (
             self.running_batch.is_empty()
             and self.running_batch.batch_is_full
@@ -159,7 +164,18 @@ class OmniPrefillScheduler(OmniScheduler):
                 continue
             try:
                 decode_stage = self._resolve_decode_stage(req)
-                transfer_id = f"{req.rid}:pd:{uuid4().hex}"
+                # Note (Audrey Zheng): every join key downstream is the
+                # transfer id, and under tp_size > 1 each rank builds this
+                # line for the same request. uuid4 is drawn per rank, so the
+                # ranks would disagree about what to call one transfer.
+                #
+                # The counter is rank-identical because every TP rank runs the
+                # same batches in the same order -- that is what makes TP a
+                # collective. The rid alone would not do: a client may supply
+                # its own request_id (`serve/openai_api.py`), and a repeat
+                # would collide with the receiver's tombstone window.
+                self._pd_handoff_seq += 1
+                transfer_id = f"{req.rid}:pd:{self._pd_handoff_seq}"
                 continuation = continuation_from_req(
                     req, transfer_id, self._pd_state_builder
                 )
@@ -173,7 +189,7 @@ class OmniPrefillScheduler(OmniScheduler):
                     ),
                     to_stage=decode_stage,
                     metadata={"decode_continuation": continuation.encode()},
-                    lease=SGLangKVLease(req, self.tree_cache),
+                    lease=SGLangKVLease(req, self.tree_cache, self._pd_due_releases),
                 )
             except Exception as exc:
                 self._release_request_kv_cache(req)

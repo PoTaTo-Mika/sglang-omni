@@ -456,10 +456,24 @@ class DecodeKVReceiver:
             slots = self._allocator.alloc(count)
             if slots is None:
                 raise RuntimeError(f"decode KV allocator failed to allocate {count}")
+            # Note (Audrey Zheng): three different quantities that happen to
+            # be equal at page_size == 1 -- how many tokens the request has,
+            # how many slots back them, and which pages hold them. Deriving
+            # all three from one number is what makes page_size > 1 look like
+            # a one-line change when it is not. The token count is the only
+            # one that is a property of the request rather than of the
+            # allocation, so take it from the continuation and check it.
+            seq_len = len(continuation.origin_input_ids)
+            if seq_len != count:
+                self._allocator.free(slots)
+                raise RuntimeError(
+                    f"KV transfer {request.transfer_id!r} carries {count} "
+                    f"pages for {seq_len} tokens; PD requires page_size == 1"
+                )
             allocation = ReservedKV(
                 slots=slots,
                 page_indices=tuple(int(slot) for slot in slots.tolist()),
-                seq_len=count,
+                seq_len=seq_len,
             )
             self._reservations[request.transfer_id] = _Reservation(
                 continuation, allocation
@@ -523,19 +537,56 @@ class DecodeKVReceiver:
 
 
 class SGLangKVLease:
-    """Keep source pages owned until the receiver ACKs the copy."""
+    """Keep source pages owned until the receiver ACKs the copy.
 
-    def __init__(self, req: Any, tree_cache: Any) -> None:
+    ``release`` is called by the comm event loop, from ``_watch_pending``'s
+    ``finally``. What it releases belongs to the scheduler thread: with
+    RadixCache disabled ``release_kv_cache`` frees through the allocator, and
+    with it enabled it inserts into the prefix tree, drops a reference, and
+    updates eviction bookkeeping -- all while the scheduler is matching and
+    evicting against that same tree.
+
+    So the lease does not release. It records that the release is due and the
+    scheduler performs it on its own thread, which is the only thread that
+    owns the tree. Handing the work over rather than locking is possible here
+    because a release needs no answer; the reservation on the receive side
+    does, which is why that one takes a lock instead.
+    """
+
+    def __init__(self, req: Any, tree_cache: Any, due: queue.SimpleQueue) -> None:
         self._req = req
         self._tree_cache = tree_cache
+        self._due = due
         self._lock = threading.Lock()
 
     def release(self) -> None:
+        """Hand the request to the scheduler thread. Idempotent."""
         with self._lock:
             req = self._req
             self._req = None
         if req is None:
             return
-        from sglang.srt.mem_cache.common import release_kv_cache
+        self._due.put(req)
 
-        release_kv_cache(req, self._tree_cache)
+
+def drain_due_releases(due: queue.SimpleQueue, tree_cache: Any) -> int:
+    """Release every request whose copy has been acknowledged.
+
+    Called on the scheduler thread. Returns how many were released, so a
+    caller can assert the queue drains rather than grows.
+    """
+    from sglang.srt.mem_cache.common import release_kv_cache
+
+    released = 0
+    while True:
+        try:
+            req = due.get_nowait()
+        except queue.Empty:
+            return released
+        try:
+            release_kv_cache(req, tree_cache)
+        except Exception:
+            logger.exception(
+                "releasing KV for request %s failed", getattr(req, "rid", "?")
+            )
+        released += 1

@@ -32,6 +32,7 @@ from sglang_omni.scheduling.pd_utils import (
     ReservedKV,
     continuation_from_req,
     defer_first_token_finish,
+    drain_due_releases,
     req_from_continuation,
 )
 from sglang_omni.scheduling.sglang_backend.request_data import SGLangARRequestData
@@ -577,6 +578,8 @@ def test_prefill_queues_one_real_token_handoff_and_source_lease_is_idempotent(
     scheduler._pd_stage_name = "thinker_prefill"
     scheduler._pd_partner_stage = "thinker_decode"
     scheduler._pd_decode_targets = ("thinker_decode",)
+    scheduler._pd_handoff_seq = 0
+    scheduler._pd_due_releases = queue.SimpleQueue()
     scheduler._pd_pool_id = "thinker_prefill:kv"
     scheduler.req_to_token_pool = req_pool
     scheduler.tree_cache = "tree"
@@ -595,9 +598,15 @@ def test_prefill_queues_one_real_token_handoff_and_source_lease_is_idempotent(
     assert req._omni_data is None
     assert released == []
 
+    # The comm event loop calls release; the tree belongs to this thread, so
+    # the lease only records that a release is due.
     transfer.lease.release()
     transfer.lease.release()
+    assert released == []
+
+    assert drain_due_releases(scheduler._pd_due_releases, "tree") == 1
     assert released == [("request-1", "tree")]
+    assert drain_due_releases(scheduler._pd_due_releases, "tree") == 0
 
 
 def test_chunked_prefill_does_not_handoff_before_final_prefill_chunk(

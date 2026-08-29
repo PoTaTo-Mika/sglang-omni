@@ -162,3 +162,92 @@ def test_a_receiver_built_after_the_wrap_gets_the_locked_allocator() -> None:
     )
 
     assert isinstance(receiver._allocator, LockedKVAllocator)
+
+
+def test_a_lease_release_does_not_touch_the_tree_on_the_calling_thread(
+    monkeypatch,
+) -> None:
+    """release runs on the comm loop; the tree belongs to the scheduler."""
+    import queue as _queue
+
+    import sglang.srt.mem_cache.common as common
+
+    from sglang_omni.scheduling.pd_utils import SGLangKVLease
+
+    freed: list[object] = []
+    monkeypatch.setattr(
+        common, "release_kv_cache", lambda req, cache: freed.append(req)
+    )
+
+    req = object()
+    due: _queue.SimpleQueue = _queue.SimpleQueue()
+    lease = SGLangKVLease(req, object(), due)
+
+    lease.release()
+
+    assert freed == []
+    assert due.get_nowait() is req
+
+
+def test_a_lease_releases_once_however_many_times_it_is_called() -> None:
+    import queue as _queue
+
+    from sglang_omni.scheduling.pd_utils import SGLangKVLease
+
+    due: _queue.SimpleQueue = _queue.SimpleQueue()
+    lease = SGLangKVLease(object(), object(), due)
+
+    lease.release()
+    lease.release()
+    lease.release()
+
+    assert due.qsize() == 1
+
+
+def test_the_scheduler_thread_drains_every_due_release(monkeypatch) -> None:
+    import queue as _queue
+
+    from sglang_omni.scheduling import pd_utils
+
+    freed: list[tuple[object, object]] = []
+    tree = object()
+
+    import sglang.srt.mem_cache.common as common
+
+    monkeypatch.setattr(
+        common, "release_kv_cache", lambda req, cache: freed.append((req, cache))
+    )
+
+    due: _queue.SimpleQueue = _queue.SimpleQueue()
+    first, second = object(), object()
+    due.put(first)
+    due.put(second)
+
+    assert pd_utils.drain_due_releases(due, tree) == 2
+    assert freed == [(first, tree), (second, tree)]
+    assert pd_utils.drain_due_releases(due, tree) == 0
+
+
+def test_one_failed_release_does_not_strand_the_rest(monkeypatch) -> None:
+    """A release that raises must not leave the queue holding the others."""
+    import queue as _queue
+
+    import sglang.srt.mem_cache.common as common
+
+    from sglang_omni.scheduling import pd_utils
+
+    freed: list[object] = []
+
+    def flaky(req, cache):
+        if req == "bad":
+            raise RuntimeError("tree said no")
+        freed.append(req)
+
+    monkeypatch.setattr(common, "release_kv_cache", flaky)
+
+    due: _queue.SimpleQueue = _queue.SimpleQueue()
+    due.put("bad")
+    due.put("good")
+
+    assert pd_utils.drain_due_releases(due, object()) == 2
+    assert freed == ["good"]
