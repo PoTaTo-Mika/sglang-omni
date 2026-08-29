@@ -37,13 +37,13 @@ def _asr_factory_kwargs(config: PipelineConfig) -> dict[str, object]:
 
 def test_chunk_length_is_mirrored_into_the_qwen3_asr_stage():
     config = Qwen3ASRPipelineConfig(model_path="dummy")
-    assert _asr_factory_kwargs(config)["max_audio_clip_s"] == 60.0
+    assert _asr_factory_kwargs(config)["max_audio_clip_s"] == 30.0
 
     # A stale mirrored value from a model_dump round-trip must not win.
     dump = config.model_dump()
-    dump["stages"][0]["factory"]["max_audio_clip_s"] = 30.0
+    dump["stages"][0]["factory"]["max_audio_clip_s"] = 15.0
     rebuilt = Qwen3ASRPipelineConfig(**dump)
-    assert _asr_factory_kwargs(rebuilt)["max_audio_clip_s"] == 60.0
+    assert _asr_factory_kwargs(rebuilt)["max_audio_clip_s"] == 30.0
 
 
 def test_dotted_override_reaches_field_and_stage():

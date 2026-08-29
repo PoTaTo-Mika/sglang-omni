@@ -17,7 +17,7 @@ from sglang_omni.serve.transcription_chunking import (
 )
 from sglang_omni.utils.audio import load_audio
 
-_ENABLED = ResolvedAudioChunking(allow_audio_chunking=True)
+_ENABLED = ResolvedAudioChunking(allow_audio_chunking=True, max_audio_clip_s=60.0)
 
 _SAMPLE_RATE = 16000
 _ENERGY_WINDOW = 1600  # 100ms at 16 kHz
@@ -87,10 +87,10 @@ def test_qwen3_asr_pipeline_declaresResolvedAudioChunking() -> None:
 
     declared = Qwen3ASRPipelineConfig(model_path="dummy").resolved_audio_chunking
     assert declared.allow_audio_chunking is True
-    # 60s is a scheduling choice, not a context limit (the context is sized
+    # 30s is a scheduling choice, not a context limit (the context is sized
     # for the model's native 1,200s): short chunks batch well and keep one
     # long upload from monopolizing the engine.
-    assert declared.max_audio_clip_s == 60.0
+    assert declared.max_audio_clip_s == 30.0
     # The native limit feeds the streaming path, which cannot chunk and so
     # accepts single requests up to what the engine context fits.
     assert declared.max_native_clip_s == 1200.0

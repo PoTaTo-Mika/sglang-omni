@@ -20,7 +20,7 @@ from sglang_omni.models.qwen3_asr.audio_lengths import QWEN3_ASR_MAX_INPUT_SECON
 _PKG = "sglang_omni.models.qwen3_asr"
 
 QWEN3_ASR_AUDIO_CHUNKING = AudioChunkingConfig(
-    max_audio_clip_s=60.0,
+    max_audio_clip_s=30.0,
 )
 
 

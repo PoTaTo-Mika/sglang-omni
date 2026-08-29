@@ -373,7 +373,7 @@ class AudioChunkingConfig(BaseModel):
     # context for the official 1,200s native limit); below that ceiling it
     # is a scheduling trade-off: shorter chunks batch better and keep a
     # long upload from monopolizing the engine, at the cost of more seams.
-    max_audio_clip_s: float = Field(default=60.0, gt=0)
+    max_audio_clip_s: float = Field(default=30.0, gt=0)
 
     # Memory guard for the whole upload: the decoded waveform stays resident
     # while its chunks run.
@@ -404,7 +404,7 @@ class ResolvedAudioChunking:
     """
 
     allow_audio_chunking: bool = False
-    max_audio_clip_s: float = 60.0
+    max_audio_clip_s: float = 30.0
     max_native_clip_s: float | None = None
     max_total_audio_s: float | None = 3600.0
     min_tail_s: float = 0.5
