@@ -10,7 +10,6 @@ import json
 import queue
 import threading
 import time
-import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -1200,15 +1199,12 @@ def build_sglang_qwen3_tts_request(
         sampling_params=sampling_params,
         eos_token_ids={int(model.config.codec_eos_token_id)},
         vocab_size=int(model.config.vocab_size),
-        extra_key=f"qwen3_tts:{uuid.uuid4().hex}",
+        extra_key="qwen3_tts:prompt:v1",
     )
     req.tokenizer = None
     req._input_embeds_are_projected = True
-    req._codec_suppress_tokens = tuple(
-        token_id
-        for token_id in range(model.config.vocab_size - 1024, model.config.vocab_size)
-        if token_id != int(model.config.codec_eos_token_id)
-    )
+    req._omni_prompt_only_radix = True
+    req._omni_prompt_cache_key = req.extra_key
 
     ref_code_len = (
         int(prepared.ref_code.shape[0]) if prepared.ref_code is not None else 0
@@ -1235,7 +1231,6 @@ def build_sglang_qwen3_tts_request(
         stream_codec_output=not state.non_streaming_mode,
         engine_start_s=time.perf_counter(),
     )
-    data.suppress_tokens = list(req._codec_suppress_tokens)
     data.pending_text_queue = PendingTextTensorQueue.from_tensor(
         prepared.trailing_text_hidden
     )
