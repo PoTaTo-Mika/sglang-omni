@@ -13,7 +13,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 
 from sglang_omni.client import Client, ClientError, GenerateRequest
-from sglang_omni.config import AudioChunkingConfig
+from sglang_omni.config import ResolvedAudioChunking
 from sglang_omni.serve import speech_to_text
 from sglang_omni.serve.openai_errors import is_bad_request_error
 from sglang_omni.serve.protocol import TranscriptionResponse, TranscriptionUsage
@@ -85,7 +85,7 @@ def register_transcriptions(app: FastAPI) -> None:
             form.file
         )
 
-        chunking: AudioChunkingConfig = app.state.audio_chunking
+        chunking: ResolvedAudioChunking = app.state.audio_chunking
 
         if form.stream:
             speech_to_text.validate_speech_to_text_response_format(

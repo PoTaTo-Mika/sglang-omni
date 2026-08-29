@@ -20,9 +20,7 @@ from sglang_omni.models.qwen3_asr.audio_lengths import QWEN3_ASR_MAX_INPUT_SECON
 _PKG = "sglang_omni.models.qwen3_asr"
 
 QWEN3_ASR_AUDIO_CHUNKING = AudioChunkingConfig(
-    allow_audio_chunking=True,
     max_audio_clip_s=60.0,
-    max_native_clip_s=float(QWEN3_ASR_MAX_INPUT_SECONDS),
 )
 
 
@@ -45,12 +43,14 @@ class Qwen3ASRPipelineConfig(PipelineConfig):
     """Single-stage batched ASR pipeline for Qwen3-ASR checkpoints."""
 
     architecture: ClassVar[str] = "Qwen3ASRForConditionalGeneration"
+    allow_audio_chunking: ClassVar[bool] = True
+    max_native_clip_s: ClassVar[float] = float(QWEN3_ASR_MAX_INPUT_SECONDS)
     audio_chunking: AudioChunkingConfig = QWEN3_ASR_AUDIO_CHUNKING
 
     def model_post_init(self, __context=None) -> None:
         super().model_post_init(__context)
-        # The engine stage sizes its encoder CUDA-graph ladder from the chunk
-        # length, and it only sees factory kwargs -- so we copy the field
+        # Note (Jeffro): the engine stage sizes its encoder CUDA-graph ladder from the chunk
+        # length, and it only sees factory kwargs, so we copy the field
         # there. We always overwrite: a factory value that differs from the
         # field has no meaning, and the field carries the validation.
         for stage in self.stages:
