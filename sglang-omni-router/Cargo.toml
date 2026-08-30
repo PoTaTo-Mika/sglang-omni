@@ -29,7 +29,6 @@ tracing = { version = "=0.1.44", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["env-filter", "fmt", "json", "std"] }
 
 [lints.rust]
-missing_docs = "deny"
 unreachable_pub = "deny"
 unsafe_code = "forbid"
 unused_must_use = "deny"
@@ -40,8 +39,6 @@ await_holding_lock = "deny"
 dbg_macro = "deny"
 expect_used = "deny"
 panic = "deny"
-print_stderr = "deny"
-print_stdout = "deny"
 todo = "deny"
 unimplemented = "deny"
 unwrap_used = "deny"

@@ -31,7 +31,12 @@ impl TestDir {
         Self(path)
     }
 
-    fn config(&self, address: SocketAddr, max_connections: u32, drain_timeout_ms: u64) -> PathBuf {
+    fn config(
+        &self,
+        address: SocketAddr,
+        max_connections: usize,
+        drain_timeout_ms: u64,
+    ) -> PathBuf {
         let path = self.0.join("router.toml");
         let contents = format!(
             "schema_version = 1\n\n[server]\nlisten = \"{address}\"\nmax_connections = {max_connections}\n\n[shutdown]\ndrain_timeout_ms = {drain_timeout_ms}\n\n[logging]\nformat = \"json\"\nfilter = \"info\"\n"
@@ -328,7 +333,7 @@ fn invalid_connection_caps_fail_check_config_with_exit_two() {
     let directory = TestDir::new();
     let address = unused_address();
 
-    for max_connections in [0, 65_536] {
+    for max_connections in [0, tokio::sync::Semaphore::MAX_PERMITS + 1] {
         let config = directory.config(address, max_connections, 1_000);
         let checked = Command::new(env!("CARGO_BIN_EXE_sgl-omni-router"))
             .arg("--config")
@@ -360,7 +365,7 @@ fn invalid_cli_and_config_exit_two_without_disclosing_contents() {
     assert_eq!(invalid.status.code(), Some(2));
     let stderr = String::from_utf8(invalid.stderr).expect("diagnostic is UTF-8");
     assert!(!stderr.contains("do-not-log"));
-    assert!(!stderr.contains("secret-path"));
+    assert!(stderr.contains("secret-path.toml"));
 }
 
 #[test]

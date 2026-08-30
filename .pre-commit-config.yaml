@@ -23,7 +23,7 @@ repos:
       - id: check-added-large-files
       - id: check-merge-conflict
       - id: check-shebang-scripts-are-executable
-        exclude: ^\.claude/skills/
+        exclude: (?:^\.claude/skills/|^sglang-omni-router/tests/.*\.rs$)
       - id: detect-private-key
       - id: debug-statements
       - id: no-commit-to-branch

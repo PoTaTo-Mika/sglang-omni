@@ -13,7 +13,6 @@ use crate::error::RouterError;
 use crate::lifecycle::Lifecycle;
 use crate::shutdown;
 
-#[path = "bounded_listener.rs"]
 mod bounded_listener;
 
 use bounded_listener::BoundedTcpListener;
@@ -27,8 +26,7 @@ pub(crate) async fn serve(config: Config) -> Result<(), RouterError> {
     let listener = tokio::net::TcpListener::bind(config.server.listen)
         .await
         .map_err(RouterError::Bind)?;
-    let max_connections = config.server.max_connections_usize()?;
-    let listener = BoundedTcpListener::new(listener, max_connections);
+    let listener = BoundedTcpListener::new(listener, config.server.max_connections);
     let (shutdown_sender, shutdown_receiver) = oneshot::channel::<()>();
 
     lifecycle.enter_serving()?;

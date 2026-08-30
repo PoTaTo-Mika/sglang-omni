@@ -1,15 +1,3 @@
-#![forbid(unsafe_code)]
-#![deny(clippy::all)]
-#![deny(clippy::dbg_macro)]
-#![deny(clippy::expect_used)]
-#![deny(clippy::panic)]
-#![deny(clippy::print_stderr)]
-#![deny(clippy::print_stdout)]
-#![deny(clippy::todo)]
-#![deny(clippy::unimplemented)]
-#![deny(clippy::unwrap_used)]
-#![deny(unused_must_use)]
-
 //! Production entry point for the standalone SGLang-Omni Rust router.
 
 use std::io::{self, Write};

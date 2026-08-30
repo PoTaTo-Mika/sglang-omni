@@ -1,5 +1,4 @@
-use std::fs::File;
-use std::io::{self, Read};
+use std::fs;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
@@ -8,13 +7,7 @@ use serde::Deserialize;
 
 use crate::error::ConfigError;
 
-/// Maximum accepted configuration size, in bytes.
-pub const MAX_CONFIG_BYTES: usize = 64 * 1024;
-/// Maximum graceful-drain timeout, in milliseconds.
-pub const MAX_DRAIN_TIMEOUT_MS: u64 = 300_000;
-const DEFAULT_MAX_CONNECTIONS: u32 = 1024;
-const MAX_CONNECTIONS: u32 = 65_535;
-const MAX_LOG_FILTER_BYTES: usize = 256;
+const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 const SCHEMA_VERSION: u32 = 1;
 
 /// Fully parsed and validated process configuration.
@@ -38,17 +31,7 @@ pub struct ServerConfig {
     pub listen: SocketAddr,
     /// Maximum number of sockets accepted into Axum connection tasks.
     #[serde(default = "default_max_connections")]
-    pub max_connections: u32,
-}
-
-impl ServerConfig {
-    /// Returns the validated connection bound in the platform semaphore type.
-    pub(crate) fn max_connections_usize(&self) -> Result<usize, ConfigError> {
-        usize::try_from(self.max_connections).map_err(|_| ConfigError::InvalidField {
-            field: "server.max_connections",
-            reason: "cannot be represented on this platform",
-        })
-    }
+    pub max_connections: usize,
 }
 
 /// Graceful-shutdown limits.
@@ -86,26 +69,23 @@ pub enum LogFormat {
 }
 
 impl Config {
-    /// Reads no more than [`MAX_CONFIG_BYTES`] and validates one TOML file.
+    /// Reads and validates one TOML file.
     ///
     /// Errors identify safe schema fields but never include file contents.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
-        let file = File::open(path).map_err(ConfigError::Read)?;
-        let limit = u64::try_from(MAX_CONFIG_BYTES)
-            .map_err(|_| ConfigError::InternalLimit)?
-            .saturating_add(1);
-        let mut bytes = Vec::with_capacity(MAX_CONFIG_BYTES.saturating_add(1));
-        file.take(limit)
-            .read_to_end(&mut bytes)
-            .map_err(ConfigError::Read)?;
-        if bytes.len() > MAX_CONFIG_BYTES {
-            return Err(ConfigError::TooLarge {
-                maximum: MAX_CONFIG_BYTES,
-            });
-        }
-
-        let text = std::str::from_utf8(&bytes).map_err(ConfigError::Encoding)?;
-        let config: Self = toml::from_str(text).map_err(ConfigError::Parse)?;
+        let bytes = fs::read(path).map_err(|source| ConfigError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let text = std::str::from_utf8(&bytes).map_err(|source| ConfigError::Encoding {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let config: Self =
+            toml::from_str(text).map_err(|source: toml::de::Error| ConfigError::Parse {
+                path: path.to_path_buf(),
+                message: source.message().to_owned(),
+            })?;
         config.validate()?;
         Ok(config)
     }
@@ -117,29 +97,33 @@ impl Config {
                 reason: "unsupported version",
             });
         }
-        if self.server.max_connections == 0 || self.server.max_connections > MAX_CONNECTIONS {
+        if self.server.max_connections == 0
+            || self.server.max_connections > tokio::sync::Semaphore::MAX_PERMITS
+        {
             return Err(ConfigError::InvalidField {
                 field: "server.max_connections",
-                reason: "must be between 1 and 65535",
+                reason: "must fit the listener semaphore and be greater than zero",
             });
         }
-        let _max_connections = self.server.max_connections_usize()?;
         if self.shutdown.drain_timeout_ms == 0 {
             return Err(ConfigError::InvalidField {
                 field: "shutdown.drain_timeout_ms",
                 reason: "must be greater than zero",
             });
         }
-        if self.shutdown.drain_timeout_ms > MAX_DRAIN_TIMEOUT_MS {
+        if std::time::Instant::now()
+            .checked_add(self.shutdown.drain_timeout())
+            .is_none()
+        {
             return Err(ConfigError::InvalidField {
                 field: "shutdown.drain_timeout_ms",
-                reason: "exceeds the maximum",
+                reason: "cannot be represented by the monotonic clock",
             });
         }
-        if self.logging.filter.is_empty() || self.logging.filter.len() > MAX_LOG_FILTER_BYTES {
+        if self.logging.filter.is_empty() {
             return Err(ConfigError::InvalidField {
                 field: "logging.filter",
-                reason: "must contain between 1 and 256 bytes",
+                reason: "must not be empty",
             });
         }
         tracing_subscriber::EnvFilter::try_new(self.logging.filter.as_str()).map_err(|_| {
@@ -152,12 +136,6 @@ impl Config {
     }
 }
 
-const fn default_max_connections() -> u32 {
+const fn default_max_connections() -> usize {
     DEFAULT_MAX_CONNECTIONS
-}
-
-impl From<io::Error> for ConfigError {
-    fn from(source: io::Error) -> Self {
-        Self::Read(source)
-    }
 }

@@ -18,7 +18,7 @@ pub(super) struct BoundedTcpListener {
 }
 
 impl BoundedTcpListener {
-    /// Wraps a bound TCP listener with exactly `max_connections` permits.
+    /// Wraps a bound TCP listener with `max_connections` permits.
     pub(super) fn new(listener: TcpListener, max_connections: usize) -> Self {
         Self {
             listener,

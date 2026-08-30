@@ -1,4 +1,5 @@
 use std::io;
+use std::path::PathBuf;
 
 use thiserror::Error;
 
@@ -6,23 +7,22 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum ConfigError {
     /// The configuration file could not be opened or read.
-    #[error("failed to read configuration")]
-    Read(#[source] io::Error),
-    /// The configured byte bound cannot be represented by this platform.
-    #[error("configuration size limit is not supported on this platform")]
-    InternalLimit,
-    /// The configuration exceeded its fixed input bound.
-    #[error("configuration exceeds the {maximum}-byte limit")]
-    TooLarge {
-        /// Maximum accepted bytes.
-        maximum: usize,
+    #[error("failed to read configuration {path}: {source}")]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
     },
     /// The configuration was not UTF-8.
-    #[error("configuration must be UTF-8")]
-    Encoding(#[source] std::str::Utf8Error),
+    #[error("configuration {path} must be UTF-8: {source}")]
+    Encoding {
+        path: PathBuf,
+        #[source]
+        source: std::str::Utf8Error,
+    },
     /// TOML syntax, duplicate fields, or unknown fields were invalid.
-    #[error("configuration is not valid strict TOML")]
-    Parse(#[source] toml::de::Error),
+    #[error("failed to parse configuration {path}: {message}")]
+    Parse { path: PathBuf, message: String },
     /// A parsed field violated a bounded semantic rule.
     #[error("invalid configuration field {field}: {reason}")]
     InvalidField {

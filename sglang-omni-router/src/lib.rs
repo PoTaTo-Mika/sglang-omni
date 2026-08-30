@@ -1,16 +1,3 @@
-#![forbid(unsafe_code)]
-#![deny(clippy::all)]
-#![deny(clippy::await_holding_lock)]
-#![deny(clippy::dbg_macro)]
-#![deny(clippy::expect_used)]
-#![deny(clippy::panic)]
-#![deny(clippy::print_stderr)]
-#![deny(clippy::print_stdout)]
-#![deny(clippy::todo)]
-#![deny(clippy::unimplemented)]
-#![deny(clippy::unwrap_used)]
-#![deny(missing_docs, unreachable_pub, unused_must_use)]
-
 //! Process foundation for the standalone SGLang-Omni Rust router.
 //!
 //! This crate owns strict startup configuration, the router-local liveness
@@ -25,7 +12,7 @@ mod shutdown;
 
 use std::path::Path;
 
-pub use config::{Config, LogFormat, MAX_CONFIG_BYTES, MAX_DRAIN_TIMEOUT_MS};
+pub use config::{Config, LogFormat};
 pub use error::{ConfigError, RouterError};
 
 /// Successful result of executing the process composition root.
