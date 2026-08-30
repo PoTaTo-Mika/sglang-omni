@@ -53,11 +53,18 @@ def test_stream_hop_math_matches_cosyvoice3() -> None:
     assert first_ar_flush_tokens(25) == AR_INITIAL_FLUSH_TOKENS
 
 
+class _FakeEstimator(torch.nn.Module):
+    def forward(self, *args, **kwargs):
+        del args, kwargs
+        raise AssertionError("causal hops must use CosyVoice Flow.inference")
+
+
 class _FakeFlow(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.anchor = torch.nn.Parameter(torch.zeros(1))
         self.calls: list[dict] = []
+        self.decoder = SimpleNamespace(estimator=_FakeEstimator())
 
     def inference(self, **kwargs):
         self.calls.append(kwargs)
