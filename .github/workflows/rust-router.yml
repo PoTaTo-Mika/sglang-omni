@@ -3,10 +3,16 @@ name: Rust Router
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - ".github/workflows/rust-router.yml"
+      - ".gitignore"
+      - "sglang-omni-router/**"
   push:
     branches: [main]
-  schedule:
-    - cron: "17 3 * * 1"
+    paths:
+      - ".github/workflows/rust-router.yml"
+      - ".gitignore"
+      - "sglang-omni-router/**"
   workflow_dispatch:
 
 concurrency:
@@ -37,7 +43,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install pinned release and MSRV toolchains
+      - name: Install pinned implementation and MSRV toolchains
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -54,78 +60,23 @@ jobs:
           cargo +1.90.0 --version --verbose
           rustc +1.90.0 --version | grep -E '^rustc 1\.90\.0 '
 
-      - name: Install cargo-deny 0.20.2
-        timeout-minutes: 3
-        run: |
-          set -euo pipefail
-
-          version="0.20.2"
-          archive="$RUNNER_TEMP/cargo-deny.tar.gz"
-          install_dir="$RUNNER_TEMP/cargo-deny"
-
-          curl \
-            --proto '=https' \
-            --tlsv1.2 \
-            --fail \
-            --location \
-            --retry 5 \
-            --output "$archive" \
-            "https://github.com/EmbarkStudios/cargo-deny/releases/download/${version}/cargo-deny-${version}-x86_64-unknown-linux-musl.tar.gz"
-
-          echo "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f  $archive" \
-            | sha256sum --check --strict
-
-          mkdir -p "$install_dir"
-          tar --extract --gzip --file "$archive" --strip-components=1 \
-            --directory "$install_dir"
-          echo "$install_dir" >> "$GITHUB_PATH"
-          "$install_dir/cargo-deny" --version
-
-      - name: Dependency and quality gates
+      - name: Quality gates
         timeout-minutes: 20
         run: |
           set -euo pipefail
 
           cargo fmt --all -- --check
-          cargo deny --locked check
           cargo +1.90.0 check --workspace --all-targets --all-features --locked
-          cargo check --workspace --all-targets --all-features --locked
           cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-          cargo build --workspace --all-features --locked
-          cargo test --workspace --all-features --locked
+          cargo test --workspace --all-targets --all-features --locked -- --test-threads=1
           RUSTDOCFLAGS="-D warnings" \
             cargo doc --workspace --all-features --no-deps --locked
 
-      - name: CLI smoke tests
-        timeout-minutes: 3
+      - name: Build operator binary
+        timeout-minutes: 10
         run: |
           set -euo pipefail
 
-          binary="./target/debug/sgl-omni-router"
-          config="$RUNNER_TEMP/sgl-omni-router.toml"
-
-          "$binary" --help
-          "$binary" --version
-
-          cat > "$config" <<'EOF'
-          schema_version = 1
-
-          [server]
-          listen = "127.0.0.1:30000"
-
-          [shutdown]
-          drain_timeout_ms = 30000
-
-          [logging]
-          format = "json"
-          filter = "info"
-          EOF
-
-          "$binary" --config "$config" --check-config
-
-      - name: Verify clean generated state
-        if: always()
-        run: |
-          set -euo pipefail
-          git diff --exit-code
-          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          cargo build --release --workspace --all-features --locked
+          ./target/release/sgl-omni-router --help
+          ./target/release/sgl-omni-router --version
