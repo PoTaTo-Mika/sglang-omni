@@ -148,7 +148,16 @@ fn read_errors_include_path_and_operating_system_cause() {
     let error = Config::load(path).expect_err("missing config must fail");
     let message = error.to_string();
     assert!(message.contains(path.to_str().expect("test path is UTF-8")));
-    assert!(message.contains("No such file") || message.contains("not found"));
+    match error {
+        ConfigError::Read {
+            path: error_path,
+            source,
+        } => {
+            assert_eq!(error_path, path);
+            assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+        }
+        other => panic!("expected read error, got {other:?}"),
+    }
 }
 
 #[test]

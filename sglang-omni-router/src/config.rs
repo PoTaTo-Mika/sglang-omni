@@ -111,7 +111,7 @@ impl Config {
                 reason: "must be greater than zero",
             });
         }
-        if std::time::Instant::now()
+        if tokio::time::Instant::now()
             .checked_add(self.shutdown.drain_timeout())
             .is_none()
         {
