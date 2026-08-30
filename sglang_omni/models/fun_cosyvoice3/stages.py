@@ -45,6 +45,8 @@ _COSYVOICE_INSTALL_HINT = (
     "in the serving environment before launching Fun-CosyVoice3."
 )
 
+_CHUNK_MASK_COMPILE_DISABLED = False
+
 
 @dataclass(frozen=True)
 class FlowBatchInput:
@@ -344,11 +346,29 @@ def _configure_dit_torch_compile() -> None:
         torch._dynamo.config.accumulated_cache_size_limit = 1024
 
 
+def _disable_compile_on_chunk_mask() -> None:
+    # note (guozhihao-224): inductor NaN-compares subsequent_chunk_mask in
+    # DiT.forward; keep the mask eager.
+    global _CHUNK_MASK_COMPILE_DISABLED
+    if _CHUNK_MASK_COMPILE_DISABLED:
+        return
+    try:
+        import cosyvoice.flow.DiT.dit as dit_mod
+        import cosyvoice.utils.mask as mask_mod
+    except ImportError:
+        return
+    disabled = torch.compiler.disable(mask_mod.add_optional_chunk_mask)
+    mask_mod.add_optional_chunk_mask = disabled
+    dit_mod.add_optional_chunk_mask = disabled
+    _CHUNK_MASK_COMPILE_DISABLED = True
+
+
 def _run_dit_estimator(
     estimator: Any,
     mel_frames: int,
     *,
     compute_dtype: torch.dtype | None = None,
+    streaming: bool = False,
 ) -> None:
 
     param = next(estimator.parameters())
@@ -366,7 +386,7 @@ def _run_dit_estimator(
         dtype=compute_dtype,
         enabled=compute_dtype is not None,
     ):
-        estimator(x, mask, mu, timestep, spks, cond, streaming=False)
+        estimator(x, mask, mu, timestep, spks, cond, streaming=streaming)
 
 
 def _compile_dit_backbone(
@@ -390,15 +410,18 @@ def _compile_dit_backbone(
 
     original_forward = estimator.forward
     _configure_dit_torch_compile()
+    _disable_compile_on_chunk_mask()
     try:
         estimator.forward = torch.compile(original_forward, dynamic=True)
         with torch.inference_mode():
-            for _ in range(warmup_steps):
-                _run_dit_estimator(
-                    estimator,
-                    warmup_mel_frames,
-                    compute_dtype=compute_dtype,
-                )
+            for streaming in (False, True):
+                for _ in range(warmup_steps):
+                    _run_dit_estimator(
+                        estimator,
+                        warmup_mel_frames,
+                        compute_dtype=compute_dtype,
+                        streaming=streaming,
+                    )
     except Exception as exc:
         estimator.forward = original_forward
         logger.warning(
@@ -410,7 +433,7 @@ def _compile_dit_backbone(
         return False
     logger.info(
         "Compiled Fun-CosyVoice3 DiT backbone (dynamic=True, compute_dtype=%s, "
-        "warmup_mel_frames=%d, warmup_steps=%d)",
+        "warmup_mel_frames=%d, warmup_steps=%d, streaming=False/True)",
         compute_dtype,
         warmup_mel_frames,
         warmup_steps,
