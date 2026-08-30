@@ -5,13 +5,11 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - ".github/workflows/rust-router.yml"
-      - ".gitignore"
       - "sglang-omni-router/**"
   push:
     branches: [main]
     paths:
       - ".github/workflows/rust-router.yml"
-      - ".gitignore"
       - "sglang-omni-router/**"
   workflow_dispatch:
 
@@ -28,7 +26,7 @@ env:
 
 jobs:
   rust-router:
-    name: foundation
+    name: quality
     runs-on: ubuntu-24.04
     timeout-minutes: 30
 
@@ -72,11 +70,20 @@ jobs:
           RUSTDOCFLAGS="-D warnings" \
             cargo doc --workspace --all-features --no-deps --locked
 
-      - name: Build operator binary
+      - name: Build and validate operator inputs
         timeout-minutes: 10
         run: |
           set -euo pipefail
 
           cargo build --release --workspace --all-features --locked
-          ./target/release/sgl-omni-router --help
-          ./target/release/sgl-omni-router --version
+          binary="./target/release/sgl-omni-router"
+
+          "$binary" --help
+          "$binary" --version
+
+          configs="$(git ls-files -- 'examples/*.toml' | LC_ALL=C sort)"
+          if [[ -n "$configs" ]]; then
+            while IFS= read -r config; do
+              "$binary" --config "$config" --check-config
+            done <<< "$configs"
+          fi
