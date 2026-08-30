@@ -49,7 +49,7 @@ impl TestDir {
         &self,
         address: SocketAddr,
         worker: SocketAddr,
-        max_connections: u32,
+        max_connections: usize,
         drain_timeout_ms: u64,
     ) -> PathBuf {
         let path = self.config(address, max_connections, drain_timeout_ms);
