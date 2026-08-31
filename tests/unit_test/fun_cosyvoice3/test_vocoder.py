@@ -409,9 +409,9 @@ def test_create_vocoder_executor_defaults_batch_for_real_lengths(monkeypatch) ->
     scheduler = stages.create_vocoder_executor("model", device="cpu")
 
     assert scheduler._max_batch_cost == stages._DEFAULT_FLOW_BATCH_ADMISSION_FRAMES
-    assert scheduler._max_batch_cost // 713 >= 8, (
-        "default admission budget no longer holds a useful batch"
-    )
+    assert (
+        scheduler._max_batch_cost // 713 >= 8
+    ), "default admission budget no longer holds a useful batch"
     assert scheduler._max_batch_size == 16
     assert scheduler._max_batch_wait_s == pytest.approx(0.03)
 
@@ -472,10 +472,7 @@ def test_preprocessing_executor_rejects_non_positive_concurrency() -> None:
 
 
 def test_onnx_intra_op_threads_reaches_both_encoders(monkeypatch) -> None:
-    from sglang_omni.models.fun_cosyvoice3 import (
-        engine_builder,
-        request_builders,
-    )
+    from sglang_omni.models.fun_cosyvoice3 import engine_builder, request_builders
 
     seen: dict[str, int] = {}
 
