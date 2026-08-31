@@ -46,9 +46,9 @@ class FunCosyVoice3PipelineConfig(PipelineConfig):
             process="pipeline",
             factory_path=f"{_PKG}.stages.create_sglang_tts_engine_executor",
             factory=FactoryArgs(
-              device=current_platform.device_type, 
-              dtype="bfloat16",
-              onnx_intra_op_threads=16,
+                device=current_platform.device_type,
+                dtype="bfloat16",
+                onnx_intra_op_threads=16,
             ),
             gpu=0,
             next="vocoder",
