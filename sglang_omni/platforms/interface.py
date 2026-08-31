@@ -60,3 +60,7 @@ class OmniPlatform(DeviceMixin):
     def enable_code2wav_graph(self):
         """Check if current platform support Graph for code2wav in Qwen3-Omni"""
         return True
+
+    def supports_torchaudio_resample(self) -> bool:
+        """Check if current platform support torchaudio.functional.resample"""
+        return True
