@@ -19,6 +19,10 @@ from sglang_omni.models.qwen3_asr.audio_lengths import QWEN3_ASR_MAX_INPUT_SECON
 
 _PKG = "sglang_omni.models.qwen3_asr"
 
+QWEN3_ASR_AUDIO_CHUNKING = AudioChunkingConfig(
+    max_audio_clip_s=30.0,
+)
+
 
 class Qwen3ASRFactoryArgs(FactoryArgs):
     """Qwen3-ASR's own constructor knobs, typed like the shared ones."""
@@ -38,11 +42,9 @@ class Qwen3ASRPipelineConfig(PipelineConfig):
     """Single-stage batched ASR pipeline for Qwen3-ASR checkpoints."""
 
     architecture: ClassVar[str] = "Qwen3ASRForConditionalGeneration"
-    audio_chunking: ClassVar[AudioChunkingConfig] = AudioChunkingConfig(
-        allow_audio_chunking=True,
-        max_audio_clip_s=60.0,
-        max_native_clip_s=float(QWEN3_ASR_MAX_INPUT_SECONDS),
-    )
+    allow_audio_chunking: ClassVar[bool] = True
+    max_native_clip_s: ClassVar[float] = float(QWEN3_ASR_MAX_INPUT_SECONDS)
+    audio_chunking: AudioChunkingConfig = QWEN3_ASR_AUDIO_CHUNKING
 
     stage_config_types: ClassVar[dict[str, type[StageConfig]]] = {
         "asr": Qwen3ASRStageConfig,

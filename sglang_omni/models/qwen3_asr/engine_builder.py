@@ -64,11 +64,14 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
         pre_lm_max_batch_size: int = 8,
         pre_lm_max_batch_wait_ms: int = 0,
         enable_encoder_cuda_graph: bool = True,
+        max_audio_clip_s: float | None = None,
     ) -> None:
         if pre_lm_max_batch_size < 1:
             raise ValueError(
                 f"pre_lm_max_batch_size must be >= 1, got {pre_lm_max_batch_size}"
             )
+        if max_audio_clip_s is not None and max_audio_clip_s <= 0:
+            raise ValueError(f"max_audio_clip_s must be > 0, got {max_audio_clip_s}")
         if pre_lm_max_batch_wait_ms < 0:
             raise ValueError(
                 f"pre_lm_max_batch_wait_ms must be >= 0, got {pre_lm_max_batch_wait_ms}"
@@ -100,6 +103,7 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
         self.pre_lm_max_batch_size = pre_lm_max_batch_size
         self.pre_lm_max_batch_wait_ms = pre_lm_max_batch_wait_ms
         self.enable_encoder_cuda_graph = enable_encoder_cuda_graph
+        self.max_audio_clip_s = max_audio_clip_s
         self.tokenizer: Any = None
         self.feature_extractor: Any = None
         self.context_length = 0
@@ -217,9 +221,13 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
             from sglang_omni.models.qwen3_asr.audio_lengths import (
                 qwen3_asr_num_audio_tokens,
             )
-            from sglang_omni.models.qwen3_asr.config import Qwen3ASRPipelineConfig
+            from sglang_omni.models.qwen3_asr.config import QWEN3_ASR_AUDIO_CHUNKING
 
-            clip_s = Qwen3ASRPipelineConfig.audio_chunking.max_audio_clip_s
+            clip_s = (
+                self.max_audio_clip_s
+                if self.max_audio_clip_s is not None
+                else QWEN3_ASR_AUDIO_CHUNKING.max_audio_clip_s
+            )
             max_tokens_per_clip = qwen3_asr_num_audio_tokens(int(clip_s * 100))
             model.init_encoder_graphs(
                 max_batch_size=self.pre_lm_max_batch_size,
