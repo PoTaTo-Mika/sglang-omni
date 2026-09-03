@@ -33,7 +33,6 @@ from sglang_omni.utils.device import resolve_device_spec
 # Note (xinran): This is an admission budget, not a maximum supported request
 # length. The scheduler admits a request that exceeds it as a singleton Flow
 # batch and defers following requests to the next batch.
-# Mel-frame budget for admitting requests into one Flow batch.
 
 _DEFAULT_FLOW_BATCH_ADMISSION_FRAMES = 8000
 
