@@ -34,17 +34,7 @@ from sglang_omni.utils.device import resolve_device_spec
 # length. The scheduler admits a request that exceeds it as a singleton Flow
 # batch and defers following requests to the next batch.
 # Mel-frame budget for admitting requests into one Flow batch.
-#
-# This is the main throttle on vocoder batching, and it has to be derived from
-# the real length distribution rather than picked by feel. On seed-tts-eval the
-# reference audio averages 7.2 s (=> ~180 flow prompt tokens) and completions
-# average ~163 tokens, so a single request costs ~690 mel frames on average
-# (713 once rounded up to a bucket). The old 2000-frame budget therefore held a
-# mean of only ~2.2 requests -- at which point a Flow solve costs ~90 ms/request
-# (5.6 -> 11.1 req/s) instead of the ~42 ms/request available at batch 8.
-#
-# 8000 frames gives a mean batch of ~10.5 on the same distribution. Cost is
-# quadratic in the padded length, so this is the knob to watch on smaller GPUs.
+
 _DEFAULT_FLOW_BATCH_ADMISSION_FRAMES = 8000
 
 _AUTOCAST_DTYPES: dict[str, torch.dtype | None] = {
