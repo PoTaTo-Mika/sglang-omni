@@ -71,10 +71,16 @@ startup:
 Not every handoff tolerates a process boundary: some stages exchange state
 through process-local registries a second process cannot read (for example,
 MOSS-TTS pipelines hand prepared requests from preprocessing to the AR engine
-through a process-local queue, and Qwen3-TTS keeps prepared requests in
-process-local module state). Splitting such an edge fails at serving time
-rather than at config validation — keep those stages in one process as the
-shipped configs do.
+through a process-local queue). A model declares those edges through
+`PipelineConfig.process_local_edges`, and splitting one is refused during
+topology compilation, before any worker starts.
+
+Qwen3-TTS keeps prepared requests in process-local module state only while
+`preprocessing` and `tts_engine` share a process; placed in its own process the
+preprocessing stage loads a prompt frontend and ships the prepared prompt
+tensors through `tensor_cpu` payload fields, so that edge can cross too. The
+`tensor_cpu` codec keeps each tensor's own dtype and lets the relay carry it
+outside the control plane, which `typed_tensor` would not do.
 
 Ming-Omni-TTS carries preprocessing fields in `StagePayload.data` and serializes the reference encoder's `spk_emb` and `prompt_latent` tensors with the `typed_tensor` wire codec. Both `preprocessing -> reference_encode` and `reference_encode -> tts_engine` can therefore cross process boundaries.
 
