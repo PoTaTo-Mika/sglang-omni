@@ -31,7 +31,11 @@ class FunCosyVoice3EngineBuilder(TtsEngineBuilder):
         super().__init__()
         self._checkpoint_root: str | None = None
 
-        self._onnx_intra_op_threads = max(1, int(onnx_intra_op_threads))
+        # note (Dayuxiaoshui): both ONNX sessions get a pool of this size, so
+        # cap it at the host core count instead of trusting the default of 16.
+        self._onnx_intra_op_threads = max(
+            1, min(int(onnx_intra_op_threads), os.cpu_count() or 1)
+        )
 
     def _blanken_dir(self) -> str:
         assert self._checkpoint_root is not None, "checkpoint_root not set"

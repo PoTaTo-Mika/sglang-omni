@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import logging
-import types
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
@@ -328,20 +327,6 @@ def _fold_weight_norm(module: torch.nn.Module) -> int:
     return folded
 
 
-def _patch_hift_for_batching(hift: Any) -> None:
-    if getattr(hift, "_sglang_omni_batched_stft", False):
-        return
-    original_stft = hift._stft
-
-    def _stft(self: Any, x: torch.Tensor) -> Any:
-        if x.dim() == 3:
-            x = x[:, 0]
-        return original_stft(x)
-
-    hift._stft = types.MethodType(_stft, hift)
-    hift._sglang_omni_batched_stft = True
-
-
 def _hift_samples_per_mel_frame(hift: Any) -> int:
     rates = getattr(hift, "upsample_rates", None)
     hop_len = (
@@ -361,12 +346,15 @@ def _hift_samples_per_mel_frame(hift: Any) -> int:
 
 
 def _prepare_hift_for_inference(hift: Any) -> None:
+    # note (Dayuxiaoshui): folding weight_norm is the only load-time step
+    # batched decode needs. The pinned CausalHiFTGenerator already squeezes
+    # the source to [B, T] before its STFT and casts f0_predictor to float64
+    # inside inference(), and right-zero-padded mels reproduce per-request
+    # output bit-for-bit except in the final mel frame of padded requests.
     folded = _fold_weight_norm(hift)
-    hift.f0_predictor.to(torch.float64)
-    _patch_hift_for_batching(hift)
     logger.info(
         "Prepared Fun-CosyVoice3 HiFT for inference (folded %d weight_norm "
-        "parametrizations, f0 predictor pinned to float64, batched decode enabled)",
+        "parametrizations)",
         folded,
     )
 
@@ -556,7 +544,7 @@ class _CosyVoice3Vocoder(BatchVocoderBase):
         hift: Any,
         compute_dtype: torch.dtype | None = None,
         flow_batch_bucket_frames: int = 50,
-        hift_compute_dtype: str = "bfloat16",
+        hift_compute_dtype: str = "float32",
         hift_max_padding_waste: float = 1.5,
     ) -> None:
         if flow_batch_bucket_frames <= 0:
@@ -767,7 +755,7 @@ def create_vocoder_executor(
     flow_batch_bucket_frames: int = 50,
     flow_batch_admission_frames: int = _DEFAULT_FLOW_BATCH_ADMISSION_FRAMES,
     enable_dit_torch_compile: bool = False,
-    hift_dtype: str = "bfloat16",
+    hift_dtype: str = "float32",
     hift_max_padding_waste: float = 1.5,
 ) -> SimpleScheduler:
     if flow_batch_admission_frames <= 0:

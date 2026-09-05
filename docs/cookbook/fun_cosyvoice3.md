@@ -82,8 +82,8 @@ HiFT is batched the same way: the mels from one Flow bucket are right-zero-padde
 tensor, decoded in one HiFT call, and sliced back to each request's true length, under the
 padding budget `hift_max_padding_waste` (1.5 by default; `1.0` only groups requests that need no
 padding at all). HiFT is prepared for this at load time by folding away its `weight_norm`
-parametrizations, pinning the f0 predictor to `float64`, and patching the internal STFT to
-accept the batched `[B, 1, T]` input.
+parametrizations. Right-zero-padding matches the zero padding HiFT applies in single-request
+inference, so batched output is identical except in the final mel frame of padded requests.
 
 The built-in Flow implementation supports the pinned CosyVoice PyTorch estimator and buffered
 `streaming=False, finalize=True` inference only. TensorRT Flow is not supported by this
@@ -132,8 +132,9 @@ stages:
 ```
 
 The remaining vocoder `factory` options are `max_batch_size` (16) and `max_batch_wait_ms` (30)
-for the scheduler batch, `dtype` (`bfloat16`) for the Flow autocast, `hift_dtype` (`bfloat16`,
-independent of `dtype`) for the HiFT autocast, and `enable_dit_torch_compile` (see below). The
+for the scheduler batch, `dtype` (`bfloat16`) for the Flow autocast, `hift_dtype` (`float32`,
+independent of `dtype`; `bfloat16` measured no faster for HiFT on H200 and lowers output fidelity)
+for the HiFT autocast, and `enable_dit_torch_compile` (see below). The
 `tts_engine` stage takes `onnx_intra_op_threads` (16) for the speech tokenizer and speaker
 encoder ONNX sessions, and `preprocessing` takes `max_concurrency` (8) for concurrent reference
 conditioning.

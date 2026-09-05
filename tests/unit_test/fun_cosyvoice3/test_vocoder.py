@@ -542,3 +542,14 @@ def test_pipeline_config_sets_flow_batch_bucket_by_default() -> None:
         "max_batch_wait_ms": 30,
         "enable_dit_torch_compile": False,
     }
+
+
+def test_vocoder_hift_defaults_to_float32(monkeypatch) -> None:
+    flow = _BatchCapableFakeFlow()
+    _install_fake_batch_adapter(monkeypatch, [])
+    vocoder = stages._CosyVoice3Vocoder(flow, _FakeHiFT())
+
+    # bfloat16 gave HiFT no speedup, so the default keeps full precision.
+    assert vocoder._hift_compute_dtype is None
+    with vocoder._hift_autocast():
+        assert not torch.is_autocast_enabled()
